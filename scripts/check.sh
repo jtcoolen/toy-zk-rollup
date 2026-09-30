@@ -18,22 +18,47 @@ cd "$ROOT"
 
 # Resolve the Rust toolchain bin dir explicitly.
 #
-# Callers must NOT pre-set HOME to the semgrep override: this script owns that
-# override and applies it only to the semgrep invocation, so `$HOME` here is the
-# real home and `$HOME/.rustup` resolves correctly. `RUSTUP_TOOLCHAIN_BIN` can
-# override the location explicitly.
+# The pinned version lives in `rust-toolchain.toml` at the repo root; rustup reads
+# it and resolves the right toolchain. Callers must NOT pre-set HOME to the
+# semgrep override: this script owns that override and applies it only to the
+# semgrep invocation, so `$HOME` here is the real home and `$RUSTUP_HOME`
+# resolves correctly.
+#
+# Resolution order:
+#   1. $RUSTUP_TOOLCHAIN_BIN  (explicit override, wins outright)
+#   2. a rustup shim, which honours rust-toolchain.toml
+#   3. a bare toolchain dir on PATH (no rustup available)
 find_toolchain_bin() {
-  local candidates=(
-    "${RUSTUP_TOOLCHAIN_BIN:-}"
-    "$HOME/.rustup/toolchains/1.90.0-aarch64-apple-darwin/bin"
-  )
-  local c
-  for c in "${candidates[@]}"; do
-    if [ -n "$c" ] && [ -x "$c/cargo" ]; then
-      printf '%s' "$c"
-      return 0
+  if [ -n "${RUSTUP_TOOLCHAIN_BIN:-}" ] && [ -x "$RUSTUP_TOOLCHAIN_BIN/cargo" ]; then
+    printf '%s' "$RUSTUP_TOOLCHAIN_BIN"
+    return 0
+  fi
+
+  # Prefer a rustup that can read rust-toolchain.toml.
+  local rustup
+  for rustup in \
+    "$HOME/.cargo/bin/rustup" \
+    "$(command -v rustup 2>/dev/null || true)"
+  do
+    if [ -n "$rustup" ] && [ -x "$rustup" ]; then
+      local resolved
+      resolved="$(RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+        "$rustup" which cargo 2>/dev/null | xargs -n1 dirname 2>/dev/null || true)"
+      if [ -n "$resolved" ] && [ -x "$resolved/cargo" ]; then
+        printf '%s' "$resolved"
+        return 0
+      fi
     fi
   done
+
+  # No rustup: fall back to whatever cargo is already on PATH.
+  local onpath
+  onpath="$(command -v cargo 2>/dev/null || true)"
+  if [ -n "$onpath" ]; then
+    printf '%s' "$(dirname "$onpath")"
+    return 0
+  fi
+
   return 1
 }
 
@@ -43,7 +68,12 @@ TOOLCHAIN_BIN="$(find_toolchain_bin)" || {
 }
 
 export CARGO_HOME="${CARGO_HOME:-$ROOT/.cargo-home}"
-export PATH="$CARGO_HOME/bin:$TOOLCHAIN_BIN:$PATH"
+export PATH="$TOOLCHAIN_BIN:$CARGO_HOME/bin:$PATH"
+
+# Report the resolved toolchain so a version mismatch is visible in CI output
+# rather than being a mysterious compile error.
+printf 'toolchain: %s\n' "$("$TOOLCHAIN_BIN/rustc" --version 2>/dev/null || echo unknown)"
+
 
 # semgrep needs a writable HOME; keep it inside the workspace.
 SEMGREP_HOME="$ROOT/.home"

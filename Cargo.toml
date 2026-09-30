@@ -12,7 +12,9 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-rust-version = "1.85"
+# Floor is set by Plonky3 v0.8.0's use of `MaybeUninit<[T]>` slice
+# initialisation. The exact build toolchain is pinned in rust-toolchain.toml.
+rust-version = "1.98.1"
 
 # ---------------------------------------------------------------------------
 # Dependency policy

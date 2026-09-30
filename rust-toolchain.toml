@@ -1,0 +1,12 @@
+# Toolchain pin.
+#
+# Plonky3 v0.8.0 uses `MaybeUninit<[T]>` slice initialisation, which is not
+# available on the 1.90.0 toolchain this repo previously built with. Verified
+# empirically: `p3-util` 0.8.0 fails to compile on 1.90.0 and compiles on 1.98.1.
+#
+# Pinned to an exact version, not `stable`: a moving `stable` would let a future
+# rustc change alter generated code or lint results under a proof system whose
+# byte-level transcript must stay fixed.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]

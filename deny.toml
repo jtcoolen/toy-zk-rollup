@@ -36,7 +36,25 @@ confidence-threshold = 0.9
 # Scope of what we check: the whole graph, not just direct deps.
 unmaintained = "all"
 unsound = "all"
-ignore = []
+
+# Every ignore needs a reason and an exit condition. An unexplained ignore turns a
+# gate into theatre.
+ignore = [
+  # RUSTSEC-2024-0436 — `paste` is archived / unmaintained.
+  #
+  # Why this is acceptable:
+  #   - `paste` is a proc-macro. It runs at compile time inside our build and
+  #     contributes ZERO bytes to any shipped binary. There is no runtime surface
+  #     for an attacker to reach, and the advisory is "unmaintained", not a
+  #     soundness or memory-safety finding.
+  #   - We do not depend on `paste` directly. It is pulled in by
+  #     `p3-field` 0.8.0 (`cargo tree -i paste`), so we cannot upgrade it
+  #     without patching Plonky3.
+  #
+  # Exit condition: drop this ignore when p3-field drops `paste` (the advisory
+  # suggests `pastey`). Re-run `cargo tree -i paste` to confirm.
+  "RUSTSEC-2024-0436",
+]
 
 # ---------------------------------------------------------------------------
 # Bans
