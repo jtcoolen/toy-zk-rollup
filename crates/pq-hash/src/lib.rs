@@ -16,12 +16,26 @@
 //! | Layer | Primitive | Why |
 //! |---|---|---|
 //! | Shielded (note/nullifier derivation) | SHA3-256 | User-mandated. FIPS-202, post-quantum. |
-//! | Commitment (Merkle tree, FRI) | Keccak-256 | `0x20` precompile on EVM: ~30 gas vs ~60 for SHA3. |
-//! | Transcript (Fiat-Shamir) | Keccak-256 | Same precompile argument; the Solidity verifier replays it natively. |
+//! | Commitment (Merkle tree, FRI) | Keccak-256 | Native EVM opcode `0x20`; ~30 gas per hash. |
+//! | Transcript (Fiat-Shamir) | Keccak-256 | Same opcode; the Solidity verifier replays it natively. |
 //!
-//! Keccak-256 and SHA3-256 differ only in the padding byte (`0x06` vs `0x01`).
-//! Using Keccak on-chain is therefore a **gas choice, not a security downgrade** —
-//! both are 128-bit post-quantum hashes with no known structural weakness.
+//! Keccak-256 and SHA3-256 are the same sponge with a different domain-separation
+//! byte: Keccak-256 (the original) pads with `0x01`, FIPS-202 SHA3-256 pads with
+//! `0x06`. They are not interchangeable — hashing the same input gives different
+//! digests — but they carry the same 128-bit collision security and no known
+//! structural weakness, so choosing Keccak on-chain is a **gas choice, not a
+//! security downgrade**.
+//!
+//! The asymmetry that drives the split: `keccak256` is a *native opcode* (0x20)
+//! costing ~30 gas, while FIPS SHA3-256 has **no precompile at all** — verifying
+//! it on-chain would mean implementing the sponge in Solidity, thousands of gas per
+//! hash. The shielded layer runs off-chain and in the wallet, where SHA3-256 is
+//! free to use; the commitment and transcript layers are replayed by the verifier,
+//! where Keccak is the only cheap option.
+//!
+//! Note that the EVM precompiles at `0x01`–`0x09` are `ecrecover`, `sha256`,
+//! `ripemd160`, `identity`, and the BLAKE2/bls set — none of them is SHA3-256,
+//! and there is no `keccakf1600` permutation precompile either.
 //!
 //! ## What this crate deliberately does not do
 //!

@@ -65,6 +65,10 @@ p3-recursion = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "8f
 p3-circuit = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "8f9876efb26cff0f4b837555b478f043c4314240" }
 p3-circuit-prover = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "8f9876efb26cff0f4b837555b478f043c4314240" }
 p3-poseidon2-circuit-air = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "8f9876efb26cff0f4b837555b478f043c4314240" }
+# `LiftPermToQuintic`: adapts the base-field Poseidon2 permutation to the D=5
+# quintic challenge lanes the recursion circuit runs on. `publish = false`
+# upstream, so it comes from the same git rev, never crates.io.
+p3-test-utils = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "8f9876efb26cff0f4b837555b478f043c4314240" }
 # crates.io-side companions the recursion stack expects at the v0.8.0 line.
 p3-lookup = "0.8.0"
 p3-sumcheck = "0.8.0"

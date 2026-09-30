@@ -1140,7 +1140,23 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 name = "recursion-test"
 version = "0.1.0"
 dependencies = [
+ "p3-air",
+ "p3-challenger",
+ "p3-circuit",
+ "p3-circuit-prover",
+ "p3-commit",
+ "p3-dft",
+ "p3-field",
+ "p3-fri",
+ "p3-keccak",
+ "p3-koala-bear",
+ "p3-lookup",
+ "p3-matrix",
+ "p3-merkle-tree",
+ "p3-poseidon2-circuit-air",
  "p3-recursion",
+ "p3-symmetric",
+ "p3-uni-stark",
 ]
 
 [[package]]

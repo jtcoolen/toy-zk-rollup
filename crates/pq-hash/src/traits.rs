@@ -23,12 +23,13 @@ pub trait ShieldedHasher: Clone + Send + Sync + 'static {
 
 /// Hash used for Merkle trees and FRI commitments that the EVM must verify.
 ///
-/// This is Keccak-256, chosen because the EVM exposes it as precompile `0x20`
-/// (~30 gas) while SHA3-256 is precompile `0x04` at a similar cost but is not
-/// what Plonky3's Merkle gadgets are built on.
+/// This is Keccak-256, chosen because the EVM exposes it as the native opcode
+/// `0x20` (~30 gas). FIPS SHA3-256 has no precompile at all — opcode `0x04` is
+/// `identity`, not SHA3 — so verifying SHA3-256 on-chain would mean implementing
+/// the sponge in Solidity at thousands of gas per hash.
 ///
-/// Keccak-256 and SHA3-256 differ only in the padding byte, so this is a gas
-/// choice and not a security reduction.
+/// Keccak-256 and SHA3-256 differ only in the domain-separation byte, so this is
+/// a gas choice and not a security reduction.
 pub trait CommitmentHasher: Clone + Send + Sync + 'static {
     /// Hash `parts` into a 32-byte digest.
     fn hash(&self, parts: &[&[u8]]) -> Digest32;

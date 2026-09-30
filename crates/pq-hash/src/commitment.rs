@@ -1,8 +1,10 @@
 //! Keccak-256 for the commitment layer (Merkle trees, FRI, Fiat-Shamir).
 //!
-//! Keccak-256 is the EVM's native hash (precompile `0x20`). Using it for every
-//! commitment the on-chain verifier touches means the verifier never pays for a
-//! non-native hash, and never has to implement one.
+//! Keccak-256 is the EVM's native hash: opcode `0x20`, ~30 gas, computing the
+//! *original* Keccak (domain byte `0x01`) — exactly what `tiny_keccak::Keccak::v256`
+//! and `p3_keccak::Keccak256Hash` produce. Using it for every commitment the
+//! on-chain verifier touches means the verifier never pays for a non-native hash,
+//! and never has to implement one.
 
 use tiny_keccak::{Hasher as _, Keccak};
 
@@ -44,7 +46,7 @@ mod tests {
     #[test]
     fn matches_known_keccak256_of_empty() {
         // The canonical Keccak-256 empty-string vector, which is *not* the SHA3
-        // one — the padding byte differs (0x06 vs 0x01).
+        // one — the domain-separation byte differs (Keccak 0x01, SHA3 0x06).
         let expected = "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470";
         let got = Keccak256Commitment::keccak256(&[]);
         let hex = hex::encode(got.as_bytes());
