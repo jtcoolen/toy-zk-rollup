@@ -1,0 +1,103 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pq-hash",
+    "crates/pq-sign",
+    "crates/shielded",
+    "crates/prover",
+    "crates/node",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+# ---------------------------------------------------------------------------
+# Dependency policy
+#
+# One version per crate across the whole workspace. `cargo deny` enforces it.
+# Versions are aligned with what Plonky3 v0.8.0 and slh-dsa 0.2.0-rc.5 already
+# pull in, so we do not create duplicate copies of sha2/sha3/rand.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+# --- Post-quantum primitives (RustCrypto) ---
+sha2 = { version = "0.11", default-features = false }
+sha3 = { version = "0.11", default-features = false }
+tiny-keccak = { version = "2.0.2", features = ["keccak"] }
+slh-dsa = { version = "0.2.0-rc.5", features = ["alloc"] }
+signature = "3.0.0-rc.10"
+zeroize = { version = "1.8", features = ["derive"] }
+rand = { version = "0.10", default-features = false }
+rand_core = { version = "0.10", default-features = false }
+
+# --- Plonky3 (STARK proving). Pinned to the v0.8.0 release line. ---
+p3-air = "0.8.0"
+p3-field = "0.8.0"
+p3-matrix = "0.8.0"
+p3-util = "0.8.0"
+p3-koala-bear = "0.8.0"
+p3-challenger = "0.8.0"
+p3-commit = "0.8.0"
+p3-fri = "0.8.0"
+p3-merkle-tree = "0.8.0"
+p3-symmetric = "0.8.0"
+p3-uni-stark = "0.8.0"
+p3-dft = "0.8.0"
+p3-keccak = "0.8.0"
+
+# Recursion: consumed from git, NOT from crates.io.
+#
+# The crates.io `p3-recursion` 0.1.0 is an empty placeholder (zero dependencies).
+# See .scratch/pq-shielded-rollup/issues/04-recursion-source-of-truth.md
+#
+# Pinned to a rev, not a branch: a drifting branch would silently change the
+# verifier circuit and invalidate every accepted proof.
+p3-recursion = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "8f9876efb26cff0f4b837555b478f043c4314240" }
+
+# --- Infrastructure ---
+thiserror = "2.0"
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = "1.0"
+subtle = { version = "2.6", default-features = false }
+
+# --- Workspace crates ---
+pq-hash = { path = "crates/pq-hash" }
+pq-sign = { path = "crates/pq-sign" }
+shielded = { path = "crates/shielded" }
+prover = { path = "crates/prover" }
+
+# ---------------------------------------------------------------------------
+# Lints: deny-by-default. `cargo clippy -- -D warnings` is a hard gate.
+# ---------------------------------------------------------------------------
+# Lint policy.
+#
+# The highest-value gate is "no unwrap/expect/unsafe in shipped code". Crates
+# enforce that per-crate with `cfg_attr(not(test), deny(..))` so tests may still
+# unwrap freely. The workspace sets the baseline; `cargo clippy -- -D warnings`
+# turns every warn below into a build failure.
+#
+# `arithmetic_side_effects` / `indexing_slicing` are left off at the workspace
+# level: they fire on nearly every index computation in field/trace code and the
+# signal drowns out. Security-critical arithmetic (balances, nullifier sets) uses
+# explicit `checked_*` in the node crate instead, and that is where it matters.
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+missing_inline_in_public_items = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

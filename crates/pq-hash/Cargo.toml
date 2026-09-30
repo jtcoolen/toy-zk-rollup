@@ -1,0 +1,17 @@
+[package]
+name = "pq-hash"
+description = "Post-quantum hashing traits and impls: SHA3-256 shielded layer, Keccak-256 commitment layer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+# Internal crate: never published to crates.io, so path deps are fine.
+publish = false
+
+[dependencies]
+sha3 = { workspace = true, features = ["alloc"] }
+tiny-keccak = { workspace = true }
+hex = { workspace = true, features = ["alloc"] }
+
+[lints]
+workspace = true

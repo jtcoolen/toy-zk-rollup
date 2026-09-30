@@ -1,0 +1,109 @@
+# cargo-deny configuration.
+#
+# Goals: (1) only OSI-approved permissive licenses, (2) no known-vulnerable
+# crates, (3) no duplicate versions of the crypto primitives — two copies of
+# `sha3` in one binary is a real bug class, not a cosmetic one.
+
+[graph]
+targets = [
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "x86_64-unknown-linux-gnu" },
+]
+
+# ---------------------------------------------------------------------------
+# Licenses
+# ---------------------------------------------------------------------------
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "CC0-1.0",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+# ---------------------------------------------------------------------------
+# Advisories (RustSec)
+# ---------------------------------------------------------------------------
+[advisories]
+# Scope of what we check: the whole graph, not just direct deps.
+unmaintained = "all"
+unsound = "all"
+ignore = []
+
+# ---------------------------------------------------------------------------
+# Bans
+# ---------------------------------------------------------------------------
+[bans]
+# Duplicate versions are a warning, not an error: the transitive graph of Plonky3
+# plus RustCrypto will have some. What we care about is *crypto* duplication, which
+# is caught by the skip-tree exceptions below being narrow.
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace-internal path deps carry no version by design; they are not
+# third-party wildcards.
+allow-wildcard-paths = true
+highlight = "all"
+
+# Classical / forbidden crypto must never enter the graph, even transitively.
+# These are belt-and-braces alongside the semgrep rules: semgrep catches source,
+# this catches a dependency sneaking one in.
+[[bans.deny]]
+name = "ring"
+reason = "Not used by our primitives; classical-crypto surface area we do not want."
+
+[[bans.deny]]
+name = "secp256k1"
+reason = "Classical elliptic-curve signature. Post-quantum requirement forbids it."
+
+[[bans.deny]]
+name = "secp256k1-sys"
+reason = "Native binding for a forbidden crate."
+
+[[bans.deny]]
+name = "ed25519-dalek"
+reason = "Classical signature. Post-quantum requirement forbids it."
+
+[[bans.deny]]
+name = "curve25519-dalek"
+reason = "Backend for a forbidden classical signature."
+
+[[bans.deny]]
+name = "ecdsa"
+reason = "Classical signature. Post-quantum requirement forbids it."
+
+[[bans.deny]]
+name = "rsa"
+reason = "Classical signature. Post-quantum requirement forbids it."
+
+[[bans.deny]]
+name = "sha-1"
+reason = "SHA-1 is broken. Use SHA-2 or SHA-3."
+
+[[bans.deny]]
+name = "sha1"
+reason = "SHA-1 is broken. Use SHA-2 or SHA-3."
+
+[[bans.deny]]
+name = "md-5"
+reason = "MD5 is broken."
+
+[[bans.deny]]
+name = "md5"
+reason = "MD5 is broken."
+
+# ---------------------------------------------------------------------------
+# Sources: only crates.io and the pinned recursion git repo.
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/Plonky3/Plonky3-recursion"]

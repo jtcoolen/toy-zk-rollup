@@ -1,0 +1,265 @@
+# Custom semgrep ruleset for the post-quantum shielded rollup.
+#
+# These encode the project's hard constraints so they are *enforced* rather than
+# remembered. Every ERROR rule is a hard failure in ./scripts/check.sh.
+#
+# Rationale for each rule lives in .scratch/pq-shielded-rollup/.
+#
+# --- Authoring notes (learned the hard way; keep these if you edit) ----------
+#
+# 1. `pattern-not-inside: mod $M { ... }` does NOT match a module whose `mod`
+#    keyword is preceded by an attribute (`#[cfg(test)] mod tests`). Use the
+#    literal `mod tests { ... }`.
+#
+# 2. A `metavariable-regex` at the top of a `patterns:` block must bind in EVERY
+#    branch of the `pattern-either` in that block. If one branch has no `$LOG`,
+#    the rule can never fire for that branch. Put per-branch metavariable
+#    constraints inside a nested `patterns:` under `pattern-either`.
+#
+# 3. Multiple `pattern:` keys under one `patterns:` are ANDed at the same
+#    location. To match any of several shapes, use `pattern-either`.
+# --------------------------------------------------------------------------
+
+rules:
+  # -------------------------------------------------------------------------
+  # Constraint: no classical signatures anywhere, including the wallet.
+  # -------------------------------------------------------------------------
+  - id: pq-no-legacy-signature
+    languages: [rust]
+    severity: ERROR
+    message: >
+      Classical signature primitives are forbidden. This project is post-quantum
+      by requirement. Use SPHINCS+ via the `SpendAuth` trait in `pq-sign`.
+    paths:
+      exclude:
+        - semgrep/
+    patterns:
+      - pattern-either:
+          - pattern: use ed25519_dalek;
+          - pattern: use k256;
+          - pattern: use p256;
+          - pattern: use rsa;
+          - pattern: use dsa;
+          - pattern: secp256k1::$ANY
+          - pattern: ed25519::$ANY
+          - pattern: $PKG::ecdsa::$ANY
+          - pattern: $PKG::schnorr::$ANY
+
+  # -------------------------------------------------------------------------
+  # Constraint: SHA-2/SHA-3 only. No MD5, no SHA-1.
+  # -------------------------------------------------------------------------
+  - id: pq-no-legacy-hash
+    languages: [rust]
+    severity: ERROR
+    message: >
+      Legacy hash functions are forbidden. Use SHA3-256 (shielded layer) or
+      Keccak-256 (commitment layer) via the traits in `pq-hash`.
+    paths:
+      exclude:
+        - semgrep/
+    patterns:
+      - pattern-either:
+          - pattern: use md5;
+          - pattern: md5::$ANY
+          - pattern: use sha1;
+          - pattern: sha1::$ANY
+          - pattern: $PKG::Md5
+          - pattern: $PKG::Sha1
+
+  # -------------------------------------------------------------------------
+  # Constraint: Poseidon is permitted ONLY inside the recursion transcript seam.
+  #
+  # Granted as an explicit exception by the human for the recursion engine.
+  # It must never appear in the shielded layer, the commitment layer, the node,
+  # or the wallet.
+  # -------------------------------------------------------------------------
+  - id: pq-no-poseidon-outside-prover
+    languages: [rust]
+    severity: ERROR
+    message: >
+      Poseidon may only be used inside `crates/prover`'s recursion transcript.
+      The shielded layer uses SHA3-256 and the commitment layer uses Keccak-256.
+      If you are adding Poseidon here, stop and re-read ticket 05.
+    paths:
+      include:
+        - /crates/**/*.rs
+      exclude:
+        - /crates/prover/**
+        - semgrep/
+    patterns:
+      - pattern-either:
+          - pattern: use p3_poseidon2;
+          - pattern: use p3_poseidon;
+          - pattern: use p3_poseidon1;
+          - pattern: $PKG::poseidon2::$ANY
+          - pattern: $PKG::Poseidon2Config
+          - pattern: $PKG::Poseidon2
+
+  # -------------------------------------------------------------------------
+  # Ambient / non-auditable randomness in production code.
+  #
+  # Key generation must take an explicit `CryptoRng` parameter so the entropy
+  # source is visible at the call site. `rand::random()` and `thread_rng()` hide
+  # it; the turbofish form `rand::random::<T>()` is the same call.
+  # -------------------------------------------------------------------------
+  - id: pq-no-insecure-rng
+    languages: [rust]
+    severity: ERROR
+    message: >
+      Ambient randomness (`rand::random()` / `thread_rng()`) must not be used in
+      production code. Take an explicit `&mut impl CryptoRng` parameter so the
+      entropy source is auditable at the call site.
+    paths:
+      exclude:
+        - "**/tests/**"
+        - semgrep/
+    patterns:
+      - pattern-either:
+          - pattern: rand::random()
+          - pattern: rand::random::<$T>()
+          - pattern: rand::thread_rng()
+          - pattern: $PKG::random()
+          - pattern: $PKG::random::<$T>()
+      - pattern-not-inside: |
+          mod tests { ... }
+
+  # -------------------------------------------------------------------------
+  # No `unsafe` in crypto crates.
+  # -------------------------------------------------------------------------
+  - id: pq-no-unsafe-in-crypto
+    languages: [rust]
+    severity: ERROR
+    message: >
+      `unsafe` is forbidden in the crypto crates. The workspace also sets
+      `unsafe_code = "deny"`; this rule catches it where a crate overrides the
+      lint.
+    paths:
+      include:
+        - /crates/pq-hash/**
+        - /crates/pq-sign/**
+        - /crates/shielded/**
+    pattern-either:
+      - pattern: unsafe { ... }
+      - pattern: unsafe fn $F(...) { ... }
+
+  # -------------------------------------------------------------------------
+  # Secrets must not reach string formatting or logs.
+  #
+  # Each branch carries its own metavariable constraints (see authoring note 2).
+  # -------------------------------------------------------------------------
+  - id: pq-no-secret-in-format
+    languages: [rust]
+    severity: ERROR
+    message: >
+      A value named like secret key material is being formatted into a string.
+      Secret key bytes must never reach logs, error messages, or Display output.
+    paths:
+      exclude:
+        - semgrep/
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern-either:
+                  - pattern: format!(..., $SK, ...)
+                  - pattern: println!(..., $SK, ...)
+                  - pattern: eprintln!(..., $SK, ...)
+              - metavariable-regex:
+                  metavariable: $SK
+                  regex: (?i).*(secret|sk_seed|sk_prf|private_key|signing_key|seed_phrase|mnemonic).*
+          - patterns:
+              - pattern: tracing::$LOG(..., $SK, ...)
+              - metavariable-regex:
+                  metavariable: $SK
+                  regex: (?i).*(secret|sk_seed|sk_prf|private_key|signing_key|seed_phrase|mnemonic).*
+              - metavariable-regex:
+                  metavariable: $LOG
+                  regex: debug|info|warn|error|trace
+
+  # -------------------------------------------------------------------------
+  # No unwrap/expect outside tests in the crypto and node crates.
+  # -------------------------------------------------------------------------
+  - id: pq-unwrap-in-production
+    languages: [rust]
+    severity: ERROR
+    message: >
+      `unwrap()` / `expect()` in production code can panic on adversarial input.
+      Return a `Result` instead.
+    paths:
+      include:
+        - /crates/pq-hash/src/**
+        - /crates/pq-sign/src/**
+        - /crates/shielded/src/**
+        - /crates/node/src/**
+      exclude:
+        - "**/tests/**"
+    patterns:
+      - pattern-either:
+          - pattern: $X.unwrap()
+          - pattern: $X.expect(...)
+      - pattern-not-inside: |
+          mod tests { ... }
+
+  # -------------------------------------------------------------------------
+  # Comparisons of secret-dependent material must be constant-time.
+  # -------------------------------------------------------------------------
+  - id: pq-constant-time-compare
+    languages: [rust]
+    severity: WARNING
+    message: >
+      A MAC/tag/auth-like value is compared with `==`. For secret-dependent values
+      use `subtle::ConstantTimeEq`. Public digests behind newtypes are fine; this
+      is a review prompt for anything secret-adjacent.
+    paths:
+      include:
+        - /crates/**/*.rs
+      exclude:
+        - "**/tests/**"
+        - semgrep/
+    patterns:
+      - pattern: $A == $B
+      - metavariable-regex:
+          metavariable: $A
+          regex: (?i).*(mac|tag|auth|witness).*
+
+  # -------------------------------------------------------------------------
+  # Secret-bearing types must zeroize on drop.
+  # -------------------------------------------------------------------------
+  - id: pq-zeroize-on-drop
+    languages: [rust]
+    severity: WARNING
+    message: >
+      A struct holding secret key material should implement `ZeroizeOnDrop` so key
+      bytes do not linger in memory. `slh-dsa`'s `SigningKey` already does;
+      wrappers around it must too.
+    paths:
+      include:
+        - /crates/**/*.rs
+      exclude:
+        - "**/tests/**"
+        - semgrep/
+    patterns:
+      - pattern: "struct $S { ... }"
+      - metavariable-regex:
+          metavariable: $S
+          regex: (?i).*(SecretKey|SigningKey|Seed|Mnemonic|SeedPhrase).*
+
+  # -------------------------------------------------------------------------
+  # No hardcoded key material.
+  # -------------------------------------------------------------------------
+  - id: pq-no-hardcoded-key-material
+    languages: [rust]
+    severity: ERROR
+    message: >
+      Hardcoded key or seed material. Seeds must come from a CSPRNG or a KDF over
+      user entropy, never from a literal in source.
+    paths:
+      exclude:
+        - "**/tests/**"
+        - semgrep/
+    patterns:
+      - pattern-either:
+          - pattern: 'let $K: &[u8] = b"...";'
+          - pattern: 'const $K: [u8; $N] = [...];'
+      - metavariable-regex:
+          metavariable: $K
+          regex: (?i).*(secret|private|seed|key|mnemonic|entropy).*

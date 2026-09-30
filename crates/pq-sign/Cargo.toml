@@ -1,0 +1,21 @@
+[package]
+name = "pq-sign"
+description = "Post-quantum spend authorization: SPHINCS+ (FIPS-205) behind a DI trait."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+# Internal crate: never published to crates.io, so path deps are fine.
+publish = false
+
+[features]
+default = []
+# Bring-up only. Accepts every signature. Never enable in release.
+insecure-stub = []
+
+[dependencies]
+slh-dsa = { workspace = true }
+rand = { workspace = true, features = ["thread_rng", "std"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "prover"
+description = "STARK proving and recursion over the shielded transfer AIR."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+# Internal crate: never published to crates.io, so path deps are fine.
+publish = false
+
+[dependencies]
+pq-hash = { workspace = true }
+pq-sign = { workspace = true }
+shielded = { workspace = true }
+
+[lints]
+workspace = true

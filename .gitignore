@@ -1,0 +1,18 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Local toolchain homes (large, machine-specific)
+.cargo-home/
+.home/
+
+# Node / wallet
+node_modules/
+wallet/dist/
+
+# Editor
+.DS_Store
+*.swp
+
+# Scratch reference clones
+/tmp/
