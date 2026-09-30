@@ -6,6 +6,7 @@ members = [
     "crates/shielded",
     "crates/prover",
     "crates/node",
+    "crates/recursion-test",
 ]
 
 [workspace.package]
@@ -57,6 +58,19 @@ p3-keccak = "0.8.0"
 # Pinned to a rev, not a branch: a drifting branch would silently change the
 # verifier circuit and invalidate every accepted proof.
 p3-recursion = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "8f9876efb26cff0f4b837555b478f043c4314240" }
+
+# The recursion stack's own support crates. Same rev as `p3-recursion`: these are
+# built together upstream, and mixing a crates.io `p3-circuit` with a git
+# `p3-recursion` would give two incompatible `ExprId` types.
+p3-circuit = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "8f9876efb26cff0f4b837555b478f043c4314240" }
+p3-circuit-prover = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "8f9876efb26cff0f4b837555b478f043c4314240" }
+p3-poseidon2-circuit-air = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "8f9876efb26cff0f4b837555b478f043c4314240" }
+# crates.io-side companions the recursion stack expects at the v0.8.0 line.
+p3-lookup = "0.8.0"
+p3-sumcheck = "0.8.0"
+p3-whir = "0.8.0"
+p3-multilinear-util = "0.8.0"
+p3-poseidon2-air = "0.8.0"
 
 # --- Infrastructure ---
 thiserror = "2.0"

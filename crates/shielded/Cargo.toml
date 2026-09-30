@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 pq-hash = { workspace = true }
 pq-sign = { workspace = true }
+hex = { workspace = true }
 
 [lints]
 workspace = true

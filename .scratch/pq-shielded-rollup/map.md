@@ -87,6 +87,9 @@ Three hashes, each chosen for a different cost environment. Never mix them by ac
 - [PQ spend authorization: SPHINCS+](issues/06-pq-signature-choice.md): hash-based, so in-circuit verification reuses the SHA AIRs instead of lattice gadgets.
 - [EVM settlement: Solidity FRI-STARK verifier](issues/07-evm-settlement.md): trust-minimized, Keccak-256 precompile for FRI Merkle paths, no trusted bridge.
 - [Session scope: map + compiling foundation](issues/08-session-scope.md): every crate compiles and the proof path runs; deep PQ circuits stay ticketed.
+- [Recursion needs NO fork](issues/15-transcript-hash-portability.md): `TrustedPreparedLayer<InSC, OutSC, …>` takes two *independent* config types (only `Challenge` is shared). Layer 0 runs on a Poseidon2 `DuplexChallenger` (matches the in-circuit `ChallengerPermConfig`, covered by the granted exception); the final layer runs on our Keccak `SerializingChallenger32`, which is the only transcript Solidity replays. The Keccak win survives with zero patches to `p3-recursion`.
+- [EVM precompile facts corrected](issues/07-evm-settlement.md): `0x01` ecrecover, `0x02` SHA-256, `0x03` RIPEMD-160, `0x04` Identity. There is **no** keccakf1600 precompile; `keccak256` is the native **opcode `0x20`** and computes *original* Keccak (`0x01` pad) — exactly what `p3-keccak` emits. FIPS SHA3-256 (`0x06` pad) has **no** precompile, so a SHA3 transcript would be expensive on-chain while a Keccak transcript is nearly free.
+- [Recursion proof size / gas](issues/16-recursion-audit-gate.md): measured KoalaBear+D=5, log_blowup 2 — 332 KB @ 1 layer → 302 KB @ 2 → 300 KB @ 3. Converges ~300 KB ≈ **4.8M gas** in calldata before any verifier compute.
 
 ## Not yet specified
 
