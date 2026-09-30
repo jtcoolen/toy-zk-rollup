@@ -3,18 +3,27 @@
 //! ## Why this exact shape
 //!
 //! The on-chain verifier replays the Fiat-Shamir transcript to derive its own
-//! challenges. If the transcript is Keccak-256, the verifier replays it with the
-//! `keccak256` precompile at ~30 gas per hash and **never touches Poseidon**.
+//! challenges. With a Keccak-256 transcript it does so with the native
+//! `keccak256` opcode (`0x20`, ~30 gas) and never implements a hash itself.
+//! FIPS SHA3-256 has no precompile at all, so a SHA3 transcript would cost the
+//! verifier thousands of gas per hash in Solidity.
 //!
-//! That is the whole reason this configuration exists rather than the Poseidon2
-//! one Plonky3 defaults to. The Poseidon2 exception granted in ticket 05 turns out
-//! not to be needed on the verified path at all.
+//! The Poseidon2 exception (ticket 05) is still required, but only *inside* the
+//! recursion engine: the in-circuit Merkle gadget that verifies a lower layer's
+//! openings is Poseidon2-shaped. The split is therefore
 //!
 //! ```text
-//!   Shielded layer   SHA3-256   (note/nullifier derivation, off-chain + Solidity 0x04)
-//!   Commitment layer Keccak-256 (Merkle tree + FRI, Solidity 0x20)
-//!   Transcript       Keccak-256 (Fiat-Shamir, Solidity keccak256())
+//!   Shielded layer   SHA3-256     note/nullifier derivation, off-chain and
+//!                                in-circuit as Keccak-f[1600] rows carrying
+//!                                the 0x06 domain byte
+//!   Layers 0..N-1    Poseidon2    Merkle + transcript, verified in-circuit
+//!                                by the recursion engine
+//!   Layer N (final)  Keccak-256   Merkle + transcript, replayed by Solidity
 //! ```
+//!
+//! One audited permutation covers both hash needs: `p3-keccak-air` constrains
+//! only the permutation, so the SHA3-vs-Keccak difference is a witness choice,
+//! not a constraint change.
 //!
 //! Field: `KoalaBear` (31-bit `Monty`, `TwoAdic`). Challenge field: the D=5 trinomial
 //! extension, giving ~128-bit conjecturable security against the union of
