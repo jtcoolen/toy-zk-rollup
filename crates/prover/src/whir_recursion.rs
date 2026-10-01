@@ -35,7 +35,15 @@
 
 use p3_challenger::DuplexChallenger;
 use p3_circuit::ops::{generate_poseidon2_trace, generate_recompose_trace};
-use p3_circuit::{CircuitBuilder, CircuitRunner, NonPrimitiveOpId};
+use p3_circuit::{
+    CircuitBuilder, CircuitRunner, NonPrimitiveOpId, StatementExport, StatementSchema,
+};
+use p3_circuit_prover::common::{NpoAirBuilder, NpoPreprocessor};
+use p3_circuit_prover::{
+    poseidon2_air_builders_for_configs, recompose_preprocessor, BatchStarkProver,
+    ConstraintProfile, Poseidon2SharedPreprocessor, RecomposeAirBuilder, StatementAirBuilder,
+    StatementPreprocessor, StatementProver,
+};
 use p3_dft::Radix2DitParallel;
 use p3_field::extension::BinomialExtensionField;
 use p3_field::Field;
@@ -43,7 +51,7 @@ use p3_koala_bear::{default_koalabear_poseidon2_16, KoalaBear, Poseidon2KoalaBea
 use p3_lookup::logup::LogUpGadget;
 use p3_merkle_tree::MerkleTreeMmcs;
 use p3_poseidon2_circuit_air::KoalaBearD4Width16;
-use p3_recursion::backend::whir::WhirRecursionConfig;
+use p3_recursion::backend::whir::{WhirRecursionBackend, WhirRecursionConfig};
 use p3_recursion::generation::OpeningTranscript;
 use p3_recursion::pcs::fri::MerkleCapTargets;
 use p3_recursion::pcs::set_whir_mmcs_private_data;
@@ -54,7 +62,8 @@ use p3_recursion::pcs::whir::uni::{
 };
 use p3_recursion::recursion::RecursionInput;
 use p3_recursion::traits::RecursiveAir;
-use p3_recursion::{Poseidon2Config, VerificationError};
+use p3_recursion::{verify_p3_uni_proof_circuit, StarkVerifierInputsBuilder};
+use p3_recursion::{PcsRecursionBackend, Poseidon2Config, ProveNextLayerParams, VerificationError};
 use p3_sumcheck::layout::{Layout, PrefixProver};
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
 use p3_uni_stark::StarkGenericConfig;
@@ -113,6 +122,18 @@ pub const SECURITY_LEVEL: usize = crate::whir::SECURITY_LEVEL;
 
 /// Folding factor per WHIR round, matching the extension degree the backend supports.
 pub const FOLDING_FACTOR: usize = 4;
+
+/// Maximum LDE height the recursion layer is sized for.
+///
+/// The recursion layer's own trace is bigger than the base proof's, so the config
+/// must be sized for the larger of the two. The recursion circuit that re-verifies
+/// a WHIR base proof stacks its columns into a multilinear of ~21 variables at
+/// this security level, which demands 16 grinding bits; sizing at 22 gives a
+/// budget of 17 that covers it with margin.
+pub const LOG_MAX_LDE: usize = 22;
+
+/// Merkle cap height for the recursion layer's commitment.
+pub const CAP_HEIGHT: usize = 0;
 
 /// The canonical `KoalaBear` width-16 Poseidon2 permutation.
 ///
@@ -346,24 +367,199 @@ impl WhirRecursionConfig for InnerWhirConfig {
     }
 }
 
+/// A recursion circuit bound to a statement, witnessed and ready to be proven
+/// under the Keccak settlement config.
+///
+/// The `circuit` and its `traces` are the two halves the settlement prover needs;
+/// `schema` describes the statement so the prover can register the matching
+/// statement table.
+pub struct RecursionCircuit {
+    /// The compiled recursion circuit (over `Challenge`).
+    pub circuit: p3_circuit::Circuit<Challenge>,
+    /// The witnessed traces, config-agnostic across the Poseidon2/Keccak split.
+    pub traces: p3_circuit::Traces<Challenge>,
+    /// The statement schema installed on the circuit.
+    pub schema: StatementSchema,
+}
+
+impl core::fmt::Debug for RecursionCircuit {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // `Traces` holds trait objects and cannot derive `Debug`, and dumping the
+        // full witness would be megabytes of noise. Report what identifies it.
+        f.debug_struct("RecursionCircuit")
+            .field("circuit", &self.circuit)
+            .field(
+                "non_primitive_traces",
+                &self.traces.non_primitive_traces.len(),
+            )
+            .field("schema", &self.schema)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Builds the recursion circuit that verifies one base WHIR proof, witnesses it,
+/// and binds its statement.
+///
+/// This is the production recursion step, not test scaffolding. It is written by
+/// hand rather than through `build_next_layer_circuit` for one reason: the
+/// statement. `build_next_layer_circuit` returns an opaque checked result whose
+/// public-value targets are crate-private, so a caller cannot bind them. Here the
+/// uni-branch build is replicated with the public pieces, and the verifier's own
+/// `air_public_targets` are installed as the circuit's statement sink via
+/// [`CircuitBuilder::set_statement_exports`]. That makes the settlement-layer
+/// `verify(&proof, &public_inputs)` bind these exact values: the statement table's
+/// public values *are* those targets, so a proof over different public values
+/// fails verification.
+///
+/// The circuit is built and witnessed entirely against the Poseidon2 `InSC` (the
+/// in-circuit Merkle gadget's field-native cap). The resulting `Traces` carry no
+/// commitment-scheme identity, so they transfer unchanged to the Keccak settlement
+/// layer — the field-native-cap bound that blocks a Keccak `WhirRecursionConfig`
+/// never applies to the outer wrap.
+///
+/// # Errors
+///
+/// Returns the first failure from the build pipeline: input preflight/validation,
+/// circuit preparation, verifier-input allocation, the verifier-circuit build,
+/// statement installation, or witnessing. A returned error means no circuit was
+/// produced; it never yields a partially bound circuit.
+pub fn build_recursion_circuit<A>(
+    inner: &InnerWhirConfig,
+    air: &A,
+    base: &p3_uni_stark::Proof<InnerWhirConfig>,
+    public_inputs: &[F],
+) -> Result<RecursionCircuit, Box<dyn std::error::Error>>
+where
+    A: RecursiveAir<F, Challenge, LogUpGadget>,
+{
+    let perm = Poseidon2Config::KOALA_BEAR_D4_W16;
+    let backend = WhirRecursionBackend::<16, 8>::new(perm).for_extension_degree::<4>();
+    let prev = RecursionInput::UniStark {
+        proof: base,
+        air,
+        public_inputs: public_inputs.to_vec(),
+        preprocessed_commit: None,
+    };
+
+    let mut builder = CircuitBuilder::new();
+    PcsRecursionBackend::<InnerWhirConfig, A, 4>::preflight_input(&backend, inner, &prev)?;
+    PcsRecursionBackend::<InnerWhirConfig, A, 4>::validate_input(&backend, inner, &prev)?;
+    PcsRecursionBackend::<InnerWhirConfig, A, 4>::prepare_circuit(&backend, inner, &mut builder)?;
+    let verifier_inputs = StarkVerifierInputsBuilder::<_, _, _>::try_allocate(
+        &mut builder,
+        base,
+        None,
+        public_inputs.len(),
+    )?;
+    let op_ids = verify_p3_uni_proof_circuit::<
+        A,
+        InnerWhirConfig,
+        MerkleCapTargets<F, DIGEST_ELEMS>,
+        (),
+        WhirUniProofTargets<F, Challenge, WhirMmcs, DIGEST_ELEMS>,
+        Poseidon2Config,
+        16,
+        8,
+    >(
+        inner,
+        air,
+        &mut builder,
+        &verifier_inputs.proof_targets,
+        &verifier_inputs.air_public_targets,
+        &verifier_inputs.preprocessed_commit,
+        inner.pcs_verifier_params(),
+        perm,
+    )?;
+    // Bind the statement: the circuit's public values are the verifier's own AIR
+    // public-value targets, exactly the values the settlement `verify` is checked
+    // against.
+    let exports: Vec<StatementExport> = verifier_inputs
+        .air_public_targets
+        .iter()
+        .map(|&target| StatementExport::Base(target))
+        .collect();
+    let schema = builder.set_statement_exports::<F>(&exports)?;
+
+    let public = verifier_inputs.try_pack_public_values(public_inputs, base, &None)?;
+    let private = verifier_inputs.try_pack_private_values(base)?;
+    let circuit = builder.build()?;
+    let mut runner = circuit.runner();
+    runner.set_public_inputs(&public)?;
+    runner.set_private_inputs(&private)?;
+    PcsRecursionBackend::<InnerWhirConfig, A, 4>::set_private_data(
+        &backend,
+        inner,
+        &mut runner,
+        &op_ids,
+        &prev,
+    )?;
+    let traces = runner.run()?;
+    Ok(RecursionCircuit {
+        circuit,
+        traces,
+        schema,
+    })
+}
+
+/// Proves a witnessed recursion circuit under the Keccak WHIR settlement config
+/// and returns the proof plus its verifier.
+///
+/// The non-primitive parts the circuit needs — the shared Poseidon2 table, the
+/// recompose tables, and the statement table — are replicated for the Keccak
+/// `StarkGenericConfig`. They recompute the same permutations the circuit used, so
+/// the relation is identical even though the outer transcript and Merkle scheme
+/// are Keccak. The returned verifier binds the statement: `verify(&proof, pis)`
+/// accepts only for the `pis` the circuit was built with.
+///
+/// # Errors
+///
+/// Returns the settlement config error if `log_max_lde` is below the protocol's
+/// minimum trace height, or a prover error if circuit preparation or proving
+/// fails.
+pub fn settle_recursion_circuit(
+    rc: &RecursionCircuit,
+    log_max_lde: usize,
+) -> Result<
+    (
+        p3_circuit_prover::BatchStarkProof<crate::whir::Config>,
+        p3_circuit_prover::CircuitVerifier<crate::whir::Config>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let settlement = crate::whir::config(CAP_HEIGHT, log_max_lde)?;
+    let shared = Poseidon2Config::KOALA_BEAR_D4_W16.for_shared_challenger_table();
+    let preprocessors: Vec<Box<dyn NpoPreprocessor<F>>> = vec![
+        Box::new(Poseidon2SharedPreprocessor::new(vec![shared])),
+        recompose_preprocessor::<F>(true),
+        Box::new(StatementPreprocessor::new(rc.schema.clone())),
+    ];
+    let mut air_builders: Vec<Box<dyn NpoAirBuilder<crate::whir::Config, 4>>> =
+        poseidon2_air_builders_for_configs::<crate::whir::Config, 4>(vec![shared]);
+    air_builders.push(Box::new(RecomposeAirBuilder::<4>::new(1, true)));
+    air_builders.push(Box::new(StatementAirBuilder::<4>::new(rc.schema.clone())));
+
+    let mut prover = BatchStarkProver::new(settlement)
+        .with_table_packing(ProveNextLayerParams::default().table_packing);
+    prover.register_poseidon2_table::<4>(shared);
+    prover.register_recompose_table::<4>(true);
+    prover.register_table_prover(Box::new(StatementProver::<4>::new(rc.schema.clone())));
+    let prepared = prover.prepare_circuit(
+        &rc.circuit,
+        &preprocessors,
+        &air_builders,
+        ConstraintProfile::Standard,
+    )?;
+    let proof = prepared.prove(&rc.traces)?;
+    Ok((proof, prepared.verifier()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use p3_circuit::test_utils::{generate_trace_rows, FibonacciAir};
-    use p3_circuit_prover::BatchStarkProver;
     use p3_field::PrimeCharacteristicRing;
-    use p3_recursion::{
-        backend::whir::WhirRecursionBackend, PreparedInput, PreparedLayer, PreparedSource,
-        ProveNextLayerParams,
-    };
+    use p3_recursion::{PreparedInput, PreparedLayer, PreparedSource};
 
-    /// The recursion layer's own trace is bigger than the base proof's, so the
-    /// config must be sized for the larger of the two. The recursion circuit that
-    /// re-verifies a WHIR base proof stacks its columns into a multilinear of
-    /// ~21 variables at this security level, which demands 16 grinding bits;
-    /// sizing at 22 gives a budget of 17 that covers it with margin.
-    const LOG_MAX_LDE: usize = 22;
-    const CAP_HEIGHT: usize = 0;
     /// Base trace length: 1024 rows.
     const BASE_TRACE: usize = 1024;
 
@@ -420,6 +616,61 @@ mod tests {
         prover
             .verify_all_tables::<Challenge>(&output.0)
             .expect("WHIR recursion layer proof should verify all tables");
+    }
+
+    /// The settlement half of the architecture: the recursion circuit built over
+    /// the Poseidon2 `InSC` is proven under the Keccak WHIR `OutSC`, so the proof
+    /// that reaches the chain carries a Keccak transcript and a Keccak Merkle
+    /// tree that Solidity replays with the native `keccak256` opcode.
+    ///
+    /// The two configs never meet inside a circuit. The recursion circuit is built
+    /// and witnessed entirely against the Poseidon2 `InSC` (the in-circuit Merkle
+    /// gadget's field-native cap), and its output — `Traces<Challenge>` — is
+    /// config-agnostic: `Challenge` is the same degree-4 extension in both. The
+    /// Keccak `OutSC` only ever wraps those traces with the outer WHIR PCS and the
+    /// outer Keccak transcript, so the field-native-cap bound that blocks a Keccak
+    /// `WhirRecursionConfig` never applies here.
+    ///
+    /// The statement is bound through `build_recursion_circuit` (see its docs):
+    /// the verifier's own AIR public-value targets become the circuit's statement
+    /// sink, so the settlement `verify(&proof, pis)` accepts only for the `pis`
+    /// the circuit was built with.
+    #[test]
+    fn keccak_settlement_proves_the_recursion_circuit() {
+        // 1. A base proof under the Poseidon2 WHIR recursion config.
+        let inner = recursion_config();
+        let air = FibonacciAir {};
+        let trace = generate_trace_rows::<F>(0, 1, BASE_TRACE);
+        let pis = vec![F::ZERO, F::ONE, fibonacci_output(BASE_TRACE)];
+        let base = p3_uni_stark::prove(&inner, &air, trace, &pis)
+            .expect("base WHIR proof should generate");
+        p3_uni_stark::verify(&inner, &air, &base, &pis).expect("base WHIR proof should verify");
+
+        // 2. Build and witness the statement-bound recursion circuit.
+        let rc = build_recursion_circuit(&inner, &air, &base, &pis)
+            .expect("recursion circuit should build and witness");
+
+        // 3. Prove it under the Keccak WHIR settlement config.
+        let (proof, verifier) = settle_recursion_circuit(&rc, LOG_MAX_LDE)
+            .expect("settlement should prove the recursion circuit under Keccak WHIR");
+
+        // 4. The settlement verifier accepts, and binds the statement: the fib
+        //    public inputs are the statement table's public values. Its transcript
+        //    is Keccak and its commitments are the Keccak wire-cap Merkle tree,
+        //    which is exactly what the Solidity verifier replays.
+        verifier
+            .verify(&proof, &pis)
+            .expect("Keccak WHIR settlement verifier should accept the recursion proof");
+
+        // 5. The binding is real: the same proof must be rejected against any
+        //    other statement. Without this, the settlement layer would accept a
+        //    proof of *some* recursion and let the chain record arbitrary public
+        //    values, which is the whole thing the statement exists to prevent.
+        let tampered = vec![F::ZERO, F::ONE, fibonacci_output(BASE_TRACE) + F::ONE];
+        assert!(
+            verifier.verify(&proof, &tampered).is_err(),
+            "settlement verifier must reject a proof bound to different public values"
+        );
     }
 
     /// `b` after `n` steps of the Fibonacci recurrence the upstream AIR encodes.
