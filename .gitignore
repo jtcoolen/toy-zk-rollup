@@ -16,3 +16,6 @@ wallet/dist/
 
 # Scratch reference clones
 /tmp/
+
+contracts/out/
+contracts/cache/

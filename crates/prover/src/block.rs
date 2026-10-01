@@ -31,8 +31,20 @@
 //!
 //! ## Statement
 //!
-//! The exported statement is the children's statement values concatenated in
-//! order: `[transfer 0: nullifiers…, outputs…, root, fee, transfer 1: …]`.
+//! The exported statement is a shape header followed by the children's statement
+//! values concatenated in order:
+//!
+//! ```text
+//! [ n, (inputs_0, outputs_0), ..., (inputs_{n-1}, outputs_{n-1}),
+//!   transfer 0: nullifiers..., outputs..., root, fee,
+//!   transfer 1: nullifiers..., outputs..., root, fee, ... ]
+//! ```
+//!
+//! The header is exported as circuit constants, so the split is **bound by the
+//! proof**. The settlement contract reads it from the verified statement rather
+//! than being told it: a prover cannot declare a split that makes the contract
+//! read an output commitment as a nullifier, or skip a real nullifier.
+//!
 //! That is what the settlement layer and L1 read to apply the state update.
 //!
 //! ## Shared anchor
@@ -60,6 +72,7 @@ use p3_circuit_prover::{
     ConstraintProfile, Poseidon2SharedPreprocessor, RecomposeAirBuilder, StatementAirBuilder,
     StatementPreprocessor, StatementProver,
 };
+use p3_field::PrimeCharacteristicRing;
 use p3_lookup::logup::LogUpGadget;
 use p3_recursion::backend::whir::{WhirRecursionBackend, WhirRecursionConfig};
 use p3_recursion::pcs::fri::MerkleCapTargets;
@@ -129,6 +142,47 @@ impl TransferShape {
     }
 }
 
+/// Width of the exported shape header for a block of `num_children` transfers:
+/// one limb for the count, then `(inputs, outputs)` per transfer.
+///
+/// The header is part of the verified statement, so the settlement layer reads
+/// the split from the proof instead of being told it.
+#[must_use]
+pub const fn shape_header_len(num_children: usize) -> usize {
+    1 + 2 * num_children
+}
+
+/// The shape header's raw limbs: `[n, nin_0, nout_0, nin_1, nout_1, …]`.
+///
+/// Shared by the circuit builder, which exports these as statement constants,
+/// and by anyone reconstructing the statement a block proof must verify against.
+/// Both sides derive the header from the same function, so neither can drift on
+/// where the header ends and the transfer limbs begin — the settlement contract
+/// performs this same derivation on the verified statement bytes.
+///
+/// # Errors
+///
+/// Returns a message if any count exceeds what a `u16` limb can hold.
+pub fn shape_header<'a>(
+    shapes: impl IntoIterator<Item = &'a TransferShape>,
+) -> Result<Vec<u16>, String> {
+    let shapes: Vec<&TransferShape> = shapes.into_iter().collect();
+    let mut header = Vec::with_capacity(shape_header_len(shapes.len()));
+    header
+        .push(u16::try_from(shapes.len()).map_err(|_| "block has too many transfers".to_string())?);
+    for shape in shapes {
+        header.push(
+            u16::try_from(shape.num_nullifiers)
+                .map_err(|_| "transfer has too many inputs".to_string())?,
+        );
+        header.push(
+            u16::try_from(shape.num_outputs)
+                .map_err(|_| "transfer has too many outputs".to_string())?,
+        );
+    }
+    Ok(header)
+}
+
 /// A client-produced transfer proof, presented for verification inside a block.
 ///
 /// The verifier travels with the proof: transfers of different shapes (different
@@ -196,6 +250,29 @@ pub fn build_multi_transfer_circuit(
     // The first child's root limbs, against which every later child's root is
     // constrained. See "Shared anchor" in the module docs.
     let mut anchor = RootAnchor::default();
+
+    // Shape header, exported as circuit constants so the split is bound by the
+    // proof rather than asserted by the caller. Without this the settlement
+    // contract would have to be *told* how many nullifiers each transfer has,
+    // and a prover could declare a split that makes the contract read an output
+    // commitment as a nullifier — or skip a real nullifier entirely.
+    //
+    // The counts are the ones the prover actually verified against: they come
+    // from each child's shape, which was checked against that child's statement
+    // length before its proof was verified. The contract re-derives the same
+    // split from the statement's own length, so a header that disagrees with
+    // the statement it ships with cannot be produced.
+    let header = shape_header(children.iter().map(|child| &child.shape))?;
+    // The header limbs are circuit *constants*, not public inputs: `define_const`
+    // bakes each value into the const trace, so the statement value is proven
+    // rather than supplied by the prover. They therefore must NOT be pushed into
+    // the public-input vector — that vector's width is fixed by the public-input
+    // slots the child verifications allocate.
+    for value in header {
+        let limb = Challenge::from_u16(value);
+        exports.push(StatementExport::Base(builder.define_const(limb)));
+    }
+    debug_assert_eq!(exports.len(), shape_header_len(children.len()));
 
     for child in children {
         let expected = child.shape.statement_len();
@@ -562,21 +639,38 @@ mod tests {
         Ok(())
     }
 
+    /// Reconstruct the statement a block proof must verify against: the shape
+    /// header, then each child's statement in order. Derived through the same
+    /// [`shape_header`] the circuit exported, so neither side can drift.
+    fn block_statement(
+        shapes: [TransferShape; 2],
+        children: [&[F]; 2],
+    ) -> Result<Vec<F>, Box<dyn Error>> {
+        let mut expected: Vec<F> = shape_header(shapes.iter())?
+            .iter()
+            .map(|&v| F::from_u16(v))
+            .collect();
+        for child in children {
+            expected.extend_from_slice(child);
+        }
+        Ok(expected)
+    }
+
     /// A block that verifies two independently-produced client transfer proofs.
     ///
     /// This is the shape the whole design turns on: the recursive prover verifies
     /// *client* proofs. Each transfer is built and proven as a client would build
-    /// and prove it — its own circuit, its own `sk_d`, its own statement — and
+    /// and prove it - its own circuit, its own `sk_d`, its own statement - and
     /// the block circuit only ever sees proofs and public statements.
     ///
     /// ```text
-    ///   transfer A --prove--> proof A (Poseidon2 WHIR) ─┐
-    ///                                                  ├─ block circuit ──▶ Keccak WHIR
-    ///   transfer B --prove--> proof B (Poseidon2 WHIR) ─┘
+    ///   transfer A --prove--> proof A (Poseidon2 WHIR) --+
+    ///                                                   +-- block circuit --> Keccak WHIR
+    ///   transfer B --prove--> proof B (Poseidon2 WHIR) --+
     /// ```
     ///
-    /// Asserts the block statement is both transfers' statements concatenated,
-    /// and that tampering with either end of it is rejected.
+    /// Asserts the block statement is the shape header followed by both
+    /// transfers' statements, and that tampering with either end is rejected.
     #[test]
     fn block_verifies_two_client_transfer_proofs() -> Result<(), Box<dyn Error>> {
         let (n1, sk1) = funded_note(11, 1_000);
@@ -623,10 +717,11 @@ mod tests {
         let rc = build_multi_transfer_circuit(&inner, &children)?;
         let (block_proof, block_verifier) = settle_block_circuit(&rc, BLOCK_LOG_MAX_LDE)?;
 
-        // The block statement is both transfers' statements, in order.
-        let mut expected: Vec<F> = Vec::new();
-        expected.extend_from_slice(&client_a.2);
-        expected.extend_from_slice(&client_b.2);
+        // The block statement is the shape header, then both transfers'
+        // statements in order. Rebuilt through the same `shape_header` the
+        // circuit used, so the two cannot drift on where the header ends.
+        let expected =
+            block_statement([ONE_IN_ONE_OUT, ONE_IN_ONE_OUT], [&client_a.2, &client_b.2])?;
         block_verifier.verify(&block_proof, &expected)?;
 
         // Tampering with either half must be rejected.
@@ -636,7 +731,8 @@ mod tests {
             block_verifier.verify(&block_proof, &tampered).is_err(),
             "tampering the first transfer's nullifier must be rejected"
         );
-        let mut tampered = expected.clone();
+        // `expected` is moved here rather than cloned: it is not read again.
+        let mut tampered = expected;
         let last = tampered.len() - 1;
         tampered[last] += F::ONE;
         assert!(

@@ -2,6 +2,67 @@
 
 Recorded choices with alternatives considered. Newest first.
 
+## D-030 — The block circuit needed a shared-root anchor (found while auditing nullifiers)
+
+**Status.** Done. `crates/prover/src/block.rs`, commit `3965a35`.
+
+**Found while.** Auditing what the block statement actually guarantees, on the way
+to closing the nullifier gap (D-022 / ticket 02). The nullifier question forced
+the question "what does a block statement attest to?", and the answer was not
+strong enough.
+
+**The hole.** `build_multi_transfer_circuit` verified each child transfer proof
+and concatenated their statements:
+
+```text
+[transfer 0: nullifiers..., outputs..., root_0, fee_0,
+ transfer 1: nullifiers..., outputs..., root_1, fee_1]
+```
+
+Nothing constrained `root_0 == root_1`. Each child was *individually* valid —
+its own membership path checks against its own root — so a prover could gather
+transfers witnessed against **different tree states** and produce a block whose
+statement describes a state transition of a tree that never existed. A
+settlement contract applying that statement would move state that no real tree
+supports.
+
+This is not the nullifier gap. It is a separate, and arguably worse, hole: the
+nullifier gap is closed by an authoritative on-chain set, whereas nothing
+downstream could catch a mixed-root block because every individual proof
+verifies.
+
+**The fix.** `RootAnchor` adopts the first child's 16 root limbs and constrains
+every later child equal to it. It is opaque by construction — `Default` plus a
+single `pin` method — so the only way to use it is to feed each child in turn,
+which is exactly the invariant. There is no accessor to read or bypass the
+pinned value.
+
+**Why not `builder.connect`.** `connect` enforces equality by aliasing witness
+slots. The statement table tracks LogUp multiplicities *per instance*, and
+aliasing across two children's instances desynchronises them: the witness fails
+to balance with `Lookup mismatch (global lookup 'WitnessChecks'): tuple [...] has
+net multiplicity 6`. Expressing equality as `sub(a, b)` + `assert_zero` is a
+plain ALU constraint that leaves the lookup structure alone. Costs one ALU row
+per limb, 16 rows per extra child.
+
+**Shape is declared, not assumed.** `ChildProof` now carries `TransferShape
+{ num_nullifiers, num_outputs }`. The root offset is derived from it, and a
+shape whose implied statement length disagrees with the actual statement is
+rejected *before* any constraint is emitted. Without that check a wrong shape
+would silently pin the anchor to the wrong limbs — a soundness bug introduced by
+the fix itself. This is the reason the shape is explicit rather than inferred
+from the statement length, which would be ambiguous.
+
+**A/B verification.** The negative test is only meaningful if the rejection is
+attributable to the anchor. With the anchor body removed, the exact same
+mixed-tree input **builds and proves cleanly**; with it restored, the witness is
+unsatisfiable and reported as a `Witness conflict`. The test asserts on that
+message so a future refactor that silently stops constraining will fail loudly.
+
+**Lesson.** Concatenating verified statements is not the same as constraining
+their relationships. Per-child verification proves each part; the *set* needs
+its own constraints or it asserts more than it proves.
+
 ## D-029 — Optimized-by-default build profile
 
 **Status.** Done. `.cargo/config.toml`.
@@ -721,3 +782,42 @@ primitive, so the hash is still off-the-shelf; only the routing is ours.
 - *Rebuild the shielded tree as a `MerkleTreeMmcs`.* Rejected: the domain tree
   is field-agnostic `Digest32` pairs; forcing field-element matrices would couple
   the tree to the field and complicate the native side for no security gain.
+
+## D-033: Solidity WHIR verifier base = ethereum/sol-whir-p3 (MIT)
+
+**Context.** User pointed at `alxkzmn/spartan-whir-dev` (meta-repo, no license), then its
+verifier `alxkzmn/sol-spartan-whir`, then the canonical home `ethereum/sol-whir-p3`
+(same tree, 591 entries, pushed 2026-09-13). Chosen as the off-the-shelf base for the
+layer-N verifier.
+
+**Verified fit.**
+- `KoalaBear.sol`: MODULUS 0x7f000001, W=3 — identical to our `F`.
+- `KoalaBearExt4.sol`: quartic binomial extension packed in uint256, assembly add/sub/mul
+  — identical shape to our `Challenge = BinomialExtensionField<F, 4>`.
+- `KeccakChallenger.observeBase`: absorbs base elements as little-endian u32 — byte-identical
+  to our `SerializingChallenger32<F, HashChallenger<u8, Keccak256Hash, 32>>`.
+- Keccak Merkle multiproof verifier — same family as our settlement
+  `PaddingFreeSponge<KeccakF, 25, 17, 4>` + `CompressionFunctionFromHasher<_, 2, 4>`.
+- Folding factor 4, sumcheck/STIR/PoW/final-poly round machinery — same WHIR protocol.
+- License: no root LICENSE file, but every .sol carries `SPDX-License-Identifier: MIT`.
+  Valid per-file grant; usable.
+
+**Gaps we must fill (this repo verifies a standalone WHIR PCS opening for Spartan-WHIR,
+not a plonky3 uni-stark STARK):**
+1. AIR constraint evaluation at the OOD point for OUR recursion circuit
+   (Poseidon2-shared + recompose + statement tables) — generated from
+   `SymbolicAirBuilder`, per the standing anti-drift plan.
+2. Blob codec: their fixtures come from `spartan-whir-export` bound to the `whir-p3`
+   FORK at rev fc7d591. We emit registry `p3-whir` 0.8.0, which already has
+   `QueryOpenings`/`MT::MultiProof` (their migration doc's "missing multi-index
+   opening" is closed upstream). We write our own exporter in `crates/prover` that
+   serializes our `WhirProof` into their blob shape; we do NOT use their exporter.
+3. Fixed-config regeneration: their `*WhirFixedConfig.sol` hardcodes k22_jb100_pow28 /
+   ext5 schedules. Ours: 96-bit, ext4, starting_log_inv_rate=1, BLOCK_LOG_MAX_LDE=25.
+   Constants emitted mechanically from our `WhirConfig`.
+4. Skipped: LeanVM/Spartan terminal layer, BabyBear variants, precompile experiments.
+
+**Adaptation shape.** Vendor field/challenger/merkle libs unmodified where possible →
+port the WHIR round loop mirroring p3-whir 0.8.0's Rust verifier (their round code as
+cross-check, not authority) → our exporter + fixed-config generator → generated AIR
+constraint evaluator. Rust-emitted test vectors pin every seam.
