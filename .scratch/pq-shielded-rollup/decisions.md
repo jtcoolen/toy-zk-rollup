@@ -16,9 +16,12 @@ measures the wrong thing.
 | profile | test wall |
 |---|---|
 | dev (opt-level 0) | 466 s |
-| optimized (opt-level 3) | **9.2 s** |
+| opt-level 3, **debug-assertions off** | 9.2 s |
+| opt-level 3, **debug-assertions on** (shipped) | **23.2 s** |
 
-**~50× runtime speedup.**
+**~20× runtime speedup** with the shipped profile. The gap between 9.2 s and
+23.2 s is `debug-assertions` alone — everything else is identical. That is a
+real cost, paid deliberately, for the reasons below.
 
 **Why the dev profile was modified rather than asking callers to pass
 `--release`:**

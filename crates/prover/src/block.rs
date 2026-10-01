@@ -68,18 +68,20 @@ use crate::whir_recursion::F;
 ///
 /// A block's statement is the concatenation of its children's statements, so
 /// more children means more claims and a higher stacked arity. The WHIR grinding
-/// budget is a function of that arity, and sizing the config one level short is
-/// a panic at prove time, not an error (D-021).
+/// budget is a function of that arity, and sizing the config below what the
+/// actual arity requires is a panic at prove time, not an error (D-021).
 ///
 /// Measured budget curve: v=22->14, 23->17, 24->18, 25->19, 26->20, 27->23,
-/// and v>=28 fails outright with `FoldedDomainExceedsCapacity`. One transfer
-/// settles at v=24; two need v=25.
+/// and v>=28 fails outright with `FoldedDomainExceedsCapacity`.
 ///
-/// **This is fan-in-2 specific and must be recomputed when the fan-in changes.**
-/// It cannot be derived here because the stacked arity depends on the exact set
-/// of padded table shapes the batch prover assembles internally; reproducing
-/// that computation in this crate would risk under-sizing into the same panic.
-/// A production path should query the prepared prover rather than hard-code it.
+/// **This must be sized close to the actual stacked arity; over-provisioning is
+/// NOT free.** The prover pads the polynomial to the declared height, so a
+/// larger budget means a larger LDE and more proving work: the same fan-in-2
+/// block took 9.2 s at v=25 and 25.1 s at v=27. Under-provisioning panics,
+/// over-provisioning wastes roughly 2.7x. Each fan-in needs its own measured
+/// value.
+///
+/// Fan-in 1 settles at v=24; fan-in 2 needs v=25.
 #[cfg(test)]
 const BLOCK_LOG_MAX_LDE: usize = 25;
 
