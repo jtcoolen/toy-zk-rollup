@@ -14,8 +14,12 @@ wallet/dist/
 .DS_Store
 *.swp
 
-# Scratch reference clones
+# Scratch reference clones. The vendored *source of truth* for the Solidity
+# verifier lives in contracts/lib/sol-whir-p3 (committed, byte-identical to
+# upstream). `.scratch/vendor/` is only the working clone used to diff against
+# upstream, so it is ignored rather than committed.
 /tmp/
+.scratch/vendor/
 
 contracts/out/
 contracts/cache/
