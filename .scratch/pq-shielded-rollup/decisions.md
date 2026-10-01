@@ -62,38 +62,55 @@ is intended — release drops the overflow checks this project depends on.
 
 **Status.** Open — design conclusion recorded, not yet built.
 
-**Measured scaling (dev profile, `parallel` on, 10-core M2 Pro).**
+**Measured, shipped profile (opt-level 3, debug-assertions on, rayon on,
+10-core M2 Pro, 32 GB).**
 
-| Aggregated client transfer proofs | wall | CPU | peak RSS |
-|---|---|---|---|
-| 1 (fan-in 1, D-023 path) | 230 s | 1077 s | 2.9 GB |
-| 2 (fan-in 2, `block.rs`) | 466 s | 2327 s | 5.8 GB |
+| Aggregated client transfer proofs | wall | peak RSS |
+|---|---|---|
+| 1 (fan-in 1, D-023 path) | 10.7 s | 2.93 GB |
+| 2 (fan-in 2, `block.rs`) | 23.2 s | 5.73 GB |
 
-Marginal cost is **~236 s and ~2.9 GB per additional transfer** — linear in both
-time and memory. Each extra transfer adds one client proof plus one in-circuit
-verification, and one child's traces held in the same circuit.
+Marginal cost: **~12.4 s and ~2.8 GB per additional transfer.** Linear in both.
+
+**Memory, not time, is the binding constraint.** On a 32 GB machine, allowing
+~4 GB for the OS and harness leaves ~28 GB for proving:
+
+```
+N_max ≈ 1 + 28 / 2.8 ≈ 11 transfers
+```
+
+Time would allow ~34 transfers in 7 minutes; memory caps it at ~11. A
+fan-in-N block circuit holds **all N children's traces simultaneously**, so it
+cannot be fixed by waiting — it is a hard ceiling per machine.
+
+**Why memory barely improved with the profile change.** Dev and shipped profiles
+give nearly identical RSS (2.9 GB at fan-in 1 in both) while differing ~20x in
+time. Trace data dominates memory; compiled code does not appear in it at all.
+No build setting fixes the memory ceiling.
 
 **Why D-026's dismissal of the tree was wrong.** D-026 said the tree "trades
 circuit size for sequential depth." That is backwards on both axes:
 
 - **Depth.** Fan-in N is *linear* depth in N on one box. A binary tree is
   `log₂ N` sequential levels. Depth improves, it does not worsen.
-- **Memory.** A fan-in-N circuit holds all N children's traces at once. At
-  N = 256 that is on the order of hundreds of GB — infeasible on one machine.
-  The tree keeps every node at fan-in 2, bounding per-node memory.
+- **Memory.** A fan-in-N circuit holds all N children's traces at once. The
+  tree keeps every node at fan-in 2, bounding per-node memory at ~5.7 GB
+  regardless of how many transfers the block covers.
 
 **The real tradeoff.** The tree costs *more total CPU work* — roughly 2N proofs
-of work across all levels versus N — and buys *lower wall clock* by proving each
-subtree independently, which fans out across **machines**, not just cores.
+of work across all levels versus N — and buys *lower wall clock* and *bounded
+memory* by proving each subtree independently, which fans out across
+**machines**, not just cores.
 
 ```
-fan-in N, one box:      N × 236 s            (linear, memory-bound)
-binary tree, K boxes:   log₂(N) × ~236 s     (parallel across boxes, bounded mem)
+fan-in N, one box:      N × 12.4 s,  N × 2.8 GB     (memory-bound at N≈11)
+binary tree, K boxes:   log₂(N) × ~23 s, ~6 GB/node  (bounded, parallel)
 ```
 
-Projection at N = 256 over 8 boxes: ~8 levels × 236 s ≈ 31 min, against ~17 h
-serially. **This is a projection from measured fan-in numbers, not a measured
-tree result** — per-level cost is assumed constant, and higher-level nodes verify
+Projection at N = 256 over 8 boxes: ~8 levels × 23 s ≈ 3 min wall, against
+~53 min serially and an infeasible ~700 GB of memory for the flat circuit.
+**This is a projection from measured fan-in numbers, not a measured tree
+result** — per-level cost is assumed constant, and higher-level nodes verify
 larger circuits than transfer proofs, so the real figure will be somewhat worse.
 
 **What still holds from D-026.** Per-transfer proofs are the shielded property
