@@ -2,6 +2,70 @@
 
 Recorded choices with alternatives considered. Newest first.
 
+## D-024 — No aggregation tree: the transfer circuit is already the wide circuit
+
+**Status.** Decision, prompted by the user asking "are you doing tree-shaped
+recursive proof aggregation?" Checking what a tree would buy overturned the
+premise of D-023's "fan-in 2 is a mechanical doubling" note.
+
+**Finding.** `build_transfer_circuit` already loops over *every* spend and *every*
+output, and `constrain_balance` sums globally:
+
+```text
+a_expr = Σ inputs[j]            (all input amounts)
+b_expr = fee[j] + Σ outs[j]     (all output amounts)
+```
+
+One transfer circuit therefore already batches up to `MAX_PARTIES = 16` spends and
+15 outputs into **one proof with one global value-conservation constraint**. A
+block is one such proof plus metadata.
+
+**Cost comparison for N transfers per block.**
+
+| Shape | Proofs/block | Depth | L1 gas |
+|---|---|---|---|
+| Fan-in 1 per transfer | N | 1 each | N× — not a rollup |
+| Binary aggregation tree | 2N−1 | log₂ N | 1× |
+| Wide circuit (already built) | 1 | 1 | 1× |
+
+The tree reaches the same endpoint as the wide circuit at strictly greater cost:
+each aggregation node's circuit is "verify two WHIR proofs in-circuit", a large
+circuit, and you build 2N−1 of them.
+
+**The decisive asymmetry.** The wide circuit witnesses N transfers *natively* —
+zero in-circuit proof verification. A tree performs `2N−1` in-circuit WHIR
+verifications, each one a large circuit. In-circuit verification is the single
+most expensive thing this stack does, so the tree multiplies exactly the cost the
+wide circuit avoids. Per-block proving work is `O(N)` witness rows versus
+`O(N)` full WHIR verifications.
+
+**When a tree would actually be justified.** Only for *distributed proving* —
+sharding independent sub-proofs across machines that never share a witness, then
+combining. That is a throughput/infrastructure concern, not a proof-size or gas
+concern, and it is out of scope for this project. It is the reason aggregation
+exists upstream; it is not a reason for us to use it.
+
+**Decision.** Do not build tree aggregation. Block = one wide transfer circuit +
+block metadata. Rejected: `TrustedPreparedAggregation` /
+`build_and_prove_aggregation_layer{,_cross}` for the block layer.
+
+**Where recursion is load-bearing: the chain, not the block.** Block N verifying
+block N−1 with `root_before → root_after` threaded through the statement is
+fan-in 1 *with state chaining*. That gives constant-size L1 verification and
+O(1) state update per block. D-023's fan-in-1 result is the right primitive for
+this; D-023 mislabelled it as a stepping stone to fan-in N rather than the
+finished shape.
+
+**Consequence for the fan-in-1 test.** `transfer_proves_under_recursion_and_keeps_its_statement`
+is still correct and valuable — it is the chain-link primitive. What it is *not*
+is a path to per-transfer-proof aggregation, because that shape is not wanted.
+
+**Sizing note.** A wider block means a bigger circuit and a taller trace, not more
+proofs. WHIR's proof size grows logarithmically in trace height, so block size
+scales. `MAX_PARTIES = 16` is the current ceiling and is a constant to raise, not
+an architectural limit — the binding constraint is `LOG_MAX_LDE` and the
+grinding-budget curve (D-021).
+
 ## D-023 — Transfer integrated with the recursive prover (fan-in 1, linear chain)
 
 **Status.** Implemented and tested. Closes the gap flagged when the user asked
