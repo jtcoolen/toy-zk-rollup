@@ -1,0 +1,43 @@
+# Build configuration.
+#
+# Optimized by default, for every command, with no `--release` flag required.
+#
+# Proving is compute-bound. The stock dev profile compiles every Plonky3 crate
+# at opt-level 0, which makes proofs several times slower -- and the code under
+# test *is* the prover, so an unoptimized build measures the wrong thing. A
+# fan-in-2 block proof took 466 s unoptimized and 9.2 s optimized.
+#
+# Why this is set on `dev` rather than telling callers to pass `--release`:
+# cargo has no `[build] profile` key (it is accepted-but-ignored and warns), and
+# `cargo test` uses the `test` profile regardless of how `cargo build` is
+# configured. `dev` and `release` are root profiles and cannot inherit from each
+# other, so the settings are spelled out here instead.
+#
+# debug-assertions are deliberately KEPT ON. Release turns them off, and they
+# have caught real bugs in this project that the release build masked -- a u8
+# overflow in a test fixture, and `debug_assert_eq!` checks inside the recursion
+# crate that catch stacked-arity mismatches. `opt-level = 3` with
+# `debug-assertions = true` is a valid combination: full speed, and overflow
+# checks still panic.
+#
+# LTO is off and codegen-units raised versus release. Release's `lto = "thin"`
+# with `codegen-units = 1` made one test binary take 67+ minutes of CPU to
+# link. The speedup comes from opt-level 3, not from whole-program LTO.
+#
+# panic stays `unwind` (the dev default). Release aborts, which would kill the
+# whole test process on the first failing assertion instead of reporting it.
+[profile.dev]
+opt-level = 3
+debug = "line-tables-only"
+debug-assertions = true
+lto = false
+codegen-units = 16
+
+# Tests inherit the optimized dev profile. Cargo forces unwind here regardless,
+# so a failing assertion reports rather than aborting the run.
+[profile.test]
+inherits = "dev"
+
+# Benches match: they measure proving throughput and must not be unoptimized.
+[profile.bench]
+inherits = "dev"

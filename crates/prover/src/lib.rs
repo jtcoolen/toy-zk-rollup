@@ -52,3 +52,43 @@ mod fixtures;
 mod spike;
 
 pub use config::{Challenge, Challenger, Config, F};
+
+#[cfg(test)]
+mod profile_guard {
+    /// Proving must run optimized, and with overflow checks still on.
+    ///
+    /// Both halves of this matter, and neither is obvious from a green suite:
+    ///
+    /// - `opt-level = 3` is what makes a block proof take 9 s instead of 466 s.
+    ///   An unoptimized prover measures the wrong thing, because the prover is
+    ///   the code under test.
+    /// - `debug_assertions` must stay **on**. Release turns them off, and they
+    ///   have caught real bugs here that the release build silently masked -- a
+    ///   `u8` overflow in a test fixture, and `debug_assert_eq!` checks inside
+    ///   the recursion crate that catch stacked-arity mismatches before they
+    ///   become wrong proofs.
+    ///
+    /// `.cargo/config.toml` sets `opt-level = 3` together with
+    /// `debug-assertions = true` on the dev profile. This test pins that
+    /// combination so a future profile reshuffle cannot quietly drop the checks
+    /// while keeping the speed.
+    ///
+    /// This fails under `cargo test --release`, which is intended: release drops
+    /// the overflow checks this project depends on. The optimized-by-default dev
+    /// profile is the supported way to build and test here -- cargo has no
+    /// `[build] profile` key, so making `dev` fast is the only way to get
+    /// release speed without passing a flag.
+    ///
+    /// Kept as a runtime assertion rather than a `const` one so a deliberate
+    /// `--release` build still compiles; only the test run objects.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn proving_keeps_overflow_checks_on() {
+        assert!(
+            cfg!(debug_assertions),
+            "the prover must be tested with debug-assertions on; release's \
+             debug_assertions = false hides overflow bugs this project has \
+             already hit. See .cargo/config.toml"
+        );
+    }
+}

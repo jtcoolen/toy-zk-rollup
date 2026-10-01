@@ -2,6 +2,59 @@
 
 Recorded choices with alternatives considered. Newest first.
 
+## D-029 — Optimized-by-default build profile
+
+**Status.** Done. `.cargo/config.toml`.
+
+**Problem.** Every duration in this log before D-027 was measured on the stock
+dev profile, which compiles every Plonky3 crate at `opt-level = 0`. Proving is
+compute-bound and the prover *is* the code under test, so an unoptimized build
+measures the wrong thing.
+
+**Measured, fan-in-2 block test:**
+
+| profile | test wall |
+|---|---|
+| dev (opt-level 0) | 466 s |
+| optimized (opt-level 3) | **9.2 s** |
+
+**~50× runtime speedup.**
+
+**Why the dev profile was modified rather than asking callers to pass
+`--release`:**
+
+- Cargo has **no `[build] profile` key.** Setting it emits
+  `warning: unused config key build.profile` and is ignored — plain
+  `cargo build` stays unoptimized.
+- `cargo test` uses the `test` profile regardless of how `cargo build` is
+  configured, so a release `build` setting would not speed up tests anyway.
+- `dev` and `release` are **root profiles and cannot inherit from each other**
+  (`inherits must not be specified in root profile dev`). The settings must be
+  spelled out on `dev` directly.
+
+**Settings on `[profile.dev]`:** `opt-level = 3`, `debug = "line-tables-only"`,
+`debug-assertions = true`, `lto = false`, `codegen-units = 16`.
+
+**`debug-assertions` deliberately kept ON.** Release turns them off, and they
+have caught real bugs in this project that the release build masked — a `u8`
+overflow in a test fixture, and `debug_assert_eq!` checks inside the recursion
+crate that catch stacked-arity mismatches. `opt-level = 3` with
+`debug-assertions = true` is a valid combination: full speed, overflow checks
+still panic. Pinned by a test in `prover/src/lib.rs` so a future profile
+reshuffle cannot quietly drop the checks while keeping the speed.
+
+**LTO off, `codegen-units = 16`.** Release's `lto = "thin"` +
+`codegen-units = 1` made one test binary take 67+ minutes of CPU to link. The
+speedup comes from `opt-level = 3`, not from whole-program LTO.
+
+**Disk cost.** The first optimized build filled the volume: `target/debug`
+reached 28 GB with 1.1 GiB free, and a build failed with `No space left on
+device`. `debug = "line-tables-only"` (rather than full debuginfo) brings the
+full-workspace target to ~4 GB. `cargo clean` recovered 38 GB.
+
+**Consequence:** `cargo test --release` now fails the profile guard test. That
+is intended — release drops the overflow checks this project depends on.
+
 ## D-028 — Aggregation tree is required at real block sizes (corrects D-026)
 
 **Status.** Open — design conclusion recorded, not yet built.
