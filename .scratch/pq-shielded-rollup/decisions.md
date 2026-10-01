@@ -2,6 +2,66 @@
 
 Recorded choices with alternatives considered. Newest first.
 
+## D-025 — Block topology: native transfers + exactly one in-circuit verification
+
+**Status.** Decision. Follows from D-024 and fixes the shape of the block circuit
+before it gets built.
+
+**The tension D-024 left unresolved.** D-024 argued the wide circuit is cheap
+because it witnesses N transfers *natively*, with no in-circuit proof
+verification. But a recursive block that verifies N per-transfer proofs
+in-circuit would throw that advantage away — 16 in-circuit WHIR verifications is
+far worse than one wide circuit. So "wide circuit" and "recursive block" are only
+compatible if the recursion is pointed at the right thing.
+
+**Decision.** A block circuit contains:
+
+| Part | How it is proven | Count per block |
+|---|---|---|
+| N transfers (spends, outputs, balance, membership, nullifiers) | **native witness** | N, zero in-circuit verification |
+| Previous block's proof | **verified in-circuit** | **exactly 1** |
+
+```text
+block circuit (InSC)
+  ├── native: N spends + M outputs, one global balance constraint
+  ├── native: root_after folded from new outputs onto root_before
+  └── in-circuit: verify prev block proof (InSC)
+        ├── prev.chain_id      == self.chain_id
+        ├── prev.block_number  + 1 == self.block_number
+        └── prev.root_after    == self.root_before
+```
+
+Exported statement: `[chain_id, block_number, timestamp, root_before, root_after, tx_root]`.
+
+**Why exactly one.** In-circuit WHIR verification is the dominant cost. Pointing
+it at the single previous block makes per-block proving work **constant** — one
+verification regardless of block size or chain length — while still proving the
+entire chain's validity back to genesis. Pointing it at N transfer proofs makes
+per-block work grow with block size and buys nothing, because those transfers are
+already witnessed natively in the same circuit.
+
+**This is fan-in 1 with state chaining, not aggregation.** The recursion edge is
+block→block, not transfer→block. D-023's `build_batch_recursion_circuit` is the
+primitive for that edge; D-024's wide circuit is the primitive for the block's
+own contents. They compose: the block circuit is a wide transfer circuit with one
+recursion edge attached.
+
+**What L1 does.** Verify one WHIR proof per block, check `root_before` against
+its stored root, record `root_after`, check `block_number` increments. Constant
+work per block. Because the proof chains to genesis, a light client can instead
+verify the *latest* proof alone and be convinced of the whole history — the
+property that makes this a validity rollup rather than a periodically-audited
+chain.
+
+**Rejected.**
+- *Verifying per-transfer proofs in-circuit.* Multiplies the dominant cost to
+  avoid a cost the wide circuit already does not incur.
+- *Aggregation tree over transfers.* D-024.
+- *No recursion at all (each block proven independently).* Sound, and cheaper per
+  block, but loses the chain-to-genesis property and the light-client property.
+  The user requires recursion in proofs and in the verifier, and this shape is
+  what makes that requirement pay for itself.
+
 ## D-024 — No aggregation tree: the transfer circuit is already the wide circuit
 
 **Status.** Decision, prompted by the user asking "are you doing tree-shaped
