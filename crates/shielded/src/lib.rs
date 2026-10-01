@@ -39,5 +39,5 @@ pub use note::Note;
 pub use nullifier_tree::{
     verify_non_inclusion, NonInclusionWitness, NullifierMap, NULLIFIER_TREE_DEPTH,
 };
-pub use transfer::{BalanceError, Transfer, TransferPublic, MAX_VALUE};
+pub use transfer::{BalanceError, NullifierRoots, Transfer, TransferPublic, MAX_VALUE};
 pub use tree::{CommitmentTree, MembershipPath};

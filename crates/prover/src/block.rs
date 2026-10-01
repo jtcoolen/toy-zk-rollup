@@ -49,20 +49,33 @@
 //!
 //! ## Shared anchor
 //!
-//! Every child is constrained to prove against the **same** root. Concatenating
-//! statements without that link would let a prover assemble a block from
-//! transfers witnessed against *different* tree states — each child individually
-//! valid, the set collectively describing a tree that never existed. The anchor
-//! equality is what makes the concatenated statement describe one real state
-//! transition, so it is enforced here, not left to the settlement layer.
+//! Every child is constrained to prove against the **same** commitment root.
+//! Concatenating statements without that link would let a prover assemble a
+//! block from transfers witnessed against *different* tree states — each child
+//! individually valid, the set collectively describing a tree that never
+//! existed. The anchor equality is what makes the concatenated statement
+//! describe one real state transition, so it is enforced here, not left to the
+//! settlement layer.
 //!
-//! ## What is *not* checked here
+//! Pinning rather than chaining the commitment root means a note created by one
+//! transfer in a block cannot be spent by another transfer in the same block.
+//! That is a deliberate restriction, not an oversight: it keeps the block's
+//! commitment transition trivial (`root_before == root_after`, outputs appended
+//! afterwards) and removes any question about ordering semantics.
 //!
-//! Nullifier uniqueness is deliberately absent. The settlement contract inserts
-//! every nullifier into an on-chain set and reverts on a duplicate, covering
-//! within-block and cross-block replay with one mechanism the chain owns
-//! authoritatively. Re-deriving it in-circuit would add a quadratic comparison
-//! to duplicate a check that is already enforced where the state lives.
+//! ## Nullifier roots are chained, not pinned
+//!
+//! The nullifier map cannot use the same trick, because each transfer's
+//! `before` and `after` genuinely differ. Instead the children are **chained**:
+//! child *i*'s `nullifier_root_after` is constrained equal to child *i+1*'s
+//! `nullifier_root_before`. The block therefore attests to one nullifier
+//! transition, from the first child's `before` to the last child's `after`,
+//! with every intermediate state pinned.
+//!
+//! This is what replaces the on-chain nullifier set (D-032). A replayed
+//! nullifier is not caught by a contract-side lookup; it is caught because the
+//! chain of roots cannot be extended — the absent-fold inside each child's
+//! proof fails against the root it inherited.
 
 use crate::whir_recursion::{Challenge, InnerWhirConfig, RecursionCircuit, WhirMmcs, DIGEST_ELEMS};
 use p3_circuit::{CircuitBuilder, ExprId, NonPrimitiveOpId, StatementExport};
@@ -116,10 +129,10 @@ const FEE_LIMBS: usize = 4;
 /// The shape of a transfer statement, needed to locate fields inside it.
 ///
 /// A transfer exports, in this order:
-/// `[nullifier_0…, output_0…, root, fee]` — 16 limbs per hash, 4 for the fee.
-/// The block circuit needs this to find each child's `root` without guessing, so
-/// a shape that does not match the statement it describes is rejected rather
-/// than silently constraining the wrong limbs.
+/// `[nullifier_0…, output_0…, root, nf_root_before, nf_root_after, fee]` —
+/// 16 limbs per hash, 4 for the fee. The block circuit needs this to find each
+/// child's roots without guessing, so a shape that does not match the statement
+/// it describes is rejected rather than silently constraining the wrong limbs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferShape {
     /// Number of inputs spent (one nullifier each).
@@ -132,13 +145,25 @@ impl TransferShape {
     /// Total statement limbs this shape implies.
     #[must_use]
     pub const fn statement_len(&self) -> usize {
-        LIMBS_PER_HASH * (self.num_nullifiers + self.num_outputs + 1) + FEE_LIMBS
+        LIMBS_PER_HASH * (self.num_nullifiers + self.num_outputs + 3) + FEE_LIMBS
     }
 
     /// Offset of the 16 root limbs within the statement.
     #[must_use]
     pub const fn root_offset(&self) -> usize {
         LIMBS_PER_HASH * (self.num_nullifiers + self.num_outputs)
+    }
+
+    /// Offset of the nullifier-map root *before* this transfer.
+    #[must_use]
+    pub const fn nullifier_before_offset(&self) -> usize {
+        LIMBS_PER_HASH * (self.num_nullifiers + self.num_outputs + 1)
+    }
+
+    /// Offset of the nullifier-map root *after* this transfer.
+    #[must_use]
+    pub const fn nullifier_after_offset(&self) -> usize {
+        LIMBS_PER_HASH * (self.num_nullifiers + self.num_outputs + 2)
     }
 }
 
@@ -250,6 +275,9 @@ pub fn build_multi_transfer_circuit(
     // The first child's root limbs, against which every later child's root is
     // constrained. See "Shared anchor" in the module docs.
     let mut anchor = RootAnchor::default();
+    // The nullifier-map root chain across children. See "Nullifier roots are
+    // chained, not pinned" in the module docs.
+    let mut nullifiers = NullifierChain::default();
 
     // Shape header, exported as circuit constants so the split is bound by the
     // proof rather than asserted by the caller. Without this the settlement
@@ -322,6 +350,8 @@ pub fn build_multi_transfer_circuit(
 
         // Pin this child's root to the block's shared root.
         anchor.pin(&mut builder, child.shape, statement_targets)?;
+        // Chain this child's nullifier transition onto the previous one's.
+        nullifiers.advance(&mut builder, child.shape, statement_targets)?;
 
         let table_public_inputs = child.verifier.table_public_values(child.statement)?;
         public.extend(verifier_inputs.try_pack_public_values(
@@ -364,18 +394,47 @@ pub fn build_multi_transfer_circuit(
     })
 }
 
-/// The block's shared-root invariant.
+/// Constrain two equal-length limb vectors to be elementwise equal.
+///
+/// Expressed arithmetically (`a - b = 0`) rather than with
+/// `CircuitBuilder::connect`. `connect` aliases witness slots, and the statement
+/// table's `LogUp` multiplicities are tracked per instance; aliasing across two
+/// children's instances desynchronises them and the witness fails to balance.
+/// A subtraction is a plain ALU constraint and leaves the lookup structure alone.
+fn assert_limbs_equal(
+    builder: &mut CircuitBuilder<Challenge>,
+    anchor: &[ExprId; LIMBS_PER_HASH],
+    limb: &[ExprId; LIMBS_PER_HASH],
+) {
+    for (a, b) in anchor.iter().zip(limb) {
+        let diff = builder.sub(*a, *b);
+        builder.assert_zero(diff);
+    }
+}
+
+/// Read 16 statement limbs out of a child's target slice.
+///
+/// Bounds-checked: a shape pointing past the end of the statement is an error,
+/// not a panic and not a silent short read.
+fn take_limbs(
+    targets: &[ExprId],
+    offset: usize,
+    what: &str,
+) -> Result<[ExprId; LIMBS_PER_HASH], Box<dyn Error>> {
+    let limbs: [ExprId; LIMBS_PER_HASH] = targets
+        .get(offset..offset + LIMBS_PER_HASH)
+        .ok_or("root limbs outside statement target range")?
+        .try_into()
+        .map_err(|_| format!("{what} limb count mismatch"))?;
+    Ok(limbs)
+}
+
+/// The block's shared commitment-root invariant.
 ///
 /// The first child observed defines the anchor; every later child is constrained
 /// equal to it. Callers cannot inspect or bypass the pinned value — the only way
 /// to use this is to feed it each child in turn, which is exactly the invariant
 /// the block needs.
-///
-/// Equality is expressed arithmetically (`a - b = 0`) rather than with
-/// `CircuitBuilder::connect`. `connect` aliases witness slots, and the statement
-/// table's `LogUp` multiplicities are tracked per instance; aliasing across two
-/// children's instances desynchronises them and the witness fails to balance.
-/// A subtraction is a plain ALU constraint and leaves the lookup structure alone.
 #[derive(Default)]
 struct RootAnchor {
     pinned: Option<[ExprId; LIMBS_PER_HASH]>,
@@ -390,21 +449,49 @@ impl RootAnchor {
         shape: TransferShape,
         targets: &[ExprId],
     ) -> Result<(), Box<dyn Error>> {
-        let off = shape.root_offset();
-        let limbs: [ExprId; LIMBS_PER_HASH] = targets
-            .get(off..off + LIMBS_PER_HASH)
-            .ok_or("root limbs outside statement target range")?
-            .try_into()
-            .map_err(|_| "root limb count mismatch")?;
+        let limbs = take_limbs(targets, shape.root_offset(), "root")?;
         match self.pinned {
             None => self.pinned = Some(limbs),
-            Some(first) => {
-                for (anchor, limb) in first.iter().zip(limbs) {
-                    let diff = builder.sub(*anchor, limb);
-                    builder.assert_zero(diff);
-                }
-            }
+            Some(first) => assert_limbs_equal(builder, &first, &limbs),
         }
+        Ok(())
+    }
+}
+
+/// The block's nullifier-root chain.
+///
+/// Unlike the commitment root, the nullifier map genuinely changes inside every
+/// transfer that spends, so the children cannot share one value. They are
+/// chained instead: each child's `before` must equal the previous child's
+/// `after`. The first child's `before` is the block's `root_before` and the
+/// last child's `after` is its `root_after`.
+///
+/// The chain is what makes replay impossible without a contract-side nullifier
+/// set (D-032): a transfer that reuses a nullifier cannot find an absent-fold
+/// that lands on the root it inherited, so the block is simply unwitnessable.
+#[derive(Default)]
+struct NullifierChain {
+    /// The previous child's `after`, which the next child's `before` must match.
+    expected_before: Option<[ExprId; LIMBS_PER_HASH]>,
+    /// The most recent `after`, i.e. the block's own `root_after`.
+    latest_after: Option<[ExprId; LIMBS_PER_HASH]>,
+}
+
+impl NullifierChain {
+    /// Check one child's `before` against the chain and advance it.
+    fn advance(
+        &mut self,
+        builder: &mut CircuitBuilder<Challenge>,
+        shape: TransferShape,
+        targets: &[ExprId],
+    ) -> Result<(), Box<dyn Error>> {
+        let before = take_limbs(targets, shape.nullifier_before_offset(), "nullifier before")?;
+        let after = take_limbs(targets, shape.nullifier_after_offset(), "nullifier after")?;
+        if let Some(prev_after) = self.expected_before {
+            assert_limbs_equal(builder, &prev_after, &before);
+        }
+        self.expected_before = Some(after);
+        self.latest_after = Some(after);
         Ok(())
     }
 }
@@ -463,13 +550,13 @@ pub fn settle_block_circuit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::{funded_note, seed, tree_with};
+    use crate::fixtures::{funded_note, nullifier_transition, seed, tree_with};
     use crate::transfer::{build_transfer_circuit, settle_transfer_circuit_with, LOG_MAX_LDE};
     use p3_field::PrimeCharacteristicRing;
     use pq_hash::{Keccak256Commitment, Sha3_256Shielded};
     use shielded::keys::derive_spend_pk;
     use shielded::transfer::Spend;
-    use shielded::Note;
+    use shielded::{Note, NullifierMap};
 
     /// Every transfer in these tests spends one note and creates one.
     const ONE_IN_ONE_OUT: TransferShape = TransferShape {
@@ -483,6 +570,12 @@ mod tests {
         p3_circuit_prover::BatchStarkProof<InnerWhirConfig>,
         Vec<F>,
     );
+
+    /// The nullifier map the block's clients share.
+    ///
+    /// One map across the whole block, not one per client: the chain constraint
+    /// only means something if the children are transitions of the *same* map.
+    type NullifierStore = NullifierMap<Keccak256Commitment>;
 
     /// One client's transfer witness, as it would exist on the spender's machine.
     struct ClientSpec<'a> {
@@ -500,6 +593,7 @@ mod tests {
         spec: &ClientSpec<'_>,
         root: pq_hash::MerkleRoot,
         recipient: shielded::SpendPublicKey,
+        map: &mut NullifierStore,
     ) -> Result<ClientTransfer, Box<dyn Error>> {
         let out = Note::new(spec.out_value, seed(200), seed(201), recipient);
         let spend = Spend {
@@ -513,8 +607,16 @@ mod tests {
             outputs: vec![out],
             fee: 100,
         };
-        let public = transfer.public(&Keccak256Commitment, &Sha3_256Shielded, root);
-        let tc = build_transfer_circuit(&transfer, &public)?;
+        // The roots and the witnesses come out of one walk of the shared map, so
+        // this client's `before` is whatever the previous client left behind.
+        let (nullifier_roots, witnesses) = nullifier_transition(&transfer, map);
+        let public = transfer.public(
+            &Keccak256Commitment,
+            &Sha3_256Shielded,
+            root,
+            nullifier_roots,
+        );
+        let tc = build_transfer_circuit(&transfer, &public, &witnesses)?;
         let (proof, verifier) = settle_transfer_circuit_with(&tc, inner.clone())?;
         verifier.verify(&proof, tc.statement())?;
         Ok((verifier, proof, tc.statement().to_vec()))
@@ -557,8 +659,9 @@ mod tests {
             index: 0,
             out_value: 1_900,
         };
-        let client_a = prove_client_transfer(&inner, &spec_a, tree_a.root(), recipient)?;
-        let client_b = prove_client_transfer(&inner, &spec_b, tree_b.root(), recipient)?;
+        let mut map = NullifierMap::new(Keccak256Commitment);
+        let client_a = prove_client_transfer(&inner, &spec_a, tree_a.root(), recipient, &mut map)?;
+        let client_b = prove_client_transfer(&inner, &spec_b, tree_b.root(), recipient, &mut map)?;
 
         let children = children_of(std::iter::once(&client_a).chain(std::iter::once(&client_b)));
 
@@ -572,6 +675,67 @@ mod tests {
         assert!(
             msg.contains("conflict"),
             "mixed-root block must fail as an unsatisfiable constraint, got: {msg}"
+        );
+
+        Ok(())
+    }
+
+    /// The nullifier chain must reject a block whose children are transitions of
+    /// **different** nullifier maps.
+    ///
+    /// This is the mirror of [`block_rejects_children_from_different_tree_states`],
+    /// and it isolates a different property: there, the commitment roots differ.
+    /// Here the commitment root is shared and every transfer is individually
+    /// valid, but the second child starts from a nullifier root the first child
+    /// did not produce.
+    ///
+    /// That is exactly what a replay looks like. A spender who reuses a
+    /// nullifier cannot extend the chain — the absent-fold inside their proof
+    /// cannot land on the root they inherited — so the block is unwitnessable
+    /// without the contract ever holding a nullifier set (D-032).
+    #[test]
+    fn block_rejects_a_broken_nullifier_chain() -> Result<(), Box<dyn Error>> {
+        let (n1, sk1) = funded_note(11, 1_000);
+        let (n2, sk2) = funded_note(22, 2_000);
+        let (tree, paths) = tree_with(&[n1, n2]);
+        let root = tree.root();
+        let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
+        let inner = InnerWhirConfig::new(LOG_MAX_LDE, 0).expect("inner config");
+
+        let spec_a = ClientSpec {
+            note: &n1,
+            sk_d: &sk1,
+            path: &paths[0],
+            index: 0,
+            out_value: 900,
+        };
+        let spec_b = ClientSpec {
+            note: &n2,
+            sk_d: &sk2,
+            path: &paths[1],
+            index: 1,
+            out_value: 1_900,
+        };
+
+        // Same tree, but client B was witnessed against its own fresh map, so
+        // its `before` is the empty-map root rather than client A's `after`.
+        let mut map_a = NullifierMap::new(Keccak256Commitment);
+        let mut map_b = NullifierMap::new(Keccak256Commitment);
+        let client_a = prove_client_transfer(&inner, &spec_a, root, recipient, &mut map_a)?;
+        let client_b = prove_client_transfer(&inner, &spec_b, root, recipient, &mut map_b)?;
+        assert_ne!(
+            map_a.root(),
+            map_b.root(),
+            "the two maps must actually differ for this test to mean anything"
+        );
+
+        let children = children_of(std::iter::once(&client_a).chain(std::iter::once(&client_b)));
+        let err = build_multi_transfer_circuit(&inner, &children)
+            .expect_err("a broken nullifier chain must not be provable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("conflict"),
+            "a broken nullifier chain must fail as an unsatisfiable constraint, got: {msg}"
         );
 
         Ok(())
@@ -614,8 +778,9 @@ mod tests {
             index: 1,
             out_value: 1_900,
         };
-        let client_a = prove_client_transfer(&inner, &spec_a, tree.root(), recipient)?;
-        let client_b = prove_client_transfer(&inner, &spec_b, tree.root(), recipient)?;
+        let mut map = NullifierMap::new(Keccak256Commitment);
+        let client_a = prove_client_transfer(&inner, &spec_a, tree.root(), recipient, &mut map)?;
+        let client_b = prove_client_transfer(&inner, &spec_b, tree.root(), recipient, &mut map)?;
 
         // Same valid children, but the second claims two outputs.
         let mut children = children_of(std::iter::once(&client_a));
@@ -696,8 +861,9 @@ mod tests {
             index: 1,
             out_value: 1_900,
         };
-        let client_a = prove_client_transfer(&inner, &spec_a, root, recipient)?;
-        let client_b = prove_client_transfer(&inner, &spec_b, root, recipient)?;
+        let mut map = NullifierMap::new(Keccak256Commitment);
+        let client_a = prove_client_transfer(&inner, &spec_a, root, recipient, &mut map)?;
+        let client_b = prove_client_transfer(&inner, &spec_b, root, recipient, &mut map)?;
 
         let children = vec![
             ChildProof {

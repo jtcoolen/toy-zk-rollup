@@ -2,6 +2,90 @@
 
 Recorded choices with alternatives considered. Newest first.
 
+## D-035 — Fixed-shape nullifier gadget: `FOLD_DEPTH = 32`, and the real cost of a spend
+
+**Status.** Done and wired. `crates/prover/src/nullifier_gadget.rs` (6 tests + a
+cost probe), threaded through `constrain_transfer` and the block circuit's
+`NullifierChain`.
+
+**The problem a circuit has that the native map does not.** The native
+`NonInclusionWitness` has a *variable* length: `start_height` is wherever the
+empty subtree containing the address actually begins, and the sibling list is
+`256 - start_height` long. A STARK trace cannot have a data-dependent number of
+rows. So the variable part becomes a compile-time floor:
+
+```text
+FOLD_START = NULLIFIER_TREE_DEPTH - FOLD_DEPTH = 256 - 32 = 224
+```
+
+Every absence fold runs exactly 32 levels, starting at height 224.
+
+**Why padding downward is exact, not approximate.** Emptiness is
+*downward-closed inside a containing subtree*: if the subtree at height `h` is
+empty then so is the one at any `h0 <= h` on the same path. So when the true
+`start_height` is above the floor, the extra bottom levels are just
+`empty[.]` constants and folding from 224 instead of from the true height
+produces the identical root. `prepare_witness` pads with `map.empty_at(h)` for
+`h in 224..start_height`.
+
+**Why padding upward would be a bug, and is refused instead.** If the true
+`start_height` is *below* 224 the map is denser than this circuit can attest
+to. Folding from 224 there would assert an emptiness that does not hold.
+`prepare_witness` returns `Err("nullifier map too dense ...")` — never silent
+padding. `FOLD_DEPTH` is therefore a capacity parameter in the same spirit as
+`LOG_MAX_LDE`: too small and proving fails loudly.
+
+**Capacity.** With addresses uniform, `FOLD_DEPTH = 32` supports on the order
+of `2^32` spent nullifiers before a transfer cannot be witnessed. That is far
+past any realistic deployment, and the fold stays at 32 hashes.
+
+**Address bits are derived, not declared.** The direction bits come from
+`decompose_to_bits` on the *in-circuit* nullifier digest limbs — 16 bits per
+limb, 16 limbs, bit `b` of the digest = bit `b % 16` of limb `b / 16`, which
+matches the native `addr_bit` because each 16-bit limb is two little-endian
+bytes. A prover who could choose the address could route a spend around the
+empty-subtree check; deriving it makes that impossible.
+
+**Measured cost: 288 Keccak-f per nullifier.** 32 for the absence fold plus
+256 for the insert fold. The insert fold is *not* reduced by sparsity: the
+empty-collapse only applies when **both** children are empty, and the inserted
+leaf is not. At 24 rows per Keccak-f that is ~6,900 AIR rows per spend. This
+is the dominant cost of the transfer circuit by a wide margin — the 32-level
+commitment fold is 32 hashes by comparison.
+
+**Consequence for the height budget.** The transfer's WHIR grinding budget rose
+from 17 to 19 ground bits (1-in/1-out) and 20 (2-in/2-out), so
+`transfer::LOG_MAX_LDE` moved 24 -> 26. Sized by measurement, not headroom:
+over-provisioning costs ~2.7x proving time (D-031) and under-provisioning
+panics at `pcs.rs:270`.
+
+**Two LogUp traps hit while wiring this.**
+
+1. `builder.connect()` between the threaded root and a fold output broke the
+   Keccak lookup multiplicities — `Lookup mismatch (global lookup
+   'WitnessChecks'): tuple [...] has net multiplicity 2130706431` — because
+   from the second spend onward the threaded root is a *live witness
+   expression*, not a constant. Fixed with `sub()` + `assert_zero()`. The
+   existing `connect` calls against `const_limbs` are fine; the rule is
+   specifically about aliasing two non-constant slots.
+2. The same rule already forced `sub()`+`assert_zero()` in the block circuit's
+   root anchor; the new `NullifierChain` reuses that helper rather than
+   rediscovering it.
+
+**Alternatives considered.**
+- *Variable-depth fold with per-branch padding.* Rejected: a circuit cannot
+  branch on `start_height` without instantiating every depth.
+- *`FOLD_DEPTH = 64` or `128`.* More capacity than needed, and 2x/4x the
+  absence-fold cost for a bound we will not approach.
+- *Make the insert fold sparse too.* Not possible: inserting at a leaf forces a
+  real hash at every level up to the root. An MMR would amortise it but is
+  backwards for the non-membership direction (D-034).
+- *Batch the insert folds across a block.* Real future optimisation: a block
+  inserting N nullifiers could share the top levels once instead of N times.
+  Deferred — it changes the statement shape and the contract's read, and the
+  per-transfer proof structure (D-026) does not allow it at the transfer layer.
+
+
 ## D-034 — Nullifier accumulator is a sparse Merkle map, full 256-bit address, depth 256
 
 **Status.** Native structure done: `crates/shielded/src/nullifier_tree.rs`, 13

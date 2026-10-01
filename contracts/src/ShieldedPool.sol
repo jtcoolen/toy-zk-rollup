@@ -5,20 +5,42 @@ import {IWhirVerifier} from "./interfaces/IWhirVerifier.sol";
 import {BlockStatement} from "./BlockStatement.sol";
 import {MerkleAccumulator} from "./MerkleAccumulator.sol";
 
-/// Settlement for the post-quantum shielded pool.
+/// Settlement for the post-quantum shielded pool: a state-root tracker.
 ///
-/// This contract is where the rollup's security actually lands. Everything the
-/// circuits prove is only meaningful because of what is checked *here*:
+/// This contract holds **two roots and nothing else that matters**. Every block
+/// must present a proof that carries the chain from the roots it currently
+/// stores to a new pair of roots, and the contract records the new pair.
 ///
-/// * **Nullifier non-membership.** The transfer AIR proves an input note exists
-///   in the tree; it cannot prove the note has never been spent before, because
-///   that is a fact about the chain's history, not about the witness. The
-///   on-chain nullifier set is what closes that gap. Without this contract the
-///   claim made in `crates/prover/src/transfer.rs` is simply false and notes
-///   can be spent twice.
-/// * **Root continuity.** Each block must build on the root the previous block
-///   left. The circuit proves its own `rootBefore` is internally consistent;
-///   only the contract can say "that is the root we are actually at".
+/// * **Commitment tree** — note commitments. The contract appends the block's
+///   outputs and derives the new root itself, because the circuit deliberately
+///   does not prove the post-append root. Appending is deterministic given the
+///   statement, so the contract is the right place for it.
+/// * **Nullifier map** — spent nullifiers. The contract stores the root and
+///   chains it; it does **not** hold a set of nullifiers and performs no replay
+///   check of its own.
+///
+/// ## Why there is no nullifier set
+///
+/// Replay resistance used to live here: insert each nullifier, revert on a
+/// duplicate. That made the contract a second source of truth for a fact the
+/// proof already establishes. The transfer circuit now proves nullifier
+/// *non-membership* in-circuit (D-032, D-035): each spend folds
+/// `keccak256` from an empty-subtree constant up to the nullifier root it
+/// inherited, then folds the nullifier itself up to the root after insertion.
+/// Both endpoints are in the verified statement, and the block circuit chains
+/// one transfer's `after` to the next transfer's `before`.
+///
+/// So a replayed nullifier cannot extend the chain: its absence fold cannot
+/// land on the root it inherited, because that root already has it inserted.
+/// The block is simply unwitnessable. A contract-side set would add a store
+/// write per nullifier (~20k gas each) to re-check something the proof already
+/// makes impossible, and — worse — would mean a bug in the contract could
+/// diverge from a correct proof.
+///
+/// What the contract *does* contribute is the one thing no proof can: knowing
+/// which root the chain is actually at. The circuit proves its own
+/// `rootBefore` is internally consistent; only this contract can say "that is
+/// the root we are at".
 ///
 /// ## Trust model
 ///
@@ -39,30 +61,31 @@ contract ShieldedPool is MerkleAccumulator {
     /// change under a live pool.
     IWhirVerifier public immutable verifier;
 
-    /// Nullifiers already spent. The whole point of this contract.
-    mapping(bytes32 nullifier => bool spent) public nullifierSet;
-
     /// Number of blocks applied.
     uint256 public blockNumber;
 
-    /// The root the next block must build on.
+    /// The commitment-tree root the next block must build on.
     bytes32 public currentRoot;
+
+    /// The nullifier-map root the next block must build on.
+    bytes32 public currentNullifierRoot;
 
     /// Collected fees, withdrawable by `feeRecipient`.
     address public feeRecipient;
 
-    /// A block was applied.
-    event BlockApplied(uint256 indexed blockNumber, bytes32 rootBefore, bytes32 rootAfter, uint256 fee);
-
-    /// A nullifier was spent.
-    event NullifierSpent(bytes32 indexed nullifier);
-
-    /// A note commitment was appended.
-    event NoteAppended(bytes32 indexed commitment, uint256 index);
+    /// A block was applied, carrying both root transitions.
+    event BlockApplied(
+        uint256 indexed blockNumber,
+        bytes32 rootBefore,
+        bytes32 rootAfter,
+        bytes32 nullifierRootBefore,
+        bytes32 nullifierRootAfter,
+        uint256 fee
+    );
 
     error NotVerified();
     error RootMismatch(bytes32 expected, bytes32 got);
-    error NullifierAlreadySpent(bytes32 nullifier);
+    error NullifierRootMismatch(bytes32 expected, bytes32 got);
     error NotFeeRecipient();
 
     constructor(IWhirVerifier verifier_, address feeRecipient_) {
@@ -70,7 +93,10 @@ contract ShieldedPool is MerkleAccumulator {
         require(feeRecipient_ != address(0), "fee recipient required");
         verifier = verifier_;
         feeRecipient = feeRecipient_;
-        // The tree starts empty; the first block's rootBefore must equal this.
+        // Both trees start empty; the first block's `before` roots must equal
+        // these. The nullifier map's empty root is the prover's, not ours: we
+        // never compute it, we just require the first block to name one and
+        // then chain from it.
         currentRoot = root();
     }
 
@@ -78,60 +104,52 @@ contract ShieldedPool is MerkleAccumulator {
     ///
     /// The order of checks is deliberate. Verification comes first because it is
     /// the expensive one and because nothing else should be examined until the
-    /// statement is known to be genuine. Nullifier replay is checked for *all*
-    /// transfers before *any* is marked, so a block that spends the same note
-    /// twice reverts without partially applying.
+    /// statement is known to be genuine. Continuity is checked next, before any
+    /// state is touched, so a block that does not extend the current state
+    /// reverts without partially applying.
     function applyBlock(uint256[] calldata statement, bytes calldata proof) external {
         if (!verifier.verify(statement, proof)) revert NotVerified();
 
+        // `decode` takes memory; copying the calldata once is cheaper than
+        // re-reading it per field and keeps the decoder simple.
         BlockStatement.Block memory block_ = statement.decode();
 
         // Continuity: this block must extend the state we are actually in.
         if (block_.rootBefore != currentRoot) {
             revert RootMismatch(currentRoot, block_.rootBefore);
         }
-
-        // Pass one: reject any nullifier already spent, including duplicates
-        // inside this block. Reading only, so a duplicate is caught before the
-        // first copy is written.
-        for (uint256 i; i < block_.transfers.length; ++i) {
-            bytes32[] memory nfs = block_.transfers[i].nullifiers;
-            for (uint256 j; j < nfs.length; ++j) {
-                if (nullifierSet[nfs[j]]) revert NullifierAlreadySpent(nfs[j]);
-            }
-        }
-
-        // Pass two: mark them spent.
-        for (uint256 i; i < block_.transfers.length; ++i) {
-            bytes32[] memory nfs = block_.transfers[i].nullifiers;
-            for (uint256 j; j < nfs.length; ++j) {
-                nullifierSet[nfs[j]] = true;
-                emit NullifierSpent(nfs[j]);
-            }
+        if (block_.nullifierBefore != currentNullifierRoot) {
+            revert NullifierRootMismatch(currentNullifierRoot, block_.nullifierBefore);
         }
 
         // Append every output commitment. The tree advances exactly as the
-        // statement says, and the resulting root becomes the next block's
-        // required rootBefore.
+        // proven statement says, and the resulting root becomes the next
+        // block's required `rootBefore`.
         for (uint256 i; i < block_.transfers.length; ++i) {
             bytes32[] memory outs = block_.transfers[i].outputs;
             for (uint256 j; j < outs.length; ++j) {
                 _append(outs[j]);
-                emit NoteAppended(outs[j], leafCount - 1);
             }
         }
 
         bytes32 rootAfter = root();
         currentRoot = rootAfter;
+        // The nullifier root is not recomputed — it is taken from the proof.
+        // That is the whole point of proving the transition in-circuit: the
+        // contract records an endpoint it cannot derive but can verify.
+        currentNullifierRoot = block_.nullifierAfter;
+
         unchecked {
             ++blockNumber;
         }
-        emit BlockApplied(blockNumber, block_.rootBefore, rootAfter, block_.totalFee);
-    }
-
-    /// Whether `nullifier` has been spent.
-    function isSpent(bytes32 nullifier) external view returns (bool) {
-        return nullifierSet[nullifier];
+        emit BlockApplied(
+            blockNumber,
+            block_.rootBefore,
+            rootAfter,
+            block_.nullifierBefore,
+            block_.nullifierAfter,
+            block_.totalFee
+        );
     }
 
     /// Withdraw collected fees. Only the fee recipient.

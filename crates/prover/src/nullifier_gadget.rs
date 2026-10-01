@@ -263,6 +263,7 @@ pub fn constrain_nullifier_non_membership(
 mod tests {
     use super::*;
     use crate::transfer::const_limbs;
+    use p3_circuit::ops::{KeccakF1600Trace, NpoTypeId};
     use pq_hash::{Digest32, Keccak256Commitment, Nullifier};
 
     fn nf(bytes: [u8; 32]) -> Nullifier {
@@ -417,5 +418,58 @@ mod tests {
             map.root_after(&w, &probe).as_bytes(),
         )
         .expect("padded fold must match the native roots");
+    }
+
+    /// Cost probe: how many rows and how long does one nullifier's proof cost?
+    ///
+    /// Not an assertion about correctness — a measurement that decides whether
+    /// the insert fold's 256 Keccak-f is affordable inside a transfer.
+    #[test]
+    #[ignore = "cost probe; run with --nocapture when sizing a block"]
+    fn measure_gadget_cost() {
+        use std::time::Instant;
+
+        let mut map = NullifierMap::new(Keccak256Commitment);
+        for seed in 1u8..=4 {
+            assert!(map.insert(&nf([seed; 32])));
+        }
+        let probe = nf([200u8; 32]);
+        let w = map.non_inclusion_witness(&probe).expect("probe absent");
+        let prepared = prepare_witness(&map, &w).expect("fits fold budget");
+
+        let before = map.root_before(&w, &probe);
+        let after = map.root_after(&w, &probe);
+
+        let built = Instant::now();
+        let mut builder = CircuitBuilder::<Challenge>::new();
+        builder.enable_keccak_f1600::<F>();
+        let limbs = const_limbs(&mut builder, probe.as_bytes());
+        let (got_before, got_after) =
+            constrain_nullifier_non_membership(&mut builder, &limbs, &prepared).expect("fold");
+        let want_before = const_limbs(&mut builder, before.as_bytes());
+        let want_after = const_limbs(&mut builder, after.as_bytes());
+        for limb in 0..KECCAK256_DIGEST_LIMBS {
+            let d_before = builder.sub(got_before[limb], want_before[limb]);
+            builder.assert_zero(d_before);
+            let d_after = builder.sub(got_after[limb], want_after[limb]);
+            builder.assert_zero(d_after);
+        }
+        let circuit = builder.build().expect("build");
+        let build_time = built.elapsed();
+
+        let ran = Instant::now();
+        let mut runner = circuit.runner();
+        runner.set_public_inputs(&[]).expect("public");
+        runner.set_private_inputs(&[]).expect("private");
+        let traces = runner.run().expect("run");
+        let witness = ran.elapsed();
+
+        let keccak = traces
+            .non_primitive_trace::<KeccakF1600Trace>(&NpoTypeId::keccak_f1600())
+            .map_or(0, |t: &KeccakF1600Trace| t.operations.len());
+        println!(
+            "gadget: build {build_time:.2?} witness {witness:.2?} keccak_f_rows {keccak} \
+             (FOLD_DEPTH {FOLD_DEPTH}, insert fold {NULLIFIER_TREE_DEPTH})"
+        );
     }
 }

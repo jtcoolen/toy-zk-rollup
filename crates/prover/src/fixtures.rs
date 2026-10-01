@@ -7,10 +7,11 @@
 
 #![cfg(test)]
 
-use pq_hash::{Digest32, Keccak256Commitment, Sha3_256Shielded};
+use crate::nullifier_gadget::NullifierWitness;
+use pq_hash::{Digest32, Keccak256Commitment, MerkleRoot, Sha3_256Shielded};
 use shielded::keys::derive_spend_pk;
 use shielded::tree::CommitmentTree;
-use shielded::Note;
+use shielded::{Note, NullifierMap, NullifierRoots, Transfer, TransferPublic};
 
 /// A tiny deterministic byte source.
 #[must_use]
@@ -55,4 +56,71 @@ pub fn tree_with(notes: &[Note]) -> (CommitmentTree<Keccak256Commitment>, Vec<Ve
         .map(|i| tree.path(i).expect("path exists").siblings)
         .collect();
     (tree, paths)
+}
+
+/// The public statement and per-spend nullifier witnesses, from one map walk.
+///
+/// These must be built together. The roots and the witnesses are two views of a
+/// single state transition: `before` is the map root on entry, each witness is
+/// the absence proof at the state it was drawn from, and `after` is the root on
+/// exit. Building them from separate walks is how they would drift apart — and a
+/// drifted pair makes a transfer unwitnessable rather than accepted, which is
+/// the safe direction but a confusing one to debug.
+///
+/// Mirrors what the node's prover orchestration does: walk the spends in order,
+/// ask the map for the absence witness, then insert.
+///
+/// # Panics
+///
+/// Panics if a fixture repeats a nullifier, or if the map is denser than the
+/// circuit's [`crate::nullifier_gadget::FOLD_DEPTH`] allows. Both are fixture
+/// bugs, not runtime conditions a test should swallow.
+#[must_use]
+pub fn nullifier_transition(
+    transfer: &Transfer<'_>,
+    map: &mut NullifierMap<Keccak256Commitment>,
+) -> (NullifierRoots, Vec<NullifierWitness>) {
+    let before = map.root();
+    let mut witnesses = Vec::with_capacity(transfer.spends.len());
+    for spend in &transfer.spends {
+        let nf = spend.note.nullifier(&Sha3_256Shielded, spend.sk_d);
+        let native = map
+            .non_inclusion_witness(&nf)
+            .expect("fixture nullifiers must be distinct");
+        witnesses.push(
+            crate::nullifier_gadget::prepare_witness(map, &native)
+                .expect("map must be sparse enough for the circuit"),
+        );
+        assert!(map.insert(&nf), "fixture must not repeat a nullifier");
+    }
+    let roots = NullifierRoots {
+        before,
+        after: map.root(),
+    };
+    (roots, witnesses)
+}
+
+/// [`nullifier_transition`] over a fresh empty map, returning the full
+/// [`TransferPublic`] ready for the circuit.
+#[must_use]
+pub fn public_and_witnesses(
+    transfer: &Transfer<'_>,
+    root: MerkleRoot,
+) -> (TransferPublic, Vec<NullifierWitness>) {
+    public_and_witnesses_from(transfer, root, NullifierMap::new(Keccak256Commitment))
+}
+
+/// [`public_and_witnesses`] over a map that already holds prior spends.
+///
+/// Taking the map as an argument is what lets a test start from a *non-empty*
+/// nullifier set, so the absence fold is not trivially the empty-subtree root.
+#[must_use]
+pub fn public_and_witnesses_from(
+    transfer: &Transfer<'_>,
+    root: MerkleRoot,
+    mut map: NullifierMap<Keccak256Commitment>,
+) -> (TransferPublic, Vec<NullifierWitness>) {
+    let (roots, witnesses) = nullifier_transition(transfer, &mut map);
+    let public = transfer.public(&Keccak256Commitment, &Sha3_256Shielded, root, roots);
+    (public, witnesses)
 }

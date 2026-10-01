@@ -122,6 +122,30 @@ pub struct Transfer<'a> {
     pub fee: u64,
 }
 
+/// The nullifier-map root pair a transfer transitions between.
+///
+/// Grouped into one type because the two roots are always used together and are
+/// the same type: passing them as separate `MerkleRoot` arguments invites
+/// swapping them, which would silently invert the replay direction.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NullifierRoots {
+    /// Root before this transfer's nullifiers are inserted.
+    pub before: MerkleRoot,
+    /// Root after they are inserted.
+    pub after: MerkleRoot,
+}
+
+impl NullifierRoots {
+    /// The roots of an empty nullifier map (before == after).
+    #[must_use]
+    pub const fn empty(map_root: MerkleRoot) -> Self {
+        Self {
+            before: map_root,
+            after: map_root,
+        }
+    }
+}
+
 /// The public surface of a transfer: everything the chain sees.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TransferPublic {
@@ -129,8 +153,15 @@ pub struct TransferPublic {
     pub nullifiers: Vec<Nullifier>,
     /// One commitment per output. Appended to the tree.
     pub outputs: Vec<NoteHash>,
-    /// The tree root the inputs were proven against.
+    /// The commitment-tree root the inputs were proven against.
     pub root: MerkleRoot,
+    /// The nullifier-map transition this transfer proves.
+    ///
+    /// Both roots are in the verified statement: `before` proves each nullifier
+    /// was absent, `after` proves the insert that follows. The settlement
+    /// contract chains these across transfers and holds no nullifier set of its
+    /// own, so replay is impossible without breaking the root chain.
+    pub nullifier_roots: NullifierRoots,
     /// The fee.
     pub fee: u64,
 }
@@ -145,10 +176,19 @@ impl Transfer<'_> {
     /// deliberately unrelated — one type satisfying both would defeat the
     /// compile-time separation the `pq-hash` crate exists to provide.
     ///
-    /// `root` is supplied rather than derived: the prover learns it from the tree
-    /// service, and the circuit takes it as a public input.
+    /// `root` and `nullifier_roots` are supplied rather than derived: the prover
+    /// learns them from the tree service, and the circuit takes them as public
+    /// inputs. The circuit re-derives the *transition* from the witnesses, so
+    /// supplying a wrong root makes the proof unwitnessable rather than
+    /// accepted.
     #[must_use]
-    pub fn public<C, S>(&self, commitment: &C, shielded: &S, root: MerkleRoot) -> TransferPublic
+    pub fn public<C, S>(
+        &self,
+        commitment: &C,
+        shielded: &S,
+        root: MerkleRoot,
+        nullifier_roots: NullifierRoots,
+    ) -> TransferPublic
     where
         C: CommitmentHasher,
         S: ShieldedHasher,
@@ -163,6 +203,7 @@ impl Transfer<'_> {
             nullifiers,
             outputs,
             root,
+            nullifier_roots,
             fee: self.fee,
         }
     }

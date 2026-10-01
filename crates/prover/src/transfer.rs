@@ -29,17 +29,20 @@
 //! ## The public statement
 //!
 //! The statement is exactly [`TransferPublic`]: nullifiers, output commitments,
-//! the root, the fee. It is exported through the statement table, so
+//! the commitment root, the nullifier-map root before and after, and the fee. It
+//! is exported through the statement table, so
 //! `CircuitVerifier::verify(&proof, statement)` binds the proof to those bytes
 //! and to nothing else.
 //!
-//! ## What this does *not* yet prove
+//! ## Nullifier non-membership is proven here
 //!
-//! Nullifier **non-membership**. The circuit proves the inputs are in the tree; it
-//! does not prove the nullifiers have not been spent before. That gap is closed
-//! by the on-chain nullifier set, which rejects a replayed nullifier before it
-//! ever reaches the verifier. See the ticket for the in-circuit sparse-Merkle
-//! upgrade that removes the reliance on the node ordering them.
+//! Property 4 is stronger than "publish the nullifier so a replay is
+//! detectable". Each spend runs the sparse-Merkle fold from
+//! [`crate::nullifier_gadget`] against the nullifier-map root it inherited, so
+//! the proof itself attests that the nullifier was absent — and yields the root
+//! after inserting it. The thread runs `before → … → after`, which makes the
+//! ordering of nullifiers inside a transfer binding, and lets the settlement
+//! contract chain transfers without ever holding a nullifier set (D-032).
 
 use std::fmt;
 
@@ -53,22 +56,32 @@ use shielded::keys::DOMAIN_PK;
 use shielded::note::{DOMAIN_NOTE, DOMAIN_NULLIFIER};
 use shielded::{Transfer, TransferPublic};
 
+use crate::nullifier_gadget::{constrain_nullifier_non_membership, NullifierWitness};
 use crate::sha3_block::sha3_256_single_block;
 use crate::whir_recursion::{Challenge, F};
 
-/// Trace height the transfer settlement is sized at.
+/// Default trace height budget for transfer settlement.
 ///
 /// WHIR derives a mandatory grinding budget from the arity of the polynomial it
 /// commits to, and `WhirConfig` *refuses to build* when the required bits exceed
-/// the budget. The transfer circuit stacks to 23 variables — 32-level Keccak
-/// Merkle folds per input dominate the trace — which needs 17 ground bits at the
-/// 96-bit target. A config declared at 22 variables only budgets 14, so the
-/// prover panics inside the PCS rather than returning an error.
+/// the budget. The transfer circuit's arity grows with what it does: a 1-in/1-out
+/// transfer needs 19 ground bits, a 2-in/2-out needs 20. The nullifier gadget
+/// added roughly 290 Keccak-f per spend (32 absence + 256 insert), which is
+/// what pushed this up from 24.
 ///
-/// Declaring one level higher budgets 18 bits, covering the 17 required with a
-/// bit of headroom for a slightly larger circuit. The verifier's cost is
-/// unchanged: grinding is prover-side work checked with a single hash.
-pub const LOG_MAX_LDE: usize = 24;
+/// This constant is the default for the *largest shape the tests exercise*, not
+/// a protocol parameter: `settle_transfer_circuit` takes `log_max_lde` per
+/// call, so a node sizes each circuit to its own measured arity.
+///
+/// **Over-provisioning is not free.** The prover pads to the declared height, so
+/// a larger budget means a larger LDE and more work — roughly 2.7x between
+/// v=25 and v=27 on a fan-in-2 block. Under-provisioning panics inside the PCS
+/// rather than returning an error, which is why the value is measured rather
+/// than guessed.
+///
+/// The verifier's cost is unchanged either way: grinding is prover-side work
+/// checked with a single hash.
+pub const LOG_MAX_LDE: usize = 26;
 
 /// A `u64` amount as little-endian 16-bit limbs. Four limbs, because the
 /// circuit's limb width is 16 bits, not the field's 31.
@@ -269,17 +282,25 @@ impl TransferCircuit {
 /// ownership of the builder moves.
 ///
 /// Returns the transfer's statement expressions in the order
-/// `[nullifiers…, output_commitments…, root, fee]`, which the caller places
-/// inside its own statement export list.
+/// `[nullifiers…, output_commitments…, root, nullifier_root_before,
+/// nullifier_root_after, fee]`, which the caller places inside its own
+/// statement export list.
+///
+/// `nullifier_witnesses` is one [`NullifierWitness`] per spend, in spend order,
+/// each prepared against the nullifier map as it stands *before* that spend's
+/// nullifier is inserted. The witnesses are what let the circuit prove absence
+/// without holding the map.
 ///
 /// # Errors
 ///
 /// Returns [`CircuitBuilderError`] if a preimage has an odd byte length (limbs
-/// pack two bytes) or a Keccak-f call is malformed.
+/// pack two bytes), a Keccak-f call is malformed, or the witness slice does not
+/// line up with the number of spends.
 pub fn constrain_transfer(
     builder: &mut CircuitBuilder<Challenge>,
     transfer: &Transfer<'_>,
     public: &TransferPublic,
+    nullifier_witnesses: &[NullifierWitness],
     private: &mut Vec<Challenge>,
 ) -> Result<Vec<ExprId>, CircuitBuilderError> {
     let parties = transfer.spends.len().max(transfer.outputs.len() + 1);
@@ -294,8 +315,22 @@ pub fn constrain_transfer(
     let mut input_amounts: Vec<Amount> = Vec::new();
     let mut output_amounts: Vec<Amount> = Vec::new();
 
+    if nullifier_witnesses.len() != transfer.spends.len() {
+        return Err(CircuitBuilderError::InvalidDimension {
+            expected: transfer.spends.len(),
+            actual: nullifier_witnesses.len(),
+        });
+    }
+
+    // The nullifier-map root, threaded through the spends. Each spend proves its
+    // own absence against the current root and advances it by inserting its
+    // nullifier; the final value must equal `public.nullifier_roots.after`.
+    // Starting from `before` rather than a fresh constant is what makes the
+    // ordering of nullifiers inside a transfer binding.
+    let mut nf_root = const_limbs(builder, public.nullifier_roots.before.as_bytes());
+
     // ---- Inputs: ownership, membership, nullifier -----------------------
-    for spend in &transfer.spends {
+    for (spend, nf_witness) in transfer.spends.iter().zip(nullifier_witnesses) {
         let sk = Secret::new(builder, spend.sk_d, "transfer.sk_d")?;
         let rho = Secret::new(builder, spend.note.rho(), "transfer.rho")?;
         let psi = Secret::new(builder, spend.note.psi(), "transfer.psi")?;
@@ -325,8 +360,28 @@ pub fn constrain_transfer(
             builder.connect(*got, *want);
         }
 
-        // (4) Nullifier.
+        // (4) Nullifier, and its absence from the nullifier map.
+        //
+        // The nullifier is derived here, so the address the fold walks is the
+        // one this spend actually produces — the prover cannot pick a
+        // different, emptier address. The fold asserts absence against the
+        // current root and yields the root after insertion, which becomes the
+        // next spend's starting root.
         let nullifier = sha3_framed(builder, DOMAIN_NULLIFIER, &[&sk.exprs, &rho.exprs])?;
+        let (absent, next_root) =
+            constrain_nullifier_non_membership(builder, &nullifier, nf_witness)?;
+        // Arithmetic equality, not `connect`. From the second spend onward
+        // `nf_root` is the *previous spend's* fold output — a live witness
+        // expression, not a constant — and `connect` aliases witness slots.
+        // Keccak-f is a lookup argument, so aliasing two of its output slots
+        // desynchronises the LogUp multiplicities and the witness fails to
+        // balance. A subtraction is a plain ALU constraint and leaves the
+        // lookup structure alone.
+        for (got, want) in absent.iter().zip(&nf_root) {
+            let diff = builder.sub(*got, *want);
+            builder.assert_zero(diff);
+        }
+        nf_root = next_root;
         statement.extend(nullifier);
 
         input_amounts.push(amount);
@@ -354,8 +409,23 @@ pub fn constrain_transfer(
         output_amounts.push(amount);
     }
 
-    // ---- The published root and the fee -------------------------------
+    // ---- The published roots and the fee ------------------------------
     statement.extend(const_limbs(builder, public.root.as_bytes()));
+
+    // The threaded nullifier root must land on the published `after`. With no
+    // spends the thread never moved, so `before == after` is required there —
+    // which is exactly what `NullifierRoots::empty` encodes.
+    //
+    // Both roots are exported. `before` is already pinned as the fold's starting
+    // point, but publishing it is what lets the settlement contract chain one
+    // transfer's `after` onto the next transfer's `before`.
+    let before = const_limbs(builder, public.nullifier_roots.before.as_bytes());
+    let after = const_limbs(builder, public.nullifier_roots.after.as_bytes());
+    for (got, want) in nf_root.iter().zip(&after) {
+        builder.connect(*got, *want);
+    }
+    statement.extend(before);
+    statement.extend(after);
 
     let fee = Amount::private(builder, transfer.fee)?;
     private.extend(fee.limbs.iter().map(|&l| Challenge::from_u16(l)));
@@ -386,12 +456,19 @@ pub fn constrain_transfer(
 pub fn build_transfer_circuit(
     transfer: &Transfer<'_>,
     public: &TransferPublic,
+    nullifier_witnesses: &[NullifierWitness],
 ) -> Result<TransferCircuit, Box<dyn std::error::Error>> {
     let mut builder = CircuitBuilder::<Challenge>::new();
     builder.enable_keccak_f1600::<F>();
 
     let mut private: Vec<Challenge> = Vec::new();
-    let statement = constrain_transfer(&mut builder, transfer, public, &mut private)?;
+    let statement = constrain_transfer(
+        &mut builder,
+        transfer,
+        public,
+        nullifier_witnesses,
+        &mut private,
+    )?;
 
     let exports: Vec<StatementExport> = statement
         .iter()
@@ -586,6 +663,16 @@ fn statement_limbs(public: &TransferPublic) -> Vec<F> {
             .iter()
             .map(|&l| F::from_u16(l)),
     );
+    out.extend(
+        bytes_to_limbs(public.nullifier_roots.before.as_bytes())
+            .iter()
+            .map(|&l| F::from_u16(l)),
+    );
+    out.extend(
+        bytes_to_limbs(public.nullifier_roots.after.as_bytes())
+            .iter()
+            .map(|&l| F::from_u16(l)),
+    );
     out.extend(split_value(public.fee).iter().map(|&l| F::from_u16(l)));
     out
 }
@@ -707,6 +794,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures::public_and_witnesses;
     use pq_hash::{Keccak256Commitment, Sha3_256Shielded, ShieldedHasher};
     use shielded::keys::{derive_spend_pk, SpendPublicKey};
     use shielded::transfer::Spend;
@@ -748,7 +836,8 @@ mod tests {
     /// The point of the round trip is that the statement survives it unchanged. The
     /// recursion circuit binds its own exported statement to the *inner* proof's
     /// statement table, so the Keccak-settled proof that reaches the chain attests
-    /// to exactly the `[nullifiers, output commitments, root, fee]` the transfer
+    /// to exactly the `[nullifiers, output commitments, root, nullifier roots,
+    /// fee]` the transfer
     /// was witnessed against — not to "some recursion happened".
     ///
     /// The inner layer must be the Poseidon2 `InSC` because a Keccak wire-cap MMCS
@@ -779,8 +868,8 @@ mod tests {
         };
         transfer.check_balance().expect("fixture balances");
 
-        let public = transfer.public(&Keccak256Commitment, &Sha3_256Shielded, root);
-        let tc = build_transfer_circuit(&transfer, &public)
+        let (public, nf_witnesses) = public_and_witnesses(&transfer, root);
+        let tc = build_transfer_circuit(&transfer, &public, &nf_witnesses)
             .expect("a balanced transfer with a valid path should witness");
 
         // Layer 0: the transfer under the recursion-capable Poseidon2 WHIR config.
@@ -886,8 +975,8 @@ mod tests {
         };
         transfer.check_balance().expect("fixture balances");
 
-        let public = transfer.public(&Keccak256Commitment, &Sha3_256Shielded, root);
-        let tc = build_transfer_circuit(&transfer, &public)
+        let (public, nf_witnesses) = public_and_witnesses(&transfer, root);
+        let tc = build_transfer_circuit(&transfer, &public, &nf_witnesses)
             .expect("a balanced transfer with valid paths should witness");
 
         let (proof, verifier) = settle_transfer_circuit(&tc, LOG_MAX_LDE)
@@ -917,8 +1006,8 @@ mod tests {
             outputs: vec![Note::new(400, seed(30), seed(31), recipient)],
             fee: 100,
         };
-        let public = transfer.public(&Keccak256Commitment, &Sha3_256Shielded, root);
-        let tc = build_transfer_circuit(&transfer, &public).expect("should witness");
+        let (public, nf_witnesses) = public_and_witnesses(&transfer, root);
+        let tc = build_transfer_circuit(&transfer, &public, &nf_witnesses).expect("should witness");
         let (proof, verifier) = settle_transfer_circuit(&tc, LOG_MAX_LDE).expect("should prove");
 
         let mut tampered = tc.statement().to_vec();
@@ -950,9 +1039,9 @@ mod tests {
             outputs: vec![Note::new(501, seed(40), seed(41), recipient)],
             fee: 100,
         };
-        let public = transfer.public(&Keccak256Commitment, &Sha3_256Shielded, root);
+        let (public, nf_witnesses) = public_and_witnesses(&transfer, root);
         assert!(
-            build_transfer_circuit(&transfer, &public).is_err(),
+            build_transfer_circuit(&transfer, &public, &nf_witnesses).is_err(),
             "an unbalanced transfer must not witness"
         );
     }
@@ -986,9 +1075,9 @@ mod tests {
             fee: 100,
         };
         // Public root is the *other* tree's root; the fold cannot reach it.
-        let public = transfer.public(&Keccak256Commitment, &Sha3_256Shielded, wrong_root);
+        let (public, nf_witnesses) = public_and_witnesses(&transfer, wrong_root);
         assert!(
-            build_transfer_circuit(&transfer, &public).is_err(),
+            build_transfer_circuit(&transfer, &public, &nf_witnesses).is_err(),
             "a path that folds to a different root must not witness"
         );
     }
