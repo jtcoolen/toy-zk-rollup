@@ -22,10 +22,23 @@ use pq_hash::{CommitmentHasher, NoteHash, ShieldedHasher};
 
 use crate::keys::SpendPublicKey;
 
-/// Domain separation tags. These are part of the consensus-critical preimage
-/// format: changing one changes every commitment and invalidates the chain.
-pub(crate) const DOMAIN_NOTE: &[u8] = b"pq-rollup/note-commit/v1";
-pub(crate) const DOMAIN_NULLIFIER: &[u8] = b"pq-rollup/nullifier/v1";
+/// Domain separation tag for note commitments. This is part of the
+/// consensus-critical preimage format: changing it changes every commitment and
+/// invalidates the chain.
+///
+/// `pub` rather than `pub(crate)` because the prover's in-circuit AIR must hash
+/// the *exact* same preimage as [`Note::commit`] and [`Note::nullifier`]; a
+/// duplicated literal in the prover could drift from this one silently. Sharing
+/// the constant makes the two sides agree by construction, and a prover test
+/// pins the circuit's output to these bytes.
+///
+/// The tag is deliberately an even number of bytes. Circuit limbs pack two bytes
+/// each, so an odd-length preimage cannot be limb-aligned; a tag of 21 bytes
+/// would make the spend-key derivation unbuildable.
+pub const DOMAIN_NOTE: &[u8] = b"pq-rollup/note-commit/v1";
+
+/// Domain separation tag for nullifiers; consensus-critical, as [`DOMAIN_NOTE`].
+pub const DOMAIN_NULLIFIER: &[u8] = b"pq-rollup/nullifier/v1";
 
 /// A shielded note.
 ///

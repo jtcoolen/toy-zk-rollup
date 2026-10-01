@@ -40,6 +40,8 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod config;
+pub mod sha3_block;
+pub mod transfer;
 pub mod whir;
 pub mod whir_recursion;
 // The spike is the executable statement of a property we depend on, not shipped API.

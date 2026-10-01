@@ -32,10 +32,16 @@ use crate::note::Note;
 
 /// The largest representable value.
 ///
-/// The circuit proves amounts with 31-bit `KoalaBear` limbs, so a `u64` amount is
-/// split into two limbs and each is range-checked. This bound is the *protocol*
-/// bound, tighter than what two limbs could encode, so that the total supply is
-/// fixed and addition of any two legal values cannot overflow a `u64`.
+/// The circuit proves amounts as four 16-bit limbs (the Keccak gadget's limb
+/// width, not the field's 31 bits), with the top limb range-checked to 14 bits —
+/// so the circuit enforces exactly `value < 2^62`, this bound, and no more.
+/// Keeping the two identical means the native check and the proof can never
+/// disagree about what a legal amount is: a value the native rule admits but the
+/// circuit rejects would stall the pipeline, and one the circuit admits but the
+/// native rule rejects would be a divergence in the other direction.
+///
+/// 2^62 also fixes the total supply so that adding any two legal values cannot
+/// overflow a `u64`.
 pub const MAX_VALUE: u64 = (1 << 62) - 1;
 
 /// A transfer's balance error.

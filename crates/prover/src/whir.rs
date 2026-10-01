@@ -371,4 +371,22 @@ mod tests {
         p3_uni_stark::verify(&config, &air, &proof, &pis)
             .expect("a small statement must verify under a batch-sized config");
     }
+    /// The grinding budget the schedule derives, per statement arity.
+    ///
+    /// Recorded as a test because the curve is what makes the settlement height a
+    /// security decision rather than a tuning knob: each doubling of the statement
+    /// costs roughly one more ground bit, and a config sized below the arity the
+    /// prover actually commits at is refused.
+    #[test]
+    fn pow_bits_grows_with_statement_arity() {
+        for v in 16..=24 {
+            match crate::whir::required_pow_bits(v) {
+                Ok(bits) => assert!(
+                    bits < SECURITY_LEVEL,
+                    "budget must stay under the target at {v} variables"
+                ),
+                Err(e) => panic!("arity {v} should be schedulable: {e}"),
+            }
+        }
+    }
 }

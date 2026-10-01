@@ -17,8 +17,11 @@ impl ShieldedHasher for Sha3_256Shielded {
         //
         // The prefix is `u64`, not `u32`: `usize -> u64` is lossless on every
         // target we build for, so a length can never silently truncate and weaken
-        // the domain separation. Solidity mirrors this with a 8-byte big-endian
-        // length header.
+        // the domain separation.
+        //
+        // Little-endian, and the circuit mirrors it as little-endian
+        // (`prover::transfer::len_header`). The direction is consensus-critical
+        // in both places, and a prover test pins the two framings together.
         h.update((domain.len() as u64).to_le_bytes());
         h.update(domain);
         for part in parts {

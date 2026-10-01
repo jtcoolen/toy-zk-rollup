@@ -17,6 +17,30 @@
 
 use core::fmt;
 
+use pq_hash::ShieldedHasher;
+
+/// Domain tag for spend-key derivation.
+///
+/// Consensus-critical, like the note and nullifier tags. Its length is **even**
+/// on purpose: the in-circuit Keccak gadget packs bytes into 16-bit limbs and
+/// requires an even total, so an odd tag would make the `pk_d` preimage
+/// unrepresentable. `b"pq-rollup/spend-pk/v1"` is 21 bytes and unusable;
+/// `b"pq-rollup/spendpk/v1"` is 20.
+pub const DOMAIN_PK: &[u8] = b"pq-rollup/spendpk/v1";
+
+/// Derive the spend public key from its secret.
+///
+/// `pk_d = H_shielded(DOMAIN_PK || sk_d)`
+///
+/// This function exists so the circuit and the native code agree *by
+/// construction*. The STARK recomputes `pk_d` from `sk_d` in-circuit, which is
+/// what makes a spend sound: the note's owner is proven by SHA3-256 preimage
+/// knowledge, not by an off-chain assertion. See D-018 in the decisions log.
+#[must_use]
+pub fn derive_spend_pk<H: ShieldedHasher>(hasher: &H, sk_d: &[u8; 32]) -> SpendPublicKey {
+    SpendPublicKey::from_bytes(*hasher.hash_to_digest(DOMAIN_PK, &[sk_d]).as_bytes())
+}
+
 /// A spend public key: the verifying half of a PQ spend keypair.
 ///
 /// Stored as raw bytes so the domain model stays independent of the signature
