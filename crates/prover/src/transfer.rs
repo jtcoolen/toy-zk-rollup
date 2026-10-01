@@ -260,7 +260,118 @@ impl TransferCircuit {
     }
 }
 
+/// Constrain one transfer's five properties into an existing builder.
+///
+/// This is [`build_transfer_circuit`] minus the builder's creation, statement
+/// installation, and witness run, so a larger circuit — a block — can lay
+/// several transfers and a recursion edge into *one* builder and export a single
+/// combined statement. The transfer's own constraints are unchanged; only the
+/// ownership of the builder moves.
+///
+/// Returns the transfer's statement expressions in the order
+/// `[nullifiers…, output_commitments…, root, fee]`, which the caller places
+/// inside its own statement export list.
+///
+/// # Errors
+///
+/// Returns [`CircuitBuilderError`] if a preimage has an odd byte length (limbs
+/// pack two bytes) or a Keccak-f call is malformed.
+pub fn constrain_transfer(
+    builder: &mut CircuitBuilder<Challenge>,
+    transfer: &Transfer<'_>,
+    public: &TransferPublic,
+    private: &mut Vec<Challenge>,
+) -> Result<Vec<ExprId>, CircuitBuilderError> {
+    let parties = transfer.spends.len().max(transfer.outputs.len() + 1);
+    if parties > MAX_PARTIES {
+        return Err(CircuitBuilderError::InvalidDimension {
+            expected: MAX_PARTIES,
+            actual: parties,
+        });
+    }
+
+    let mut statement: Vec<ExprId> = Vec::new();
+    let mut input_amounts: Vec<Amount> = Vec::new();
+    let mut output_amounts: Vec<Amount> = Vec::new();
+
+    // ---- Inputs: ownership, membership, nullifier -----------------------
+    for spend in &transfer.spends {
+        let sk = Secret::new(builder, spend.sk_d, "transfer.sk_d")?;
+        let rho = Secret::new(builder, spend.note.rho(), "transfer.rho")?;
+        let psi = Secret::new(builder, spend.note.psi(), "transfer.psi")?;
+        let amount = Amount::private(builder, spend.note.value())?;
+        private.extend(sk.witness.iter().copied());
+        private.extend(rho.witness.iter().copied());
+        private.extend(psi.witness.iter().copied());
+        private.extend(amount.limbs.iter().map(|&l| Challenge::from_u16(l)));
+
+        // (1) Ownership. `pk_d` is derived, never supplied: the only way to
+        // produce a witness here is to know `sk_d`.
+        let pk_d = sha3_framed(builder, DOMAIN_PK, &[&sk.exprs])?;
+
+        // (2) Commitment, over the exact native preimage.
+        let mut leaf_msg = const_limbs(builder, DOMAIN_NOTE);
+        leaf_msg.extend(amount.exprs.iter().copied());
+        leaf_msg.extend(rho.exprs.iter().copied());
+        leaf_msg.extend(psi.exprs.iter().copied());
+        leaf_msg.extend(pk_d.iter().copied());
+        let leaf = builder.keccak256_limbs::<F>(&leaf_msg)?;
+
+        // (3) Membership: fold to the root, mirroring
+        // `MembershipPath::compute_root`, and bind the fold to the published root.
+        let folded = fold_membership(builder, &leaf, spend.path, spend.index, private)?;
+        let root_limbs = const_limbs(builder, public.root.as_bytes());
+        for (got, want) in folded.iter().zip(&root_limbs) {
+            builder.connect(*got, *want);
+        }
+
+        // (4) Nullifier.
+        let nullifier = sha3_framed(builder, DOMAIN_NULLIFIER, &[&sk.exprs, &rho.exprs])?;
+        statement.extend(nullifier);
+
+        input_amounts.push(amount);
+    }
+
+    // ---- Outputs ------------------------------------------------------
+    for note in &transfer.outputs {
+        let rho = Secret::new(builder, note.rho(), "output.rho")?;
+        let psi = Secret::new(builder, note.psi(), "output.psi")?;
+        let amount = Amount::private(builder, note.value())?;
+        private.extend(rho.witness.iter().copied());
+        private.extend(psi.witness.iter().copied());
+        private.extend(amount.limbs.iter().map(|&l| Challenge::from_u16(l)));
+
+        // The recipient's spend key is public to the sender, so it is a
+        // constant: the output commitment is pinned, not chosen.
+        let mut leaf_msg = const_limbs(builder, DOMAIN_NOTE);
+        leaf_msg.extend(amount.exprs.iter().copied());
+        leaf_msg.extend(rho.exprs.iter().copied());
+        leaf_msg.extend(psi.exprs.iter().copied());
+        leaf_msg.extend(const_limbs(builder, note.pk_d().as_bytes()));
+        let commitment = builder.keccak256_limbs::<F>(&leaf_msg)?;
+        statement.extend(commitment);
+
+        output_amounts.push(amount);
+    }
+
+    // ---- The published root and the fee -------------------------------
+    statement.extend(const_limbs(builder, public.root.as_bytes()));
+
+    let fee = Amount::private(builder, transfer.fee)?;
+    private.extend(fee.limbs.iter().map(|&l| Challenge::from_u16(l)));
+    statement.extend(fee.exprs.iter().copied());
+
+    // ---- (5) Value conservation ---------------------------------------
+    constrain_balance(builder, &input_amounts, &output_amounts, &fee, private)?;
+
+    Ok(statement)
+}
+
 /// Build and witness a transfer circuit against a published [`TransferPublic`].
+///
+/// A thin wrapper: create the builder, enable Keccak-f, constrain the transfer,
+/// install the statement sink, build, and witness. Every property lives in
+/// [`constrain_transfer`].
 ///
 /// `public` is the single source of truth for the statement *and* for the root
 /// the inputs are proven against: the circuit recomputes the root from the
@@ -276,99 +387,12 @@ pub fn build_transfer_circuit(
     transfer: &Transfer<'_>,
     public: &TransferPublic,
 ) -> Result<TransferCircuit, Box<dyn std::error::Error>> {
-    let parties = transfer.spends.len().max(transfer.outputs.len() + 1);
-    if parties > MAX_PARTIES {
-        return Err(format!(
-            "a transfer may have at most {MAX_PARTIES} inputs or outputs, got {parties}"
-        )
-        .into());
-    }
-
     let mut builder = CircuitBuilder::<Challenge>::new();
     builder.enable_keccak_f1600::<F>();
 
     let mut private: Vec<Challenge> = Vec::new();
-    let mut statement: Vec<ExprId> = Vec::new();
-    let mut input_amounts: Vec<Amount> = Vec::new();
-    let mut output_amounts: Vec<Amount> = Vec::new();
+    let statement = constrain_transfer(&mut builder, transfer, public, &mut private)?;
 
-    // ---- Inputs: ownership, membership, nullifier -----------------------
-    for spend in &transfer.spends {
-        let sk = Secret::new(&mut builder, spend.sk_d, "transfer.sk_d")?;
-        let rho = Secret::new(&mut builder, spend.note.rho(), "transfer.rho")?;
-        let psi = Secret::new(&mut builder, spend.note.psi(), "transfer.psi")?;
-        let amount = Amount::private(&mut builder, spend.note.value())?;
-        private.extend(sk.witness.iter().copied());
-        private.extend(rho.witness.iter().copied());
-        private.extend(psi.witness.iter().copied());
-        private.extend(amount.limbs.iter().map(|&l| Challenge::from_u16(l)));
-
-        // (1) Ownership. `pk_d` is derived, never supplied: the only way to
-        // produce a witness here is to know `sk_d`.
-        let pk_d = sha3_framed(&mut builder, DOMAIN_PK, &[&sk.exprs])?;
-
-        // (2) Commitment, over the exact native preimage.
-        let mut leaf_msg = const_limbs(&mut builder, DOMAIN_NOTE);
-        leaf_msg.extend(amount.exprs.iter().copied());
-        leaf_msg.extend(rho.exprs.iter().copied());
-        leaf_msg.extend(psi.exprs.iter().copied());
-        leaf_msg.extend(pk_d.iter().copied());
-        let leaf = builder.keccak256_limbs::<F>(&leaf_msg)?;
-
-        // (3) Membership: fold to the root, mirroring
-        // `MembershipPath::compute_root`, and bind the fold to the published root.
-        let folded = fold_membership(&mut builder, &leaf, spend.path, spend.index, &mut private)?;
-        let root_limbs = const_limbs(&mut builder, public.root.as_bytes());
-        for (got, want) in folded.iter().zip(&root_limbs) {
-            builder.connect(*got, *want);
-        }
-
-        // (4) Nullifier.
-        let nullifier = sha3_framed(&mut builder, DOMAIN_NULLIFIER, &[&sk.exprs, &rho.exprs])?;
-        statement.extend(nullifier);
-
-        input_amounts.push(amount);
-    }
-
-    // ---- Outputs ------------------------------------------------------
-    for note in &transfer.outputs {
-        let rho = Secret::new(&mut builder, note.rho(), "output.rho")?;
-        let psi = Secret::new(&mut builder, note.psi(), "output.psi")?;
-        let amount = Amount::private(&mut builder, note.value())?;
-        private.extend(rho.witness.iter().copied());
-        private.extend(psi.witness.iter().copied());
-        private.extend(amount.limbs.iter().map(|&l| Challenge::from_u16(l)));
-
-        // The recipient's spend key is public to the sender, so it is a
-        // constant: the output commitment is pinned, not chosen.
-        let mut leaf_msg = const_limbs(&mut builder, DOMAIN_NOTE);
-        leaf_msg.extend(amount.exprs.iter().copied());
-        leaf_msg.extend(rho.exprs.iter().copied());
-        leaf_msg.extend(psi.exprs.iter().copied());
-        leaf_msg.extend(const_limbs(&mut builder, note.pk_d().as_bytes()));
-        let commitment = builder.keccak256_limbs::<F>(&leaf_msg)?;
-        statement.extend(commitment);
-
-        output_amounts.push(amount);
-    }
-
-    // ---- The published root and the fee -------------------------------
-    statement.extend(const_limbs(&mut builder, public.root.as_bytes()));
-
-    let fee = Amount::private(&mut builder, transfer.fee)?;
-    private.extend(fee.limbs.iter().map(|&l| Challenge::from_u16(l)));
-    statement.extend(fee.exprs.iter().copied());
-
-    // ---- (5) Value conservation ---------------------------------------
-    constrain_balance(
-        &mut builder,
-        &input_amounts,
-        &output_amounts,
-        &fee,
-        &mut private,
-    )?;
-
-    // ---- Statement ----------------------------------------------------
     let exports: Vec<StatementExport> = statement
         .iter()
         .map(|&expr| StatementExport::Base(expr))

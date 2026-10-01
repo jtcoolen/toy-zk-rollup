@@ -2,7 +2,81 @@
 
 Recorded choices with alternatives considered. Newest first.
 
+## D-026 — D-024 is WRONG: per-transfer proofs are the shielded property, not overhead
+
+**Status.** Correction, made while starting the block circuit. D-024's "wide
+circuit" is unusable and must not be built.
+
+**What D-024 claimed.** One transfer circuit already batches up to
+`MAX_PARTIES = 16` spends natively, so a block is one wide proof and an
+aggregation tree only multiplies cost.
+
+**Why that is false.** `shielded::transfer::Spend` carries the full spend secret:
+
+```rust
+pub struct Spend<'a> {
+    pub note: &'a Note,
+    pub sk_d: &'a [u8; 32],
+    pub path: &'a MembershipPath,
+    pub index: usize,
+}
+```
+
+The transfer circuit witnesses `pk_d = H(DOMAIN_PK ‖ sk_d)` and
+`nullifier = H(DOMAIN_NULLIFIER ‖ sk_d ‖ rho)` in-circuit. Proving a spend
+*requires* `sk_d` as a witness. So a circuit that natively witnesses N transfers
+requires whoever builds it to hold **every spender's `sk_d`**.
+
+That is not a rollup, it is a custodial mixer with extra steps. The entire point
+of the shielded pool is that each spender produces their own proof on their own
+machine and their secret never leaves it. The per-transfer proof is not an
+inefficiency to be optimized away — **it is the property being protected.**
+
+D-024 optimised the wrong axis. It minimised proof count by centralising secrets.
+
+**Correct architecture.**
+
+```text
+Layer 0  per-transfer proof, produced LOCALLY by each spender (InSC / Poseidon2 WHIR)
+         statement: [nullifiers…, outputs…, root_before, fee]
+         holds that spender's sk_d; nothing else's
+              │
+              ▼
+Layer 1  block circuit — verifies N transfer proofs + 1 previous block proof,
+         all in-circuit (InSC). Never sees any sk_d.
+         exports: [chain_id, block_number, timestamp, root_before,
+                   nullifiers…, outputs…, fee]
+              │
+              ▼
+Layer 2  settlement wrap under Keccak OutSC → L1 verifies one proof
+```
+
+**Fan-in is N+1, in one circuit.** The block circuit verifies N transfer proofs
+plus the previous block proof directly. This is what a validity rollup does. A
+binary aggregation tree is *optional*, and only earns its keep if the single
+block circuit grows too large to prove — it trades circuit size for sequential
+depth. It is not the default, and it is not required for correctness or for gas.
+
+**What survives from D-024.** The observation that in-circuit WHIR verification
+is the dominant cost is correct and still governs sizing: it is why block size is
+bounded and why `LOG_MAX_LDE` matters. What does not survive is the conclusion
+that we should avoid in-circuit verification by widening the witnessed circuit.
+
+**What survives from D-025.** The chain-link shape (block N verifies block N−1,
+`chain_id` and `block_number` constrained in-circuit) is unchanged and correct.
+The block circuit's fan-in is N transfer proofs + 1 chain proof, not 1.
+
+**Superseded.** D-024's decision to not build aggregation is retained only in
+the weak sense that the tree is not the default. Its central claim — that the wide
+circuit replaces per-transfer proving — is retracted.
+
 ## D-025 — Block topology: native transfers + exactly one in-circuit verification
+
+> **Partially superseded by D-026.** The chain-link shape and the metadata
+> constraints below are correct and retained. The claim that the block's N
+> transfers are a *native witness* is wrong — that would require the block
+> producer to hold every spender's `sk_d`. The transfers arrive as N separate
+> locally-produced proofs, verified in-circuit. Fan-in is N+1, not 1.
 
 **Status.** Decision. Follows from D-024 and fixes the shape of the block circuit
 before it gets built.
@@ -53,11 +127,10 @@ verify the *latest* proof alone and be convinced of the whole history — the
 property that makes this a validity rollup rather than a periodically-audited
 chain.
 
-**Refinement: L1 computes `root_after`; the circuit does not.** Folding k new
-output leaves into a depth-32 Merkle tree in-circuit costs two folds per append
-(one to prove the insertion slot was empty against the current root, one to
-compute the new root) — `64k` Keccak-f permutations. That is the most expensive
-thing the block circuit could do, and it is unnecessary:
+**Refinement: L1 computes `root_after`; the circuit does not.** Appending one
+leaf to the depth-32 append-only tree costs one Keccak-f per level — 32
+permutations per output, not two. For a 4-output block that is 128 Keccak-f
+permutations the circuit does not need to do:
 
 - The proof attests that every transfer is **valid against `root_before`** —
   membership, ownership, nullifier formation, global balance.
@@ -70,8 +143,18 @@ public data in the statement, so every honest node derives the same one. The
 proof attests to the *validity of the transition*; L1 computes the *result*.
 `root_after` drops out of the statement.
 
-Cost moved on-chain: k appends × 32 `keccak256` ≈ 30 gas each, so 4 outputs is
-~40k gas. Cheap. Cost removed from the circuit: 256 Keccak-f permutations.
+**What this moves to L1, and what it does not.** L1 must check each block's
+`root_before` against its own stored root, then append the outputs. That is
+~32 `keccak256` per output at ~30 gas each — 4 outputs is ~4k hashes of gas,
+negligible. Root *continuity* therefore becomes an L1-enforced property rather
+than a proof-enforced one. The in-circuit chain link binds `chain_id` and
+`block_number` only.
+
+**Honest limit on the light-client claim.** A light client verifying only the
+latest proof is convinced of transfer validity and block numbering back to
+genesis, but takes the root sequence from L1's storage — which L1 checked at each
+block. It is not a standalone root recomputation. Stating it stronger would be
+overclaiming.
 
 **Statement becomes** `[chain_id, block_number, timestamp, root_before,
 nullifiers…, outputs…, fee]` — the transfers' own public data plus block
