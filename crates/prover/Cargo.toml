@@ -26,6 +26,12 @@ p3-symmetric = { workspace = true }
 p3-uni-stark = { workspace = true }
 p3-dft = { workspace = true }
 p3-keccak = { workspace = true }
+# WHIR settlement path. `WhirUniPcs` is defined by the recursion crate (same rev
+# as everywhere else in this workspace); `p3-whir` supplies the protocol
+# parameters and `p3-sumcheck` the sumcheck layout WHIR folds through.
+p3-recursion = { workspace = true }
+p3-whir = { workspace = true }
+p3-sumcheck = { workspace = true }
 
 rand = { workspace = true, features = ["thread_rng", "std"] }
 
