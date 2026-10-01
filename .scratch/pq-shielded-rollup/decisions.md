@@ -2,6 +2,88 @@
 
 Recorded choices with alternatives considered. Newest first.
 
+## D-028 — Aggregation tree is required at real block sizes (corrects D-026)
+
+**Status.** Open — design conclusion recorded, not yet built.
+
+**Measured scaling (dev profile, `parallel` on, 10-core M2 Pro).**
+
+| Aggregated client transfer proofs | wall | CPU | peak RSS |
+|---|---|---|---|
+| 1 (fan-in 1, D-023 path) | 230 s | 1077 s | 2.9 GB |
+| 2 (fan-in 2, `block.rs`) | 466 s | 2327 s | 5.8 GB |
+
+Marginal cost is **~236 s and ~2.9 GB per additional transfer** — linear in both
+time and memory. Each extra transfer adds one client proof plus one in-circuit
+verification, and one child's traces held in the same circuit.
+
+**Why D-026's dismissal of the tree was wrong.** D-026 said the tree "trades
+circuit size for sequential depth." That is backwards on both axes:
+
+- **Depth.** Fan-in N is *linear* depth in N on one box. A binary tree is
+  `log₂ N` sequential levels. Depth improves, it does not worsen.
+- **Memory.** A fan-in-N circuit holds all N children's traces at once. At
+  N = 256 that is on the order of hundreds of GB — infeasible on one machine.
+  The tree keeps every node at fan-in 2, bounding per-node memory.
+
+**The real tradeoff.** The tree costs *more total CPU work* — roughly 2N proofs
+of work across all levels versus N — and buys *lower wall clock* by proving each
+subtree independently, which fans out across **machines**, not just cores.
+
+```
+fan-in N, one box:      N × 236 s            (linear, memory-bound)
+binary tree, K boxes:   log₂(N) × ~236 s     (parallel across boxes, bounded mem)
+```
+
+Projection at N = 256 over 8 boxes: ~8 levels × 236 s ≈ 31 min, against ~17 h
+serially. **This is a projection from measured fan-in numbers, not a measured
+tree result** — per-level cost is assumed constant, and higher-level nodes verify
+larger circuits than transfer proofs, so the real figure will be somewhat worse.
+
+**What still holds from D-026.** Per-transfer proofs are the shielded property
+and must not be collapsed into one natively-witnessed circuit. The tree sits
+*above* those proofs; it does not change Layer 0.
+
+**Not yet decided.** Tree fan-in (2 vs 4), whether the chain-link previous-block
+proof joins at the root or per-level, and the level-parallel scheduling policy.
+Deferred until the node crate drives real block assembly.
+
+## D-027 — Enable `parallel`: the prover was running on one core
+
+**Status.** Done. Default-on feature in `crates/prover/Cargo.toml`.
+
+**Symptom.** The fan-in-2 block test used 22:16 CPU over 22:36 elapsed — 98% of a
+single core on a 10-core M2 Pro.
+
+**Cause.** Plonky3 routes every parallel loop (DFT butterflies, LDE rows, Merkle
+nodes) through `p3-maybe-rayon`, a shim whose `parallel` feature is **off by
+default**. Without it the shim maps `ParallelIterator` onto `core::iter::Iterator`
+and `IndexedParallelIterator` onto `ExactSizeIterator` — the parallel code is
+present but executes serially. Our `Radix2DitParallel` type name was cosmetic.
+
+**Fix.** A `parallel` feature on the prover crate forwarding to every direct
+dependency that exposes the switch (`p3-dft`, `p3-whir`, `p3-sumcheck`,
+`p3-uni-stark`, `p3-fri`, `p3-matrix`, `p3-field`, `p3-challenger`,
+`p3-lookup`, `p3-merkle-tree`, `p3-util`, plus the git-side `p3-circuit`,
+`p3-circuit-prover`, `p3-recursion`, `p3-poseidon2-circuit-air`), enabled in
+`default`. Forwarded explicitly rather than relying on feature unification to
+reach the shim indirectly.
+
+**Measured (dev profile, fan-in-2 block test).**
+
+| | wall | CPU | peak RSS |
+|---|---|---|---|
+| before | 1652 s | ~1360 s | — |
+| after, 10 threads | **466 s** | 2327 s | 5.8 GB |
+| after, `RAYON_NUM_THREADS=6` | 498 s | 1913 s | 5.7 GB |
+
+**3.5× faster.** All-cores beats P-core-only (6) — no benefit to pinning around
+the efficiency cores here, so the default is left alone.
+
+**Caveat for anyone reading timings.** Every duration in this log before this entry
+is a single-core number. The recursion figures in D-023 in particular were
+measured without `parallel`.
+
 ## D-026 — D-024 is WRONG: per-transfer proofs are the shielded property, not overhead
 
 **Status.** Correction, made while starting the block circuit. D-024's "wide
@@ -56,6 +138,11 @@ plus the previous block proof directly. This is what a validity rollup does. A
 binary aggregation tree is *optional*, and only earns its keep if the single
 block circuit grows too large to prove — it trades circuit size for sequential
 depth. It is not the default, and it is not required for correctness or for gas.
+
+> **Corrected by D-028.** "Trades circuit size for sequential depth" is
+> backwards. Measured scaling shows fan-in N is linear in N on one box, and the
+> tree's real benefit is that each subtree proves independently, so it fans out
+> across *machines*. The tree is not optional at real block sizes.
 
 **What survives from D-024.** The observation that in-circuit WHIR verification
 is the dominant cost is correct and still governs sizing: it is why block size is

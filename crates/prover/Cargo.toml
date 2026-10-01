@@ -43,5 +43,33 @@ p3-poseidon2-circuit-air = { workspace = true }
 
 rand = { workspace = true, features = ["thread_rng", "std"] }
 
+# Proving is embarrassingly parallel (DFT butterflies, LDE rows, Merkle nodes),
+# but Plonky3 routes all of it through `p3-maybe-rayon`, a shim that maps
+# `ParallelIterator` onto `core::iter::Iterator` unless the `parallel` feature
+# is on. Without it every proof runs on one core. Enabled by default: a prover
+# that leaves cores idle is the wrong default.
+#
+# Forwarded to every direct dependency that exposes the switch, rather than
+# relying on feature unification to reach the shim indirectly.
+[features]
+default = ["parallel"]
+parallel = [
+    "p3-challenger/parallel",
+    "p3-circuit-prover/parallel",
+    "p3-circuit/parallel",
+    "p3-dft/parallel",
+    "p3-field/parallel",
+    "p3-fri/parallel",
+    "p3-lookup/parallel",
+    "p3-matrix/parallel",
+    "p3-merkle-tree/parallel",
+    "p3-poseidon2-circuit-air/parallel",
+    "p3-recursion/parallel",
+    "p3-sumcheck/parallel",
+    "p3-uni-stark/parallel",
+    "p3-util/parallel",
+    "p3-whir/parallel",
+]
+
 [lints]
 workspace = true
