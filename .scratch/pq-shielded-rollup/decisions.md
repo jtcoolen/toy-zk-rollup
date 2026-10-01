@@ -2,6 +2,147 @@
 
 Recorded choices with alternatives considered. Newest first.
 
+## D-034 — Nullifier accumulator is a sparse Merkle map, full 256-bit address, depth 256
+
+**Status.** Native structure done: `crates/shielded/src/nullifier_tree.rs`, 13
+tests green. Circuit gadget is the next step.
+
+**The shape.** A sparse Merkle tree over the *full* 256-bit nullifier space.
+The address of a nullifier is the nullifier itself — all 256 bits, one bit per
+tree level. The leaf value is the nullifier digest (presence *is* the value).
+Empty leaf is the zero digest; `empty[h] = H(empty[h-1], empty[h-1])`.
+
+Non-inclusion is certified by a **constant**, not a traversal: fold
+`empty[start_height]` up through the witness's siblings and compare to the
+root. `start_height` is the height of the largest empty subtree containing the
+address.
+
+**Why the full address, no truncation (user directive, and correct).**
+Truncating the address to `d` bits makes two nullifiers collide in position at
+2^d work. At `d = 32` that is a weekend of GPU time, which turns tree
+collisions into a griefing vector. Full-width addressing puts that at 2^128 and
+removes the question. The tree being 256 deep costs almost nothing here because
+it is *sparse*, and the empty-subtree constant is what exploits the sparsity.
+
+**Why this is cheap, not expensive.** Bucket each spent address by the highest
+bit at which it differs from the probe. A bucket at level `j` is exactly the
+sibling subtree of our path at level `j`. With k occupants scattered over
+2^256, the closest one differs at roughly bit `log2(k)`, so the witness is
+~`log2(k)` siblings and the fold is ~`log2(k)` hashes — independent of the
+256 depth. Measured: 16 occupants → witness well under 64 hashes.
+
+**The derivation trap, recorded because it was got wrong twice in one session.**
+Two addresses share the level-`h` subtree iff they agree on every bit from `h`
+upward, i.e. iff their highest differing bit is **below** `h`. So the subtree
+at `h` is empty only once `h` reaches the **closest** occupant's highest
+differing bit:
+
+```text
+start_height = min over spent b of highest_differing_bit(probe, b)
+```
+
+The first instinct — `max`, or `max + 1` — is wrong in both directions. The
+first cut used `max + 1` and produced a witness that verified against a root it
+should not have.
+
+**What the witness is NOT.** It is not bound to a single nullifier. Any address
+agreeing on bits ≥ `start_height` folds to the same root, so a witness is
+portable across absent addresses. That is harmless: verification implies
+absence, which is the only thing the circuit needs. The test
+`witness_never_attests_to_a_spent_nullifier` pins exactly the property that
+matters — no spent address ever verifies — rather than a stronger property that
+is both false and unnecessary.
+
+**Cost of the insert direction, honestly recorded.** Non-inclusion is
+O(log k), but insertion folds from the leaf all the way to the root: 256
+Keccak-f per nullifier, *not* reduced by sparsity, because the collapse only
+applies when both children are empty. So a transfer pays ~256 + log2(k)
+Keccak-f per nullifier. At 24 rows per Keccak-f that is ~6.2k rows per
+nullifier — fits a transfer trace comfortably, to be confirmed by measurement.
+
+**Alternatives considered.**
+- *Depth 32, truncated address.* Cheapest (≤32 hashes both directions) but the
+  2^32 collision griefing is real. Rejected.
+- *Depth 128.* Collision-safe at 2^128 and halves the insert cost. Genuinely
+  competitive; rejected only because the directive is full-width and the
+  measured cost at 256 is acceptable. Revisit if proving time bites.
+- *Append-only MMR for nullifiers.* Insertion is cheap but non-inclusion is
+  O(n). Exactly backwards from what the circuit needs. Rejected.
+- *Contract-side nullifier set.* Forbidden by the governing instruction: the
+  Solidity contract tracks state roots, replay resistance is proven in circuit.
+
+**Model.** `midnightntwrk/midnight-zk` `circuits/src/map` is the same
+structure and independently confirms the design: their `verify_path` folds from
+the leaf with `cond_swap` on the address bits, and non-inclusion is the *same
+code path with `value = 0`*. Their default-zero map is why one gadget serves
+both directions. Their code is Apache-2.0; ours is written from the structure,
+not copied, so no licence obligation attaches to the implementation.
+
+## D-032 — Nullifier non-membership moves in-circuit; the contract stops checking replays
+
+**Status.** Governing pivot, in progress.
+
+**Directive.** "i want state updates under zk, including nullifier. Solidity
+contract tracks state roots."
+
+**What changes.** The nullifier replay check moves from the contract into the
+proof. `ShieldedPool.sol` as first written holds a `mapping(bytes32 => bool)
+nullifierSet` and does two contract-side replay passes. Both are now wrong by
+construction and must be deleted. The contract keeps: verify the proof, apply
+`root_before -> root_after` for **both** trees, block numbering, fee
+accounting.
+
+**Why the contract-side set was the wrong shape.** With a contract nullifier
+set, the proof attests only to *membership* of what it spends. Replay
+resistance lives in contract storage, so the thing the rollup most needs to
+guarantee is the one thing not covered by the proof — and every consumer of
+the root (bridges, other chains, light clients) has to re-derive it from
+contract state rather than from the proof. Proving absence in circuit makes the
+root itself the guarantee.
+
+**Two roots, both tracked and chained.** The commitment tree root (membership)
+and the nullifier map root (non-membership). Both belong in the verified
+statement; the contract stores both transitions.
+
+**Consequence for existing docs.** `transfer.rs` doc lines 39-40 claim the
+nullifier gap "is closed by the on-chain nullifier set", and D-030 says
+nullifier uniqueness is "deliberately absent … covered by the settlement
+contract". Both are obsolete and must point at the in-circuit proof instead.
+
+## D-031 — Transfer shape is bound into the verified statement as circuit constants
+
+**Status.** Done, commit `b2f2d79`.
+
+**The hole.** The split between each transfer's nullifiers and its output
+commitments was supplied by the caller. A prover could declare a split that
+makes the contract read an **output commitment as a nullifier**, or skip a real
+nullifier, and settle a double spend.
+
+**The fix.** Export the split as circuit constants inside the verified
+statement:
+
+```text
+[ n, (nin_0,nout_0), ..., (nin_k,nout_k) | child statements... ]
+```
+
+`shape_header` is the single source of truth. The circuit exports the limbs via
+`define_const`, so the values are *proven*, not supplied; the test rebuilds the
+expected statement through the same function, so neither side can drift on
+where the header ends and the transfer limbs begin.
+
+**The defence is proof-binding, not a length invariant.** A 0-in/2-out
+declaration has exactly the same statement length as 1-in/1-out. No length
+check can catch the split shift. Only the fact that the header bytes live
+inside the hashed/committed statement does.
+
+**Two facts discovered the hard way, both load-bearing.**
+- `define_const` bakes a value into the const trace and allocates **no**
+  public-input slot. Pushing header limbs into the public-input vector
+  overshoots the circuit width by exactly the header length
+  (`PublicInputLengthMismatch { expected: 15358, got: 15363 }`).
+- Over-provisioning the height budget is not free: fan-in 2 cost 9.2s at
+  v=25 vs 25.1s at v=27. Each fan-in needs its own measured value.
+
 ## D-030 — The block circuit needed a shared-root anchor (found while auditing nullifiers)
 
 **Status.** Done. `crates/prover/src/block.rs`, commit `3965a35`.

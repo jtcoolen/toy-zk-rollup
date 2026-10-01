@@ -30,10 +30,14 @@
 
 pub mod keys;
 pub mod note;
+pub mod nullifier_tree;
 pub mod transfer;
 pub mod tree;
 
 pub use keys::{IncomingViewingKey, SpendPublicKey};
 pub use note::Note;
+pub use nullifier_tree::{
+    verify_non_inclusion, NonInclusionWitness, NullifierMap, NULLIFIER_TREE_DEPTH,
+};
 pub use transfer::{BalanceError, Transfer, TransferPublic, MAX_VALUE};
 pub use tree::{CommitmentTree, MembershipPath};
