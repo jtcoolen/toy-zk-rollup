@@ -53,10 +53,36 @@ verify the *latest* proof alone and be convinced of the whole history — the
 property that makes this a validity rollup rather than a periodically-audited
 chain.
 
+**Refinement: L1 computes `root_after`; the circuit does not.** Folding k new
+output leaves into a depth-32 Merkle tree in-circuit costs two folds per append
+(one to prove the insertion slot was empty against the current root, one to
+compute the new root) — `64k` Keccak-f permutations. That is the most expensive
+thing the block circuit could do, and it is unnecessary:
+
+- The proof attests that every transfer is **valid against `root_before`** —
+  membership, ownership, nullifier formation, global balance.
+- The output commitments are **public**, in the statement.
+- L1 applies the canonical state update itself: append the output commitments to
+  its own tree, insert the nullifiers into its spent set.
+
+Soundness holds because L1 derives the resulting root deterministically from
+public data in the statement, so every honest node derives the same one. The
+proof attests to the *validity of the transition*; L1 computes the *result*.
+`root_after` drops out of the statement.
+
+Cost moved on-chain: k appends × 32 `keccak256` ≈ 30 gas each, so 4 outputs is
+~40k gas. Cheap. Cost removed from the circuit: 256 Keccak-f permutations.
+
+**Statement becomes** `[chain_id, block_number, timestamp, root_before,
+nullifiers…, outputs…, fee]` — the transfers' own public data plus block
+metadata, with no derived root to recompute.
+
 **Rejected.**
 - *Verifying per-transfer proofs in-circuit.* Multiplies the dominant cost to
   avoid a cost the wide circuit already does not incur.
 - *Aggregation tree over transfers.* D-024.
+- *Computing `root_after` in-circuit.* Correct but pays `64k` Keccak-f
+  permutations for something L1 gets nearly free.
 - *No recursion at all (each block proven independently).* Sound, and cheaper per
   block, but loses the chain-to-genesis property and the light-client property.
   The user requires recursion in proofs and in the verifier, and this shape is
