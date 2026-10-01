@@ -2,6 +2,71 @@
 
 Recorded choices with alternatives considered. Newest first.
 
+## D-023 — Transfer integrated with the recursive prover (fan-in 1, linear chain)
+
+**Status.** Implemented and tested. Closes the gap flagged when the user asked
+"have you integrated the transfer circuit to the recursive prover?" — before this,
+`transfer` and `whir_recursion` had never been joined.
+
+**Decision.** Three pieces:
+
+1. `transfer::settle_transfer_circuit_with<SC>` — the existing settlement run,
+   generalised over the STARK config. Provable under *either* layer because
+   nothing in the transfer's relation depends on the commitment scheme: the
+   circuit is `Circuit<Challenge>` in both cases, and both of its non-primitive
+   tables (`KeccakF1600Preprocessor`, `StatementPreprocessor`) are keyed on the
+   *base* field `KoalaBear`, which both configs share. The PCS and the
+   Fiat-Shamir challenger are the only things that differ between layers, and
+   neither appears in a transfer constraint.
+2. `whir_recursion::build_batch_recursion_circuit` — re-verifies a
+   `BatchStarkProof<InnerWhirConfig>` inside a circuit and binds the outer
+   statement to the inner statement table.
+3. `transfer::tests::transfer_proves_under_recursion_and_keeps_its_statement` —
+   the round trip, plus rejection of a tampered statement at the far end.
+
+```text
+transfer circuit ──prove──▶ BatchStarkProof<InnerWhirConfig>   (Poseidon2 WHIR, InSC)
+        │ re-verified in-circuit, exactly one child
+        ▼
+batch recursion circuit ──prove──▶ Keccak WHIR proof           (OutSC, chain-facing)
+```
+
+**Why the trusted entry point.** `verify_trusted_p3_batch_proof_circuit` rather
+than `verify_p3_batch_proof_circuit`. The trusted variant derives every table AIR
+and every table's public values from the *retained verifier descriptor*, not from
+the proof, so a proof cannot choose its own relation. It also runs
+`verifier.verify(proof, statement)` before allocating anything, which is what
+makes the statement binding real rather than advisory.
+
+**Why not `TrustedPreparedLayer`.** It is the tidy upstream wrapper and was the
+first attempt, but its `OutSC` must itself satisfy `WhirRecursionConfig` — so it
+cannot take the Keccak `OutSC`, which is the whole point of the settlement layer.
+Hand-building with the public backend methods reaches the same result and keeps the
+InSC/OutSC split. `TrustedPreparedLayer` is usable for InSC→InSC chaining only.
+
+**Statement binding is per-instance.** The statement table is one instance among
+the batch's non-primitive tables; its index comes from
+`verifier.statement_layout().table_instance()`. The circuit's statement sink is
+installed from *that instance's* AIR public-value targets — the same targets the
+in-circuit verifier constrained.
+
+**Topology: fan-in 1, not a tree.** Answering the user's question directly — this
+is a linear chain, not tree-shaped aggregation. `BatchStarkProof`'s "batch" is
+the *proving-system shape* (several AIR instances folded into one proof:
+primitive ALU + Keccak-f + statement), **not** a batch of transfers. Each
+`TransferCircuit` is one transfer.
+
+Fan-in 1 first because it is the piece that proves the join works: if a single
+child's statement does not survive in-circuit re-verification, neither will N
+children's. Fan-in 2 is then a mechanical doubling.
+
+**Not chosen here (deferred to the block layer, D-022).** Tree aggregation via
+`TrustedPreparedAggregation` / `PreparedAggregation{,Cross}` /
+`build_and_prove_aggregation_layer{,_cross}`. Upstream aggregation is **binary
+only**, so folding N transfers costs `2N−1` proofs and `log₂N` sequential depth.
+Depth is the expensive axis: each WHIR layer is the slow one, so latency grows
+with `log N` while proof count grows linearly either way.
+
 ## D-022 — Block metadata binding via statement forwarding (InSC/OutSC split)
 
 **Status.** Designed, not yet implemented. Recorded because the gap is load-bearing:

@@ -553,6 +553,123 @@ pub fn settle_recursion_circuit(
     Ok((proof, prepared.verifier()))
 }
 
+/// Build, witness, and statement-bind the recursion circuit that verifies one
+/// *batch* WHIR proof — the shape a transfer settlement produces.
+///
+/// This is the join between [`crate::transfer`] and the recursion engine. The
+/// transfer is proven under the Poseidon2 `InSC` with
+/// [`crate::transfer::settle_transfer_circuit_with`], yielding a
+/// `BatchStarkProof<InnerWhirConfig>`; this function re-verifies that proof
+/// inside a circuit and exports its statement, so the resulting `RecursionCircuit`
+/// can be wrapped by [`settle_recursion_circuit`] under the Keccak `OutSC`.
+///
+/// ## Why the trusted entry point
+///
+/// [`p3_recursion::verifier::verify_trusted_p3_batch_proof_circuit`] is used
+/// rather than the plain `verify_p3_batch_proof_circuit`. The trusted variant
+/// derives every table AIR and every table's public values from the *retained
+/// verifier descriptor* instead of from the proof, so a proof cannot choose its own
+/// relation. It also calls `verifier.verify(proof, statement)` before allocating
+/// anything, which is what makes the statement binding real rather than advisory.
+///
+/// ## Statement binding
+///
+/// The statement table is one instance among the batch's non-primitive tables. Its
+/// position comes from `verifier.statement_layout().table_instance()`, and the
+/// circuit's statement sink is installed from *that instance's* AIR public-value
+/// targets — the same targets the in-circuit verifier constrained. A proof bound to
+/// any other statement fails before the sink is ever reached.
+///
+/// # Errors
+///
+/// Returns the first failure from native verification of the inner proof, table
+/// reconstruction, circuit preparation, verifier-circuit build, statement
+/// installation, or witnessing.
+pub fn build_batch_recursion_circuit(
+    inner: &InnerWhirConfig,
+    verifier: &p3_circuit_prover::CircuitVerifier<InnerWhirConfig>,
+    proof: &p3_circuit_prover::BatchStarkProof<InnerWhirConfig>,
+    statement: &[F],
+) -> Result<RecursionCircuit, Box<dyn std::error::Error>> {
+    use p3_recursion::verifier::verify_trusted_p3_batch_proof_circuit;
+    use p3_recursion::{BatchOnly, TrustedPcsRecursionBackend};
+
+    let perm = Poseidon2Config::KOALA_BEAR_D4_W16;
+    let backend = WhirRecursionBackend::<16, 8>::new(perm).for_extension_degree::<4>();
+
+    let statement_instance = verifier
+        .statement_layout()
+        .table_instance()
+        .ok_or("inner verifier carries no statement table to bind")?;
+
+    let mut builder = CircuitBuilder::new();
+    PcsRecursionBackend::<InnerWhirConfig, BatchOnly, 4>::prepare_circuit(
+        &backend,
+        inner,
+        &mut builder,
+    )?;
+
+    let (verifier_inputs, op_ids) = verify_trusted_p3_batch_proof_circuit::<
+        InnerWhirConfig,
+        MerkleCapTargets<F, DIGEST_ELEMS>,
+        (),
+        WhirUniProofTargets<F, Challenge, WhirMmcs, DIGEST_ELEMS>,
+        LogUpGadget,
+        Poseidon2Config,
+        16,
+        8,
+        4,
+    >(
+        verifier,
+        &mut builder,
+        proof,
+        statement,
+        inner.pcs_verifier_params(),
+        &LogUpGadget::new(),
+        perm,
+    )?;
+
+    // Bind the statement: the circuit's exported base values are the AIR public
+    // targets of the statement table instance, exactly the targets the in-circuit
+    // verifier constrained against the inner proof.
+    let statement_targets = verifier_inputs
+        .air_public_targets
+        .get(statement_instance)
+        .ok_or("statement table instance absent from verifier inputs")?;
+    let exports: Vec<StatementExport> = statement_targets
+        .iter()
+        .map(|&target| StatementExport::Base(target))
+        .collect();
+    let schema = builder.set_statement_exports::<F>(&exports)?;
+
+    let table_public_inputs = verifier.table_public_values(statement)?;
+    let public = verifier_inputs.try_pack_public_values(
+        &table_public_inputs,
+        &proof.proof,
+        verifier.common_data(),
+    )?;
+    let private = verifier_inputs.try_pack_private_values(&proof.proof)?;
+
+    let circuit = builder.build()?;
+    let mut runner = circuit.runner();
+    runner.set_public_inputs(&public)?;
+    runner.set_private_inputs(&private)?;
+    TrustedPcsRecursionBackend::<InnerWhirConfig, BatchOnly, 4>::set_private_data_for_trusted_batch(
+        &backend,
+        verifier,
+        proof,
+        statement,
+        &mut runner,
+        &op_ids,
+    )?;
+    let traces = runner.run()?;
+    Ok(RecursionCircuit {
+        circuit,
+        traces,
+        schema,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

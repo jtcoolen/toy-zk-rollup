@@ -587,6 +587,68 @@ pub fn settle_transfer_circuit(
     ),
     Box<dyn std::error::Error>,
 > {
+    let settlement = crate::whir::config(0, log_max_lde)?;
+    settle_transfer_circuit_with(tc, settlement)
+}
+
+/// Prove a witnessed transfer circuit under an arbitrary WHIR configuration.
+///
+/// This is the same proving run as [`settle_transfer_circuit`], generalised over
+/// the STARK configuration so the transfer can be proven under *either* layer of
+/// the architecture:
+///
+/// * the Keccak `OutSC` ([`crate::whir::Config`]) for direct settlement, or
+/// * the Poseidon2 `InSC` ([`crate::whir_recursion::InnerWhirConfig`]) when the
+///   proof is going to be re-verified inside a recursion circuit.
+///
+/// Generalising is possible because nothing in the transfer's own relation depends
+/// on the commitment scheme. The circuit is `Circuit<Challenge>` in both cases —
+/// the same degree-4 extension — and its two non-primitive tables are keyed on
+/// the *base* field, `KoalaBear`, which both configurations share:
+///
+/// * `KeccakF1600Preprocessor` is implemented for `BinomialExtensionField<KoalaBear, 4>`,
+/// * `StatementPreprocessor` likewise.
+///
+/// The PCS and the Fiat-Shamir challenger are the only things that differ, and
+/// neither appears in a transfer constraint. They decide *how the proof is
+/// committed and hashed*, which is exactly the property that must change between
+/// layers, and exactly the property the AIR is indifferent to.
+///
+/// # Errors
+///
+/// Returns a prover error if the circuit cannot be prepared or proven under
+/// `config` — most commonly a trace-height or grinding-budget mismatch.
+pub fn settle_transfer_circuit_with<SC>(
+    tc: &TransferCircuit,
+    config: SC,
+) -> Result<
+    (
+        p3_circuit_prover::BatchStarkProof<SC>,
+        p3_circuit_prover::CircuitVerifier<SC>,
+    ),
+    Box<dyn std::error::Error>,
+>
+where
+    SC: p3_uni_stark::StarkGenericConfig<Challenge = Challenge> + Send + Sync + Clone + 'static,
+    p3_uni_stark::Val<SC>:
+        p3_field::PrimeField64 + p3_field::Field + p3_circuit_prover::config::StarkField,
+    Challenge: p3_field::ExtensionField<p3_uni_stark::Val<SC>>
+        + p3_field::BasedVectorSpace<p3_uni_stark::Val<SC>>
+        + From<p3_uni_stark::Val<SC>>
+        + p3_circuit_prover::field_params::ExtractBinomialW<p3_uni_stark::Val<SC>>,
+    SC::Challenger: p3_challenger::GrindingChallenger<Witness = p3_uni_stark::Val<SC>>,
+    p3_uni_stark::PcsProverError<SC>: Send,
+    SC::Pcs: Sync,
+    <SC::Pcs as p3_commit::Pcs<Challenge, SC::Challenger>>::Domain: Send + Sync,
+    <SC::Pcs as p3_commit::Pcs<Challenge, SC::Challenger>>::ProverData: Sync,
+    <SC::Pcs as p3_commit::Pcs<Challenge, SC::Challenger>>::Commitment: Sync,
+    p3_air::SymbolicExpressionExt<p3_uni_stark::Val<SC>, Challenge>: p3_field::Algebra<p3_uni_stark::SymbolicExpression<p3_uni_stark::Val<SC>>>
+        + p3_field::Algebra<Challenge>,
+    p3_circuit_prover::batch_stark_prover::KeccakF1600Preprocessor:
+        p3_circuit_prover::common::NpoPreprocessor<p3_uni_stark::Val<SC>>,
+    p3_circuit_prover::batch_stark_prover::StatementPreprocessor:
+        p3_circuit_prover::common::NpoPreprocessor<p3_uni_stark::Val<SC>>,
+{
     use p3_circuit_prover::batch_stark_prover::{
         BatchStarkProver, KeccakF1600AirBuilder, KeccakF1600Preprocessor, KeccakF1600Prover,
         StatementAirBuilder, StatementPreprocessor, StatementProver,
@@ -594,17 +656,16 @@ pub fn settle_transfer_circuit(
     use p3_circuit_prover::common::{NpoAirBuilder, NpoPreprocessor};
     use p3_circuit_prover::ConstraintProfile;
 
-    let settlement = crate::whir::config(0, log_max_lde)?;
-    let preprocessors: Vec<Box<dyn NpoPreprocessor<F>>> = vec![
+    let preprocessors: Vec<Box<dyn NpoPreprocessor<p3_uni_stark::Val<SC>>>> = vec![
         Box::new(KeccakF1600Preprocessor),
         Box::new(StatementPreprocessor::new(tc.schema.clone())),
     ];
-    let air_builders: Vec<Box<dyn NpoAirBuilder<crate::whir::Config, 4>>> = vec![
+    let air_builders: Vec<Box<dyn NpoAirBuilder<SC, 4>>> = vec![
         Box::new(KeccakF1600AirBuilder::<4>),
         Box::new(StatementAirBuilder::<4>::new(tc.schema.clone())),
     ];
 
-    let mut prover = BatchStarkProver::new(settlement)
+    let mut prover = BatchStarkProver::new(config)
         .with_table_packing(p3_recursion::ProveNextLayerParams::default().table_packing);
     prover.register_table_prover(Box::new(KeccakF1600Prover::<4>));
     prover.register_table_prover(Box::new(StatementProver::<4>::new(tc.schema.clone())));
@@ -647,6 +708,91 @@ mod tests {
     /// differ from each other and from other notes'. Offsets are applied with
     /// wrapping arithmetic: the fixture is not a checked cast, and a plain `+`
     /// panics on `byte + 200` in a debug build.
+    /// The transfer, one recursion layer deep.
+    ///
+    /// This is the integration the settlement story was missing: the same witnessed
+    /// transfer circuit is proven twice, and the second proof *verifies the first
+    /// inside a circuit*.
+    ///
+    /// ```text
+    ///   transfer circuit --prove--> BatchStarkProof<InnerWhirConfig>   (Poseidon2 WHIR)
+    ///                                     |  re-verified in-circuit
+    ///                                     v
+    ///              batch recursion circuit --prove--> Keccak WHIR proof  (OutSC)
+    /// ```
+    ///
+    /// The point of the round trip is that the statement survives it unchanged. The
+    /// recursion circuit binds its own exported statement to the *inner* proof's
+    /// statement table, so the Keccak-settled proof that reaches the chain attests
+    /// to exactly the `[nullifiers, output commitments, root, fee]` the transfer
+    /// was witnessed against — not to "some recursion happened".
+    ///
+    /// The inner layer must be the Poseidon2 `InSC` because a Keccak wire-cap MMCS
+    /// cannot satisfy the recursion engine's field-native cap bound (see
+    /// [`crate::whir_recursion`]). That is the whole reason the two configs exist.
+    #[test]
+    fn transfer_proves_under_recursion_and_keeps_its_statement() {
+        use crate::whir_recursion::{
+            build_batch_recursion_circuit, settle_recursion_circuit, InnerWhirConfig,
+        };
+
+        let (a, sk_a) = funded_note(1, 1_000);
+        let (tree, paths) = tree_with(&[a]);
+        let root = tree.root();
+
+        let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
+        let outputs = vec![Note::new(900, seed(20), seed(21), recipient)];
+
+        let transfer = Transfer {
+            spends: vec![Spend {
+                note: &a,
+                sk_d: &sk_a,
+                path: &paths[0],
+                index: 0,
+            }],
+            outputs,
+            fee: 100,
+        };
+        transfer.check_balance().expect("fixture balances");
+
+        let public = transfer.public(&Keccak256Commitment, &Sha3_256Shielded, root);
+        let tc = build_transfer_circuit(&transfer, &public)
+            .expect("a balanced transfer with a valid path should witness");
+
+        // Layer 0: the transfer under the recursion-capable Poseidon2 WHIR config.
+        let inner = InnerWhirConfig::new(LOG_MAX_LDE, 0).expect("inner config should build");
+        let (inner_proof, inner_verifier) = settle_transfer_circuit_with(&tc, inner.clone())
+            .expect("the transfer should prove under the InSC");
+        inner_verifier
+            .verify(&inner_proof, tc.statement())
+            .expect("the InSC verifier should accept the honest transfer");
+
+        // Layer 1: re-verify that proof inside a circuit, binding this circuit's
+        // statement to the inner statement table.
+        let rc =
+            build_batch_recursion_circuit(&inner, &inner_verifier, &inner_proof, tc.statement())
+                .expect("the batch recursion circuit should build and witness");
+
+        // Layer 1 settlement: the recursion circuit proven under Keccak WHIR, so
+        // what reaches the chain has a Keccak transcript Solidity can replay.
+        let (outer_proof, outer_verifier) = settle_recursion_circuit(&rc, LOG_MAX_LDE)
+            .expect("the recursion circuit should settle under Keccak WHIR");
+
+        // The statement forwarded through both layers is the transfer's own.
+        outer_verifier
+            .verify(&outer_proof, tc.statement())
+            .expect("the settled recursion proof should attest to the transfer statement");
+
+        // And the binding is load-bearing at the far end of the chain: a different
+        // statement must be rejected even though the proof is otherwise untouched.
+        let mut tampered = tc.statement().to_vec();
+        tampered[0] += F::ONE;
+        assert!(
+            outer_verifier.verify(&outer_proof, &tampered).is_err(),
+            "a settled recursion proof must not attest to a statement other than the transfer's"
+        );
+    }
+
     fn funded_note(byte: u8, value: u64) -> (Note, [u8; 32]) {
         let sk_d = seed(byte);
         let pk_d = derive_spend_pk(&Sha3_256Shielded, &sk_d);
