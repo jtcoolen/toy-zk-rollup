@@ -124,6 +124,12 @@ impl<H: CommitmentHasher> NullifierMap<H> {
         }
     }
 
+    /// The hasher in use.
+    #[must_use]
+    pub const fn hasher(&self) -> &H {
+        &self.hasher
+    }
+
     /// The empty-subtree digest at height `h`.
     #[must_use]
     pub fn empty_at(&self, h: usize) -> Digest32 {

@@ -193,7 +193,7 @@ const fn split_value(value: u64) -> [u16; VALUE_LIMBS] {
 }
 
 /// Constant limbs for a byte string.
-fn const_limbs(builder: &mut CircuitBuilder<Challenge>, bytes: &[u8]) -> Vec<ExprId> {
+pub(crate) fn const_limbs(builder: &mut CircuitBuilder<Challenge>, bytes: &[u8]) -> Vec<ExprId> {
     bytes_to_limbs(bytes)
         .into_iter()
         .map(|limb| builder.define_const(Challenge::from_u16(limb)))

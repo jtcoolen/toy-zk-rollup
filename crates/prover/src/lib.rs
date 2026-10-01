@@ -41,6 +41,7 @@
 
 pub mod block;
 pub mod config;
+pub mod nullifier_gadget;
 pub mod sha3_block;
 pub mod transfer;
 pub mod whir;
