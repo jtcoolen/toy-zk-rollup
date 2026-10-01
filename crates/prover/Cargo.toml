@@ -32,6 +32,14 @@ p3-keccak = { workspace = true }
 p3-recursion = { workspace = true }
 p3-whir = { workspace = true }
 p3-sumcheck = { workspace = true }
+# The recursion engine's own support crates. The in-circuit verifier circuit is a
+# `p3_circuit::Circuit` proven through `p3_circuit_prover::BatchStarkProver`; its
+# Poseidon2 non-primitive tables come from `p3_poseidon2_circuit_air`. Same git rev
+# as `p3-recursion` so the `ExprId`/`Target` types are the same ones.
+p3-circuit = { workspace = true }
+p3-circuit-prover = { workspace = true }
+p3-lookup = { workspace = true }
+p3-poseidon2-circuit-air = { workspace = true }
 
 rand = { workspace = true, features = ["thread_rng", "std"] }
 

@@ -131,6 +131,18 @@ pub const FOLDING_FACTOR: usize = 4;
 /// A config that serves more than one trace size — a base proof's opening and the
 /// verifier circuit's own trace — needs this, or the two would demand conflicting
 /// schedules from one fixed list.
+///
+/// The soundness regime is [`SecurityAssumption::JohnsonBound`]. The settlement
+/// layer proves the recursion circuit, which re-verifies a WHIR base proof and
+/// opens ~500 claims at once. The initial claim-combination ceiling is
+/// `field_size_bits - log2(claims - 1) - list_size_bits`, and `CapacityBound`'s
+/// degree-dependent list size puts that near 86 bits — under the
+/// [`SECURITY_LEVEL`] target, unrecoverable by grinding because the batching
+/// challenge precedes the first grind. `JohnsonBound`'s list size is
+/// degree-independent (~4.8 bits at rate ½), lifting the ceiling to ~109 bits,
+/// and is the proven regime rather than a capacity conjecture. See
+/// [`crate::whir_recursion::protocol_params`] for the same reasoning on the
+/// recursion side.
 #[must_use]
 pub const fn protocol_params() -> ProtocolParameters {
     ProtocolParameters {
@@ -138,7 +150,7 @@ pub const fn protocol_params() -> ProtocolParameters {
         pow_bits: 0,
         round_log_inv_rates: Vec::new(),
         folding_factor: FoldingFactor::Constant(FOLDING_FACTOR),
-        soundness_type: SecurityAssumption::CapacityBound,
+        soundness_type: SecurityAssumption::JohnsonBound,
         starting_log_inv_rate: 1,
     }
 }

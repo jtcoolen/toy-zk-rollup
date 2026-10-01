@@ -41,6 +41,7 @@
 
 pub mod config;
 pub mod whir;
+pub mod whir_recursion;
 // The spike is the executable statement of a property we depend on, not shipped API.
 #[cfg(test)]
 mod spike;
