@@ -2,6 +2,96 @@
 
 Recorded choices with alternatives considered. Newest first.
 
+## D-036 — Vendor sol-whir-p3's STANDALONE WHIR verifier; do NOT use their LeanVM terminal
+
+**Status.** `ethereum/sol-whir-p3` @ `18eda721fea91b5304242cc62d1d5f585d7b23ff`
+cloned to `.scratch/vendor/sol-whir-p3` for study. Vendoring as a pinned
+Foundry lib is the next step.
+
+**Their repo has two verifier paths, and only one is ours.**
+
+| Path | Contract | What the chain verifies |
+|---|---|---|
+| Standalone WHIR | `WhirVerifier4`, `WhirBlobVerifierNative*` | One multilinear **PCS opening**: WHIR folding rounds, Merkle multiproof openings, WHIR's own sumchecks |
+| LeanVM terminal | `LeanVmTwoCommitmentTerminal_*.verifyC1V1` | "LeanVM correctly executed the whole Spartan-WHIR verifier" — a zkVM guest trace |
+
+They need the terminal because a Spartan-WHIR verifier is too large to
+re-implement directly in Solidity, so they prove the verification inside a VM
+and verify the VM. ~20 extra Solidity files (`LeanVmAir`, `LeanVmGkrSumcheck`,
+`LeanVmLogUp`, `LeanVmPoseidon1`, `LeanVmPackedPolynomial`, …) and a
+**quintic** field (`KoalaBearExt5`) where the standalone path is `Ext4`.
+
+**We do not need it.** Our recursion is already in-circuit via
+`p3-recursion`'s `WhirRecursionBackend`: layer N is a Keccak-transcript WHIR
+proof over the recursion circuit. The chain therefore verifies exactly one
+WHIR PCS opening — the standalone path. Adopting the terminal would mean
+adopting a zkVM to avoid writing a verifier we already have a proof for.
+
+**What the standalone verifier does NOT give us (must generate ourselves).**
+
+1. **The AIR quotient identity.** uni-stark's
+   `sum(alpha_i * C_i(trace@z, trace@omega*z)) = quotient@z * Z_H(z)` — the
+   Solidity equivalent of `VerifierConstraintFolder`. Their repo has no
+   analogue because Spartan's AIR is the VM's, not ours. This is the
+   "generate the constraint evaluator from `SymbolicAirBuilder`" item, and it
+   is roughly half the verifier effort. Generating rather than hand-writing is
+   the anti-drift requirement: a hand-written evaluator silently diverges from
+   the Rust AIR the moment either changes.
+2. **Our fixed config.** Their `QuarticWhirFixedConfig_lir6_ff5_rsv1` is
+   emitted by `spartan-whir-export` from *their* prover's schedule. Ours must
+   be emitted mechanically from `p3-whir` 0.8.0's `WhirConfig` accessors —
+   `round_parameters()`, `final_round_config()`, `commitment_ood_samples()`,
+   `starting_folding_pow_bits()`, `final_sumcheck_rounds()`,
+   `n_rounds()`, `max_pow_bits()` — for our parameters: 96-bit,
+   `starting_log_inv_rate = 1`, `FoldingFactor::Constant(4)`,
+   `JohnsonBound`, `LOG_MAX_LDE = 26`.
+
+**The feasibility signal.** The two proof shapes are near-isomorphic:
+
+```text
+ours   WhirProof { initial_ood_answers, initial_sumcheck, rounds[],
+                  final_poly: Option<Poly<EF>>, final_pow_witness,
+                  final_openings: QueryOpenings, final_sumcheck: Option }
+theirs WhirProof { initialCommitment,   initialOodAnswers, initialSumcheck,
+                  rounds[], finalPoly, finalPowWitness,
+                  finalQueryBatch, finalSumcheck }
+```
+
+Round-level: ours `WhirRoundProof { commitment: Option<Com>, ood_answers,
+pow_witness, openings: QueryOpenings<F,EF,MultiProof>, sumcheck }` vs theirs
+`WhirRoundProof { commitment, oodAnswers, powWitness, queryBatch, sumcheck }`.
+Their `QueryBatchOpening {kind, numQueries, rowLen, values, decommitments}`
+is a flattened form of our `QueryOpenings::Base|Extension(SharedProofOpening
+{ rows, proof })` — the `kind` tag is exactly our Base/Extension discriminant.
+
+**Two transcript facts that make the port tractable.**
+
+- Their `KeccakChallenger.observeBase(value)` appends a little-endian `u32`,
+  which is exactly `SerializingChallenger32::observe` (`value.to_unique_u32()
+  .to_le_bytes()`). Same byte stream.
+- Their `sampleBase` masks with `0x7fffffff` and rejects `>= p` — the same
+  rejection-sampling-without-modulo-bias that `SerializingChallenger32::sample`
+  does via `pow_of_two_bound`. So challenge values agree bit for bit.
+- Their sponge is **not** a duplex: `flush()` hashes the whole input buffer
+  including the previous output (`input_buffer.extend_from_slice(&output)`),
+  and sampling consumes from `output_buffer`. That matches p3's
+  `HashChallenger::flush` exactly — same chaining, same re-hash of the digest.
+  This is the single most important thing to get right and it matches.
+
+**Their Merkle uses `0x00`/`0x01` domain prefixes; ours is prefix-free**
+(`hash_pair(l, r) = keccak256(l || r)`, no leaf hashing). Adapt THEIR Merkle
+helpers to prefix-free rather than the reverse — our tree convention is pinned
+by `crates/shielded/tests/contract_vectors.rs` and the golden roots in
+`contracts/test/vectors/merkle.json`.
+
+**Skip list.** LeanVM/* (all 20 files), `KoalaBearExt5`, `KoalaBearExt8`,
+BabyBear everything, `*Precompile*`, `spartan-whir-export` (different prover).
+
+**Licensing.** Per-file `SPDX-License-Identifier: MIT` throughout the files we
+want. Keep the per-file SPDX on vendored files and record provenance in the
+commit that adds them.
+
+
 ## D-035 — Fixed-shape nullifier gadget: `FOLD_DEPTH = 32`, and the real cost of a spend
 
 **Status.** Done and wired. `crates/prover/src/nullifier_gadget.rs` (6 tests + a

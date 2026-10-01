@@ -19,3 +19,14 @@ via_ir = true
 # heuristic cannot tell those apart, so it is off; the casts and bounds it would
 # have caught are checked explicitly in LimbCodec.
 exclude_lints = ["require-revert-in-loop"]
+
+# Vendored third-party code is NOT linted by our policy.
+#
+# `lib/sol-whir-p3` is upstream MIT code (ethereum/sol-whir-p3, pinned commit
+# recorded in the commit that added it). Rewriting it to satisfy our linter
+# would break byte-identity against upstream, which is what makes the vendored
+# copy auditable by diffing. The files carry their own SPDX headers and are
+# reviewed as *imported* code, not as ours.
+#
+# Our own `src/` stays under the full strict policy.
+ignore = ["lib/sol-whir-p3/"]
