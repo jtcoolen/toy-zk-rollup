@@ -125,6 +125,24 @@ pub const SECURITY_LEVEL: usize = 96;
 /// backend's supported extension degree and keeps the round count low.
 pub const FOLDING_FACTOR: usize = 4;
 
+/// Arity the zero-knowledge masks add to every committed polynomial.
+///
+/// Blinding doubles each committed height, and the stacked arity WHIR sizes its
+/// grinding against is the height of what actually gets committed. So a
+/// statement whose trace tops out at `2^n` is committed at `2^(n + 1)`, and the
+/// grinding budget has to be read off that arity — sizing it at `n` asks the
+/// schedule for fewer bits than the doubled commitment will demand, and the
+/// commit is rejected as under-grounded.
+///
+/// The second unit is the witness width. The stacked arity WHIR sizes against
+/// is not the trace height alone but the height plus the columns stacked on
+/// top of it, and for these circuits the width contributes one more variable
+/// on top of the doubling. Measured on both the recursion circuit (which
+/// demands 18 grinding bits at `log_max_lde = 22`) and the block circuit
+/// (23 bits at 25), the largest commitment stacks at exactly
+/// `log_max_lde + 2`, so that is the arity the budget is read off.
+pub const ZK_ARITY_SLACK: usize = 2;
+
 /// Build the WHIR protocol parameters.
 ///
 /// `round_log_inv_rates` is left empty so the round schedule is derived per commit.
@@ -173,10 +191,20 @@ pub const fn protocol_params() -> ProtocolParameters {
 /// So the answer is the smallest budget that builds a schedule with queries left in
 /// it, which is also the cheapest one that is still sound.
 ///
+/// If the requested arity is past the field's domain capacity — no budget builds
+/// a schedule at all — the search backs off to the largest arity that does build,
+/// rather than failing. This is safe: the grinding budget is an upper bound on
+/// what any smaller statement will demand, and a budget sized at a larger arity
+/// only ever over-provisions (more grinding, never less soundness). It is the
+/// width-plus-ZK ceiling (`log_max_lde + 2`) that runs into the capacity wall at
+/// the top of the supported range; backing off keeps the top of the range usable
+/// without special-casing each circuit.
+///
 /// # Errors
 ///
-/// Returns the last WHIR configuration error if no budget below the security level
-/// yields a feasible schedule, which means the target cannot be met at this size.
+/// Returns the last WHIR configuration error if no arity from `num_variables`
+/// down to zero yields a feasible schedule, which means the target cannot be met
+/// at any size.
 ///
 /// # Panics
 ///
@@ -185,19 +213,23 @@ pub const fn protocol_params() -> ProtocolParameters {
 pub fn required_pow_bits(num_variables: usize) -> Result<usize, WhirConfigError> {
     const _: () = assert!(SECURITY_LEVEL > 0, "security level must be positive");
     let mut last_error = None;
-    for budget in 0..SECURITY_LEVEL {
-        let params = ProtocolParameters {
-            pow_bits: budget,
-            ..protocol_params()
-        };
-        match WhirConfig::<Challenge, F, Challenger>::new(num_variables, params) {
-            Ok(schedule) => return Ok(schedule.max_pow_bits()),
-            Err(err) => last_error = Some(err),
+    // Back off from the requested arity down to zero. The first arity that builds
+    // a schedule wins; within it, the smallest budget that leaves queries in.
+    for arity in (0..=num_variables).rev() {
+        for budget in 0..SECURITY_LEVEL {
+            let params = ProtocolParameters {
+                pow_bits: budget,
+                ..protocol_params()
+            };
+            match WhirConfig::<Challenge, F, Challenger>::new(arity, params) {
+                Ok(schedule) => return Ok(schedule.max_pow_bits()),
+                Err(err) => last_error = Some(err),
+            }
         }
     }
-    // The const assertion above makes the loop run at least once, so `last_error`
-    // is always `Some` here; the fallback is unreachable but returns an error
-    // rather than panicking, so no caller can crash on it.
+    // The inner loop runs at least once for arity 0, so `last_error` is always
+    // `Some` here; the fallback is unreachable but returns an error rather than
+    // panicking, so no caller can crash on it.
     last_error.map_or_else(
         || {
             Err(WhirConfigError::PowBitsExceedBudget {
@@ -225,7 +257,7 @@ pub fn required_pow_bits(num_variables: usize) -> Result<usize, WhirConfigError>
 /// Returns the WHIR configuration error if `num_variables` cannot reach
 /// [`SECURITY_LEVEL`].
 pub fn config(cap_height: usize, num_variables: usize) -> Result<Config, WhirConfigError> {
-    let pow_bits = required_pow_bits(num_variables)?;
+    let pow_bits = required_pow_bits(num_variables + ZK_ARITY_SLACK)?;
     let params = ProtocolParameters {
         pow_bits,
         ..protocol_params()
@@ -355,11 +387,34 @@ mod tests {
         (RowMajorMatrix::new(values, 2), vec![last_row_a])
     }
 
-    /// Trace length used by these tests; 64 rows is 6 variables.
-    const LOG_TRACE: usize = 6;
+    /// Trace length used by these tests.
+    ///
+    /// Zero knowledge puts a floor on this: the mask must supply at least
+    /// `2 * (e * n_F + n_D)` random field elements (eq. 17 of
+    /// <https://eprint.iacr.org/2024/1037>), where `e` is the extension
+    /// degree, `n_F` the out-of-domain opening count and `n_D` the WHIR
+    /// query count. At 96-bit security with a degree-4 extension that floor is
+    /// a few hundred elements, so a 64-row trace cannot be hidden at all and
+    /// the prover refuses it rather than emitting a proof that leaks. 4096
+    /// rows clears it with room to spare and matches the smallest batch the
+    /// settlement layer actually sees.
+    const LOG_TRACE: usize = 12;
+
+    /// Height the test config is sized at, mirroring production: one config
+    /// built at the largest LDE the settlement layer will see, used for every
+    /// smaller statement.
+    ///
+    /// The prover's *stacked* commit arity is not the trace height. It is the
+    /// trace height plus the width's contribution, plus the ZK doubling, and
+    /// the quotient-chunk expansion pushes it higher still — for this AIR the
+    /// largest commitment stacks to 17 variables even though the trace is 12.
+    /// Sizing the grinding budget at the raw trace height under-provisions it
+    /// and the prover refuses the statement. Production sidesteps this by
+    /// sizing once at the batch ceiling; the tests do the same.
+    const CONFIG_LDE: usize = 22;
 
     fn settlement_config() -> Config {
-        config(0, LOG_TRACE).expect("WHIR settlement config should build")
+        config(0, CONFIG_LDE).expect("WHIR settlement config should build")
     }
 
     #[test]

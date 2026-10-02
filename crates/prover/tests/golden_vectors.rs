@@ -73,8 +73,10 @@ fn vectors_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
-        .map(|root| root.join("contracts/test/vectors"))
-        .unwrap_or_else(|| PathBuf::from("contracts/test/vectors"))
+        .map_or_else(
+            || PathBuf::from("contracts/test/vectors"),
+            |root| root.join("contracts/test/vectors"),
+        )
 }
 
 fn write_vector(name: &str, value: &serde_json::Value) -> Result<PathBuf, Box<dyn Error>> {
@@ -95,16 +97,11 @@ fn write_vector(name: &str, value: &serde_json::Value) -> Result<PathBuf, Box<dy
 /// and the largest canonical value.
 #[test]
 fn field_vectors() -> Result<(), Box<dyn Error>> {
-    let values: Vec<u32> = vec![
-        0,
-        1,
-        2,
-        7,
-        0xffff,
-        0x1234,
-        1_000_000,
-        (KOALABEAR_P - 1) as u32,
-    ];
+    // p - 1 fits in u32: p = 2^31 - 2^27 + 1 < 2^31, so the narrowing cast
+    // below is exact and cannot truncate.
+    #[allow(clippy::cast_possible_truncation)]
+    const P_MINUS_ONE: u32 = (KOALABEAR_P - 1) as u32;
+    let values: Vec<u32> = vec![0, 1, 2, 7, 0xffff, 0x1234, 1_000_000, P_MINUS_ONE];
     let mut out = Vec::new();
     for &v in &values {
         let m = monty(v);

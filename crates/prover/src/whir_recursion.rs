@@ -196,18 +196,27 @@ pub const fn protocol_params(pow_bits: usize) -> ProtocolParameters {
 /// search finds the cheapest sound budget. Generic over the challenger so the
 /// Poseidon2 recursion layer and the Keccak settlement layer share one rule.
 ///
+///
+/// Backs off to the largest feasible arity when the request is past the field's
+/// domain capacity, for the same reason as [`crate::whir::required_pow_bits`]:
+/// the budget is an upper bound on what any smaller statement demands, and an
+/// arity above the capacity cannot be committed at all, so there is nothing to
+/// provision for.
+///
 /// # Errors
 ///
-/// Returns the last WHIR configuration error if no budget below the security level
-/// yields a feasible schedule.
+/// Returns the last WHIR configuration error if no arity from `num_variables`
+/// down to zero yields a feasible schedule.
 pub fn required_pow_bits(num_variables: usize) -> Result<usize, WhirConfigError> {
     const _: () = assert!(SECURITY_LEVEL > 0, "security level must be positive");
     let mut last_error = None;
-    for budget in 0..SECURITY_LEVEL {
-        let params = protocol_params(budget);
-        match WhirConfig::<Challenge, F, WhirChallenger>::new(num_variables, params) {
-            Ok(schedule) => return Ok(schedule.max_pow_bits()),
-            Err(err) => last_error = Some(err),
+    for arity in (0..=num_variables).rev() {
+        for budget in 0..SECURITY_LEVEL {
+            let params = protocol_params(budget);
+            match WhirConfig::<Challenge, F, WhirChallenger>::new(arity, params) {
+                Ok(schedule) => return Ok(schedule.max_pow_bits()),
+                Err(err) => last_error = Some(err),
+            }
         }
     }
     last_error.map_or_else(
@@ -254,7 +263,9 @@ impl InnerWhirConfig {
         log_max_lde_height: usize,
         cap_height: usize,
     ) -> Result<Self, WhirVerifierParamsError> {
-        let pow_bits = required_pow_bits(log_max_lde_height)?;
+        // Blinding doubles the committed height, so the schedule must be sized
+        // one arity above the trace bound. See `crate::whir::ZK_ARITY_SLACK`.
+        let pow_bits = required_pow_bits(log_max_lde_height + crate::whir::ZK_ARITY_SLACK)?;
         let params = protocol_params(pow_bits);
         let challenger = WhirChallenger::new(whir_perm());
         let pcs = WhirPcs::new(

@@ -562,11 +562,6 @@ where
     crate::prepared::input::validate_builtin_input_raw::<SC, A, SC::Commitment, SC::OpeningProof>(
         prev,
     )?;
-    if config.is_zk() != 0 {
-        return Err(VerificationError::InvalidProofShape(
-            "WhirRecursionBackend supports only non-ZK STARK inputs".into(),
-        ));
-    }
     if config
         .pcs_verifier_params()
         .permutation_config()
@@ -648,11 +643,6 @@ where
         .verify(proof, statement)
         .map_err(|error| VerificationError::InvalidProofShape(error.to_string()))?;
     let config = verifier.config();
-    if config.is_zk() != 0 {
-        return Err(VerificationError::InvalidProofShape(
-            "WhirRecursionBackend supports only non-ZK STARK inputs".into(),
-        ));
-    }
     if config
         .pcs_verifier_params()
         .permutation_config()

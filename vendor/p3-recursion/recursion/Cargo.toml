@@ -42,7 +42,16 @@ p3-uni-stark.workspace = true
 p3-util.workspace = true
 p3-whir.workspace = true
 postcard = { version = "1.1.3", features = ["alloc"] }
-rand = { workspace = true, features = ["std_rng"] }
+# `std_rng` gives `rand::rngs::StdRng` (ChaCha12), the masking stream used by the
+# hiding WHIR PCS. `sys_rng` is required because this crate is `no_std`: it pulls
+# in `rand::rngs::SysRng`, the getrandom-backed OS entropy source used to seed
+# `StdRng` in `WhirUniPcs::new`. Without it there is no entropy source at all
+# here, and a masking stream with a fixed seed leaks every secret it masks.
+rand = { workspace = true, features = ["std_rng", "sys_rng"] }
+# `spin::Mutex` rather than `std::sync::Mutex`: the masking RNG lives inside the
+# PCS, which has to stay `Sync` in a `no_std` environment. `spin::Mutex<T, R>` is
+# `Send`/`Sync` for `T: Send` by explicit `unsafe impl` (spin 0.9.9, mutex.rs:117).
+spin = { workspace = true }
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

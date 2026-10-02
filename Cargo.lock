@@ -930,6 +930,7 @@ dependencies = [
  "postcard",
  "rand",
  "serde",
+ "spin 0.9.9",
  "thiserror",
  "tracing",
  "unroll",

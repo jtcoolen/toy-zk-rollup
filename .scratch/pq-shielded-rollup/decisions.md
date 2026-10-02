@@ -1699,3 +1699,114 @@ must not collide, which is exactly what the length prefixes buy.
 
 **Security basis.** Honest about what is and is not proven. The security story
 does not claim more than the cryptography delivers.
+
+## D-046 — HVZK blinding is live: three masks, pooled budget, and the σ^h factor
+
+**Decision.** Honest-verifier zero knowledge is turned on end to end: the WHIR
+PCS reports `ZK = true`, every witness commitment is masked, and the verifier
+(in Rust now, Solidity later) verifies the hiding shape. This is not optional in
+this design — a shielded pool whose proof leaks the witness shape is not
+shielded.
+
+**The gap that was closed.** `ZK` was hardcoded `false` in the
+`UnivariateStarkPcs` impl, so every blinding branch in uni-stark and
+batch-stark was dead code, and the recursion backend additionally rejected
+`is_zk != 0` outright at `preflight_whir_context` /
+`preflight_trusted_whir_batch`. Both rejections removed; the flag is now true
+and the branches are exercised.
+
+**The three masks** (all in
+`vendor/p3-recursion/recursion/src/pcs/whir/uni/pcs.rs`), matching
+Haböck & Kindi, *A note on adding zero-knowledge to STARKs*
+(<https://eprint.iacr.org/2024/1037>) §4.2:
+
+1. **Trace interleave.** Each witness matrix is committed with a random
+   companion row interleaved (`with_random_cols` reinterpreted at the
+   original width), doubling the committed height. Half the codeword is
+   uniformly random.
+2. **Quotient chunk masking.** With the Lagrange decomposition
+   `q = Σ_i L_i · q_i` (paper eq. 11–12), each chunk is replaced by
+   `q̂_i = q_i + v_{H_i} · t_i` for random `t_i` (eq. 13), except the last,
+   which is `q̂_d = q_d − v_{H_d} · Σ_{i<d} (c_d⁻¹ c_i) t_i` (eq. 14). The
+   recomposition still holds because the extra term is
+   `(Π_j v_j) · Σ_i c_i t_i ≡ 0` (eq. 15).
+3. **Randomization polynomial R.** A fully random polynomial per instance,
+   committed *before* the trace challenge, opened at ζ. The verifier binds it
+   through the `random` commitment slot; the STARK's OOD check is against
+   `q + R` rather than `q`.
+
+**The bug that ate a day: the σ^h factor.** The mask initially failed with
+`OodEvaluationMismatch`. The cause is a vanishing-polynomial convention
+difference. This codebase's `vanishing_poly_at_point` is the *normalized*
+`v_{gH}(X) = (X/g)^h − 1` (p3-commit `domain.rs:316`), not the
+unnormalized `X^h − σ^h`. They differ by the constant `σ^h`:
+
+    X^h − σ_i^h = σ_i^h · v_{H_i}(X)
+
+The mask is applied in the unnormalized form, so the polynomial that actually
+enters the paper's identity is `t_i = σ_i^h · T_i`, not `T_i`. The paper's
+cancellation condition is `Σ c_i t_i = 0`, so the compensation weights must
+carry the ratio `σ_i^h / σ_d^h`:
+
+    mul_i = c_i / c_d · σ_i^h / σ_d^h
+
+Dropping the σ^h leaves a residual `P(X) · Σ c_i σ_i^h T_i` in the
+recomposed quotient, which the verifier sees as an OOD mismatch at the first
+instance. With the ratio in place the identity closes exactly.
+
+**Lesson recorded.** When porting a paper's mask math into a library, check
+the library's vanishing-polynomial normalization *first*. The paper writes
+`v_H` abstractly; the library's `v_H` carries a `g^{-|H|}` factor, and every
+place the two meet needs the constant tracked.
+
+**Pooled hiding budget, not per-matrix.** The first budget check was per
+matrix and rejected legitimate batches: a 1×4 public-input matrix riding in
+a 16384-row batch has no randomness of its own but is hidden by the batch.
+Hiding is a property of the single *stacked* polynomial the commitment
+binds, so the budget is checked once per commitment over
+`Σ height × width` of the batch. Same for the R round, whose per-instance
+matrices commit as one batch. The rule is paper eq. (17):
+
+    2 · (e · n_F + n_D) ≤ h ≤ |H|
+
+implemented as `required = (EF::DIMENSION · points + query_margin) * 2`
+against the pooled random-cell count, where `query_margin` is the WHIR
+schedule's actual query count at the *stacked* arity (not the security
+level, which over-counts and rejected small-but-legal commitments).
+
+**The quotient's hiding is inherited.** The quotient polynomial is computed
+from the already-masked trace, so its off-domain coefficients are already
+random; the chunk check is a minimal guard, and the real budget was paid at
+trace-commit time. This is why masking the trace buys hiding for the whole
+proof and the chunk masks are what make the *quotient's* randomness
+independent of the witness.
+
+**Arity slack: 2, with backoff.** Blinding doubles the committed height and
+the witness width contributes one more stacked variable, so the grinding
+budget must be read at `log_max_lde + 2`, not `log_max_lde`. KoalaBear's
+folded-domain capacity caps the stacked arity at 27, so the top of the
+supported range (`log_max_lde = 26`) overflows the *requested* arity.
+`required_pow_bits` now backs off to the largest feasible arity instead of
+failing. This is safe: the budget is an upper bound on what any *feasible*
+commit demands, and an arity above the capacity cannot be committed at all,
+so there is nothing to under-provision. Verified monotonic: requests ≥ 27
+all return the budget at 27.
+
+**Cost.** Paper's model: `C_zk / C_non-zk ≈ 1 + 4 / log|H|` per witness
+column. At our block arity (25) that is ~16% proving cost for full witness
+hiding. Accepted without hesitation.
+
+**Verification status.** 46/46 prover tests and 279/279 recursion lib tests
+green with all three masks live. The vendored unit tests were updated to the
+masked semantics: they now assert that the witness survives in the *even*
+rows of the committed codeword and that the masked chunk interpolates to the
+original chunk evaluations on its own coset (the mask vanishes there) — the
+strongest statements that survive blinding.
+
+**Still open (tracked).** The recursion *circuit* must bind the R round:
+`recursive_pcs.rs` still carries `NO_RANDOM_OPENED_VALUES` with a comment
+claiming no WHIR variant splits off random codewords. That comment is now
+false and the target-side mirror of the R openings must be implemented
+against `pcs/fri/targets.rs`. Until then the recursion circuit does not
+bind the hiding proof's random round, and the Solidity verifier must verify
+the R commitment and its openings as well.

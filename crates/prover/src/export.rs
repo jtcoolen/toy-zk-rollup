@@ -38,7 +38,7 @@
 use p3_field::{PrimeField32, PrimeField64};
 use serde::{Deserialize, Serialize};
 
-/// The KoalaBear modulus, `2^31 - 2^27 + 1`.
+/// The `KoalaBear` modulus, `2^31 - 2^27 + 1`.
 ///
 /// Spelled out rather than imported so the conversion below can be checked
 /// against the field implementation as an independent fact.
@@ -56,25 +56,38 @@ const MONTGOMERY_R_INV: u64 = mod_inv(MONTGOMERY_R, KOALABEAR_P);
 
 /// Modular inverse by extended Euclid, usable in `const` context.
 ///
+/// Every intermediate is `i128` so no narrowing cast is needed: the quotients
+/// and remainders of a Euclid run on two `u64`s never exceed the inputs, and
+/// the coefficient is kept in the wider type so the final reduction to
+/// `[0, modulus)` is a plain conditional rather than a lossy cast.
+///
 /// Panics if the arguments are not coprime. Both call sites use a prime
 /// modulus and a nonzero argument, so they cannot trigger it.
+#[allow(
+    clippy::many_single_char_names,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 const fn mod_inv(a: u64, m: u64) -> u64 {
     assert!(a != 0, "mod_inv requires a nonzero argument");
+    let modulus = m as i128;
     let mut t: i128 = 0;
     let mut new_t: i128 = 1;
-    let mut r: u64 = m;
-    let mut new_r: u64 = a;
+    let mut r: i128 = m as i128;
+    let mut new_r: i128 = a as i128;
     while new_r != 0 {
-        let q = (r / new_r) as i128;
+        let q = r / new_r;
         let next_t = t - q * new_t;
         t = new_t;
         new_t = next_t;
-        let next_r = r - (q as u64).wrapping_mul(new_r);
+        let next_r = r - q * new_r;
         r = new_r;
         new_r = next_r;
     }
     assert!(r == 1, "mod_inv requires coprime arguments");
-    let positive = if t < 0 { t + m as i128 } else { t };
+    // `t` is reduced into `[0, modulus)` above, and `modulus` fits in `u64`
+    // by construction, so the narrowing cast below is exact.
+    let positive = if t < 0 { t + modulus } else { t };
     positive as u64
 }
 
@@ -212,6 +225,12 @@ impl std::error::Error for ExportError {}
 /// finding one means the caller handed over something malformed — and
 /// shipping it would make the contract absorb a value its own verifier
 /// rejects.
+///
+/// # Errors
+///
+/// Returns [`ExportError::LimbOutOfRange`] if any canonical statement limb is
+/// at or above [`KOALABEAR_P`], or [`ExportError::Encoding`] if the proof
+/// cannot be serialized to the wire format.
 pub fn bundle<S, F>(
     statement: &[F],
     proof: &S,
@@ -339,7 +358,7 @@ mod tests {
     fn an_out_of_range_limb_is_rejected() {
         // Constructing a limb >= p requires bypassing the field, so the check
         // is exercised on the canonical projection directly.
-        let bad = vec![1u64, 2, KOALABEAR_P];
+        let bad = [1u64, 2, KOALABEAR_P];
         for (index, &value) in bad.iter().enumerate() {
             if value >= KOALABEAR_P {
                 assert_eq!(

@@ -1254,7 +1254,10 @@ mod tests {
     #[test]
     fn borrowed_whir_context_checks_statement_axes_before_replay() {
         let (pcs, _commitment, coms, mut proof) = open_two_matrices();
-        let context = WhirContextParams::from_native(&pcs.whir_config(8));
+        // `open_two_matrices` commits masked matrices, whose stacked arity is
+        // one above the unmasked witness's; the context must match what the
+        // commitment actually made.
+        let context = WhirContextParams::from_native(&pcs.whir_config(9));
         let shapes: Vec<_> = coms
             .iter()
             .map(|(domain, openings)| (domain.log_size(), openings[0].1.len(), openings.len()))
