@@ -23,3 +23,8 @@ wallet/dist/
 
 contracts/out/
 contracts/cache/
+
+# Reference clones for study only (sol-whir-p3, plutus-plonky3-exploration,
+# bitcoin-stark-verifier). The committed source of truth for the Solidity
+# verifier is contracts/lib/sol-whir-p3; these are throwaway study copies.
+.scratch/refs/
