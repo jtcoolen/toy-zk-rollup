@@ -42,6 +42,7 @@ p3-lookup = { workspace = true }
 p3-poseidon2-circuit-air = { workspace = true }
 
 rand = { workspace = true, features = ["thread_rng", "std"] }
+serde = { workspace = true }
 
 # Proof-size measurement only (dev). `postcard` is the compact binary format the
 # settlement layer ships proofs in: it is `serde` over a varint-framed, non-self
@@ -49,6 +50,7 @@ rand = { workspace = true, features = ["thread_rng", "std"] }
 # JSON field-name overhead. The byte count is the calldata the chain pays for, so
 # this is the number that decides whether on-chain verification is feasible.
 [dev-dependencies]
+serde_json = "1"
 postcard = "1.1"
 
 # Proving is embarrassingly parallel (DFT butterflies, LDE rows, Merkle nodes),
