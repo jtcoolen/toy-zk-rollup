@@ -247,6 +247,64 @@ mod tests {
     use p3_field::PrimeCharacteristicRing;
     use p3_matrix::dense::RowMajorMatrix;
 
+    #[test]
+    #[ignore = "parameter sweep; run with --nocapture when sizing the on-chain schedule"]
+    fn dump_schedule_curve() {
+        // Extension degree vs query count, at our block circuit's actual
+        // stacked arity (25; measured as needing 19 grinding bits).
+        //
+        // WHIR's initial batching ceiling is
+        //     bits = log2(|EF|) - 1 - log2(claims - 1) - list_size_bits
+        // and everything short of the security target is bought back with
+        // QUERIES. So |EF| is the biggest single lever on proof size.
+        //
+        // KoalaBear supports binomial extensions of degree 4 and 8 only
+        // (`BinomialExtensionData<4>` / `<8>`); the quintic `sol-whir-p3`
+        // uses is a TRINOMIAL (X^5+X^2-1), a different type that this
+        // workspace's WHIR path does not accept.
+        use p3_field::extension::BinomialExtensionField;
+        type EF4 = BinomialExtensionField<F, 4>;
+        type EF8 = BinomialExtensionField<F, 8>;
+
+        for (label, rows) in [("ext4", sweep_q::<EF4>()), ("ext8", sweep_q::<EF8>())] {
+            for (lir, pow, rounds, total) in rows {
+                println!(
+                    "  {label} lir={lir} pow={pow:>3}: rounds={rounds} total_queries={total:>4}"
+                );
+            }
+        }
+    }
+
+    /// Total queries per (lir, pow) for a given extension field, at nv=25.
+    fn sweep_q<EF>() -> Vec<(usize, usize, usize, usize)>
+    where
+        EF: p3_field::ExtensionField<F> + p3_field::TwoAdicField,
+    {
+        let mut out = Vec::new();
+        for lir in [1usize, 2, 3] {
+            for pow in [19usize, 24, 32, 48] {
+                let params = ProtocolParameters {
+                    security_level: SECURITY_LEVEL,
+                    pow_bits: pow,
+                    round_log_inv_rates: Vec::new(),
+                    folding_factor: FoldingFactor::Constant(FOLDING_FACTOR),
+                    soundness_type: SecurityAssumption::JohnsonBound,
+                    starting_log_inv_rate: lir,
+                };
+                if let Ok(cfg) = WhirConfig::<EF, F, Challenger>::new(25, params) {
+                    let total: usize = cfg
+                        .round_parameters()
+                        .iter()
+                        .map(|r| r.num_queries)
+                        .sum::<usize>()
+                        + cfg.final_round_config().num_queries;
+                    out.push((lir, pow, cfg.n_rounds(), total));
+                }
+            }
+        }
+        out
+    }
+
     /// Fibonacci AIR: `a' = a + b`, `b' = a + 2b`, with the *final* `a` exposed
     /// as the public output.
     ///

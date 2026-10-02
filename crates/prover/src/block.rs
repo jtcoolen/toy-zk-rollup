@@ -120,6 +120,23 @@ use crate::whir_recursion::F;
 #[cfg(test)]
 const BLOCK_LOG_MAX_LDE: usize = 25;
 
+/// Merkle cap height for the settlement layer.
+///
+/// **Measured: raising it makes the proof BIGGER, not smaller.** The intuition
+/// that a cap shortens authentication paths is correct but incomplete here —
+/// WHIR re-commits every folding round, and with a cap the commitment is a
+/// `2^cap_height`-element Merkle cap serialized *per round*. At cap 8 that is
+/// 256 digests per round against ~15 rounds, which swamps the path saving:
+/// 767 KB at cap 0 became 905 KB at cap 8.
+///
+/// Cap height is therefore not a lever in this stack. It would only pay off if
+/// the cap were sent once and referenced by digest, which the WHIR proof
+/// format does not do.
+///
+/// Not `#[cfg(test)]`: `settle_block_circuit` reads it, so it is part of the
+/// production configuration even though its value was chosen by measurement.
+pub const BLOCK_CAP_HEIGHT: usize = 0;
+
 /// Limbs per 32-byte hash in a transfer statement (32 bytes / 16-bit limbs).
 const LIMBS_PER_HASH: usize = 16;
 /// Limbs of the fee field in a transfer statement (`VALUE_LIMBS` in the
@@ -520,7 +537,15 @@ pub fn settle_block_circuit(
     ),
     Box<dyn Error>,
 > {
-    let settlement = crate::whir::config(0, log_max_lde)?;
+    // Cap height is the number of top Merkle levels withheld from the
+    // commitment and held by the verifier as public data. Every query's
+    // authentication path is `depth - cap_height` long, so raising the cap
+    // shortens the dominant term of the proof with no security loss: the cap
+    // is a handful of digests the verifier holds once.
+    //
+    // Measured at cap 0 the final proof is 767 KB, dominated by 24-level
+    // Keccak paths. See D-038.
+    let settlement = crate::whir::config(BLOCK_CAP_HEIGHT, log_max_lde)?;
     let shared = Poseidon2Config::KOALA_BEAR_D4_W16.for_shared_challenger_table();
     let preprocessors: Vec<Box<dyn NpoPreprocessor<F>>> = vec![
         Box::new(Poseidon2SharedPreprocessor::new(vec![shared])),
@@ -906,6 +931,170 @@ mod tests {
             "tampering the second transfer's fee must be rejected"
         );
 
+        Ok(())
+    }
+
+    /// The size of the proof that actually reaches the chain.
+    ///
+    /// This is the number that decides whether on-chain verification is
+    /// feasible: the serialized block proof IS the calldata, and calldata is
+    /// 16 gas per non-zero byte on Cancun. A 40 KB proof is ~640k gas of
+    /// calldata alone before a single WHIR round is verified.
+    ///
+    /// Reported alongside the statement length, because both travel in the
+    /// calldata, and alongside the per-round query counts, because those drive
+    /// the compute side of the cost.
+    #[test]
+    #[ignore = "size probe; run with --nocapture when sizing the settlement calldata"]
+    fn measure_final_proof_size() -> Result<(), Box<dyn Error>> {
+        let (n1, sk1) = funded_note(11, 1_000);
+        let (n2, sk2) = funded_note(22, 2_000);
+        let (tree, paths) = tree_with(&[n1, n2]);
+        let root = tree.root();
+        let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
+        let inner = InnerWhirConfig::new(LOG_MAX_LDE, 0).expect("inner config");
+
+        let spec_a = ClientSpec {
+            note: &n1,
+            sk_d: &sk1,
+            path: &paths[0],
+            index: 0,
+            out_value: 900,
+        };
+        let spec_b = ClientSpec {
+            note: &n2,
+            sk_d: &sk2,
+            path: &paths[1],
+            index: 1,
+            out_value: 1_900,
+        };
+        let mut map = NullifierMap::new(Keccak256Commitment);
+        let client_a = prove_client_transfer(&inner, &spec_a, root, recipient, &mut map)?;
+        let client_b = prove_client_transfer(&inner, &spec_b, root, recipient, &mut map)?;
+        let children = children_of(std::iter::once(&client_a).chain(std::iter::once(&client_b)));
+
+        let rc = build_multi_transfer_circuit(&inner, &children)?;
+        let (block_proof, _v) = settle_block_circuit(&rc, BLOCK_LOG_MAX_LDE)?;
+
+        let bytes = postcard::to_allocvec(&block_proof).expect("serialize");
+
+        // Decompose: what dominates the proof? Serialize each piece on its own
+        // rather than guessing at field sizes — the answer decides where to
+        // optimize, so it must be measured, not estimated.
+        let op = &block_proof.proof.opening_proof;
+        println!(
+            "opening_proof total: {}",
+            postcard::to_allocvec(op).map_or(0, |b| b.len())
+        );
+        for (i, rp) in op.rounds.iter().enumerate() {
+            println!(
+                "  round {i}: {} bytes ({} whir rounds, {} evals)",
+                postcard::to_allocvec(rp).map_or(0, |b| b.len()),
+                rp.whir.rounds.len(),
+                rp.evals.len(),
+            );
+            for (j, wr) in rp.whir.rounds.iter().enumerate() {
+                println!(
+                    "    whir round {j}: {} bytes, ood={} sumcheck={}",
+                    postcard::to_allocvec(wr).map_or(0, |b| b.len()),
+                    wr.ood_answers.len(),
+                    wr.sumcheck.polynomial_evaluations.len(),
+                );
+            }
+        }
+        let statement =
+            block_statement([ONE_IN_ONE_OUT, ONE_IN_ONE_OUT], [&client_a.2, &client_b.2])?;
+        // Each statement limb is a base-field element serialized as one
+        // little-endian u32, so the statement's wire size is 4 bytes per limb.
+        let stmt_bytes = statement.len() * 4;
+
+        // Calldata gas on Cancun: 16 per non-zero byte, 4 per zero byte.
+        let nonzero = bytes.iter().filter(|&&b| b != 0).count();
+        let zeros = bytes.len() - nonzero;
+        let calldata_gas = nonzero * 16 + zeros * 4;
+
+        println!(
+            "FINAL PROOF: {} bytes ({} nonzero, {} zero) | statement {} limbs / {} bytes\n\
+             calldata gas ~{} (16/byte nonzero, 4/byte zero)\n\
+             inner transfer proofs: {} and {} bytes",
+            bytes.len(),
+            nonzero,
+            zeros,
+            statement.len(),
+            stmt_bytes,
+            calldata_gas,
+            postcard::to_allocvec(&client_a.1).map_or(0, |b| b.len()),
+            postcard::to_allocvec(&client_b.1).map_or(0, |b| b.len()),
+        );
+        Ok(())
+    }
+
+    /// How the final proof size scales with block fan-in.
+    ///
+    /// This is the question that decides whether the rollup is economical, and
+    /// the answer is not obvious from a single measurement. The final proof is
+    /// the WHIR proof of the RECURSION circuit, whose trace is dominated by
+    /// the fixed cost of verifying inner proofs (Poseidon2 rounds, statement
+    /// tables, ALU rows) — not by the shielded logic of each transfer.
+    ///
+    /// If size grows slowly with fan-in, the per-transfer cost collapses:
+    /// 767 KB over 2 transfers is ruinous, the same over 32 is 24 KB each.
+    /// The curve below is the economic basis for choosing the aggregation
+    /// fan-in (D-028).
+    #[test]
+    #[ignore = "scaling probe; run with --nocapture when choosing the aggregation fan-in"]
+    fn measure_proof_size_vs_fan_in() -> Result<(), Box<dyn Error>> {
+        let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
+        let inner = InnerWhirConfig::new(LOG_MAX_LDE, 0).expect("inner config");
+
+        println!("fan_in | block_bytes | bytes_per_transfer | total_queries");
+        println!("-------+-------------+--------------------+--------------");
+        for fan in [1usize, 2, 4, 8] {
+            let mut map = NullifierMap::new(Keccak256Commitment);
+            let mut clients = Vec::new();
+            let mut notes = Vec::new();
+            for i in 0..fan {
+                notes.push(funded_note(u8::try_from(i + 1).expect("small"), 1_000));
+            }
+            let plain: Vec<Note> = notes.iter().map(|(n, _)| *n).collect();
+            let (tree, paths) = tree_with(&plain);
+            let root = tree.root();
+            for (i, (note, sk)) in notes.iter().enumerate() {
+                let spec = ClientSpec {
+                    note,
+                    sk_d: sk,
+                    path: &paths[i],
+                    index: i,
+                    out_value: 900,
+                };
+                clients.push(prove_client_transfer(
+                    &inner, &spec, root, recipient, &mut map,
+                )?);
+            }
+            let children = children_of(clients.iter());
+            let rc = build_multi_transfer_circuit(&inner, &children)?;
+            // Fan-in changes the stacked arity, so the height budget must grow
+            // with it. Search upward for the smallest that builds: the WHIR
+            // budget panics when under-provisioned, so try each level and keep
+            // the first that works.
+            // `WhirConfig::new` PANICS (does not return Err) when the grinding
+            // budget is below what the committed arity requires, so the search
+            // for the smallest feasible height has to catch the panic rather
+            // than match on a Result.
+            let mut reported = false;
+            for lde in 24..=28 {
+                let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    settle_block_circuit(&rc, lde)
+                }));
+                if let Ok(Ok((block_proof, _v))) = attempt {
+                    let bytes = postcard::to_allocvec(&block_proof).map_or(0, |b| b.len());
+                    println!("{fan:>6} | {:>11} | {:>18} | lde {lde}", bytes, bytes / fan);
+                    reported = true;
+                    break;
+                }
+            }
+            assert!(reported, "no height budget built for fan-in {fan}");
+        }
         Ok(())
     }
 

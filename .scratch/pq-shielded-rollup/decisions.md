@@ -2,6 +2,353 @@
 
 Recorded choices with alternatives considered. Newest first.
 
+## D-039 — Splitting the verifier: chunk by WHIR round across transactions, bound by the transcript
+
+**Answers:** how do we verify a 767 KB proof on EVM; how many contracts; how to
+split; how to keep it atomic and pass information correctly.
+
+### Measured: the proof size is a fixed base plus a small marginal cost
+
+`block::tests::measure_proof_size_vs_fan_in` (postcard, 96-bit, `lir=1`):
+
+```text
+fan_in | block_bytes | bytes_per_transfer | min feasible lde
+   1   |   705,995 |            705,995 | 24
+   4   |   865,005 |            216,251 | 26
+   8   | 1,010,426 |            126,303 | 27
+```
+
+Marginal cost per extra transfer: **~43 KB**. Fixed base: **~662 KB**. So
+amortization is real and strong — 8 transfers is 126 KB each versus 706 KB
+for one — but the base dominates at any small fan-in. The base is the
+recursion circuit's own trace (Poseidon2 rounds, statement table, ALU rows),
+not the shielded logic.
+
+**Consequence for D-028 (aggregation fan-in):** high fan-in is mandatory for
+economics. Target 16–32 transfers per aggregated block; the marginal 43 KB
+per transfer is what the chain actually pays.
+
+### Why parameters cannot fix this
+
+Measured this session, all at our actual stacked arity (25):
+
+- **Extension degree is not a lever.** ext4 and ext8 give **identical** query
+  counts at every `(lir, pow)`. The schedule solves for queries to hit the
+  96-bit target; a larger field does not move it in this regime. (KoalaBear
+  supports binomial ext 4 and 8 only; `sol-whir-p3`'s quintic is a
+  *trinomial*, a different type our WHIR path will not accept.)
+- **`lir` is capped at 3** by KoalaBear's 2^24 two-adicity against arity 25
+  (`nv + lir <= 28`).
+- **Grinding helps but is prover-limited.** 271 queries at pow=19 → 78 at
+  pow=48, but 2^48 hashes per block is beyond a sequencer.
+- **Cap height made it worse** (767 KB → 905 KB at cap 8); WHIR re-commits
+  every round and serializes the whole cap each time.
+
+### The design: chunk by WHIR round, one round per transaction
+
+Our proof decomposes into **four top-level WHIR runs** (measured: 191 KB,
+143 KB, 185 KB, 205 KB), each with 3–4 inner folding rounds. That structure
+is the natural cut point.
+
+**Why this is sound by construction — the key insight.** Fiat-Shamir is a
+*running hash*. The verifier's challenges are derived from everything
+absorbed so far. Splitting *where the bytes are fed in* does not change what
+the transcript commits to. So a chunked verifier that carries the sponge
+state between transactions is not a weakened verifier — it is the same
+verifier, paused.
+
+This is the property that makes the whole scheme safe, and it is why the
+alternative (trusting an off-chain "pre-verified" flag) is not needed.
+
+**Contracts: two.**
+
+1. **`ChunkVerifier`** — the verification state machine. Knows nothing about
+   shielded transfers. Holds, per `verificationId`:
+   ```text
+   struct Session {
+       bytes32 statementHash;   // committed at begin(); binds the claim
+       uint32  roundIndex;      // advances by exactly 1 per step()
+       uint32  status;          // OPEN / VERIFIED / DEAD
+       bytes   spongeBuffer;    // the Keccak challenger's absorbed bytes
+       bytes   outputBuffer;    // its unconsumed sampled bytes
+       uint256[] accumulated;  // running sumcheck claim / folding randomness
+   }
+   ```
+   `begin(statement, firstChunk) -> id`, `step(id, chunk)`, `isVerified(id)`.
+
+2. **`ShieldedPool`** — the settlement contract, unchanged in role. Calls
+   `begin`, drives `step` until the verifier reports VERIFIED, then applies
+   the root transition. It never trusts a bare boolean from anywhere else.
+
+**Why two and not more.** Splitting the *verifier* across contracts does not
+help: a transaction's gas limit is per-transaction regardless of how many
+contracts it calls. The only thing that raises the budget is more
+transactions. So the split must be in *time*, not in *code location*.
+Extra contracts would add delegatecall overhead and an attack surface for no
+gas benefit.
+
+**Gas budget per step.** From `sol-whir-p3`'s measured 3.64 M gas over ~20
+queries (~138 k gas/query) plus 16 gas/byte calldata:
+
+```text
+per WHIR round: ~190 KB calldata (~3.0 M gas) + ~65 queries (~9.0 M gas)
+              ≈ 12 M gas per transaction
+```
+
+Comfortably inside a 30 M block limit, with room for the state-machine
+overhead. A full block verification is ~6 transactions (4 rounds + initial
++ final).
+
+### Atomicity and information passing
+
+**Within a transaction:** trivial. EVM reverts atomically; a failed `step`
+persists nothing.
+
+**Across transactions:** the state machine makes partial verification
+harmless rather than trying to make it impossible.
+
+- `begin` commits `statementHash = keccak256(chainId, blockNumber, statement)`.
+  Every subsequent call must present the same `verificationId`, so a step
+  cannot be replayed against a different claim.
+- `roundIndex` must advance by exactly one. A skipped round is a revert, not
+  a silently-missed check.
+- Each `step` re-derives its challenges from the **stored sponge state** and
+  checks its chunk against them. A tampered intermediate state produces a
+  different challenge and fails immediately — the transcript is the
+  integrity check on the session, not a hash we added on top.
+- The final step checks the closing identity against `statementHash`. Only
+  then does `status = VERIFIED`, and only `ShieldedPool` acting on that
+  applies the state update.
+- **Liveness, not soundness:** a malicious actor can stall verification by
+  never submitting the last chunk. Nothing is applied, nothing is lost but
+  gas. The sequencer owns the submission schedule, and a block that is not
+  finalized within its window is simply not adopted.
+
+**What must NOT be passed between contracts:** any pre-computed "this is
+valid" boolean from an off-chain source. The only trusted inputs are the
+statement, the proof bytes, and the transcript's own derivation.
+
+### Cross-checks from the two reference repos
+
+**`input-output-hk/plutus-plonky3-exploration`** (Apache-2.0) — same problem
+on a far tighter target (Plutus, ~14 M mem/tx). Their result: 186 KB proof
+at `log_blowup=8`, 22 queries, verified across **23 transactions** — one
+per query plus one for shared work. Per-query 9.47 M mem / 3.23 B cpu.
+Confirms: (a) chunking across transactions is the standard answer, (b) our
+EVM budget is far more generous, (c) they also found the fixed-work/query
+split dominates.
+
+Their `log_blowup` ↔ `num_queries` table matches our `lir` ↔ queries curve
+directionally (blowup 2→8 cuts 83→22 queries), which is independent
+confirmation that our rate lever behaves as measured.
+
+**`GOATNetwork/bitcoin-stark-verifier`** — WHIR over KoalaBear ext4, *our
+exact field*, verified in Bitcoin Script with no `OP_CAT`. Two things worth
+taking:
+
+1. **Their `docs/whir-review.pdf`** is a formal account of the STIR and WHIR
+   proximity tests — what is checked, what is not, and why. That is directly
+   reusable as the correctness reference for our Solidity verifier, and is
+   the most valuable artifact either repo offers us.
+2. **"The script is built from the proof it verifies"** — a proof-specialized
+   verifier. They must do this because Bitcoin Script has no loops; their
+   script is 198 MB. **We have loops**, so we write one general verifier.
+   Their constraint is our freedom.
+
+Their "what is not checked" list is a useful honesty template for our own
+verifier docs: the statement is supplied because it *is* the claim; a
+different statement is a different claim, not a cheaper proof of the same
+one.
+
+**Not applicable to us:** their Poseidon2-as-algebraic-hash trick exists to
+avoid `OP_CAT`. On EVM `keccak256` is a native opcode that hashes arbitrary
+bytes, so we keep Keccak and our prefix-free tree convention unchanged.
+
+### Rejected alternatives
+
+- **SNARK-wrap the WHIR proof.** Forbidden (no SNARKs).
+- **LeanVM terminal (D-036).** Does not shrink the final proof; adds a zkVM
+  to solve a problem our in-circuit recursion already solves.
+- **Split the verifier across many contracts in one tx.** No gas benefit —
+  the limit is per-transaction.
+- **EIP-4844 blobs for the proof.** Contracts cannot read blob contents,
+  only their commitments. The verifier needs the bytes. Not usable.
+- **Lower the security level.** Cuts queries directly but 96 was already a
+  concession from 128; needs a user decision.
+
+
+## D-038 — MEASURED: the final proof is 767 KB. On-chain verification is infeasible as configured.
+
+**The answer to "how large is the final proof we want to verify in Solidity?"**
+
+Measured on the real fan-in-2 block proof (`block::tests::measure_final_proof_size`,
+postcard-serialized, `LOG_MAX_LDE = 25`, 96-bit, `lir = 1`, `pow = 19`):
+
+```text
+FINAL PROOF:        767,697 bytes  (742,544 nonzero / 2,515 zero)
+STATEMENT:              173 limbs  = 692 bytes
+CALLDATA GAS:     ~11,981,316     (16/byte nonzero + 4/byte zero, Cancun)
+```
+
+Calldata alone is ~12M gas before a single WHIR round is verified. Against a
+30M block gas limit that leaves ~18M for the actual verification of a proof
+with **271 queries**. Not viable.
+
+**Decomposition — where the bytes are:**
+
+```text
+opening_proof total: 724,094
+  round 0: 191,044   (4 whir rounds, 8 evals)   whir0=105,368
+  round 1: 143,072   (3 whir rounds, 8 evals)   whir0= 85,305
+  round 2: 185,247   (4 whir rounds, 8 evals)   whir0=104,948
+  round 3: 204,730   (4 whir rounds, 12 evals)  whir0=104,106
+```
+
+Two facts fall out:
+
+1. **The batch has FOUR top-level WHIR proximity proofs**, not one. Each
+   commitment phase of the batch STARK (trace, quotient, lookup, …) gets its
+   own WHIR folding run. We pay the WHIR overhead four times.
+2. **Each phase is dominated by its first WHIR round** (~105 KB of ~190 KB).
+   At 177 queries that is ~595 bytes/query, which is a Merkle path: 24
+   levels x 32-byte Keccak digests = 768 B. **Merkle paths over the Keccak
+   tree are the cost**, exactly as expected for a hash-based PCS.
+
+**Comparison that frames the problem.** `sol-whir-p3`'s KoalaBear-quintic
+standalone WHIR: 3,637,880 gas total, 54,436 B calldata, **~20 queries**.
+We are at 271 queries and 767 KB — 14x the queries, 14x the bytes.
+
+**Why our query count is so much higher.** Two compounding causes:
+
+- **Many opening claims.** The circuit-prover stacks every table — witness,
+  const, public, ALU, Poseidon2, recompose, statement, Keccak-f — into one
+  batch. WHIR's initial batching claim costs `log2(claims - 1)` bits of
+  security, and the deficit is made up with queries. Their standalone verifier
+  opens ONE claim.
+- **`lir = 1` forced by arity.** Measured: the fan-in-2 block circuit's
+  actual stacked arity is **25** (needs 19 grinding bits; v=25 supplies
+  exactly 19, v=24 fails with `PowBitsExceedBudget { required: 19, budget: 18 }`).
+  KoalaBear's two-adicity caps the folded domain at 2^24, so
+  `nv + lir <= 28` and at nv=25 only `lir <= 3` is reachable. The arity is
+  forced by the nullifier gadget's 288 Keccak-f per spend (D-035).
+
+**This is why they built the LeanVM terminal.** The measurement vindicates
+their architecture: a full recursive proof over a rich AIR is too large to
+verify directly, so they prove the verification inside a VM. We rejected that
+(D-036) because our recursion is already in-circuit — but we did not
+anticipate that the *final* proof would still be 767 KB.
+
+**Levers, measured (nv=25, total queries / est. size):**
+
+| lir | pow | queries | est. KB | prover-feasible? |
+|---|---|---|---|---|
+| 1 | 19 | 271 | 756 | yes (current) |
+| 1 | 32 | 225 | 628 | yes (~4G hashes) |
+| 2 | 24 | 152 | 424 | yes |
+| 2 | 32 | 135 | 377 | yes |
+| 3 | 32 | 102 | 284 | yes |
+| 3 | 48 | 78 | 217 | marginal (2^48) |
+| 4 | any | — | — | INFEASIBLE (domain cap) |
+
+Grinding is prover-side and verifier-free (one hash), so moving right/down is
+cheap for the chain. But 2^48 is already beyond a sequencer's budget, and
+even the best feasible point (~284 KB, ~4.5M gas calldata) plus 102 queries
+of Merkle verification is not comfortably inside a block.
+
+**Real fixes, in order of leverage.**
+
+1. ~~**Raise the Merkle cap height.**~~ **MEASURED AND REJECTED.** Cap 8 made
+   the proof 905 KB, up from 767 KB. The path shortening is real, but WHIR
+   re-commits every folding round and a capped commitment is a
+   `2^cap_height`-element Merkle cap serialized *per round* — 256 digests x
+   ~15 rounds swamps the saving. The cap would have to be sent once and
+   referenced by digest, which the WHIR proof format does not do.
+2. **Reduce the number of top-level WHIR runs.** Four proximity proofs is
+   four times the fixed cost. Whether the batch can be restructured to commit
+   fewer phases is a `p3-circuit-prover` question worth investigating.
+3. **Reduce opening claims.** Fewer stacked tables → less security lost at
+   batching → fewer queries. The statement/const/public tables may be
+   foldable into fewer polynomials.
+4. **Shrink the nullifier insert fold** (256 → shared-across-block), which
+   lowers `nv` and unlocks a higher `lir`. Biggest structural win, biggest
+   change.
+5. **Lower the security level.** 96 → 80 cuts queries directly. Needs a
+   user decision; 96 was already a concession from 128.
+
+**Not a fix:** SNARK wrapping (forbidden), and their LeanVM terminal (D-036).
+
+**Standing measurement to re-run after every change:**
+`cargo test -p prover --lib block::tests::measure_final_proof_size -- --ignored --nocapture`
+
+
+## D-037 — BLOCKING: our WHIR query count is ~13x theirs; `starting_log_inv_rate` is the lever and `nv` is what pins it
+
+**Status.** Found while generating the Solidity fixed config. Not yet resolved.
+This gates the whole on-chain story, so it is recorded before any verifier code
+is written — generating a verifier for an infeasible schedule is wasted work.
+
+**The measurement** (`whir::tests::dump_schedule_curve`, `#[ignore]`, 96-bit,
+`FoldingFactor::Constant(4)`, `JohnsonBound`, total = rounds + final queries):
+
+```text
+lir=1  nv=26: 268 queries   start_dom=2^27   round0=177   <- OURS TODAY
+lir=1  nv=22: 275 queries   start_dom=2^23
+lir=3  nv=22: 114 queries   start_dom=2^25
+lir=4  nv=22:  91 queries   start_dom=2^26
+lir=6  nv=18:  59 queries   start_dom=2^24
+lir=6  nv=22:  65 queries   start_dom=2^28
+lir=3  nv=26: INFEASIBLE    FoldedDomainExceedsCapacity { 25 > 24 }
+lir=4  nv=24: INFEASIBLE    FoldedDomainExceedsCapacity { 26 > 24 }
+```
+
+**Why this is blocking.** `sol-whir-p3` measures 3,637,880 gas for a whole
+KoalaBear-quintic WHIR tx with ~20 queries, of which 54,436 B calldata is
+~870k gas. That leaves ~2.7M for compute over ~20 queries — roughly
+**135k gas/query**. At 268 queries that is ~36M gas, over the 30M block gas
+limit. Our current schedule cannot be verified on an EVM chain.
+
+**The mechanism.** WHIR trades domain size (prover FFT cost) against query
+count (verifier gas). Higher `starting_log_inv_rate` = more redundancy per
+query = fewer queries for the same security. But the committed domain is
+`2^(nv + lir)` and `p3-whir` 0.8.0 caps the **folded** domain at `2^24`
+(`FoldedDomainExceedsCapacity`). So:
+
+```text
+   bigger circuit (nv)  ->  lower affordable lir  ->  more queries  ->  more gas
+```
+
+**Root cause of `nv=26`:** the nullifier gadget (D-035). 288 Keccak-f per
+nullifier pushed the transfer's stacked arity from ~22 to 26, which pushed
+`LOG_MAX_LDE` from 24 to 26, which pinned `lir` at 1. **Proving nullifier
+non-membership in-circuit — the governing requirement — is what made the
+on-chain verifier expensive.** That tension is the finding; it is not a
+reason to back out of the in-circuit proof.
+
+**Candidate resolutions, in order of preference.**
+
+1. **Stop over-provisioning `nv`.** `config(cap_height, num_variables)` is
+   being called with `num_variables = LOG_MAX_LDE`, the *maximum*, not the
+   *actual* stacked arity. If the real stacked arity of the block circuit is
+   ~22, then `lir=6` becomes affordable at 65 queries — a 4x cut. Measure
+   the actual stacked arity and size the config to it. **Do this first.**
+2. **Raise `starting_log_inv_rate` deliberately** once (1) fixes the input.
+   The table shows each +1 LIR roughly halves queries.
+3. **Shrink the nullifier insert fold.** The 256-level insert fold is the bulk
+   of the arity. A block-level shared insert (insert N nullifiers sharing the
+   top levels once) would cut it from 256N to ~256 + N. Deferred: changes the
+   statement shape and cannot live at the transfer layer (D-026).
+4. **Lower the security level.** 96 -> 80 cuts queries, but 96 was already a
+   concession from the 128 target; going lower needs a user decision.
+
+**Rejected:** wrapping in a SNARK to amortise (forbidden — no SNARKs), and
+their LeanVM terminal (D-036 — that solves a different problem).
+
+**Next action.** Measure the actual stacked variable count of the transfer and
+block circuits instead of passing `LOG_MAX_LDE`, then re-run the curve at the
+real `nv` and pick the highest feasible `lir`. The Solidity fixed config must
+be generated from whatever that lands on.
+
+
 ## D-036 — Vendor sol-whir-p3's STANDALONE WHIR verifier; do NOT use their LeanVM terminal
 
 **Status.** `ethereum/sol-whir-p3` @ `18eda721fea91b5304242cc62d1d5f585d7b23ff`

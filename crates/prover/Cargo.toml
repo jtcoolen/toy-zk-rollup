@@ -43,6 +43,14 @@ p3-poseidon2-circuit-air = { workspace = true }
 
 rand = { workspace = true, features = ["thread_rng", "std"] }
 
+# Proof-size measurement only (dev). `postcard` is the compact binary format the
+# settlement layer ships proofs in: it is `serde` over a varint-framed, non-self
+# -describing encoding, so a `#[derive(Serialize)]` proof serializes without any
+# JSON field-name overhead. The byte count is the calldata the chain pays for, so
+# this is the number that decides whether on-chain verification is feasible.
+[dev-dependencies]
+postcard = "1.1"
+
 # Proving is embarrassingly parallel (DFT butterflies, LDE rows, Merkle nodes),
 # but Plonky3 routes all of it through `p3-maybe-rayon`, a shim that maps
 # `ParallelIterator` onto `core::iter::Iterator` unless the `parallel` feature

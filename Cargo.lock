@@ -1133,6 +1133,7 @@ dependencies = [
  "p3-uni-stark",
  "p3-util",
  "p3-whir",
+ "postcard",
  "pq-hash",
  "pq-sign",
  "rand",
