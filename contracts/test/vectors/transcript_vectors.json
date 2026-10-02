@@ -86,31 +86,31 @@
       "tag": null
     },
     {
-      "hex": "f2ffff0d",
+      "hex": "e5ffff1a",
       "len": 4,
       "op": "observe",
       "tag": null
     },
     {
-      "hex": "b0",
+      "hex": "f0",
       "len": 1,
       "op": "sample",
       "tag": null
     },
     {
-      "hex": "bf",
+      "hex": "03",
       "len": 1,
       "op": "sample",
       "tag": null
     },
     {
-      "hex": "38",
+      "hex": "4b",
       "len": 1,
       "op": "sample",
       "tag": null
     },
     {
-      "hex": "68",
+      "hex": "e0",
       "len": 1,
       "op": "sample",
       "tag": null
@@ -120,6 +120,6 @@
   "note": "exact byte sequence a verifier must replay; sample hex is squeezed, observe hex is absorbed",
   "pow_bits": 4,
   "pow_prefix_observations_hex": "b5c7220afeffff01fcffff03fafbfd05",
-  "witness_canonical": 7,
+  "witness_canonical": 1065353230,
   "zeta_canonical": 935446202
 }
