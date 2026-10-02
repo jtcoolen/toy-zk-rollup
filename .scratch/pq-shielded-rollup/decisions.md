@@ -1,6 +1,67 @@
 # Decisions log
 
 Recorded choices with alternatives considered. Newest first.
+## D-049 — SumcheckCore: the transcript is a chained sponge, and limbs live at bit 128
+
+**Status.** Implemented and green. `contracts/src/verifier/SumcheckCore.sol`
+replays all three recorded Rust shapes (1, 4 and 5 rounds) to the exact
+final claim, driven by `sumcheck_vectors.json` generated from the real
+`SumcheckData::verify_rounds`.
+
+**The three bugs the vector harness caught, none of which a hand-written
+test would have.**
+
+1. **Canonical vs Montgomery on the absorb path.** Field arithmetic in
+   this codebase is canonical, but `SerializingChallenger32::observe(F)`
+   writes `to_unique_u32()`, which is the internal *Montgomery* form.
+   Absorbing the canonical `1` instead of `0x01fffffe` desynchronizes
+   every subsequent challenge while producing a perfectly well-formed
+   digest. Fixed with `toMontgomery(v) = v * R mod p`, `R = 2^32 mod p =
+   0x01fffffe` — not `2^31`, which is the natural wrong guess and also
+   silently wrong.
+
+2. **The last limb is at bit 128, not bit 0.** `KoalaBearExt4.pack` is
+   `c0<<224 | c1<<192 | c2<<160 | c3<<128`; the low 128 bits are always
+   zero. Reading `packed & mask` for the fourth limb yields a valid-looking
+   zero. Round 0 of the vectors has `c3 == 0`, so round 0 passed and the
+   bug only surfaced at round 1 — the classic shape of a bug that a
+   single-example spot check confirms rather than catches.
+
+3. **The sponge chains; it does not clear.** `HashChallenger::flush`
+   (p3-challenger 0.8.0, `hash_challenger.rs:59-67`) drains
+   `input_buffer`, hashes it, then writes the digest **back into
+   `input_buffer`** as well as `output_buffer`. So round *n+1* absorbs
+   `digest_n || new_bytes`, not `new_bytes` alone. Verified independently:
+   `keccak256(prefix || round0_pair)` =
+   `64edc676...1963fa3a`, and `keccak256(that || round1_pair)`
+   reproduces round 1's sampled bytes exactly. The vendored
+   `KeccakChallenger._flush` already chains correctly, so this was a
+   thing to *confirm*, not to fix — but it is load-bearing and was not
+   previously written down anywhere.
+
+**Why the replay is the right test, not a property test.** Fiat–Shamir is
+a running hash whose *order* of absorbs determines every challenge. A
+reordered absorb set derives completely different challenges and looks
+correct in review. `test_replay_matches_rust` pins the whole interleaved
+program; `test_missing_prefix_desynchronizes` proves the coupling is real
+by showing that dropping the domain-separator prefix changes the output.
+
+**Reverted decision: use `observeValidatedPackedExt4Pair`.** The vendored
+pair absorber byte-swaps limbs big-endian for its own transcript
+convention. Ours is little-endian. We absorb each limb through
+`observeBase` (which is `_appendBaseLE`) after the Montgomery conversion,
+so the wire is `monty(c0).LE || monty(c1).LE || monty(c2).LE ||
+monty(c3).LE` per element, `c_a` before `c_inf`.
+
+**Anti-drift.** `prefix_hex` and `round_absorbs_hex` are emitted by the
+Rust generator from the real verifier's own trace, never hand-written. A
+change to the field, the transcript, or the round count shows up as a
+reviewable diff in `sumcheck_vectors.json`.
+
+**Revert this if** p3 changes `flush` to a non-chaining sponge, or if the
+packed limb layout changes. Either change breaks `test_replay_matches_rust`
+loudly, which is the point.
+
 ## D-048 — The vendored sumcheck fold is the WRONG FIELD IDENTITY for us
 
 **Status.** Discovered while generating sumcheck vectors, before writing any

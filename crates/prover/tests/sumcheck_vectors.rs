@@ -105,6 +105,35 @@ fn hex(bytes: &[u8]) -> String {
         })
 }
 
+/// The domain-separator prefix: everything absorbed before the first round.
+///
+/// Rendered as one contiguous hex string so the Solidity side can absorb
+/// it verbatim instead of reconstructing the `InteractionPattern`. The
+/// prefix is deterministic for a fixed shape, so this is a constant the
+/// generated fixed config can carry.
+fn prefix_hex(wire: &[String], num_rounds: usize) -> String {
+    let observes: Vec<&str> = wire
+        .iter()
+        .filter(|e| e.starts_with("observe "))
+        .map(|e| e.split('_').nth(1).unwrap_or(""))
+        .collect();
+    let prefix = &observes[..observes.len() - 8 * num_rounds];
+    prefix.concat()
+}
+
+/// The per-round absorbed bytes, round by round, as hex strings.
+fn round_absorbs_hex(wire: &[String], num_rounds: usize) -> Vec<String> {
+    let observes: Vec<&str> = wire
+        .iter()
+        .filter(|e| e.starts_with("observe "))
+        .map(|e| e.split('_').nth(1).unwrap_or(""))
+        .collect();
+    let split = observes.len() - 8 * num_rounds;
+    (0..num_rounds)
+        .map(|i| observes[split + 8 * i..split + 8 * (i + 1)].concat())
+        .collect()
+}
+
 /// What one replay of the real verifier produced.
 struct Replay {
     /// The folding challenges, one per round.
@@ -221,6 +250,8 @@ fn emit_sumcheck_vectors() -> Result<(), Box<dyn Error>> {
             "challenges": r2.challenges,
             "final_claim": r2.final_claim,
             "wire": r2.wire,
+            "prefix_hex": prefix_hex(&r2.wire, n_rounds),
+            "round_absorbs_hex": round_absorbs_hex(&r2.wire, n_rounds),
         }));
     }
 
