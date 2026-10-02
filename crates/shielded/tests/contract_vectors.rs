@@ -123,7 +123,52 @@ fn emit_contract_vectors() {
             "    {{ \"leaves\": [{joined}], \"root\": \"{root}\" }}{comma}"
         ));
     }
-    lines.push("  ]".to_string());
+    lines.push("  ],".to_string());
+
+    // Membership openings. The settlement verifier never rebuilds the tree; it
+    // checks that a claimed leaf sits at a claimed index under a root it already
+    // trusts. So the vectors must carry real paths, produced by the Rust tree,
+    // for the Solidity path checker to replay.
+    //
+    // Rebuilt from scratch here rather than reused from `cases` because the
+    // opening needs the tree in a populated state.
+    let mut tree = CommitmentTree::new(hasher);
+    for n in 1..=5u8 {
+        tree.append(&NoteHash::from_digest(leaf(n)));
+    }
+    let root = hex::encode(tree.root().as_bytes());
+    lines.push("  \"opening\": {".to_string());
+    lines.push(format!("    \"root\": \"{root}\","));
+    lines.push("    \"cases\": [".to_string());
+    let mut opening_cases = Vec::new();
+    for index in 0..5usize {
+        let path = tree.path(index).expect("index is populated");
+        let siblings: Vec<String> = path
+            .siblings
+            .iter()
+            .map(|s| hex::encode(s.as_bytes()))
+            .collect();
+        let leaf_hex =
+            hex::encode(leaf(u8::try_from(index + 1).expect("test index fits")).as_bytes());
+        opening_cases.push((index, leaf_hex, siblings));
+    }
+    for (i, (index, leaf_hex, siblings)) in opening_cases.iter().enumerate() {
+        let joined = siblings
+            .iter()
+            .map(|s| format!("\"{s}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let comma = if i + 1 == opening_cases.len() {
+            ""
+        } else {
+            ","
+        };
+        lines.push(format!(
+            "      {{ \"index\": {index}, \"leaf\": \"{leaf_hex}\", \"siblings\": [{joined}] }}{comma}"
+        ));
+    }
+    lines.push("    ]".to_string());
+    lines.push("  }".to_string());
     lines.push("}".to_string());
 
     let path = concat!(
@@ -131,4 +176,185 @@ fn emit_contract_vectors() {
         "/../../contracts/test/vectors/merkle.json"
     );
     std::fs::write(path, lines.join("\n") + "\n").expect("write vectors");
+
+    emit_solidity_merkle_test(hasher);
+}
+
+/// One Solidity assertion per populated index, opening against the tree's root.
+fn opening_lines(tree: &CommitmentTree<Keccak256Commitment>) -> Vec<String> {
+    let leaf = |b: u8| Digest32::new([b; 32]);
+    let mut out = Vec::new();
+    for index in 0..5usize {
+        let path = tree.path(index).expect("index is populated");
+        assert_eq!(path.siblings.len(), DEPTH, "path depth");
+        let sibs = path
+            .siblings
+            .iter()
+            .map(|s| format!("bytes32(0x{})", hex::encode(s.as_bytes())))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let leaf_hex =
+            hex::encode(leaf(u8::try_from(index + 1).expect("test index fits")).as_bytes());
+        out.push(format!(
+            "        bytes32[DEPTH] memory s{index} = [{sibs}];"
+        ));
+        out.push(format!(
+            "        assertTrue(MerkleProof.verify(root, {index}, bytes32(0x{leaf_hex}), s{index}), \"opening at {index} must verify\");"
+        ));
+    }
+    out
+}
+
+/// Emit the generated Solidity Merkle test.
+///
+/// Same anti-drift mechanism as the transcript vectors: the Rust tree is the
+/// source of truth and the on-chain test is generated from it rather than
+/// hand-written, so a change in the hashing or the fold shows up as a
+/// reviewable diff instead of a silent divergence between two
+/// implementations of the same idea.
+///
+/// Two things are pinned:
+/// - the append-only accumulator's root after each batch of leaves, against
+///   the real Rust `CommitmentTree`;
+/// - membership openings, which is what the settlement verifier actually
+///   does — it never rebuilds the tree, it checks a claimed leaf at a claimed
+///   index under a root it already trusts.
+fn emit_solidity_merkle_test(hasher: Keccak256Commitment) {
+    let leaf = |b: u8| Digest32::new([b; 32]);
+
+    // Append cases: root after each successive leaf.
+    let mut tree = CommitmentTree::new(hasher);
+    let mut append_lines: Vec<String> = Vec::new();
+    append_lines.push(format!(
+        "        assertEq(acc.root(), bytes32(0x{}), \"empty root\");",
+        hex::encode(tree.root().as_bytes())
+    ));
+    for n in 1..=5u8 {
+        tree.append(&NoteHash::from_digest(leaf(n)));
+        append_lines.push(format!(
+            "        acc.appendLeaf(bytes32(0x{})); // leaf {n}",
+            hex::encode(leaf(n).as_bytes())
+        ));
+        append_lines.push(format!(
+            "        assertEq(acc.root(), bytes32(0x{}), \"root after {n} leaves\");",
+            hex::encode(tree.root().as_bytes())
+        ));
+    }
+
+    // Opening cases: real paths from the real tree.
+    let root_hex = hex::encode(tree.root().as_bytes());
+    let open_lines = opening_lines(&tree);
+
+    // The negative tests need index 0's siblings too; emit them inline rather
+    // than trying to share a constant (Solidity has no constant dynamic
+    // arrays, and a fixed-size array parameter would force every call site
+    // into memory anyway).
+    let path0 = tree.path(0).expect("index 0 is populated");
+    let sibs0 = path0
+        .siblings
+        .iter()
+        .map(|x| format!("bytes32(0x{})", hex::encode(x.as_bytes())))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let src = format!(
+        r#"// SPDX-License-Identifier: MIT
+// GENERATED by `crates/shielded/tests/contract_vectors.rs::emit_contract_vectors`.
+// DO NOT EDIT BY HAND — regenerate with:
+//     cargo test -p shielded --test contract_vectors
+//
+// Pins the on-chain Merkle implementation to the Rust tree that produces
+// the real commitments. Both halves matter: the append-only accumulator
+// root, and the membership openings the settlement verifier actually
+// performs. The negative cases matter as much as the positive ones — a
+// verifier that always returns true passes every positive vector.
+pragma solidity ^0.8.28;
+
+import {{Test}} from "forge-std/Test.sol";
+import {{MerkleAccumulator}} from "../src/MerkleAccumulator.sol";
+import {{MerkleProof}} from "../src/MerkleProof.sol";
+
+/// Concrete wrapper so the append-only accumulator can be driven from a test.
+contract TestAccumulator is MerkleAccumulator {{
+    function appendLeaf(bytes32 leaf) external {{
+        _append(leaf);
+    }}
+}}
+
+contract MerkleVectorTest is Test {{
+    /// The tree depth the generated vectors were built at.
+    uint256 internal constant DEPTH = {depth};
+
+    /// The library's own depth must match the vectors'. If these ever
+    /// disagree the vectors are testing the wrong tree.
+    function test_depth_agrees_with_library() public pure {{
+        assertEq(MerkleProof.DEPTH, DEPTH, "vector depth != library depth");
+    }}
+
+    /// Append-only roots, replayed against the Rust `CommitmentTree`.
+    function test_append_roots_match_rust() public {{
+        TestAccumulator acc = new TestAccumulator();
+{append}
+    }}
+
+    /// Membership openings under the final root.
+    function test_openings_match_rust() public pure {{
+        bytes32 root = bytes32(0x{root});
+{open}
+    }}
+
+    /// A wrong index must not verify. The index selects the side at every
+    /// level, so a shifted index folds the siblings in the wrong order.
+    function test_wrong_index_rejects() public pure {{
+        bytes32 root = bytes32(0x{root});
+        bytes32[DEPTH] memory s0 = [{sibs0}];
+        assertFalse(
+            MerkleProof.verify(root, 1, bytes32(0x{leaf0}), s0),
+            "a shifted index must not verify"
+        );
+    }}
+
+    /// A substituted leaf must not verify.
+    function test_wrong_leaf_rejects() public pure {{
+        bytes32 root = bytes32(0x{root});
+        bytes32[DEPTH] memory s0 = [{sibs0}];
+        assertFalse(
+            MerkleProof.verify(root, 0, bytes32(0x{leaf1}), s0),
+            "a substituted leaf must not verify"
+        );
+    }}
+
+    /// A wrong sibling must not verify. This is the case a truncated or
+    /// spliced opening turns into at the decode boundary: the shape is right
+    /// because the codec enforced it, but the bytes are not the tree's.
+    function test_wrong_sibling_rejects() public pure {{
+        bytes32 root = bytes32(0x{root});
+        bytes32[DEPTH] memory bad = s0_at_zero();
+        bad[7] = bytes32(uint256(0xdead));
+        assertFalse(
+            MerkleProof.verify(root, 0, bytes32(0x{leaf0}), bad),
+            "a tampered sibling must not verify"
+        );
+    }}
+
+    /// Index 0's opening, for the negative cases.
+    function s0_at_zero() internal pure returns (bytes32[DEPTH] memory) {{
+        return [{sibs0}];
+    }}
+}}
+"#,
+        append = append_lines.join("\n"),
+        root = root_hex,
+        open = open_lines.join("\n"),
+        sibs0 = sibs0,
+        leaf0 = hex::encode(leaf(1).as_bytes()),
+        leaf1 = hex::encode(leaf(2).as_bytes()),
+        depth = DEPTH,
+    );
+
+    let out = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../contracts/test/MerkleVectors.t.sol"
+    );
+    std::fs::write(out, src).expect("write generated solidity");
 }
