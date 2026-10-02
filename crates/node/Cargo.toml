@@ -13,6 +13,17 @@ pq-hash = { workspace = true }
 pq-sign = { workspace = true }
 shielded = { workspace = true }
 prover = { workspace = true }
+# Direct deps on types that appear in the node's public API (`CircuitVerifier`,
+# `BatchStarkProof`) and on the field arithmetic at the statement boundary.
+# Same git rev as `prover`'s, pinned once in the workspace so the two crates
+# cannot drift onto incompatible `ExprId` types.
+p3-circuit-prover = { workspace = true }
+p3-field = { workspace = true }
+
+[dev-dependencies]
+# Real notes and trees, so the sequencer is driven by the same fixtures the
+# prover's own tests use.
+prover = { workspace = true, features = ["testkit"] }
 
 [lints]
 workspace = true

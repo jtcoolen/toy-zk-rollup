@@ -1483,3 +1483,219 @@ not a plonky3 uni-stark STARK):**
 port the WHIR round loop mirroring p3-whir 0.8.0's Rust verifier (their round code as
 cross-check, not authority) → our exporter + fixed-config generator → generated AIR
 constraint evaluator. Rust-emitted test vectors pin every seam.
+
+---
+
+## D-040 — Transcript absorbs base fields in Montgomery form; Solidity must be fed Montgomery limbs
+
+**Date:** proven by test `transcript_trace::tests::field_observes_are_recorded_as_montgomery_little_endian_u32`
+
+**Decision.** `SerializingChallenger32::observe(F)` serializes through
+`to_unique_u32()`, which returns the **Montgomery (raw internal)** representation,
+not the canonical value. For KoalaBear, `F::from_u32(0x1234)` is observed as
+`monty(0x1234) = 0x30ffdb4f`, little-endian bytes `4f db ff 30` — **not**
+`34 12 00 00`. The settlement exporter must therefore emit Montgomery-form limbs,
+and the Solidity challenger must absorb exactly those bytes.
+
+**Why.** This was discovered by writing the byte-level transcript recorder
+(`crates/prover/src/transcript_trace.rs`) and comparing against the canonical
+value computed independently as `R = 2^32 mod p` via `1u64.rotate_left(32) % P`.
+The vendored `KeccakChallenger.observeBase` requires `value < MODULUS` and appends
+a LE u32 — which is consistent with *either* form, so nothing in the vendored code
+disambiguates it. Assuming canonical would produce a verifier that accepts nothing
+(or worse, accepts the wrong statements) with no error pointing at the cause.
+
+**Alternatives considered.**
+- *Convert to canonical at the boundary.* Rejected: the transcript is what it is.
+  Converting would mean the Solidity side absorbs different bytes than the Rust
+  side, which is the drift this whole exercise exists to prevent.
+- *Document only, don't pin.* Rejected: a fact this load-bearing must be a test.
+  The pin computes `R` independently rather than calling the same `monty()` the
+  prover uses, so it cannot be circular.
+
+**Consequences.**
+1. The exporter emits `to_unique_u32()` output, not `as_canonical_u64()`.
+2. `BlockStatement.sol`'s limb decoding must be pinned against a Rust-emitted
+   golden vector before any trust is placed in it.
+3. Sampled values are a separate case: the sampler reads 4 raw bytes, masks with
+   `0x7fff_ffff`, and rejects ≥ modulus. The recorder sits **below** the mask, so
+   `raw & 0x7fff_ffff == canonical`. Pinned by
+   `field_samples_record_the_bytes_actually_returned`.
+
+**Security basis.** Fiat-Shamir soundness depends on prover and verifier deriving
+identical challenges. A representation mismatch is a total break of that
+identity — not a weakening, a failure to verify. Pinning it as a byte-level test
+is the only defense that survives a plonky3 upgrade.
+
+---
+
+## D-041 — Node holds trees, contract holds roots; state advances by replay, never assignment
+
+**Decision.** `PoolState` (crates/node/src/state.rs) holds the full note
+`CommitmentTree` and `NullifierMap`. The settlement contract stores two
+`bytes32` values and nothing else that matters. There is no `set_root` anywhere:
+the only way a root changes is that notes were appended or nullifiers inserted,
+and both recompute the root from the structure.
+
+**Why.** The split is deliberately asymmetric. The node can rebuild its trees by
+replaying the contract's published `BlockApplied` events — every output
+commitment and nullifier is in the verified statement. The contract cannot rebuild
+anything from a root; a root is a digest, not a data structure. So the node is a
+replaceable service and the contract is the irreplaceable ledger. Losing the node
+costs availability until another syncs; losing the contract costs the pool.
+
+**Alternatives considered.**
+- *Contract holds a full Merkle tree.* Rejected: on-chain insertion is ~50k gas
+  per note against ~200 gas for a root swap, and buys nothing — the tree's
+  contents are already on-chain as event data.
+- *Node stores only roots, refetches paths on demand.* Rejected: the prover needs
+  full paths and the full nullifier trie; refetching is strictly worse than
+  holding.
+
+**Security basis.** A `set_root` is the hole through which a node "fixes" a
+mismatched root and silently corrupts its own view. Its absence means every root
+in the node's history is derivable from operations that were themselves verified.
+
+---
+
+## D-042 — Batch members share the committed tree root and chain the nullifier root
+
+**Decision.** Within a batch, the two roots a transfer witnesses advance on
+**different schedules**, and the sequencer tracks both:
+
+| root | behaviour within a batch | why |
+|---|---|---|
+| tree root | **constant** — every transfer witnesses the same committed root | a transfer's outputs are not spendable until its block lands |
+| nullifier root | **chains forward** transfer by transfer | double-spend must be excluded against everything already queued |
+
+`Sequencer` holds a `pending: NullifierMap` projection. `submit` checks against
+`pending.root()` (not `state.nullifier_root()`), then advances `pending`. After a
+block settles, `pending` is rebuilt from the newly-committed map plus whatever is
+still queued.
+
+**Why.** A single check that read both roots from one snapshot could express
+neither. The tree root must *not* move within a batch — if transfer B could spend
+transfer A's output before A's block landed, the batch would be minting. The
+nullifier root *must* move — if B were checked only against committed state, two
+queued transfers spending the same note would both pass admission, and the block
+would be unwitnessable (or worse, if the chain constraint were absent, a
+double-spend).
+
+**Alternatives considered.**
+- *Check both against committed state.* Rejected: admits intra-batch double
+  spends at admission time; they only fail later, during proving, after CPU is
+  spent.
+- *Check both against a fully-pending state.* Rejected: would let a transfer
+  witness a tree root that includes queued outputs, i.e. spend money that has not
+  settled.
+- *Rebuild `pending` incrementally on every submit only.* Rejected: after a
+  rejection the projection could drift ahead of the ledger. Rebuilding from
+  committed state after each block keeps it anchored.
+
+**Security basis.** `PoolState::check_admit_against(public, expected_nf_root)`
+takes the nullifier root as an argument precisely so one implementation serves
+both the committed and pending cases without duplicating the tree-root check.
+Tested by `a_double_spend_across_the_batch_is_rejected_at_admission`.
+
+---
+
+## D-043 — `apply` validates before it mutates (atomic state transitions)
+
+**Decision.** `PoolState::apply` performs all validation on a probe copy before
+touching the real state. A rejected transfer leaves the state byte-identical to
+how it was found.
+
+**Why.** Found by a failing test, not by review. The first implementation
+inserted nullifiers as it checked them, so a transfer whose *second* nullifier
+was a duplicate left its *first* nullifier spent — a half-applied transfer that
+desynchronizes the two trees and leaves the node unable to build or verify the
+next block. The block driver applies transfers one at a time, so this is not a
+theoretical concern.
+
+**Alternatives considered.**
+- *Transactional wrapper with rollback.* Rejected: rebuilding the map is O(k·depth)
+  either way; a probe copy is simpler and has no rollback path to get wrong.
+- *Check-then-apply without the probe (check roots after insert).* Rejected: that
+  is exactly the bug. The root check must happen before the real insert.
+
+**Consequences.** The duplicate check also catches a transfer that lists the same
+nullifier twice (`seen: HashSet`), which a set-based insert would silently
+deduplicate rather than reject. Pinned by
+`a_transfer_cannot_spend_the_same_nullifier_twice`, whose fixture is built so
+that only the intra-batch check can catch it — a deduplicating insert would land
+on exactly the claimed `after` root and sail through.
+
+**Security basis.** A state machine that can be left half-advanced by a rejected
+input is not a state machine. Atomicity here is what makes "rejected" mean
+"nothing happened".
+
+---
+
+## D-044 — One client-walk implementation, shared via a `testkit` feature
+
+**Decision.** `prover::client::prove_client_transfer` is the single
+implementation of "build and prove one transfer". The prover's own test
+fixtures (`fixtures::nullifier_transition`) **delegate** to it rather than
+reimplementing the walk. Downstream crates get the fixtures via the non-default
+`testkit` feature.
+
+**Why.** Before this there were two copies of the nullifier-walk logic: one in
+`fixtures.rs` (test-only) and the inline sequence in `block.rs`'s tests. Two
+copies is how a test starts passing against a state transition the production
+prover would not produce. The node's integration tests need the same fixtures to
+drive the sequencer realistically, and a third copy in the node would have been
+the natural next step.
+
+**Alternatives considered.**
+- *Keep fixtures `#![cfg(test)]` and duplicate in node.* Rejected: the node's
+  e2e test would then be testing against a fixture the prover never uses.
+- *Make fixtures always-public, no feature gate.* Rejected: `seed(11)` is not
+  production API and should not appear in a downstream's default feature set.
+- *Promote fixtures to their own crate.* Considered; rejected as overkill for
+  ~130 lines, and the feature gate keeps the dependency graph unchanged.
+
+**Consequences.** `ClientSpec` now carries the output `Note` rather than an
+`out_value`, because the output's `rho`/`psi` must come from a CSPRNG owned by
+the wallet. Deriving them from the spent note's randomness — the obvious shortcut
+the first draft took — would make the two notes linkable by anyone who learns one
+of them, quietly breaking hiding for every transfer the shortcut touches.
+
+**Security basis.** Single implementation means the e2e path tested is the path
+shipped. The `testkit` gate keeps test scaffolding out of production builds.
+
+---
+
+## D-045 — SPHINCS+ envelope is defense-in-depth, not the spend authorization
+
+**Decision.** The SPHINCS+ signature in `ShieldedTransfer` is an **outer
+envelope**. It is explicitly *not* what authorizes a spend. The in-circuit
+nullifier relation (`nf = H(DOMAIN_NF ‖ sk_d ‖ rho)`, with `pk_d` committed in
+the note) is what authorizes.
+
+**Why.** The node cannot verify that a revealed SPHINCS+ verifying key
+corresponds to a note's `pk_d`: that relation is `pk_d = H(sk_d)` with `sk_d`
+secret, and no public function of the verifying key yields it. Making the
+binding cryptographic is precisely what in-circuit SPHINCS+ (ticket 10) buys.
+Until then the envelope is defense against a *misbehaving wallet*, not a
+replacement for the circuit's binding. Stating this in the module doc rather
+than glossing it, because a reader who assumes the envelope authorizes the spend
+would be wrong in a way that matters.
+
+**What the envelope does buy:**
+1. Junk stops at the mempool door — one signature check before any proving CPU.
+2. Non-repudiable provenance for submission.
+3. The seam ticket 10 closes cryptographically, with the wire format unchanged.
+
+**The signed message** is a domain-separated, length-prefixed encoding of the
+public statement (`DOMAIN_TX ‖ counts ‖ digests ‖ roots ‖ fee`), including both
+roots so a transfer re-broadcast against different state is a different message.
+Injectivity is tested directly: one 64-byte nullifier vs two 32-byte nullifiers
+must not collide, which is exactly what the length prefixes buy.
+
+**Alternatives considered.**
+- *Sign only the nullifiers.* Rejected: an output or fee could be swapped.
+- *Skip the envelope until ticket 10.* Rejected: no mempool DoS protection in
+  the interim, and the wire format would have to change later anyway.
+
+**Security basis.** Honest about what is and is not proven. The security story
+does not claim more than the cryptography delivers.

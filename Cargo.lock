@@ -329,6 +329,8 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 name = "node"
 version = "0.1.0"
 dependencies = [
+ "p3-circuit-prover",
+ "p3-field",
  "pq-hash",
  "pq-sign",
  "prover",

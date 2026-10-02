@@ -4,8 +4,17 @@
 //! wallet; these exist so circuit tests can build real, self-consistent notes
 //! without a random source, and so the same fixture is not reimplemented per
 //! module (a drifted copy is how a test starts passing against the wrong note).
+//!
+//! Built for the crate's own tests and for downstream crates that enable the
+//! `testkit` feature; see the module declaration in `lib.rs`.
 
-#![cfg(test)]
+// Fixtures assert their own preconditions with `expect`: a fixture that fails
+// should say so loudly at the call site rather than return a `Result` every
+// caller is obliged to thread through a test body. The panics are the point,
+// so `missing_panics_doc` is suppressed rather than documented per function —
+// every function in this file panics on a malformed fixture, and saying so
+// twenty times would obscure the one thing each one actually means.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::missing_panics_doc)]
 
 use crate::nullifier_gadget::NullifierWitness;
 use pq_hash::{Digest32, Keccak256Commitment, MerkleRoot, Sha3_256Shielded};
@@ -60,15 +69,10 @@ pub fn tree_with(notes: &[Note]) -> (CommitmentTree<Keccak256Commitment>, Vec<Ve
 
 /// The public statement and per-spend nullifier witnesses, from one map walk.
 ///
-/// These must be built together. The roots and the witnesses are two views of a
-/// single state transition: `before` is the map root on entry, each witness is
-/// the absence proof at the state it was drawn from, and `after` is the root on
-/// exit. Building them from separate walks is how they would drift apart — and a
-/// drifted pair makes a transfer unwitnessable rather than accepted, which is
-/// the safe direction but a confusing one to debug.
-///
-/// Mirrors what the node's prover orchestration does: walk the spends in order,
-/// ask the map for the absence witness, then insert.
+/// Delegates to [`crate::client::nullifier_transition`] rather than
+/// reimplementing the walk. Two copies of this logic is how a test starts
+/// passing against a state transition the production prover would not
+/// produce; one implementation means the fixture cannot drift.
 ///
 /// # Panics
 ///
@@ -80,24 +84,8 @@ pub fn nullifier_transition(
     transfer: &Transfer<'_>,
     map: &mut NullifierMap<Keccak256Commitment>,
 ) -> (NullifierRoots, Vec<NullifierWitness>) {
-    let before = map.root();
-    let mut witnesses = Vec::with_capacity(transfer.spends.len());
-    for spend in &transfer.spends {
-        let nf = spend.note.nullifier(&Sha3_256Shielded, spend.sk_d);
-        let native = map
-            .non_inclusion_witness(&nf)
-            .expect("fixture nullifiers must be distinct");
-        witnesses.push(
-            crate::nullifier_gadget::prepare_witness(map, &native)
-                .expect("map must be sparse enough for the circuit"),
-        );
-        assert!(map.insert(&nf), "fixture must not repeat a nullifier");
-    }
-    let roots = NullifierRoots {
-        before,
-        after: map.root(),
-    };
-    (roots, witnesses)
+    crate::client::nullifier_transition(transfer, map)
+        .expect("fixture must produce a valid nullifier transition")
 }
 
 /// [`nullifier_transition`] over a fresh empty map, returning the full

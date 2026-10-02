@@ -40,6 +40,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod block;
+pub mod client;
 pub mod config;
 pub mod nullifier_gadget;
 pub mod sha3_block;
@@ -49,11 +50,22 @@ pub mod whir;
 pub mod whir_recursion;
 // The spike is the executable statement of a property we depend on, not shipped API.
 #[cfg(test)]
-mod fixtures;
-#[cfg(test)]
 mod spike;
 
 pub use config::{Challenge, Challenger, Config, F};
+
+/// Deterministic shielded fixtures.
+///
+/// Compiled for the crate's own tests and for any downstream crate that
+/// enables the `testkit` feature. The node's integration tests need real,
+/// self-consistent notes to drive the sequencer, and reimplementing the
+/// fixture there is how a test ends up passing against a note the prover
+/// would never accept. One fixture, shared deliberately.
+///
+/// Gated rather than always-on because it is not production API: nothing in a
+/// real deployment should be building notes from `seed(11)`.
+#[cfg(any(test, feature = "testkit"))]
+pub mod fixtures;
 
 #[cfg(test)]
 mod profile_guard {

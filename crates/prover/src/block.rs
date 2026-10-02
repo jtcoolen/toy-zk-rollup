@@ -117,8 +117,12 @@ use crate::whir_recursion::F;
 /// value.
 ///
 /// Fan-in 1 settles at v=24; fan-in 2 needs v=25.
-#[cfg(test)]
-const BLOCK_LOG_MAX_LDE: usize = 25;
+///
+/// `pub` because the node's block driver passes it to
+/// [`settle_block_circuit`]. The value is production configuration chosen by
+/// measurement, not a test-only knob; a driver that batches more than two
+/// transfers must raise it and re-measure, per the curve above.
+pub const BLOCK_LOG_MAX_LDE: usize = 25;
 
 /// Merkle cap height for the settlement layer.
 ///
@@ -575,12 +579,11 @@ pub fn settle_block_circuit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::{funded_note, nullifier_transition, seed, tree_with};
-    use crate::transfer::{build_transfer_circuit, settle_transfer_circuit_with, LOG_MAX_LDE};
+    use crate::fixtures::{funded_note, seed, tree_with};
+    use crate::transfer::LOG_MAX_LDE;
     use p3_field::PrimeCharacteristicRing;
     use pq_hash::{Keccak256Commitment, Sha3_256Shielded};
     use shielded::keys::derive_spend_pk;
-    use shielded::transfer::Spend;
     use shielded::{Note, NullifierMap};
 
     /// Every transfer in these tests spends one note and creates one.
@@ -613,6 +616,11 @@ mod tests {
 
     /// Build and prove one client transfer, as a spender would on their own
     /// machine, returning the artefacts a block consumes.
+    ///
+    /// A thin adapter over [`crate::client::prove_client_transfer`]. The
+    /// production client is the single implementation of this walk; keeping a
+    /// second copy here is how a test would end up passing against a state
+    /// transition the real prover does not produce.
     fn prove_client_transfer(
         inner: &InnerWhirConfig,
         spec: &ClientSpec<'_>,
@@ -621,30 +629,16 @@ mod tests {
         map: &mut NullifierStore,
     ) -> Result<ClientTransfer, Box<dyn Error>> {
         let out = Note::new(spec.out_value, seed(200), seed(201), recipient);
-        let spend = Spend {
+        let client_spec = crate::client::ClientSpec {
             note: spec.note,
             sk_d: spec.sk_d,
             path: spec.path,
             index: spec.index,
-        };
-        let transfer = Transfer {
-            spends: vec![spend],
-            outputs: vec![out],
+            output: &out,
             fee: 100,
         };
-        // The roots and the witnesses come out of one walk of the shared map, so
-        // this client's `before` is whatever the previous client left behind.
-        let (nullifier_roots, witnesses) = nullifier_transition(&transfer, map);
-        let public = transfer.public(
-            &Keccak256Commitment,
-            &Sha3_256Shielded,
-            root,
-            nullifier_roots,
-        );
-        let tc = build_transfer_circuit(&transfer, &public, &witnesses)?;
-        let (proof, verifier) = settle_transfer_circuit_with(&tc, inner.clone())?;
-        verifier.verify(&proof, tc.statement())?;
-        Ok((verifier, proof, tc.statement().to_vec()))
+        let artifacts = crate::client::prove_client_transfer(inner, &client_spec, root, map)?;
+        Ok((artifacts.verifier, artifacts.proof, artifacts.statement))
     }
 
     /// The shared-root anchor must reject a block assembled from transfers
@@ -1097,6 +1091,4 @@ mod tests {
         }
         Ok(())
     }
-
-    use shielded::Transfer;
 }

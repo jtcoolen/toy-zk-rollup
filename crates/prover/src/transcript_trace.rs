@@ -119,13 +119,14 @@ impl TranscriptTrace {
                 Event::Observe { tag, bytes } => ("observe", tag, bytes),
                 Event::Sample { tag, bytes } => ("sample", tag, bytes),
             };
-            let hex: String = bytes
-                .iter()
-                .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-                    use std::fmt::Write as _;
-                    let _ = write!(acc, "{b:02x}");
-                    acc
-                });
+            let hex: String =
+                bytes
+                    .iter()
+                    .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
+                        use std::fmt::Write as _;
+                        let _ = write!(acc, "{b:02x}");
+                        acc
+                    });
             let label = tag.as_deref().unwrap_or("-");
             let _ = writeln!(out, "{i:>4} {verb:<8} {label:<28} {hex}");
         }
@@ -362,7 +363,10 @@ mod tests {
             p3_challenger::HashChallenger::new(Vec::new(), p3_keccak::Keccak256Hash {}),
             sink.clone(),
         );
-        (p3_challenger::SerializingChallenger32::<F, _>::new(inner), sink)
+        (
+            p3_challenger::SerializingChallenger32::<F, _>::new(inner),
+            sink,
+        )
     }
 
     /// The recorder must be transparent: wrapping cannot change the values
@@ -373,11 +377,9 @@ mod tests {
     /// would be meaningless.
     #[test]
     fn wrapping_does_not_change_the_transcript() {
-        let mut plain =
-            p3_challenger::SerializingChallenger32::<F, _>::new(p3_challenger::HashChallenger::new(
-                Vec::new(),
-                p3_keccak::Keccak256Hash {},
-            ));
+        let mut plain = p3_challenger::SerializingChallenger32::<F, _>::new(
+            p3_challenger::HashChallenger::new(Vec::new(), p3_keccak::Keccak256Hash {}),
+        );
         let (mut traced_ch, _sink) = traced();
 
         for i in 0..8u32 {

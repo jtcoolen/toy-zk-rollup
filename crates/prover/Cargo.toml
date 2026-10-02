@@ -63,6 +63,10 @@ postcard = "1.1"
 # relying on feature unification to reach the shim indirectly.
 [features]
 default = ["parallel"]
+
+# Expose the deterministic shielded fixtures (see `fixtures`) to downstream
+# crates' tests. Off by default: it is test scaffolding, not API.
+testkit = []
 parallel = [
     "p3-challenger/parallel",
     "p3-circuit-prover/parallel",

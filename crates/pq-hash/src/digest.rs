@@ -63,6 +63,15 @@ impl NoteHash {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         self.0.as_bytes()
     }
+
+    /// Lowercase hex encoding.
+    ///
+    /// Re-exposed on each newtype rather than reached through `.0`: callers
+    /// logging a commitment should not have to know it wraps a `Digest32`.
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        self.0.to_hex()
+    }
 }
 
 impl Nullifier {
@@ -77,6 +86,12 @@ impl Nullifier {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         self.0.as_bytes()
     }
+
+    /// Lowercase hex encoding.
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        self.0.to_hex()
+    }
 }
 
 impl MerkleRoot {
@@ -90,6 +105,15 @@ impl MerkleRoot {
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
         self.0.as_bytes()
+    }
+
+    /// Lowercase hex encoding.
+    ///
+    /// Re-exposed on each newtype rather than reached through `.0`: callers
+    /// logging a root should not have to know it wraps a `Digest32`.
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        self.0.to_hex()
     }
 }
 
