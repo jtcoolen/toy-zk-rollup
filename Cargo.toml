@@ -106,6 +106,45 @@ hex = { version = "0.4", default-features = false, features = ["alloc"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = "1.0"
 subtle = { version = "2.6", default-features = false }
+# Property-based testing. Dev-only: the node's keystore, token, and rate-limiter
+# tests use it to fuzz inputs the hand-written cases would not reach.
+proptest = "1.11"
+
+# --- Node security: password-protected keystore ---
+#
+# Argon2id (RFC 9106) for password hashing: memory-hard, the current
+# OWASP/Password-Hashing-Cheatsheet recommendation for server-side and
+# local-vault KDFs. We use `hash_password_into` with a salt drawn from the
+# workspace CSPRNG, so no `password-hash` string encoding is pulled in.
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
+# AES-256-GCM (AEAD) for encrypting the vault payload under the KDF-derived
+# key. `getrandom` gives the 96-bit nonce from OS entropy. `hazmat` is NOT
+# enabled: the safe API is the only one exposed.
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
+# HMAC-SHA256 for signing node-issued bearer tokens: stateless auth, so a
+# restart does not invalidate sessions, and verification is one hash.
+# `sha2` (the digest) and `zeroize` are already declared above as workspace
+# deps; the node consumes them via `workspace = true` in its own manifest.
+hmac = { version = "0.13", default-features = false }
+
+# --- Node transport: HTTP + middleware ---
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+axum = { version = "0.8", features = ["matched-path"] }
+tower-http = { version = "0.7", features = ["cors", "request-id", "trace", "limit"] }
+# Per-client rate limiting (token bucket), keyed by remote peer.
+governor = { version = "0.10", default-features = false, features = ["std"] }
+nonzero_ext = "0.3"
+
+# --- Observability: Prometheus metrics + structured logs ---
+metrics = "0.24"
+# `metrics-util` provides `MetricKindMask` for the exporter's idle-timeout
+# configuration. Same version line the exporter pulls in, so no duplicate.
+metrics-util = "0.20"
+# No built-in HTTP listener: axum already owns the port, so the exporter is
+# used in pull-render mode (`render()`) served at /metrics by our router.
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # --- Workspace crates ---
 pq-hash = { path = "crates/pq-hash" }

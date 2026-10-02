@@ -56,10 +56,15 @@
 //! machine. A node that could build them is a node that could spend anything.
 //! The client-side half is the wallet; see `wallet/`.
 
+pub mod auth;
+pub mod keystore;
+pub mod metrics;
 pub mod sequencer;
 pub mod state;
 pub mod tx;
 
+pub use auth::{Acl, AuthError, Role, TokenSigner};
+pub use keystore::{KeystoreError, SealedVault};
 pub use sequencer::{BlockArtifact, ClientTransferProof, Sequencer, SequencerError};
 pub use state::{PoolState, StateError};
 pub use tx::{ShieldedTransfer, TxError};

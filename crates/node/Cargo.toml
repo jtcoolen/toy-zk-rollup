@@ -20,10 +20,44 @@ prover = { workspace = true }
 p3-circuit-prover = { workspace = true }
 p3-field = { workspace = true }
 
+# --- Security: password-protected keystore + signed bearer tokens ---
+argon2 = { workspace = true }
+aes-gcm = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
+subtle = { workspace = true }
+rand = { workspace = true, features = ["sys_rng", "std"] }
+hex = { workspace = true }
+
+# --- Transport: HTTP server with CORS, request-id, rate limiting ---
+tokio = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+governor = { workspace = true }
+nonzero_ext = { workspace = true }
+
+# --- Observability: Prometheus metrics + structured logs ---
+metrics = { workspace = true }
+metrics-util = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# --- Serialization for the wire DTOs ---
+serde = { workspace = true, features = ["std"] }
+serde_json = { workspace = true }
+postcard = { version = "1.0", default-features = false, features = ["alloc"] }
+thiserror = { workspace = true }
+
 [dev-dependencies]
 # Real notes and trees, so the sequencer is driven by the same fixtures the
 # prover's own tests use.
 prover = { workspace = true, features = ["testkit"] }
+# Integration tests drive the HTTP server over a real socket. Plain HTTP only,
+# so no TLS provider is pulled into the dev-dependency graph.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+proptest = { workspace = true }
 
 [lints]
 workspace = true
