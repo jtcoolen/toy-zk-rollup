@@ -1,0 +1,55 @@
+{
+  "modulus": 2130706433,
+  "montgomery_r": 33554430,
+  "note": "montgomery_le_hex is the byte string the transcript absorbs; it is NOT canonical_le_hex",
+  "values": [
+    {
+      "canonical": 0,
+      "canonical_le_hex": "00000000",
+      "montgomery": 0,
+      "montgomery_le_hex": "00000000"
+    },
+    {
+      "canonical": 1,
+      "canonical_le_hex": "01000000",
+      "montgomery": 33554430,
+      "montgomery_le_hex": "feffff01"
+    },
+    {
+      "canonical": 2,
+      "canonical_le_hex": "02000000",
+      "montgomery": 67108860,
+      "montgomery_le_hex": "fcffff03"
+    },
+    {
+      "canonical": 7,
+      "canonical_le_hex": "07000000",
+      "montgomery": 234881010,
+      "montgomery_le_hex": "f2ffff0d"
+    },
+    {
+      "canonical": 65535,
+      "canonical_le_hex": "ffff0000",
+      "montgomery": 100531194,
+      "montgomery_le_hex": "fafbfd05"
+    },
+    {
+      "canonical": 4660,
+      "canonical_le_hex": "34120000",
+      "montgomery": 822074191,
+      "montgomery_le_hex": "4fdbff30"
+    },
+    {
+      "canonical": 1000000,
+      "canonical_le_hex": "40420f00",
+      "montgomery": 65093116,
+      "montgomery_le_hex": "fc3de103"
+    },
+    {
+      "canonical": 2130706432,
+      "canonical_le_hex": "0000007f",
+      "montgomery": 2097152003,
+      "montgomery_le_hex": "0300007d"
+    }
+  ]
+}

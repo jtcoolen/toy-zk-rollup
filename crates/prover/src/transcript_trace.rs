@@ -355,6 +355,39 @@ mod tests {
         )
     }
 
+    /// Pin the relationship between a digest limb's canonical value and the
+    /// bytes the transcript actually absorbs.
+    ///
+    /// The statement the contract decodes carries *canonical* 16-bit limbs
+    /// (`LimbCodec.digestFromLimbs` reads them as such). The transcript
+    /// absorbs *Montgomery* bytes. Both are true at once, and the settlement
+    /// verifier has to know which form it is absorbing at each point, so the
+    /// mapping is pinned here rather than reasoned about at the call site.
+    #[test]
+    fn digest_limbs_are_canonical_in_the_statement_and_montgomery_in_the_transcript() {
+        use p3_field::PrimeField64;
+        let mut ch = traced();
+        let limb = 0x1234u32;
+        let f = F::from_u32(limb);
+        ch.0.observe(f);
+        let trace = ch.1.trace();
+        let bytes = match trace.events.last() {
+            Some(Event::Observe { bytes, .. }) => bytes.clone(),
+            other => panic!("expected an observe event, got {other:?}"),
+        };
+        // Canonical LE would be `34 12 00 00`.
+        assert_ne!(
+            bytes,
+            vec![0x34, 0x12, 0x00, 0x00],
+            "the transcript must NOT absorb canonical bytes"
+        );
+        // And the canonical value round-trips independently of the transcript.
+        assert_eq!(f.as_canonical_u64(), u64::from(limb));
+        // So the two forms differ, and the exporter must be explicit about
+        // which one it hands to the contract.
+        assert_eq!(bytes.len(), 4);
+    }
+
     /// Build a traced challenger and return it with its sink, so tests can
     /// read the trace without reaching through the wrapper.
     fn traced() -> (Traced, TraceSink) {

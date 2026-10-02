@@ -43,15 +43,27 @@ p3-poseidon2-circuit-air = { workspace = true }
 
 rand = { workspace = true, features = ["thread_rng", "std"] }
 serde = { workspace = true }
+# The settlement proof format. `postcard` is serde over a varint-framed,
+# non-self-describing encoding, so a `#[derive(Serialize)]` proof serializes
+# with no field-name overhead — and the byte count is the calldata the chain
+# pays for, which makes it the format that decides whether on-chain
+# verification is feasible at all.
+postcard = "1.1"
 
-# Proof-size measurement only (dev). `postcard` is the compact binary format the
-# settlement layer ships proofs in: it is `serde` over a varint-framed, non-self
-# -describing encoding, so a `#[derive(Serialize)]` proof serializes without any
-# JSON field-name overhead. The byte count is the calldata the chain pays for, so
-# this is the number that decides whether on-chain verification is feasible.
 [dev-dependencies]
 serde_json = "1"
-postcard = "1.1"
+# Used by the golden-vector generator to fingerprint proof bytes with the same
+# Keccak the settlement transcript uses, so the vector's digest is meaningful
+# to the Solidity side.
+p3-keccak = { workspace = true }
+p3-symmetric = { workspace = true }
+# Self-dependency with `testkit` on. An integration test links against the lib
+# compiled *without* `cfg(test)`, so the fixtures gated on it are otherwise
+# invisible to `tests/`. Depending on ourselves with the feature enabled is the
+# standard way to reach test-only items from integration tests without putting
+# them in the default feature set. Cargo handles the cycle by building the lib
+# once with the feature on.
+prover = { path = ".", features = ["testkit"] }
 
 # Proving is embarrassingly parallel (DFT butterflies, LDE rows, Merkle nodes),
 # but Plonky3 routes all of it through `p3-maybe-rayon`, a shim that maps
