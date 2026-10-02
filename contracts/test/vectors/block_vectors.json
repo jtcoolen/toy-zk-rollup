@@ -1,8 +1,8 @@
 {
   "note": "a real settled block; statement limbs are canonical, transcript_words are Montgomery",
   "num_transfers": 1,
-  "proof_keccak_hex": "9f88bf90d831f501c9482ff33269b966d4ddd0f1d617e44975eafecba2e965b1",
-  "proof_len": 728344,
+  "proof_keccak_hex": "ed2cdf58198e0e34745c12a92505ab1ab019da9f2136b9200377303446a728aa",
+  "proof_len": 850941,
   "statement": [
     2136,
     10068,

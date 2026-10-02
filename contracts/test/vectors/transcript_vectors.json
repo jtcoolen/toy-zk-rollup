@@ -1,5 +1,9 @@
 {
   "alpha_canonical": 1934910242,
+  "challenges": [
+    1934910242,
+    935446202
+  ],
   "events": [
     {
       "hex": "b5c7220a",
@@ -86,31 +90,31 @@
       "tag": null
     },
     {
-      "hex": "e5ffff1a",
+      "hex": "f2ffff0d",
       "len": 4,
       "op": "observe",
       "tag": null
     },
     {
-      "hex": "f0",
+      "hex": "b0",
       "len": 1,
       "op": "sample",
       "tag": null
     },
     {
-      "hex": "03",
+      "hex": "bf",
       "len": 1,
       "op": "sample",
       "tag": null
     },
     {
-      "hex": "4b",
+      "hex": "38",
       "len": 1,
       "op": "sample",
       "tag": null
     },
     {
-      "hex": "e0",
+      "hex": "68",
       "len": 1,
       "op": "sample",
       "tag": null
@@ -119,7 +123,30 @@
   "hash": "keccak256",
   "note": "exact byte sequence a verifier must replay; sample hex is squeezed, observe hex is absorbed",
   "pow_bits": 4,
-  "pow_prefix_observations_hex": "b5c7220afeffff01fcffff03fafbfd05",
-  "witness_canonical": 1065353230,
+  "program": [
+    {
+      "observe": 3735928559
+    },
+    {
+      "sample": true
+    },
+    {
+      "observe": 1
+    },
+    {
+      "observe": 2
+    },
+    {
+      "observe": 65535
+    },
+    {
+      "sample": true
+    },
+    {
+      "grind": 4
+    }
+  ],
+  "witness_canonical": 7,
+  "witness_montgomery_le_hex": "f2ffff0d",
   "zeta_canonical": 935446202
 }

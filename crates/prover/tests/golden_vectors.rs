@@ -129,46 +129,68 @@ fn field_vectors() -> Result<(), Box<dyn Error>> {
     println!("wrote {}", path.display());
     Ok(())
 }
+/// One step of a transcript program.
+///
+/// The transcript is a *program*, not a blob: a sequence of absorbs and
+/// squeezes whose order determines every challenge. Expressing it as data
+/// lets the same program drive the Rust challenger (producing the golden
+/// values) and the Solidity challenger (replaying them), which is the whole
+/// anti-drift mechanism.
+enum Step {
+    /// Absorb a base-field element.
+    Observe(u32),
+    /// Sample a base-field challenge.
+    Sample,
+    /// Grind a proof-of-work witness of `bits` difficulty.
+    Grind(usize),
+}
+
+/// A transcript program that mirrors the settlement verifier's shape:
+/// commit, challenge, public values, OOD point, proof-of-work.
+fn settlement_program() -> Vec<Step> {
+    vec![
+        Step::Observe(0xdead_beef), // a commitment
+        Step::Sample,               // alpha
+        Step::Observe(1),           // public values
+        Step::Observe(2),
+        Step::Observe(0xffff),
+        Step::Sample, // zeta
+        Step::Grind(4),
+    ]
+}
 
 /// Transcript vectors from a live challenger.
 ///
-/// Runs the same absorb/squeeze pattern a verifier replay would, records every
-/// byte, and emits the sequence. The Solidity verifier is correct when it
-/// reproduces this exact sequence.
+/// Runs the settlement program against a traced challenger, records every
+/// byte and every derived challenge, and emits both the JSON vector and a
+/// generated Solidity test that replays the same program.
 #[test]
 fn transcript_vectors() -> Result<(), Box<dyn Error>> {
-    let mut traced = TracedTranscript::<prover::whir::F>::new();
+    use prover::whir::F;
 
-    // A pattern that mirrors the real verifier's phases: observe a commitment,
-    // squeeze a challenge, observe public values, squeeze an OOD point, grind.
-    traced
-        .challenger
-        .observe(<prover::whir::F>::from_u32(0xdead_beef));
-    let alpha: prover::whir::F = traced.challenger.sample();
-    traced.challenger.observe_slice(&[
-        <prover::whir::F>::from_u32(1),
-        <prover::whir::F>::from_u32(2),
-        <prover::whir::F>::from_u32(0xffff),
-    ]);
-    let zeta: prover::whir::F = traced.challenger.sample();
-    // Grinding: search for a witness whose absorption makes the next
-    // `bits` sampled bits all zero.
-    //
-    // `grind` runs the check itself before returning — `check_witness` is
-    // stateful, absorbing the witness and consuming bits from the sponge, so
-    // calling it again here would be checking against a transcript that has
-    // already moved past the point the witness was found at. The absorb and
-    // sample the check performs are recorded in the trace, which is exactly
-    // what the Solidity verifier must replay.
-    // `grind` validates its own output: before returning it asserts
-    // `check_witness` against this very challenger, so the witness is pinned
-    // against the live transcript state a Solidity replay will reproduce.
-    // The absorb and the bits it samples are recorded in the trace, which is
-    // what the on-chain `checkWitness` must replay.
-    let pow_bits = 4usize;
-    let witness = traced.challenger.grind(pow_bits);
+    let mut traced = TracedTranscript::<F>::new();
+    let mut challenges: Vec<u64> = Vec::new();
+    let mut witness: Option<F> = None;
+    let mut pow_bits = 0usize;
+
+    for step in settlement_program() {
+        match step {
+            Step::Observe(v) => traced.challenger.observe(F::from_u32(v)),
+            Step::Sample => {
+                let c: F = traced.challenger.sample();
+                challenges.push(c.as_canonical_u64());
+            }
+            Step::Grind(bits) => {
+                pow_bits = bits;
+                witness = Some(traced.challenger.grind(bits));
+            }
+        }
+    }
 
     let trace = traced.trace();
+    let alpha = challenges[0];
+    let zeta = challenges[1];
+    let witness = witness.expect("the program grinds");
 
     let events: Vec<serde_json::Value> = trace
         .events
@@ -183,36 +205,154 @@ fn transcript_vectors() -> Result<(), Box<dyn Error>> {
         })
         .collect();
 
-    // The bytes absorbed *before* the proof-of-work absorb. A Solidity test
-    // feeds these to its challenger, then calls `checkWitness(witness)` and
-    // must get `true` — deterministic, because the witness came from the
-    // file rather than from a fresh parallel search.
-    let pow_absorb_index = trace
-        .events
-        .iter()
-        .rposition(|ev| matches!(ev, Event::Observe { bytes, .. } if bytes.len() == 4))
-        .expect("the witness absorb is recorded");
-    let mut pow_prefix_hex = String::new();
-    for ev in &trace.events[..pow_absorb_index] {
-        if let Event::Observe { bytes, .. } = ev {
-            pow_prefix_hex.push_str(&hex(bytes));
-        }
-    }
-
     let path = write_vector(
         "transcript_vectors.json",
         &serde_json::json!({
             "hash": "keccak256",
             "note": "exact byte sequence a verifier must replay; sample hex is squeezed, observe hex is absorbed",
-            "alpha_canonical": alpha.as_canonical_u64(),
-            "zeta_canonical": zeta.as_canonical_u64(),
+            "program": settlement_program_json(),
+            "challenges": challenges,
+            "alpha_canonical": alpha,
+            "zeta_canonical": zeta,
             "witness_canonical": witness.as_canonical_u64(),
+            "witness_montgomery_le_hex": hex(&witness.to_unique_u32().to_le_bytes()),
             "pow_bits": pow_bits,
-            "pow_prefix_observations_hex": pow_prefix_hex,
             "events": events,
         }),
     )?;
     println!("wrote {} ({} events)", path.display(), trace.len());
+
+    emit_solidity_transcript_test(&challenges, &hex(&witness.to_unique_u32().to_le_bytes()))?;
+    Ok(())
+}
+
+/// The program as JSON, so the Solidity generator and any future consumer
+/// reads the same description rather than re-deriving it from a trace.
+fn settlement_program_json() -> Vec<serde_json::Value> {
+    settlement_program()
+        .into_iter()
+        .map(|s| match s {
+            Step::Observe(v) => serde_json::json!({"observe": v}),
+            Step::Sample => serde_json::json!({"sample": true}),
+            Step::Grind(b) => serde_json::json!({"grind": b}),
+        })
+        .collect()
+}
+
+/// Emit the generated Solidity transcript-replay test.
+///
+/// The Rust side is the source of truth; the on-chain test is generated from
+/// it and never hand-written. This is the anti-drift mechanism from
+/// `input-output-hk/plutus-plonky3-exploration`: their `convert.py` turns a
+/// Rust proof dump into an Aiken test literal, and the generated file is
+/// checked in so a transcript change shows up as a reviewable diff.
+///
+/// The emitted program is the trace *up to the grind's own absorb*. The
+/// grind's search activity is prover-side noise that the verifier never
+/// replays: the verifier absorbs the witness that came from the proof and
+/// calls `checkWitness`, which is exactly the last absorb plus a bit sample.
+fn emit_solidity_transcript_test(
+    challenges: &[u64],
+    witness_monty_le: &str,
+) -> Result<(), Box<dyn Error>> {
+    // Emit the program itself, not a trace parse. The program is the source
+    // of truth and the recorded challenges are its real outputs, so the
+    // generated Solidity is the same program with the same expected values.
+    //
+    // (Parsing the trace instead would be wrong: `grind` clones the
+    // challenger to search candidates and the `Arc`-shared sink records the
+    // clone's activity, so the raw event stream contains prover-side search
+    // noise the verifier never replays.)
+    let mut lines: Vec<String> = Vec::new();
+    let mut samples = 0usize;
+    let mut challenge_at = 0usize;
+
+    for step in settlement_program() {
+        match step {
+            Step::Observe(v) => {
+                // The transcript absorbs the MONTGOMERY representation, not
+                // the canonical value. This is the transport fact from
+                // D-045 and the single most likely place for a silent
+                // divergence between the two implementations.
+                let bytes = prover::export::monty(v).to_le_bytes();
+                lines.push(format!(
+                    "        state.observeBytes(hex\"{}\"); // canonical {v:#x}, absorbed as Montgomery",
+                    hex(&bytes)
+                ));
+            }
+            Step::Sample => {
+                let expected = challenges[challenge_at];
+                challenge_at += 1;
+                lines.push(format!("        uint256 s{samples} = state.sampleBase();"));
+                lines.push(format!(
+                    "        assertEq(s{samples}, {expected}, \"sample {samples} diverges from the Rust transcript\");"
+                ));
+                samples += 1;
+            }
+            Step::Grind(bits) => {
+                lines.push(format!(
+                    "        // Proof-of-work: absorbing the witness must zero the next {bits} bits."
+                ));
+                lines.push(format!(
+                    "        state.observeBytes(hex\"{witness_monty_le}\");"
+                ));
+                lines.push(format!(
+                    "        assertEq(state.sampleBitsUnchecked({bits}), 0, \"PoW witness does not satisfy the challenge\");"
+                ));
+            }
+        }
+    }
+
+    let body = lines.join("\n");
+
+    let src = format!(
+        r#"// SPDX-License-Identifier: MIT
+// GENERATED by `crates/prover/tests/golden_vectors.rs::transcript_vectors`.
+// DO NOT EDIT BY HAND — regenerate with:
+//     cargo test -p prover --test golden_vectors transcript_vectors -- --ignored --nocapture
+//
+// Replays the exact interleaved absorb/sample program the Rust settlement
+// transcript performs, asserting every challenge the Solidity challenger
+// derives equals the value the Rust prover saw.
+//
+// Interleaving is the point. Fiat-Shamir is a running hash: absorbing the
+// same set of bytes in a different order derives completely different
+// challenges while looking correct in review. This file is generated from
+// the program that produced the real values, so the order cannot drift.
+//
+// Note the absorbed bytes are MONTGOMERY forms, not canonical values. The
+// statement crossing the settlement boundary is canonical; the transcript
+// absorbs Montgomery. See D-045.
+pragma solidity ^0.8.28;
+
+import {{Test}} from "forge-std/Test.sol";
+import {{KeccakChallenger}} from "../lib/sol-whir-p3/transcript/KeccakChallenger.sol";
+
+contract TranscriptReplayTest is Test {{
+    using KeccakChallenger for KeccakChallenger.State;
+
+    /// The whole point of this test: replay the Rust program and land on the
+    /// Rust challenges. Any change to the absorb/sample order changes every
+    /// subsequent challenge, so this fails loudly rather than drifting.
+    function test_replay_matches_rust_challenges() public pure {{
+        KeccakChallenger.State memory state;
+
+{body}
+    }}
+}}
+"#,
+    );
+
+    // `vectors_dir()` is `<root>/contracts/test/vectors`; its parent is the
+    // Solidity test directory.
+    let dir = vectors_dir()
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or("could not locate contracts/test")?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("TranscriptReplay.t.sol");
+    std::fs::write(&path, src)?;
+    println!("wrote generated {}", path.display());
     Ok(())
 }
 
