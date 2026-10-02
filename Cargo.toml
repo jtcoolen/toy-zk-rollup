@@ -9,6 +9,14 @@ members = [
     "crates/recursion-test",
 ]
 
+# The vendored recursion tree is a full upstream repo with its OWN workspace root
+# (vendor/p3-recursion/Cargo.toml). Without this `exclude`, cargo would treat the
+# vendored crates as auto-members of THIS workspace, and their `version.workspace =
+# true` / `[lints] workspace = true` inheritance would resolve against our
+# manifest instead of upstream's. Excluding keeps them in their own workspace:
+# upstream's package metadata and upstream's lint profile stay intact.
+exclude = ["vendor"]
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
@@ -50,25 +58,41 @@ p3-uni-stark = "0.8.0"
 p3-dft = "0.8.0"
 p3-keccak = "0.8.0"
 
-# Recursion: consumed from git, NOT from crates.io.
+# Recursion: consumed from a VENDORED copy, NOT from git or crates.io.
 #
 # The crates.io `p3-recursion` 0.1.0 is an empty placeholder (zero dependencies).
 # See .scratch/pq-shielded-rollup/issues/04-recursion-source-of-truth.md
 #
-# Pinned to a rev, not a branch: a drifting branch would silently change the
-# verifier circuit and invalidate every accepted proof.
-p3-recursion = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "8f9876efb26cff0f4b837555b478f043c4314240" }
+# Upstream was pinned at rev
+# 8f9876efb26cff0f4b837555b478f043c4314240 and then PATCHED locally. The patch
+# is load-bearing: upstream hardcodes `const ZK: bool = false` on the WHIR uni
+# PCS, which makes every blinding branch in uni-stark dead code and leaves spend
+# secrets recoverable from opened trace cells. We cannot ship that.
+# See .scratch/pq-shielded-rollup/decisions.md D-046.
+#
+# `vendor/p3-recursion` is a full copy of the upstream repo, including its own
+# workspace root, so `workspace = true` inheritance inside it still resolves
+# against upstream's manifest rather than ours. That also means the vendored
+# crates keep upstream's lint profile instead of inheriting ours.
+#
+# The pristine copy at .scratch/vendor/p3-recursion-pristine is kept so the local
+# diff can be re-emitted as a `git apply`-able patch against the upstream rev:
+#
+#   diff -ruN .scratch/vendor/p3-recursion-pristine vendor/p3-recursion
+#
+# Only the four crates we actually depend on are built from this tree.
+p3-recursion = { path = "vendor/p3-recursion/recursion" }
 
-# The recursion stack's own support crates. Same rev as `p3-recursion`: these are
-# built together upstream, and mixing a crates.io `p3-circuit` with a git
-# `p3-recursion` would give two incompatible `ExprId` types.
-p3-circuit = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "8f9876efb26cff0f4b837555b478f043c4314240" }
-p3-circuit-prover = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "8f9876efb26cff0f4b837555b478f043c4314240" }
-p3-poseidon2-circuit-air = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "8f9876efb26cff0f4b837555b478f043c4314240" }
+# The recursion stack's own support crates. Same vendored tree as `p3-recursion`:
+# these are built together upstream, and mixing a crates.io `p3-circuit` with a
+# patched `p3-recursion` would give two incompatible `ExprId` types.
+p3-circuit = { path = "vendor/p3-recursion/circuit" }
+p3-circuit-prover = { path = "vendor/p3-recursion/circuit-prover" }
+p3-poseidon2-circuit-air = { path = "vendor/p3-recursion/poseidon2-circuit-air" }
 # `LiftPermToQuintic`: adapts the base-field Poseidon2 permutation to the D=5
 # quintic challenge lanes the recursion circuit runs on. `publish = false`
-# upstream, so it comes from the same git rev, never crates.io.
-p3-test-utils = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "8f9876efb26cff0f4b837555b478f043c4314240" }
+# upstream, so it comes from the vendored tree, never crates.io.
+p3-test-utils = { path = "vendor/p3-recursion/test-utils" }
 # crates.io-side companions the recursion stack expects at the v0.8.0 line.
 p3-lookup = "0.8.0"
 p3-sumcheck = "0.8.0"

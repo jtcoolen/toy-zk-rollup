@@ -1,0 +1,3947 @@
+use alloc::vec::Vec;
+use alloc::{format, vec};
+use core::cmp::{Reverse, min};
+use core::marker::PhantomData;
+
+use itertools::Itertools;
+use p3_challenger::{CanObserve, FieldChallenger, GrindingChallenger};
+use p3_circuit::ops::{PermCall, PermConfig, perm_private_data};
+use p3_circuit::{CircuitBuilder, CircuitBuilderError, CircuitRunner, NonPrimitiveOpId};
+use p3_commit::{
+    CommitmentOpening, CommitmentWithOpeningPoints, MatrixOpening, Mmcs, PointOpening,
+};
+use p3_field::coset::TwoAdicMultiplicativeCoset;
+use p3_field::{BasedVectorSpace, ExtensionField, Field, PackedValue, PrimeField64, TwoAdicField};
+use p3_fri::verifier::{FriError, PowPhase, fold_query, open_inputs};
+use p3_fri::{
+    BatchMultiOpening, FriFoldingStrategy, FriParameters, FriProof, FriShape, TwoAdicFriFolding,
+    TwoAdicFriFoldingForMmcs,
+};
+use p3_matrix::Dimensions;
+use p3_maybe_rayon::prelude::*;
+use p3_merkle_tree::{MerkleTreeError, MerkleTreeHidingMmcs, MerkleTreeMmcs, PrunedMerklePaths};
+use p3_symmetric::{CryptographicHasher, PseudoCompressionFunction};
+use p3_util::log2_strict_usize;
+use p3_whir::pcs::proof::QueryOpenings;
+use rand::distr::{Distribution, StandardUniform};
+use rand::{CryptoRng, SeedableRng};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+use crate::Target;
+
+/// Recomposition lowering selected by each MMCS caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BaseCoeffPacking {
+    Alu,
+    CoeffBound,
+}
+
+fn use_coeff_bound_binary_base_opening<F, EF>(
+    permutation_config: PermConfig,
+    salts: Option<&[Vec<Target>]>,
+) -> bool
+where
+    F: Field,
+    EF: ExtensionField<F>,
+{
+    <EF as BasedVectorSpace<F>>::DIMENSION == 4
+        && salts.is_none()
+        && permutation_config.as_poseidon2().is_some_and(|config| {
+            config.d() == 4
+                && config.width() == 16
+                && (config.is_baby_bear() || config.is_koala_bear())
+                && !config.is_challenger()
+                && !config.is_shared()
+        })
+}
+
+/// Hash base field coefficients using overwrite-mode sponge (matching native PaddingFreeSponge).
+///
+/// Native `PaddingFreeSponge` uses "overwrite mode": when absorbing a partial chunk,
+/// only the absorbed positions are overwritten; the remaining rate positions keep their
+/// values from the previous permutation output.
+///
+/// This function implements the same behavior in the circuit by:
+/// 1. Processing base coefficients in chunks of `rate` (8 for BabyBear / KoalaBear)
+/// 2. For partial chunks, mixing absorbed values with previous output for remaining positions
+/// 3. Using proper chaining for the capacity portion
+///
+/// # Parameters
+/// - `circuit`: Circuit builder
+/// - `permutation_config`: Poseidon2 configuration
+/// - `base_coeffs`: Base field coefficient targets (in lifted representation)
+/// - `reset`: If true, starts a new hash chain (initial state = zeros)
+/// - `packing`: selects the binding-aware coefficient lookup table or the legacy ALU chain for
+///   recomposition and partial-chunk carry unpacking. The coefficient-bound table is only selected
+///   by the non-hiding binary D4/W16 Poseidon2 base-opening entrypoint; all other callers retain
+///   the ALU route for compatibility.
+fn add_hash_base_coeffs_overwrite<F, EF>(
+    circuit: &mut CircuitBuilder<EF>,
+    permutation_config: &PermConfig,
+    base_coeffs: &[Target],
+    reset: bool,
+    packing: BaseCoeffPacking,
+    merkle_seed: bool,
+) -> Result<Vec<Target>, CircuitBuilderError>
+where
+    F: Field + PrimeField64,
+    EF: ExtensionField<F>,
+{
+    if base_coeffs.is_empty() {
+        // Return zeros for empty input (shouldn't happen in practice)
+        let zero = circuit.define_const(EF::ZERO);
+        return Ok(vec![zero, zero]);
+    }
+
+    let ext_degree = <EF as BasedVectorSpace<F>>::DIMENSION;
+    let rate = permutation_config.rate();
+    let rate_ext = permutation_config.rate_ext();
+    let width_ext = permutation_config.width_ext();
+
+    let num_chunks = base_coeffs.len().div_ceil(rate);
+
+    // A single-chunk `merkle_seed` leaf is a Merkle-mode row: its digest lands directly in the
+    // merkle chain slot, which the first arity-4 compression inherits via the placement
+    // constraint. A multi-chunk leaf instead absorbs in normal mode across rows; the executor
+    // mirrors the final normal-mode digest into the merkle slot, so every absorb row stays a plain
+    // sponge row and only the last one seeds the chain.
+    let single_chunk_seed = merkle_seed && num_chunks == 1;
+    let merkle_bit = single_chunk_seed.then(|| circuit.define_const(EF::ZERO));
+    let mut last_rate_outputs: Option<Vec<Target>> = None;
+    let mut final_outputs: Vec<Option<Target>> = vec![None; width_ext];
+
+    let use_per_base_lift = permutation_config.d() == 1 && ext_degree > 1;
+
+    for (chunk_idx, chunk) in base_coeffs.chunks(rate).enumerate() {
+        let is_first = chunk_idx == 0;
+        let is_last = chunk_idx == num_chunks - 1;
+
+        let mut inputs: Vec<Option<Target>> = vec![None; width_ext];
+
+        if use_per_base_lift {
+            // D=1 width-16 perm uses lifted scalars per rate slot. Opened batch values are already
+            // `EF::from(base)` targets (FRI BatchOpeningTargets); use them directly — recompose would
+            // add redundant NPO/ALU wiring and can desync witness sharing with cap/public inputs.
+            for ext_idx in 0..rate_ext {
+                if ext_idx < chunk.len() {
+                    inputs[ext_idx] = Some(chunk[ext_idx]);
+                } else {
+                    inputs[ext_idx] = None;
+                }
+            }
+        } else {
+            for ext_idx in 0..rate_ext {
+                let base_start = ext_idx * ext_degree;
+                let num_values_in_ext = min(ext_degree, chunk.len().saturating_sub(base_start));
+
+                if num_values_in_ext == 0 {
+                    // No values for this extension position - use None for chaining
+                    // This keeps the previous output (overwrite mode)
+                    inputs[ext_idx] = None;
+                } else if num_values_in_ext == ext_degree {
+                    // Full extension element - just recompose our values
+                    let ext_coeffs: Vec<_> =
+                        (0..ext_degree).map(|i| chunk[base_start + i]).collect();
+                    inputs[ext_idx] = Some(if packing == BaseCoeffPacking::Alu {
+                        circuit.recompose_base_coeffs_to_ext_via_alu::<F>(&ext_coeffs)?
+                    } else {
+                        circuit.recompose_base_coeffs_to_ext_with_coeff_lookups::<F>(&ext_coeffs)?
+                    });
+                } else {
+                    // Partial extension element - mix with previous output (overwrite mode)
+                    // This is the key fix: unused positions keep previous permutation output
+                    let prev_coeffs: Option<Vec<Target>> = if !is_first {
+                        if let Some(ref prev_rate) = last_rate_outputs {
+                            Some(if packing == BaseCoeffPacking::Alu {
+                                circuit
+                                    .decompose_ext_to_base_coeffs_via_alu::<F>(prev_rate[ext_idx])?
+                            } else {
+                                circuit.decompose_ext_to_base_coeffs_with_coeff_lookups::<F>(
+                                    prev_rate[ext_idx],
+                                )?
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    let mut ext_coeffs = Vec::with_capacity(ext_degree);
+                    for coeff_idx in 0..ext_degree {
+                        if coeff_idx < num_values_in_ext {
+                            // Use our absorbed value
+                            ext_coeffs.push(chunk[base_start + coeff_idx]);
+                        } else if let Some(ref prev) = prev_coeffs {
+                            // Overwrite mode: keep previous output for this position
+                            ext_coeffs.push(prev[coeff_idx]);
+                        } else {
+                            // First permutation with new_start, use zero
+                            ext_coeffs.push(circuit.define_const(EF::ZERO));
+                        }
+                    }
+
+                    inputs[ext_idx] = Some(if packing == BaseCoeffPacking::Alu {
+                        circuit.recompose_base_coeffs_to_ext_via_alu::<F>(&ext_coeffs)?
+                    } else {
+                        circuit.recompose_base_coeffs_to_ext_with_coeff_lookups::<F>(&ext_coeffs)?
+                    });
+                }
+            }
+        }
+
+        // Add permutation
+        let (_, maybe_outputs) = circuit.add_perm(
+            *permutation_config,
+            &PermCall {
+                new_start: if is_first { reset } else { false },
+                merkle_path: single_chunk_seed,
+                mmcs_bit: merkle_bit,
+                mmcs_bit2: merkle_bit,
+                inputs,
+                out_ctl: vec![true; rate_ext],
+                return_all_outputs: false,
+                mmcs_index_sum: None,
+            },
+        )?;
+
+        if !is_last {
+            last_rate_outputs = Some(
+                maybe_outputs
+                    .iter()
+                    .take(rate_ext)
+                    .map(|o| o.ok_or(CircuitBuilderError::MissingOutput))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+
+        final_outputs = maybe_outputs;
+    }
+
+    final_outputs
+        .into_iter()
+        .take(rate_ext)
+        .map(|o| o.ok_or(CircuitBuilderError::MissingOutput))
+        .collect()
+}
+
+/// Hash extension field elements directly (no recompose). Use when values are already
+/// extension elements (e.g. FRI commit-phase evals). Absorbs in chunks of `rate_ext`.
+///
+/// For D=1 Poseidon2 in a high-degree extension context, each extension element is decomposed
+/// into its `D` base field coefficients and hashed flat, matching native `ExtensionMmcs`
+/// behavior which flattens extension elements before hashing. Decomposition is a no-op when the
+/// element came from `recompose_base_coeffs_to_ext` in the same circuit (see circuit builder).
+fn add_hash_extension_elements<F, EF>(
+    circuit: &mut CircuitBuilder<EF>,
+    permutation_config: &PermConfig,
+    ext_elements: &[Target],
+    reset: bool,
+    merkle_seed: bool,
+) -> Result<Vec<Target>, CircuitBuilderError>
+where
+    F: Field + PrimeField64,
+    EF: ExtensionField<F>,
+{
+    let ext_degree = <EF as BasedVectorSpace<F>>::DIMENSION;
+
+    // For D=1 Poseidon2 in a higher-degree extension context, the native `ExtensionMmcs`
+    // flattens each EF element to D base field values before hashing. Mirror that by
+    // decomposing each element and routing coefficients through the base-coefficient path.
+    if permutation_config.d() == 1 && ext_degree > 1 {
+        if ext_elements.is_empty() {
+            let zero = circuit.define_const(EF::ZERO);
+            return Ok(vec![zero; permutation_config.rate_ext()]);
+        }
+        let mut base_coeffs: Vec<Target> = Vec::with_capacity(ext_elements.len() * ext_degree);
+        for &t in ext_elements {
+            let coeffs = circuit.decompose_ext_to_base_coeffs::<F>(t)?;
+            base_coeffs.extend(coeffs);
+        }
+        return add_hash_base_coeffs_overwrite::<F, EF>(
+            circuit,
+            permutation_config,
+            &base_coeffs,
+            reset,
+            BaseCoeffPacking::Alu,
+            merkle_seed,
+        );
+    }
+
+    let rate_ext = permutation_config.rate_ext();
+    let width_ext = permutation_config.width_ext();
+    if ext_elements.is_empty() {
+        let zero = circuit.define_const(EF::ZERO);
+        return Ok(vec![zero; rate_ext]);
+    }
+
+    let num_chunks = ext_elements.len().div_ceil(rate_ext);
+    // Single-chunk seeds are Merkle-mode rows whose digest lands directly in the merkle chain
+    // slot; multi-chunk leaves absorb in normal mode and rely on the executor mirroring the final
+    // normal-mode digest into that slot (see `add_hash_base_coeffs_overwrite`).
+    let single_chunk_seed = merkle_seed && num_chunks == 1;
+
+    let zero = circuit.define_const(EF::ZERO);
+    let mut last_rate_outputs: Option<Vec<Target>> = None;
+    let mut final_outputs: Vec<Option<Target>> = vec![None; width_ext];
+
+    for (i, chunk) in ext_elements.chunks(rate_ext).enumerate() {
+        let is_first = i == 0;
+        let mut inputs: Vec<Option<Target>> = vec![None; width_ext];
+        for (j, &t) in chunk.iter().enumerate() {
+            inputs[j] = Some(t);
+        }
+        for j in chunk.len()..rate_ext {
+            inputs[j] = Some(if is_first {
+                zero
+            } else {
+                last_rate_outputs.as_ref().map(|o| o[j]).unwrap_or(zero)
+            });
+        }
+
+        let (_, maybe_outputs) = circuit.add_perm(
+            *permutation_config,
+            &PermCall {
+                new_start: is_first && reset,
+                merkle_path: single_chunk_seed,
+                mmcs_bit: single_chunk_seed.then_some(zero),
+                mmcs_bit2: single_chunk_seed.then_some(zero),
+                inputs,
+                out_ctl: vec![true; rate_ext],
+                return_all_outputs: false,
+                mmcs_index_sum: None,
+            },
+        )?;
+
+        if chunk.len() == rate_ext {
+            last_rate_outputs = Some(
+                maybe_outputs
+                    .iter()
+                    .take(rate_ext)
+                    .map(|o| o.ok_or(CircuitBuilderError::MissingOutput))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        final_outputs = maybe_outputs;
+    }
+
+    final_outputs
+        .into_iter()
+        .take(rate_ext)
+        .map(|o| o.ok_or(CircuitBuilderError::MissingOutput))
+        .collect()
+}
+
+/// Recursive version of `MerkleTreeMmcs::verify_batch`. Adds a circuit that verifies an opened
+/// batch of rows with respect to a given commitment (Merkle cap).
+///
+/// - `circuit`: The circuit builder to which we add the verify_batch circuit
+/// - `commitment_cap`: The Merkle cap entries. Each inner slice has `rate_ext` packed extension
+///   targets representing one cap entry. A single-element cap (`cap_height = 0`) corresponds to
+///   the traditional single root.
+/// - `dimensions`: A vector of the dimensions of the matrices committed to.
+/// - `index_bits`: The little-endian binary decomposition of the index of a leaf in the tree.
+///   Length must equal `log2_ceil(max_height)`.
+/// - `opened_values`: A vector of matrix rows (packed extension field targets).
+///
+/// Returns the list of permutation operations requiring private data, otherwise returns an error.
+///
+/// # Merkle Cap Support
+///
+/// The Merkle cap of height `h` is the `h`-th layer from the root. A cap of height 0 is the root
+/// itself. When `cap_height > 0`, the opening proof is `cap_height` elements shorter and the
+/// remaining upper index bits select the correct cap entry to verify against.
+///
+/// # Parameters
+/// - `circuit`: The circuit builder
+/// - `permutation_config`: Poseidon2 configuration
+/// - `commitment_cap`: Merkle cap entries, each with `rate_ext` packed extension targets
+/// - `dimensions`: Matrix dimensions (height used for tree structure)
+/// - `index_bits`: All Merkle path direction bits (length = `log_max_height`)
+/// - `opened_base_coeffs`: Base field coefficients per matrix (already decomposed)
+/// - `salts`: Optional per-matrix salt coefficients for a hiding MMCS. When `Some`, each
+///   matrix's salt is appended to that matrix's leaf preimage (matching the native
+///   `MerkleTreeHidingMmcs`, which commits `[row | salt]` per matrix). `None` for a
+///   non-hiding `MerkleTreeMmcs`.
+///
+/// For the ordinary non-hiding binary BabyBear/KoalaBear D4 W16 Poseidon2 geometry, this entry
+/// point uses the coefficient-bound recompose table for leaf packing and fails closed with
+/// `RecomposeCoeffLookupsUnavailable` when that table is not enabled. Other geometries and hiding
+/// calls retain the legacy ALU lowering.
+pub fn verify_batch_circuit<F, EF>(
+    circuit: &mut CircuitBuilder<EF>,
+    permutation_config: impl Into<PermConfig>,
+    commitment_cap: &[Vec<Target>],
+    dimensions: &[Dimensions],
+    index_bits: &[Target],
+    opened_base_coeffs: &[Vec<Target>],
+    salts: Option<&[Vec<Target>]>,
+) -> Result<Vec<NonPrimitiveOpId>, CircuitBuilderError>
+where
+    F: Field + TwoAdicField + PrimeField64,
+    EF: ExtensionField<F>,
+{
+    let permutation_config: PermConfig = permutation_config.into();
+    if dimensions.len() != opened_base_coeffs.len() {
+        return Err(CircuitBuilderError::WrongBatchSize {
+            expected: dimensions.len(),
+            got: opened_base_coeffs.len(),
+        });
+    }
+
+    if let Some(salts) = salts
+        && salts.len() != opened_base_coeffs.len()
+    {
+        return Err(CircuitBuilderError::WrongBatchSize {
+            expected: opened_base_coeffs.len(),
+            got: salts.len(),
+        });
+    }
+
+    let cap_height = validate_commitment_cap(commitment_cap, index_bits.len())?;
+
+    let max_height_log = index_bits.len();
+    let path_depth = max_height_log - cap_height;
+
+    // Split index_bits into path bits (for Merkle traversal) and cap index bits
+    let path_bits = &index_bits[..path_depth];
+    let cap_index_bits = &index_bits[path_depth..];
+
+    // Select the correct cap entry using a multiplexer
+    let selected_root = select_cap_entry(circuit, commitment_cap, cap_index_bits);
+
+    // Group matrices by height level (matching format_openings logic)
+    // Native MMCS combines all matrices at the same height THEN hashes them together
+    let mut heights_tallest_first = dimensions
+        .iter()
+        .enumerate()
+        .sorted_by_key(|(_, dims)| Reverse(dims.height))
+        .peekable();
+
+    // Build digests for path_depth levels (the Merkle path below the cap) plus one
+    // extra level for matrices whose heights match the cap level. In the native MMCS,
+    // these cap-level rows are injected after the last sibling compression.
+    let digest_levels = path_depth + 1;
+    let mut formatted_digests = vec![vec![]; digest_levels];
+    for (i, digest) in formatted_digests.iter_mut().enumerate() {
+        let curr_height = 1 << (max_height_log - i);
+
+        // Collect all base coefficients from matrices at this height level. For a hiding
+        // MMCS each matrix's leaf is `[row | salt]`, so the salt is appended directly after
+        // that matrix's coefficients before the next matrix in the height group.
+        let all_base_coeffs: Vec<Target> = heights_tallest_first
+            .peeking_take_while(|(_, dims)| dims.height.next_power_of_two() == curr_height)
+            .flat_map(|(mat_idx, _)| {
+                let mut coeffs: Vec<Target> = opened_base_coeffs[mat_idx].clone();
+                if let Some(salts) = salts {
+                    coeffs.extend(salts[mat_idx].iter().copied());
+                }
+                coeffs
+            })
+            .collect();
+
+        if all_base_coeffs.is_empty() {
+            continue;
+        }
+
+        // Hash using overwrite-mode sponge (matching native PaddingFreeSponge). Non-hiding binary
+        // D4/W16 Poseidon2 leaves use coefficient-bound recomposition; salted and all excluded
+        // geometries retain the legacy ALU lowering.
+        let packing = if use_coeff_bound_binary_base_opening::<F, EF>(permutation_config, salts) {
+            BaseCoeffPacking::CoeffBound
+        } else {
+            BaseCoeffPacking::Alu
+        };
+        *digest = add_hash_base_coeffs_overwrite::<F, EF>(
+            circuit,
+            &permutation_config,
+            &all_base_coeffs,
+            true,
+            packing,
+            false,
+        )?;
+    }
+
+    let op_vals_digests = formatted_digests;
+
+    circuit.add_mmcs_verify(
+        permutation_config,
+        &op_vals_digests,
+        path_bits,
+        &selected_root,
+    )
+}
+
+/// Like `verify_batch_circuit` but opened values are already extension elements (no decompose).
+/// Use for FRI commit-phase where evals are extension and only the challenger needs base form.
+/// `salts` carries optional per-matrix hiding-MMCS salt coefficients. When `Some`, the
+/// extension leaf is flattened to base field coefficients and the salt is appended (matching
+/// native `ExtensionMmcs<_, _, MerkleTreeHidingMmcs>`, which flattens the row then salts it);
+/// `None` keeps the non-hiding extension-element hashing path.
+pub fn verify_batch_circuit_from_extension_opened<F, EF>(
+    circuit: &mut CircuitBuilder<EF>,
+    permutation_config: impl Into<PermConfig>,
+    commitment_cap: &[Vec<Target>],
+    dimensions: &[Dimensions],
+    index_bits: &[Target],
+    opened_extension_values: &[Vec<Target>],
+    salts: Option<&[Vec<Target>]>,
+) -> Result<Vec<NonPrimitiveOpId>, CircuitBuilderError>
+where
+    F: Field + TwoAdicField + PrimeField64,
+    EF: ExtensionField<F>,
+{
+    let permutation_config: PermConfig = permutation_config.into();
+    if dimensions.len() != opened_extension_values.len() {
+        return Err(CircuitBuilderError::WrongBatchSize {
+            expected: dimensions.len(),
+            got: opened_extension_values.len(),
+        });
+    }
+
+    if let Some(salts) = salts
+        && salts.len() != opened_extension_values.len()
+    {
+        return Err(CircuitBuilderError::WrongBatchSize {
+            expected: opened_extension_values.len(),
+            got: salts.len(),
+        });
+    }
+
+    let cap_height = validate_commitment_cap(commitment_cap, index_bits.len())?;
+
+    let max_height_log = index_bits.len();
+    let path_depth = max_height_log - cap_height;
+    let path_bits = &index_bits[..path_depth];
+    let cap_index_bits = &index_bits[path_depth..];
+
+    let selected_root = select_cap_entry(circuit, commitment_cap, cap_index_bits);
+
+    let mut heights_tallest_first = dimensions
+        .iter()
+        .enumerate()
+        .sorted_by_key(|(_, dims)| Reverse(dims.height))
+        .peekable();
+
+    let digest_levels = path_depth + 1;
+    let mut formatted_digests = vec![vec![]; digest_levels];
+    for (i, digest) in formatted_digests.iter_mut().enumerate() {
+        let curr_height = 1 << (max_height_log - i);
+
+        let mats_at_height: Vec<usize> = heights_tallest_first
+            .peeking_take_while(|(_, dims)| dims.height.next_power_of_two() == curr_height)
+            .map(|(mat_idx, _)| mat_idx)
+            .collect();
+
+        if mats_at_height.is_empty() {
+            continue;
+        }
+
+        *digest = if let Some(salts) = salts {
+            // Hiding extension MMCS: native flattens each extension row to base field
+            // coefficients then appends the per-matrix base-field salt before hashing.
+            let mut all_base: Vec<Target> = Vec::new();
+            for &mat_idx in &mats_at_height {
+                for &ext in &opened_extension_values[mat_idx] {
+                    all_base.extend(circuit.decompose_ext_to_base_coeffs::<F>(ext)?);
+                }
+                all_base.extend(salts[mat_idx].iter().copied());
+            }
+            add_hash_base_coeffs_overwrite::<F, EF>(
+                circuit,
+                &permutation_config,
+                &all_base,
+                true,
+                BaseCoeffPacking::Alu,
+                false,
+            )?
+        } else {
+            let all_ext: Vec<Target> = mats_at_height
+                .iter()
+                .flat_map(|&mat_idx| opened_extension_values[mat_idx].iter().copied())
+                .collect();
+            add_hash_extension_elements::<F, EF>(
+                circuit,
+                &permutation_config,
+                &all_ext,
+                true,
+                false,
+            )?
+        };
+    }
+
+    circuit.add_mmcs_verify(
+        permutation_config,
+        &formatted_digests,
+        path_bits,
+        &selected_root,
+    )
+}
+
+/// Validates a proof-supplied Merkle commitment cap's length and returns its height (`log2` of
+/// its length, i.e. how many upper index bits select a cap entry instead of walking the tree).
+///
+/// A cap must be non-empty and have a power-of-two length -- proof-controlled shape properties
+/// that must be rejected as malformed rather than panicking downstream (`log2_strict_usize`
+/// asserts on a non-power-of-two length).
+pub(crate) fn validate_commitment_cap_len<T>(
+    commitment_cap: &[T],
+) -> Result<usize, CircuitBuilderError> {
+    validate_commitment_cap_count(commitment_cap.len())
+}
+
+pub(crate) fn validate_commitment_cap_count(roots: usize) -> Result<usize, CircuitBuilderError> {
+    if roots == 0 {
+        return Err(CircuitBuilderError::InvalidMerkleCap {
+            details: "commitment cap must have at least one entry".into(),
+        });
+    }
+    if !roots.is_power_of_two() {
+        return Err(CircuitBuilderError::InvalidMerkleCap {
+            details: format!("commitment cap length must be a power of two, got {roots}"),
+        });
+    }
+    Ok(roots.trailing_zeros() as usize)
+}
+
+/// Like [`validate_commitment_cap_len`], but also rejects a cap taller than the tree it caps
+/// (`tree_height`, the tree's own height in index bits) -- otherwise `tree_height - cap_height`
+/// underflows downstream.
+pub(crate) fn validate_commitment_cap<T>(
+    commitment_cap: &[T],
+    tree_height: usize,
+) -> Result<usize, CircuitBuilderError> {
+    validate_binary_cap_count(commitment_cap.len(), tree_height)
+}
+
+/// Integer-only binary cap validation for contextual FRI preflight.
+pub(crate) fn validate_binary_cap_count(
+    roots: usize,
+    tree_height: usize,
+) -> Result<usize, CircuitBuilderError> {
+    let cap_height = validate_commitment_cap_count(roots)?;
+    if cap_height > tree_height {
+        return Err(CircuitBuilderError::InvalidMerkleCap {
+            details: format!(
+                "commitment cap height {cap_height} exceeds tree height {tree_height}"
+            ),
+        });
+    }
+    Ok(cap_height)
+}
+
+pub(crate) fn checked_next_power_of_two(value: usize) -> Result<usize, CircuitBuilderError> {
+    value
+        .checked_next_power_of_two()
+        .ok_or_else(|| CircuitBuilderError::InvalidMerkleCap {
+            details: "matrix height cannot be rounded to a power of two".into(),
+        })
+}
+
+pub(crate) fn checked_padded_len(raw_len: usize) -> Result<usize, CircuitBuilderError> {
+    if raw_len <= 1 {
+        Ok(raw_len)
+    } else if raw_len < 4 {
+        Ok(4)
+    } else {
+        raw_len
+            .div_ceil(4)
+            .checked_mul(4)
+            .ok_or_else(|| CircuitBuilderError::InvalidMerkleCap {
+                details: "padded arity-4 matrix height overflows".into(),
+            })
+    }
+}
+
+/// One scalar level of the arity-4 Merkle walk.  The target builder uses this
+/// same value-only decision to materialize its operation schedule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Arity4StepGeometry {
+    pub(crate) step: usize,
+    pub(crate) injection_height: Option<usize>,
+}
+
+/// Visit native arity-4 cap geometry without rows, targets, proof values, or
+/// height-count allocations.  Repeated scans retain the input order for the
+/// target caller while the scalar state only tracks the next unconsumed power
+/// bucket.  Equal next-power buckets must have equal raw heights, so one
+/// bucket value is sufficient to represent a consumed group.
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn visit_arity4_path<I, V>(
+    heights: I,
+    roots: usize,
+    mut visit: V,
+) -> Result<usize, CircuitBuilderError>
+where
+    I: Iterator<Item = usize> + Clone,
+    V: FnMut(Arity4StepGeometry),
+{
+    validate_commitment_cap_count(roots)?;
+
+    let scan = heights.clone();
+    let mut max_height = 0usize;
+    let mut has_height = false;
+    for height in scan {
+        if height == 0 {
+            continue;
+        }
+        has_height = true;
+        max_height = max_height.max(height);
+    }
+    if !has_height {
+        return Err(CircuitBuilderError::Poseidon2ConfigMismatch {
+            expected: "at least one non-empty matrix".into(),
+            got: "empty batch".into(),
+        });
+    }
+
+    // Validate every next-power computation and reject unequal raw heights in
+    // one native bucket.  There are at most usize::BITS representable buckets,
+    // so this fixed table keeps validation O(matrix_count * word_bits) without
+    // a matrix-count allocation or a quadratic pairwise scan.
+    let mut buckets: [Option<usize>; usize::BITS as usize + 1] = [None; usize::BITS as usize + 1];
+    for height in heights {
+        let bucket = checked_next_power_of_two(height)?;
+        let bucket_index = bucket.trailing_zeros() as usize;
+        match buckets[bucket_index] {
+            Some(existing) if existing != height => {
+                return Err(CircuitBuilderError::Poseidon2ConfigMismatch {
+                    expected: "matrix heights that round up to the same power of two must be equal"
+                        .into(),
+                    got: "incompatible matrix heights".into(),
+                });
+            }
+            None => buckets[bucket_index] = Some(height),
+            Some(_) => {}
+        }
+    }
+
+    let mut curr = checked_padded_len(max_height)?;
+    let mut consumed_below = checked_next_power_of_two(max_height)?;
+    let mut path_bits = 0usize;
+    while curr > roots {
+        let step = if curr < 4 {
+            2
+        } else {
+            let target = checked_next_power_of_two(curr / 4)?;
+            let mut has_intermediate = false;
+            for (bucket_index, height) in buckets.iter().enumerate() {
+                if height.is_some() {
+                    let bucket = 1usize << bucket_index;
+                    if bucket < consumed_below && bucket > target {
+                        has_intermediate = true;
+                        break;
+                    }
+                }
+            }
+            if has_intermediate { 2 } else { 4 }
+        };
+
+        let logical_next = curr / step;
+        let next = checked_padded_len(logical_next)?;
+        let logical_next_bucket = checked_next_power_of_two(logical_next)?;
+        let injection_height = if logical_next_bucket < consumed_below {
+            let bucket_index = logical_next_bucket.trailing_zeros() as usize;
+            buckets[bucket_index]
+        } else {
+            None
+        };
+        if injection_height.is_some() {
+            consumed_below = logical_next_bucket;
+        }
+        if next == curr && injection_height.is_none() {
+            return Err(CircuitBuilderError::InvalidMerkleCap {
+                details: "arity-4 cap walk made no progress".into(),
+            });
+        }
+
+        visit(Arity4StepGeometry {
+            step,
+            injection_height,
+        });
+        curr = next;
+        path_bits = path_bits
+            .checked_add(if step == 4 { 2 } else { 1 })
+            .ok_or_else(|| CircuitBuilderError::InvalidMerkleCap {
+                details: "arity-4 path bit count overflows".into(),
+            })?;
+    }
+    Ok(path_bits)
+}
+
+/// Walk native arity-4 cap geometry without allocating a height table.
+#[allow(dead_code)]
+pub(crate) fn validate_arity4_cap_geometry(
+    heights: &[usize],
+    roots: usize,
+) -> Result<usize, CircuitBuilderError> {
+    visit_arity4_path(heights.iter().copied(), roots, |_| {})
+}
+
+/// Select one cap entry from a Merkle cap using a binary tree multiplexer.
+///
+/// For `cap_height = 0` (single entry), returns the entry directly.
+/// For `cap_height > 0`, progressively halves the candidates using one index bit
+/// at each level. Each selection step computes `left + bit * (right - left)` per
+/// component, requiring only one multiplication per component per level.
+///
+/// Total cost: `rate_ext * (2^cap_height - 1)` multiplications, compared to
+/// `(cap_height + rate_ext) * 2^cap_height` for the one-hot + dot-product approach.
+fn select_cap_entry<EF: Field>(
+    circuit: &mut CircuitBuilder<EF>,
+    cap: &[Vec<Target>],
+    index_bits: &[Target],
+) -> Vec<Target> {
+    if cap.len() == 1 {
+        return cap[0].clone();
+    }
+
+    debug_assert_eq!(cap.len(), 1 << index_bits.len());
+
+    let rate_ext = cap[0].len();
+
+    // Binary tree selection: each bit halves the number of candidates.
+    // bit[0] (LSB) selects between adjacent pairs, bit[1] between groups of 4, etc.
+    let mut current: Vec<Vec<Target>> = cap.to_vec();
+
+    for &bit in index_bits {
+        let half = current.len() / 2;
+        let mut next = Vec::with_capacity(half);
+        for i in 0..half {
+            let left = &current[2 * i];
+            let right = &current[2 * i + 1];
+            let mut selected = Vec::with_capacity(rate_ext);
+            for j in 0..rate_ext {
+                // left[j] + bit * (right[j] - left[j])
+                let diff = circuit.sub(right[j], left[j]);
+                let val = circuit.mul_add(bit, diff, left[j]);
+                selected.push(val);
+            }
+            next.push(selected);
+        }
+        current = next;
+    }
+
+    debug_assert_eq!(current.len(), 1);
+    current.into_iter().next().unwrap()
+}
+
+/// Convert a base field Merkle proof to extension field sibling values for MMCS private data.
+///
+/// When `DIGEST_ELEMS` is a multiple of `EF::DIMENSION`, digest coefficients are packed into
+/// `DIGEST_ELEMS / D` extension limbs (e.g. eight bases and quartic `EF` → two limbs).
+///
+/// Otherwise (e.g. eight bases and quintic `EF`), each base digest element is embedded as its
+/// own extension limb so the D=1 lifted-scalar Poseidon path matches native absorption.
+pub fn convert_merkle_proof_to_siblings<F, EF, const DIGEST_ELEMS: usize>(
+    opening_proof: &[[F; DIGEST_ELEMS]],
+) -> Vec<Vec<EF>>
+where
+    F: Field,
+    EF: ExtensionField<F> + BasedVectorSpace<F>,
+{
+    let d = EF::DIMENSION;
+    opening_proof
+        .iter()
+        .map(|digest| {
+            if DIGEST_ELEMS.is_multiple_of(d) {
+                let ext_count = DIGEST_ELEMS / d;
+                (0..ext_count)
+                    .map(|chunk_idx| {
+                        let start = chunk_idx * d;
+                        let mut coeffs = vec![F::ZERO; d];
+                        coeffs[..d].copy_from_slice(&digest[start..(d + start)]);
+                        EF::from_basis_coefficients_slice(&coeffs)
+                            .expect("coefficients match extension degree")
+                    })
+                    .collect()
+            } else {
+                digest
+                    .iter()
+                    .map(|&b| {
+                        let mut coeffs = vec![F::ZERO; d];
+                        coeffs[0] = b;
+                        EF::from_basis_coefficients_slice(&coeffs)
+                            .expect("embedded base digest element")
+                    })
+                    .collect()
+            }
+        })
+        .collect()
+}
+
+/// The Merkle authentication paths one FRI query needs, in the order the verifier circuit's MMCS
+/// operations consume them.
+///
+/// A FRI proof authenticates every query into a given tree with one shared, pruned multiproof
+/// ([`p3_merkle_tree::PrunedMerklePaths`]), while the in-circuit MMCS gadget walks one full
+/// authentication path per query. These are the per-query chains that multiproof stands for:
+/// `input[b]` authenticates this query's rows in input batch `b`, and `commit_phase[r]`
+/// authenticates its row in commit-phase round `r`. Each chain is flat and level-major, leaf
+/// level first — the shape a single-query [`p3_commit::Mmcs::Proof`] has.
+///
+/// Restoring them needs more than the proof carries — the queried leaf indices come from the
+/// Fiat-Shamir transcript, and a commit-phase leaf digest covers the query's full reconstructed
+/// evaluation row, whose own entry is the folded value the fold chain carries forward — so
+/// [`restore_fri_query_paths`] replays the verifier's transcript to produce them.
+#[derive(Clone, Debug)]
+pub struct FriQueryPaths<F, const DIGEST_ELEMS: usize> {
+    /// One full sibling chain per input batch, in batch order.
+    pub input: Vec<Vec<[F; DIGEST_ELEMS]>>,
+    /// One full sibling chain per commit-phase round, in round order.
+    pub commit_phase: Vec<Vec<[F; DIGEST_ELEMS]>>,
+}
+
+/// The `MerkleTreeMmcs` a FRI instance commits with, over base field `Val`.
+type FriTreeMmcs<Val, H, C, const N: usize, const DIGEST_ELEMS: usize> =
+    MerkleTreeMmcs<<Val as Field>::Packing, <Val as Field>::Packing, H, C, N, DIGEST_ELEMS>;
+
+/// Everything a FRI proof's queries depend on that the proof itself does not carry.
+///
+/// A pruned multiproof authenticates a leaf only against the index it is opened at, and a
+/// commit-phase leaf covers the query's full reconstructed evaluation row — whose own entry is the
+/// folded value the fold chain carries forward. Both come out of the verifier's transcript, which
+/// [`replay_fri_query_layout`] walks.
+#[derive(Clone, Debug)]
+pub struct FriQueryLayout<Challenge> {
+    /// The sampled query index into the tallest committed domain, one per query.
+    pub indices: Vec<usize>,
+    /// `log2` of the tallest committed input height, before any folding.
+    pub log_global_max_height: usize,
+    /// The validated log-arity schedule, one entry per commit-phase round.
+    pub log_arities: Vec<usize>,
+    /// Per round, per query: the index of the group the query's row belongs to.
+    pub group_indices_by_round: Vec<Vec<usize>>,
+    /// Per round, per query: the reconstructed evaluation row(s) that round's leaf covers.
+    pub rows_by_round: Vec<Vec<Vec<Vec<Challenge>>>>,
+}
+
+/// Replay the FRI verifier's transcript, returning what its queries depend on.
+///
+/// This walks the same steps [`p3_fri::verifier::verify_fri`] does — sampling `alpha`, the
+/// per-round `beta`s, and the query indices, then running [`p3_fri::verifier::open_inputs`] and
+/// [`p3_fri::verifier::fold_query`] — so a caller that has to rebuild per-query Merkle paths from
+/// a shared pruned multiproof knows which leaves to rebuild and what they contain.
+///
+/// `challenger` must be in the state `verify_fri` expects: every opened value observed, nothing
+/// sampled since.
+pub fn replay_fri_query_layout<Val, Challenge, InputMmcs, FriMmcs, Challenger>(
+    params: &FriParameters<FriMmcs>,
+    input_mmcs: &InputMmcs,
+    proof: &FriProof<
+        Challenge,
+        FriMmcs,
+        Challenger::Witness,
+        Vec<BatchMultiOpening<Val, InputMmcs>>,
+    >,
+    challenger: &mut Challenger,
+    commitments_with_opening_points: &[CommitmentWithOpeningPoints<
+        Challenge,
+        InputMmcs::Commitment,
+        TwoAdicMultiplicativeCoset<Val>,
+    >],
+) -> Result<FriQueryLayout<Challenge>, FriError<FriMmcs::Error, InputMmcs::Error>>
+where
+    Val: TwoAdicField + PrimeField64,
+    Challenge: ExtensionField<Val>,
+    // The folding strategy carries the input proof and its error type across the fold chain, so
+    // both have to be shareable.
+    InputMmcs: Mmcs<Val, MultiProof: Sync, Error: Sync>,
+    FriMmcs: Mmcs<Challenge>,
+    Challenger: FieldChallenger<Val> + GrindingChallenger + CanObserve<FriMmcs::Commitment>,
+{
+    let samples = sample_fri_queries(params, proof, challenger, commitments_with_opening_points)?;
+    fold_fri_queries(
+        params,
+        input_mmcs,
+        proof,
+        commitments_with_opening_points,
+        samples,
+    )
+}
+
+/// The transcript values a FRI query phase is sampled from, before any opening is read.
+struct FriQuerySamples<Challenge> {
+    alpha: Challenge,
+    betas: Vec<Challenge>,
+    log_arities: Vec<usize>,
+    log_global_max_height: usize,
+    log_final_height: usize,
+    extra_query_index_bits: usize,
+    indices: Vec<usize>,
+}
+
+/// Validate the proof's shape against `params` and replay the FRI transcript up to and including
+/// the query indices, exactly as [`p3_fri::verifier::verify_fri`] does before reading openings.
+fn sample_fri_queries<Val, Challenge, InputMmcs, FriMmcs, Challenger>(
+    params: &FriParameters<FriMmcs>,
+    proof: &FriProof<
+        Challenge,
+        FriMmcs,
+        Challenger::Witness,
+        Vec<BatchMultiOpening<Val, InputMmcs>>,
+    >,
+    challenger: &mut Challenger,
+    commitments_with_opening_points: &[CommitmentWithOpeningPoints<
+        Challenge,
+        InputMmcs::Commitment,
+        TwoAdicMultiplicativeCoset<Val>,
+    >],
+) -> Result<FriQuerySamples<Challenge>, FriError<FriMmcs::Error, InputMmcs::Error>>
+where
+    Val: TwoAdicField + PrimeField64,
+    Challenge: ExtensionField<Val>,
+    // The folding strategy carries the input proof and its error type across the fold chain, so
+    // both have to be shareable.
+    InputMmcs: Mmcs<Val, MultiProof: Sync, Error: Sync>,
+    FriMmcs: Mmcs<Challenge>,
+    Challenger: FieldChallenger<Val> + GrindingChallenger + CanObserve<FriMmcs::Commitment>,
+{
+    type Folding<Val, InputMmcs> = TwoAdicFriFoldingForMmcs<Val, InputMmcs>;
+    let folding: Folding<Val, InputMmcs> = TwoAdicFriFolding(PhantomData);
+
+    // Reject a vacuous instance before any transcript work, mirroring `verify_fri`: with zero
+    // queries the per-query loop never runs, so any final polynomial would otherwise pass.
+    if params.num_queries == 0 {
+        return Err(FriError::ZeroQueries);
+    }
+
+    let expected_rounds = proof.commit_phase_commits.len();
+    if proof.commit_phase_openings.len() != expected_rounds {
+        return Err(FriError::CommitPhaseOpeningsCountMismatch {
+            expected: expected_rounds,
+            got: proof.commit_phase_openings.len(),
+        });
+    }
+
+    if params.max_log_arity == 0 {
+        return Err(FriError::ZeroFoldingArity);
+    }
+    // Since p3-fri 0.8 the fold schedule comes from the configuration and the committed input
+    // heights, exactly as `verify_fri` derives it; the proof no longer carries it.
+    let mut input_log_heights = Vec::new();
+    for claim in commitments_with_opening_points {
+        for MatrixOpening { domain, .. } in &claim.matrices {
+            let height = log2_strict_usize(domain.size())
+                .checked_add(params.log_blowup)
+                .filter(|&height| height < usize::BITS as usize)
+                .ok_or(FriError::GlobalMaxHeightTooLarge {
+                    log_global_max_height: usize::MAX,
+                    two_adicity: Val::TWO_ADICITY,
+                })?;
+            input_log_heights.push(height);
+        }
+    }
+    input_log_heights.sort_unstable_by(|a, b| b.cmp(a));
+    input_log_heights.dedup();
+    let log_final_height_for_schedule = params
+        .log_blowup
+        .checked_add(params.log_final_poly_len)
+        .ok_or(FriError::GlobalMaxHeightTooLarge {
+            log_global_max_height: usize::MAX,
+            two_adicity: Val::TWO_ADICITY,
+        })?;
+    let log_arities = p3_fri::fold_schedule(
+        &input_log_heights,
+        log_final_height_for_schedule,
+        params.max_log_arity,
+    );
+    if proof.commit_phase_openings.len() != log_arities.len() {
+        return Err(FriError::CommitPhaseOpeningsCountMismatch {
+            expected: log_arities.len(),
+            got: proof.commit_phase_openings.len(),
+        });
+    }
+
+    for (round, opening) in proof.commit_phase_openings.iter().enumerate() {
+        if opening.sibling_values.len() != params.num_queries {
+            return Err(FriError::CommitPhaseQueryCountMismatch {
+                round,
+                expected: params.num_queries,
+                got: opening.sibling_values.len(),
+            });
+        }
+        let expected_siblings = (1usize << log_arities[round]) - 1;
+        if let Some(actual) = opening
+            .sibling_values
+            .iter()
+            .map(Vec::len)
+            .find(|&actual| actual != expected_siblings)
+        {
+            return Err(FriError::SiblingValuesLengthMismatch {
+                round,
+                expected: expected_siblings,
+                got: actual,
+            });
+        }
+    }
+
+    let log_global_max_height = log_arities
+        .iter()
+        .try_fold(0usize, |sum, &arity| sum.checked_add(arity))
+        .and_then(|sum| sum.checked_add(params.log_blowup))
+        .and_then(|sum| sum.checked_add(params.log_final_poly_len))
+        .ok_or(FriError::GlobalMaxHeightTooLarge {
+            log_global_max_height: usize::MAX,
+            two_adicity: Val::TWO_ADICITY,
+        })?;
+
+    // Bound the global height by the field two-adicity before using it: the query phase
+    // evaluates the final polynomial at a 2^log_global_max_height-th root of unity, which
+    // does not exist past the two-adicity and would panic. When the input has no commitments
+    // the cross-check below is skipped, so for a malformed proof this is the only guard
+    // standing between us and that panic.
+    if log_global_max_height > Val::TWO_ADICITY || log_global_max_height >= usize::BITS as usize {
+        return Err(FriError::GlobalMaxHeightTooLarge {
+            log_global_max_height,
+            two_adicity: Val::TWO_ADICITY,
+        });
+    }
+
+    // Cross-check: the global log-height has two independent derivations which must agree
+    // (Ben-Sasson et al., "Fast RS IOPP", ICALP 2018, §2.1.1):
+    //   H_in   = max committed log_2(domain.size) + log_blowup
+    //   H_fold = sum(per-round log-arities) + log_blowup + log_final_poly_len
+    let mut expected_log_global_max_height = None;
+    for claim in commitments_with_opening_points {
+        for MatrixOpening { domain, .. } in &claim.matrices {
+            let height = log2_strict_usize(domain.size())
+                .checked_add(params.log_blowup)
+                .filter(|&height| height < usize::BITS as usize)
+                .ok_or(FriError::GlobalMaxHeightTooLarge {
+                    log_global_max_height: usize::MAX,
+                    two_adicity: Val::TWO_ADICITY,
+                })?;
+            expected_log_global_max_height =
+                Some(expected_log_global_max_height.map_or(height, |old: usize| old.max(height)));
+        }
+    }
+    if let Some(expected) = expected_log_global_max_height
+        && log_global_max_height != expected
+    {
+        // The schedule is derived from these very heights, so this cannot disagree; keep the
+        // independent derivation as a guard against a schedule/height drift.
+        return Err(FriError::GlobalMaxHeightTooLarge {
+            log_global_max_height: log_global_max_height.max(expected),
+            two_adicity: Val::TWO_ADICITY,
+        });
+    }
+
+    if proof.commit_pow_witnesses.len() != proof.commit_phase_commits.len() {
+        return Err(FriError::CommitPowWitnessCountMismatch {
+            expected: proof.commit_phase_commits.len(),
+            got: proof.commit_pow_witnesses.len(),
+        });
+    }
+
+    if proof.final_poly.len() != params.final_poly_len() {
+        return Err(FriError::FinalPolyLengthMismatch {
+            expected: params.final_poly_len(),
+            got: proof.final_poly.len(),
+        });
+    }
+
+    let log_final_height = params
+        .log_blowup
+        .checked_add(params.log_final_poly_len)
+        .filter(|&height| height < usize::BITS as usize)
+        .ok_or(FriError::GlobalMaxHeightTooLarge {
+            log_global_max_height: usize::MAX,
+            two_adicity: Val::TWO_ADICITY,
+        })?;
+
+    let extra_query_index_bits =
+        FriFoldingStrategy::<Val, Challenge>::extra_query_index_bits(&folding);
+    let query_index_bits = log_global_max_height
+        .checked_add(extra_query_index_bits)
+        .filter(|&bits| bits < usize::BITS as usize)
+        .ok_or(FriError::GlobalMaxHeightTooLarge {
+            log_global_max_height: usize::MAX,
+            two_adicity: Val::TWO_ADICITY,
+        })?;
+
+    if proof.input_openings.len() != commitments_with_opening_points.len() {
+        return Err(FriError::InputProofBatchCountMismatch {
+            expected: commitments_with_opening_points.len(),
+            got: proof.input_openings.len(),
+        });
+    }
+    for (batch, (opening, CommitmentOpening { matrices, .. })) in proof
+        .input_openings
+        .iter()
+        .zip(commitments_with_opening_points)
+        .enumerate()
+    {
+        if opening.opened_values.len() != params.num_queries {
+            return Err(FriError::InputOpeningsQueryCountMismatch {
+                batch,
+                expected: params.num_queries,
+                got: opening.opened_values.len(),
+            });
+        }
+        for rows in &opening.opened_values {
+            if rows.len() != matrices.len() {
+                return Err(FriError::BatchOpenedValuesCountMismatch {
+                    batch,
+                    expected: matrices.len(),
+                    got: rows.len(),
+                });
+            }
+            for (matrix, (row, MatrixOpening { points, .. })) in
+                rows.iter().zip(matrices).enumerate()
+            {
+                if points.is_empty() {
+                    return Err(FriError::MatrixWithoutOpeningPoints { batch, matrix });
+                }
+                for (
+                    point,
+                    PointOpening {
+                        values: claimed, ..
+                    },
+                ) in points.iter().enumerate()
+                {
+                    if row.len() != claimed.len() {
+                        return Err(FriError::PointEvaluationCountMismatch {
+                            batch,
+                            matrix,
+                            point,
+                            expected: row.len(),
+                            got: claimed.len(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Only after the complete borrowed schedule/proof preflight may transcript
+    // replay begin. The challenger sits after the PCS transcript's claimed openings; finish the
+    // PCS batch phase, then open the low-degree test's own transcript with its seed.
+    if !challenger.check_witness(params.batch_proof_of_work_bits, proof.batch_pow_witness) {
+        return Err(FriError::InvalidPowWitness(PowPhase::Batch));
+    }
+    let alpha: Challenge = challenger.sample_algebra_element();
+    FriShape::with_schedule(params, log_arities.clone(), query_index_bits)
+        .domain_separator::<Val, Challenge>()
+        .seed(challenger);
+
+    let betas: Vec<Challenge> = proof
+        .commit_phase_commits
+        .iter()
+        .zip(&proof.commit_pow_witnesses)
+        .map(|(comm, witness)| {
+            challenger.observe(comm.clone());
+            if !challenger.check_witness(params.commit_proof_of_work_bits, *witness) {
+                return Err(FriError::InvalidPowWitness(PowPhase::CommitPhase));
+            }
+            Ok(challenger.sample_algebra_element())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    challenger.observe_algebra_slice(&proof.final_poly);
+
+    if !challenger.check_witness(params.query_proof_of_work_bits, proof.query_pow_witness) {
+        return Err(FriError::InvalidPowWitness(PowPhase::Query));
+    }
+
+    let indices: Vec<usize> = core::iter::repeat_with(|| challenger.sample_bits(query_index_bits))
+        .take(params.num_queries)
+        .collect();
+
+    Ok(FriQuerySamples {
+        alpha,
+        betas,
+        log_arities,
+        log_global_max_height,
+        log_final_height,
+        extra_query_index_bits,
+        indices,
+    })
+}
+
+/// Reduce the input openings at the sampled queries and walk every query's fold chain.
+fn fold_fri_queries<Val, Challenge, InputMmcs, FriMmcs, Witness>(
+    params: &FriParameters<FriMmcs>,
+    input_mmcs: &InputMmcs,
+    proof: &FriProof<Challenge, FriMmcs, Witness, Vec<BatchMultiOpening<Val, InputMmcs>>>,
+    commitments_with_opening_points: &[CommitmentWithOpeningPoints<
+        Challenge,
+        InputMmcs::Commitment,
+        TwoAdicMultiplicativeCoset<Val>,
+    >],
+    samples: FriQuerySamples<Challenge>,
+) -> Result<FriQueryLayout<Challenge>, FriError<FriMmcs::Error, InputMmcs::Error>>
+where
+    Val: TwoAdicField,
+    Challenge: ExtensionField<Val>,
+    InputMmcs: Mmcs<Val, MultiProof: Sync, Error: Sync>,
+    FriMmcs: Mmcs<Challenge>,
+{
+    type Folding<Val, InputMmcs> = TwoAdicFriFoldingForMmcs<Val, InputMmcs>;
+    let folding: Folding<Val, InputMmcs> = TwoAdicFriFolding(PhantomData);
+    let FriQuerySamples {
+        alpha,
+        betas,
+        log_arities,
+        log_global_max_height,
+        log_final_height,
+        extra_query_index_bits,
+        indices,
+    } = samples;
+
+    let reduced_openings = open_inputs::<Val, Challenge, _, FriMmcs>(
+        params,
+        log_global_max_height,
+        &indices,
+        &proof.input_openings,
+        alpha,
+        input_mmcs,
+        commitments_with_opening_points,
+    )?;
+
+    // Walk every query's fold chain, recording each round's group index and reconstructed row.
+    let num_rounds = proof.commit_phase_commits.len();
+    let mut group_indices_by_round: Vec<Vec<usize>> = vec![Vec::new(); num_rounds];
+    let mut rows_by_round: Vec<Vec<Vec<Vec<Challenge>>>> = vec![Vec::new(); num_rounds];
+    for (query, (&index, ro)) in indices.iter().zip(reduced_openings).enumerate() {
+        let mut domain_index = index >> extra_query_index_bits;
+        fold_query(
+            &folding,
+            query,
+            &mut domain_index,
+            &betas,
+            &log_arities,
+            &proof.commit_phase_openings,
+            ro,
+            log_global_max_height,
+            log_final_height,
+            &mut group_indices_by_round,
+            &mut rows_by_round,
+        )?;
+    }
+
+    Ok(FriQueryLayout {
+        indices,
+        log_global_max_height,
+        log_arities,
+        group_indices_by_round,
+        rows_by_round,
+    })
+}
+
+/// The committed dimensions and per-query leaf indices of one FRI input batch.
+///
+/// Both are rederived from the verifier-known opening points exactly as
+/// [`p3_fri::verifier::open_inputs`] derives them; the proof contributes only each matrix's
+/// opened width.
+fn input_batch_layout<Val, Challenge, E1: core::fmt::Debug, E2: core::fmt::Debug>(
+    params: &FriParameters<impl Mmcs<Challenge>>,
+    batch: usize,
+    log_global_max_height: usize,
+    indices: &[usize],
+    mats: &[MatrixOpening<Challenge, TwoAdicMultiplicativeCoset<Val>>],
+) -> Result<(Vec<Dimensions>, Vec<usize>), FriError<E1, E2>>
+where
+    Val: TwoAdicField,
+    Challenge: ExtensionField<Val>,
+{
+    let batch_heights: Vec<usize> = mats
+        .iter()
+        .map(|matrix| matrix.domain.size() << params.log_blowup)
+        .collect();
+    let batch_dims = batch_heights
+        .iter()
+        .zip(mats)
+        .enumerate()
+        .map(|(matrix, (&height, opening))| {
+            let PointOpening { values, .. } = opening
+                .points
+                .first()
+                .ok_or(FriError::MatrixWithoutOpeningPoints { batch, matrix })?;
+            Ok(Dimensions {
+                width: values.len(),
+                height,
+            })
+        })
+        .collect::<Result<Vec<_>, FriError<E1, E2>>>()?;
+
+    let reduced_indices: Vec<usize> = batch_heights
+        .iter()
+        .max()
+        .map(|&h| {
+            let bits_reduced = log_global_max_height - log2_strict_usize(h);
+            indices.iter().map(|&index| index >> bits_reduced).collect()
+        })
+        .unwrap_or_else(|| vec![0; indices.len()]);
+
+    Ok((batch_dims, reduced_indices))
+}
+
+/// The dimensions of one commit-phase round's committed matrix: `arity` extension columns
+/// flattened to base field, over the folded domain.
+const fn commit_phase_dims<Challenge: BasedVectorSpace<Val>, Val: Field>(
+    log_arity: usize,
+    log_folded_height: usize,
+) -> Dimensions {
+    Dimensions {
+        width: (1 << log_arity) * Challenge::DIMENSION,
+        height: 1 << log_folded_height,
+    }
+}
+
+/// Assemble per-query [`FriQueryPaths`] from per-batch and per-round chain sets.
+fn transpose_query_paths<Val, const DIGEST_ELEMS: usize>(
+    num_queries: usize,
+    input_paths_by_batch: &[Vec<Vec<[Val; DIGEST_ELEMS]>>],
+    commit_phase_paths_by_round: &[Vec<Vec<[Val; DIGEST_ELEMS]>>],
+) -> Vec<FriQueryPaths<Val, DIGEST_ELEMS>>
+where
+    Val: Clone,
+{
+    (0..num_queries)
+        .map(|query| FriQueryPaths {
+            input: input_paths_by_batch
+                .iter()
+                .map(|batch| batch[query].clone())
+                .collect(),
+            commit_phase: commit_phase_paths_by_round
+                .iter()
+                .map(|round| round[query].clone())
+                .collect(),
+        })
+        .collect()
+}
+
+/// Restore every FRI query's per-tree Merkle authentication paths from the proof's shared,
+/// pruned multiproofs.
+///
+/// This replays the verifier's own transcript — the same steps
+/// [`p3_fri::verifier::verify_fri`] takes — because the restoration is driven by data the proof
+/// does not carry: the queried leaf indices, and, for a commit-phase round, the query's full
+/// reconstructed evaluation row (whose own entry is the folded value the fold chain carries
+/// forward). [`p3_fri::verifier::open_inputs`] and [`p3_fri::verifier::fold_query`] produce both,
+/// and `MerkleTreeMmcs::restore_and_recompute_paths` recomputes each digest the multiproof
+/// omitted from them.
+///
+/// `challenger` must be in the state `verify_fri` expects: every opened value observed, nothing
+/// sampled since. `commit_phase_mmcs` is the base-field tree the commit-phase
+/// [`p3_commit::ExtensionMmcs`] wraps, which that wrapper does not expose.
+///
+/// The returned paths are in query order, each ready for
+/// [`set_fri_mmcs_private_data`] / [`set_fri_mmcs_private_data_arity4`].
+#[expect(clippy::type_complexity)]
+pub fn restore_fri_query_paths<
+    Val,
+    Challenge,
+    FriMmcs,
+    Challenger,
+    H,
+    C,
+    const N: usize,
+    const DIGEST_ELEMS: usize,
+>(
+    params: &FriParameters<FriMmcs>,
+    input_mmcs: &FriTreeMmcs<Val, H, C, N, DIGEST_ELEMS>,
+    commit_phase_mmcs: &FriTreeMmcs<Val, H, C, N, DIGEST_ELEMS>,
+    proof: &FriProof<
+        Challenge,
+        FriMmcs,
+        Challenger::Witness,
+        Vec<BatchMultiOpening<Val, FriTreeMmcs<Val, H, C, N, DIGEST_ELEMS>>>,
+    >,
+    challenger: &mut Challenger,
+    commitments_with_opening_points: &[CommitmentWithOpeningPoints<
+        Challenge,
+        <FriTreeMmcs<Val, H, C, N, DIGEST_ELEMS> as Mmcs<Val>>::Commitment,
+        TwoAdicMultiplicativeCoset<Val>,
+    >],
+) -> Result<Vec<FriQueryPaths<Val, DIGEST_ELEMS>>, FriError<MerkleTreeError, MerkleTreeError>>
+where
+    Val: TwoAdicField + PrimeField64 + Serialize + DeserializeOwned,
+    Challenge: ExtensionField<Val>,
+    FriMmcs: Mmcs<Challenge, MultiProof = PrunedMerklePaths<Val, DIGEST_ELEMS>, Error = MerkleTreeError>
+        + Sync,
+    FriMmcs::Commitment: Sync,
+    Challenger: FieldChallenger<Val> + GrindingChallenger + CanObserve<FriMmcs::Commitment>,
+    H: CryptographicHasher<Val, [Val; DIGEST_ELEMS]>
+        + CryptographicHasher<Val::Packing, [Val::Packing; DIGEST_ELEMS]>
+        + Sync,
+    C: PseudoCompressionFunction<[Val; DIGEST_ELEMS], N>
+        + PseudoCompressionFunction<[Val::Packing; DIGEST_ELEMS], N>
+        + Sync,
+    [Val; DIGEST_ELEMS]: Serialize + DeserializeOwned,
+{
+    let samples = sample_fri_queries(params, proof, challenger, commitments_with_opening_points)?;
+    let indices = samples.indices.clone();
+    let log_global_max_height = samples.log_global_max_height;
+
+    // Input batches: the opened rows are explicit, so only the leaf indices and the committed
+    // dimensions have to be rederived — exactly as `open_inputs` derives them. Those depend only
+    // on the sampled indices, so the paths are rebuilt while the fold chains are walked.
+    let (layout, input_paths_by_batch) = join(
+        || {
+            fold_fri_queries(
+                params,
+                input_mmcs,
+                proof,
+                commitments_with_opening_points,
+                samples,
+            )
+        },
+        || {
+            proof
+                .input_openings
+                .par_iter()
+                .zip(commitments_with_opening_points.par_iter())
+                .enumerate()
+                .map(
+                    |(batch, (batch_opening, CommitmentOpening { matrices: mats, .. }))| {
+                        let (batch_dims, reduced_indices) =
+                            input_batch_layout::<Val, Challenge, MerkleTreeError, MerkleTreeError>(
+                                params,
+                                batch,
+                                log_global_max_height,
+                                &indices,
+                                mats,
+                            )?;
+                        Ok(input_mmcs
+                            .restore_and_recompute_paths(
+                                &batch_dims,
+                                &reduced_indices,
+                                &batch_opening.opened_values,
+                                &batch_opening.opening_proof,
+                            )
+                            .map_err(FriError::InputError)?
+                            .into_iter()
+                            .map(|path| path.siblings)
+                            .collect())
+                    },
+                )
+                .collect::<Result<
+                    Vec<Vec<Vec<[Val; DIGEST_ELEMS]>>>,
+                    FriError<MerkleTreeError, MerkleTreeError>,
+                >>()
+        },
+    );
+    let layout = layout?;
+    let input_paths_by_batch = input_paths_by_batch?;
+
+    // Commit-phase rounds: one matrix of `arity` extension columns per round, flattened to base
+    // field the way the round's `ExtensionMmcs` commits it.
+    let log_folded_heights: Vec<usize> = layout
+        .log_arities
+        .iter()
+        .scan(layout.log_global_max_height, |log_height, &log_arity| {
+            *log_height -= log_arity;
+            Some(*log_height)
+        })
+        .collect();
+    let commit_phase_paths_by_round: Vec<Vec<Vec<[Val; DIGEST_ELEMS]>>> = proof
+        .commit_phase_openings
+        .par_iter()
+        .zip(
+            layout
+                .log_arities
+                .par_iter()
+                .zip(log_folded_heights.par_iter()),
+        )
+        .enumerate()
+        .map(|(round, (opening, (&log_arity, &log_folded_height)))| {
+            let dims = [commit_phase_dims::<Challenge, Val>(
+                log_arity,
+                log_folded_height,
+            )];
+            let opened_values: Vec<Vec<Vec<Val>>> = layout.rows_by_round[round]
+                .iter()
+                .map(|rows| {
+                    rows.iter()
+                        .map(|row| Challenge::flatten_to_base(row.clone()))
+                        .collect()
+                })
+                .collect();
+
+            Ok(commit_phase_mmcs
+                .restore_and_recompute_paths(
+                    &dims,
+                    &layout.group_indices_by_round[round],
+                    &opened_values,
+                    &opening.opening_proof,
+                )
+                .map_err(FriError::CommitPhaseMmcsError)?
+                .into_iter()
+                .map(|path| path.siblings)
+                .collect())
+        })
+        .collect::<Result<_, FriError<MerkleTreeError, MerkleTreeError>>>()?;
+
+    Ok(transpose_query_paths(
+        params.num_queries,
+        &input_paths_by_batch,
+        &commit_phase_paths_by_round,
+    ))
+}
+
+/// Hiding counterpart of [`restore_fri_query_paths`], for a FRI instance whose input and
+/// commit-phase MMCSs are salted [`p3_merkle_tree::MerkleTreeHidingMmcs`] trees.
+///
+/// A hiding tree commits each leaf as `row ++ salt`, so its pruned multiproof travels as
+/// `(salts, paths)` and the restoration has to widen every committed dimension by `SALT_ELEMS`
+/// and re-append each query's salt before walking the tree. `input_tree` and `commit_phase_tree`
+/// are the plain [`MerkleTreeMmcs`] the hiding wrappers are built over — same hasher, compression
+/// function and cap height — because a hiding MMCS does not expose the tree underneath it.
+#[expect(clippy::type_complexity)]
+pub fn restore_hiding_fri_query_paths<
+    Val,
+    Challenge,
+    FriMmcs,
+    Challenger,
+    R,
+    H,
+    C,
+    const N: usize,
+    const DIGEST_ELEMS: usize,
+    const SALT_ELEMS: usize,
+>(
+    params: &FriParameters<FriMmcs>,
+    input_mmcs: &HidingTreeMmcs<Val, H, C, R, N, DIGEST_ELEMS, SALT_ELEMS>,
+    input_tree: &FriTreeMmcs<Val, H, C, N, DIGEST_ELEMS>,
+    commit_phase_tree: &FriTreeMmcs<Val, H, C, N, DIGEST_ELEMS>,
+    proof: &FriProof<
+        Challenge,
+        FriMmcs,
+        Challenger::Witness,
+        Vec<BatchMultiOpening<Val, HidingTreeMmcs<Val, H, C, R, N, DIGEST_ELEMS, SALT_ELEMS>>>,
+    >,
+    challenger: &mut Challenger,
+    commitments_with_opening_points: &[CommitmentWithOpeningPoints<
+        Challenge,
+        <HidingTreeMmcs<Val, H, C, R, N, DIGEST_ELEMS, SALT_ELEMS> as Mmcs<Val>>::Commitment,
+        TwoAdicMultiplicativeCoset<Val>,
+    >],
+) -> Result<Vec<FriQueryPaths<Val, DIGEST_ELEMS>>, FriError<MerkleTreeError, MerkleTreeError>>
+where
+    Val: TwoAdicField + PrimeField64 + Serialize + DeserializeOwned,
+    Challenge: ExtensionField<Val>,
+    FriMmcs: Mmcs<
+            Challenge,
+            MultiProof = (Vec<Vec<Vec<Val>>>, PrunedMerklePaths<Val, DIGEST_ELEMS>),
+            Error = MerkleTreeError,
+        >,
+    Challenger: FieldChallenger<Val> + GrindingChallenger + CanObserve<FriMmcs::Commitment>,
+    R: CryptoRng + SeedableRng + Send,
+    H: CryptographicHasher<Val, [Val; DIGEST_ELEMS]>
+        + CryptographicHasher<Val::Packing, [Val::Packing; DIGEST_ELEMS]>
+        + Sync,
+    C: PseudoCompressionFunction<[Val; DIGEST_ELEMS], N>
+        + PseudoCompressionFunction<[Val::Packing; DIGEST_ELEMS], N>
+        + Sync,
+    StandardUniform: Distribution<Val>,
+    [Val; DIGEST_ELEMS]: Serialize + DeserializeOwned,
+{
+    let layout = replay_fri_query_layout(
+        params,
+        input_mmcs,
+        proof,
+        challenger,
+        commitments_with_opening_points,
+    )?;
+
+    let mut input_paths_by_batch: Vec<Vec<Vec<[Val; DIGEST_ELEMS]>>> =
+        Vec::with_capacity(proof.input_openings.len());
+    for (batch, (batch_opening, CommitmentOpening { matrices: mats, .. })) in proof
+        .input_openings
+        .iter()
+        .zip(commitments_with_opening_points)
+        .enumerate()
+    {
+        let (batch_dims, reduced_indices) = input_batch_layout::<Val, Challenge, _, _>(
+            params,
+            batch,
+            layout.log_global_max_height,
+            &layout.indices,
+            mats,
+        )?;
+        let (salts, paths) = &batch_opening.opening_proof;
+        let salted_dims = salted_dimensions::<SALT_ELEMS>(&batch_dims);
+        let salted_values =
+            salt_opened_values::<Val, SALT_ELEMS>(&batch_opening.opened_values, salts)
+                .map_err(FriError::InputError)?;
+
+        input_paths_by_batch.push(
+            input_tree
+                .restore_and_recompute_paths(&salted_dims, &reduced_indices, &salted_values, paths)
+                .map_err(FriError::InputError)?
+                .into_iter()
+                .map(|path| path.siblings)
+                .collect(),
+        );
+    }
+
+    let mut commit_phase_paths_by_round: Vec<Vec<Vec<[Val; DIGEST_ELEMS]>>> =
+        Vec::with_capacity(layout.log_arities.len());
+    let mut log_current_height = layout.log_global_max_height;
+    for (round, (opening, &log_arity)) in proof
+        .commit_phase_openings
+        .iter()
+        .zip(&layout.log_arities)
+        .enumerate()
+    {
+        let log_folded_height = log_current_height - log_arity;
+        let dims = [commit_phase_dims::<Challenge, Val>(
+            log_arity,
+            log_folded_height,
+        )];
+        let opened_values: Vec<Vec<Vec<Val>>> = layout.rows_by_round[round]
+            .iter()
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| Challenge::flatten_to_base(row.clone()))
+                    .collect()
+            })
+            .collect();
+        let (salts, paths) = &opening.opening_proof;
+        let salted_dims = salted_dimensions::<SALT_ELEMS>(&dims);
+        let salted_values = salt_opened_values::<Val, SALT_ELEMS>(&opened_values, salts)
+            .map_err(FriError::CommitPhaseMmcsError)?;
+
+        commit_phase_paths_by_round.push(
+            commit_phase_tree
+                .restore_and_recompute_paths(
+                    &salted_dims,
+                    &layout.group_indices_by_round[round],
+                    &salted_values,
+                    paths,
+                )
+                .map_err(FriError::CommitPhaseMmcsError)?
+                .into_iter()
+                .map(|path| path.siblings)
+                .collect(),
+        );
+        log_current_height = log_folded_height;
+    }
+
+    Ok(transpose_query_paths(
+        params.num_queries,
+        &input_paths_by_batch,
+        &commit_phase_paths_by_round,
+    ))
+}
+
+/// The `MerkleTreeHidingMmcs` a hiding FRI instance commits with, over base field `Val`.
+type HidingTreeMmcs<
+    Val,
+    H,
+    C,
+    R,
+    const N: usize,
+    const DIGEST_ELEMS: usize,
+    const SALT_ELEMS: usize,
+> = MerkleTreeHidingMmcs<
+    <Val as Field>::Packing,
+    <Val as Field>::Packing,
+    H,
+    C,
+    R,
+    N,
+    DIGEST_ELEMS,
+    SALT_ELEMS,
+>;
+
+/// Widen every committed dimension by the salt columns a hiding tree appends to each leaf.
+fn salted_dimensions<const SALT_ELEMS: usize>(dimensions: &[Dimensions]) -> Vec<Dimensions> {
+    dimensions
+        .iter()
+        .map(|dims| Dimensions {
+            width: dims.width + SALT_ELEMS,
+            height: dims.height,
+        })
+        .collect()
+}
+
+/// Rebuild the salted leaf rows a hiding tree hashes: each opened row with its salt appended.
+fn salt_opened_values<Val: Clone, const SALT_ELEMS: usize>(
+    opened_values: &[Vec<Vec<Val>>],
+    salts: &[Vec<Vec<Val>>],
+) -> Result<Vec<Vec<Vec<Val>>>, MerkleTreeError> {
+    if salts.len() != opened_values.len() {
+        return Err(MerkleTreeError::WrongBatchSize {
+            expected: opened_values.len(),
+            got: salts.len(),
+        });
+    }
+    opened_values
+        .iter()
+        .zip(salts)
+        .map(|(rows, query_salts)| {
+            if query_salts.len() != rows.len() {
+                return Err(MerkleTreeError::WrongBatchSize {
+                    expected: rows.len(),
+                    got: query_salts.len(),
+                });
+            }
+            rows.iter()
+                .zip(query_salts)
+                .map(|(row, salt)| {
+                    if salt.len() != SALT_ELEMS {
+                        return Err(MerkleTreeError::WrongBatchSize {
+                            expected: SALT_ELEMS,
+                            got: salt.len(),
+                        });
+                    }
+                    Ok(row.iter().chain(salt).cloned().collect())
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Assign one Merkle sibling digest per operation id, consuming `op_ids` from `op_idx`.
+fn set_path_private_data<F, EF, const DIGEST_ELEMS: usize>(
+    runner: &mut CircuitRunner<'_, EF>,
+    op_ids: &[NonPrimitiveOpId],
+    op_idx: &mut usize,
+    path: &[[F; DIGEST_ELEMS]],
+    permutation_config: PermConfig,
+    label: &'static str,
+) -> Result<(), &'static str>
+where
+    F: Field,
+    EF: ExtensionField<F> + BasedVectorSpace<F>,
+{
+    for sibling in convert_merkle_proof_to_siblings::<F, EF, DIGEST_ELEMS>(path) {
+        if *op_idx >= op_ids.len() {
+            return Err("More siblings in proof than op_ids provided");
+        }
+        runner
+            .set_private_data(
+                op_ids[*op_idx],
+                perm_private_data(permutation_config, sibling),
+            )
+            .map_err(|_| label)?;
+        *op_idx += 1;
+    }
+    Ok(())
+}
+
+/// Set private data for FRI MMCS verification operations.
+///
+/// Feeds each query's restored Merkle sibling chains to the circuit operations returned by
+/// `verify_fri_circuit`. A hiding MMCS needs no separate entry point: its salts enter the leaf
+/// preimage as circuit private inputs (see
+/// [`HidingHashProofTargets`](crate::pcs::HidingHashProofTargets)), so the chains here carry
+/// sibling digests either way.
+///
+/// # Parameters
+/// - `runner`: The circuit runner to set private data on
+/// - `op_ids`: Operation IDs returned by `verify_fri_circuit`
+/// - `query_paths`: One [`FriQueryPaths`] per FRI query, in query order
+///
+/// # Returns
+/// `Ok(())` if all private data was set successfully, or an error if there was a mismatch.
+///
+/// # Operation ID Order
+/// The `op_ids` are expected in the following order (matching `verify_fri_circuit`):
+/// 1. For each query:
+///    - Input batch MMCS ops (one per batch, each with `path_depth` siblings)
+///    - Commit-phase MMCS ops (one per phase, each with `phase_depth` siblings)
+pub fn set_fri_mmcs_private_data<F, EF, const DIGEST_ELEMS: usize>(
+    runner: &mut CircuitRunner<'_, EF>,
+    op_ids: &[NonPrimitiveOpId],
+    query_paths: &[FriQueryPaths<F, DIGEST_ELEMS>],
+    permutation_config: impl Into<PermConfig>,
+) -> Result<(), &'static str>
+where
+    F: Field,
+    EF: ExtensionField<F> + BasedVectorSpace<F>,
+{
+    let permutation_config: PermConfig = permutation_config.into();
+    let mut op_idx = 0;
+
+    for query in query_paths {
+        for path in &query.input {
+            set_path_private_data::<F, EF, DIGEST_ELEMS>(
+                runner,
+                op_ids,
+                &mut op_idx,
+                path,
+                permutation_config,
+                "Failed to set private data for input batch MMCS",
+            )?;
+        }
+
+        for path in &query.commit_phase {
+            set_path_private_data::<F, EF, DIGEST_ELEMS>(
+                runner,
+                op_ids,
+                &mut op_idx,
+                path,
+                permutation_config,
+                "Failed to set private data for commit-phase MMCS",
+            )?;
+        }
+    }
+
+    if op_idx != op_ids.len() {
+        return Err("Fewer siblings in proof than op_ids provided");
+    }
+
+    Ok(())
+}
+
+/// One level of the arity-4 Merkle path: a `step` (2 or 4) plus the matrices whose rows are
+/// injected after that level's compression (mixed-height batches).
+struct Arity4PathStep {
+    step: usize,
+    injection_rows: Vec<usize>,
+}
+
+/// Matrices present at the initial leaf layer (all rounding up to the tallest power-of-two height).
+fn arity4_leaf_rows(dimensions: &[Dimensions]) -> Result<Vec<usize>, CircuitBuilderError> {
+    let max_height = dimensions.iter().map(|dims| dims.height).max().unwrap_or(0);
+    let leaf_height_npt = crate::pcs::mmcs::checked_next_power_of_two(max_height)?;
+    dimensions
+        .iter()
+        .enumerate()
+        .filter_map(|(mat_idx, dims)| {
+            if dims.height == 0 {
+                None
+            } else {
+                Some(
+                    crate::pcs::mmcs::checked_next_power_of_two(dims.height)
+                        .map(|height| (mat_idx, height)),
+                )
+            }
+        })
+        .filter_map(|result| match result {
+            Ok((mat_idx, height)) if height == leaf_height_npt => Some(Ok(mat_idx)),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
+}
+
+/// Derive the per-level `step` (2 or 4) and injection schedule for an arity-4 Merkle path,
+/// matching native `arity_schedule`. Bridge (`step = 2`) levels arise when an intermediate
+/// matrix height lands between two quaternary layers.
+fn arity4_path_schedule(
+    dimensions: &[Dimensions],
+    num_roots: usize,
+) -> Result<Vec<Arity4PathStep>, CircuitBuilderError> {
+    let mut steps = Vec::new();
+    crate::pcs::mmcs::visit_arity4_path(
+        dimensions.iter().map(|dims| dims.height),
+        num_roots,
+        |geometry| {
+            let injection_rows = geometry.injection_height.map_or_else(Vec::new, |height| {
+                dimensions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(mat_idx, dims)| (dims.height == height).then_some(mat_idx))
+                    .collect()
+            });
+            let step = geometry.step;
+            steps.push(Arity4PathStep {
+                step,
+                injection_rows,
+            });
+        },
+    )?;
+    Ok(steps)
+}
+
+/// Hash flattened base-field leaf rows with the wide (W32) overwrite-mode sponge and return the
+/// `capacity_ext` digest limbs that seed the arity-4 Merkle chain.
+///
+/// When `merkle_seed` is set the digest is recorded in the merkle chain slot so the first arity-4
+/// compression inherits it via the placement constraint; an injected matrix's digest (consumed as
+/// an explicit compression input) passes `false`.
+fn add_arity4_leaf_digest_from_base<F, EF>(
+    circuit: &mut CircuitBuilder<EF>,
+    permutation_config: PermConfig,
+    leaf_data: &[Target],
+    merkle_seed: bool,
+) -> Result<Vec<Target>, CircuitBuilderError>
+where
+    F: Field + PrimeField64,
+    EF: ExtensionField<F>,
+{
+    let digest = add_hash_base_coeffs_overwrite::<F, EF>(
+        circuit,
+        &permutation_config,
+        leaf_data,
+        true,
+        BaseCoeffPacking::Alu,
+        merkle_seed,
+    )?;
+    Ok(digest
+        .into_iter()
+        .take(permutation_config.capacity_ext())
+        .collect())
+}
+
+/// Hash already-extension leaf rows with the wide sponge and return the `capacity_ext` digest limbs.
+///
+/// `merkle_seed` has the same meaning as in [`add_arity4_leaf_digest_from_base`].
+fn add_hash_packed_ext_leaf<F, EF>(
+    circuit: &mut CircuitBuilder<EF>,
+    permutation_config: PermConfig,
+    leaf_data: &[Target],
+    merkle_seed: bool,
+) -> Result<Vec<Target>, CircuitBuilderError>
+where
+    F: Field + PrimeField64,
+    EF: ExtensionField<F>,
+{
+    let digest = add_hash_extension_elements::<F, EF>(
+        circuit,
+        &permutation_config,
+        leaf_data,
+        true,
+        merkle_seed,
+    )?;
+    Ok(digest
+        .into_iter()
+        .take(permutation_config.capacity_ext())
+        .collect())
+}
+
+/// Emit one arity-4 compression row.
+///
+/// Chunk `k` spans lanes `[k·capacity_ext, (k+1)·capacity_ext)`. The previous row's running hash
+/// is chained into chunk `pos = mmcs_bit + 2·mmcs_bit2` by the AIR's placement constraint
+/// (`inputs = None` there, `in_ctl = 0`), and free sibling chunks are supplied via private data.
+///
+/// `step ∈ {2, 4}` selects how many chunks are active. The unused chunks of a `step = 2` bridge or
+/// an injection level are pinned to CTL-loaded zeros (`Some(zero)`, `in_ctl = 1`) so a tampered
+/// nonzero pad fails the witness/CTL bus equality. For an injection level chunk 1 carries the
+/// injected matrix's W32 leaf digest.
+fn add_arity4_compression_row<EF: Field>(
+    circuit: &mut CircuitBuilder<EF>,
+    permutation_config: PermConfig,
+    direction: [Target; 2],
+    step: usize,
+    injected_digest: Option<&[Target]>,
+    is_final: bool,
+    zero: Target,
+) -> Result<(NonPrimitiveOpId, Vec<Option<Target>>), CircuitBuilderError> {
+    let width_ext = permutation_config.width_ext();
+    let rate_ext = permutation_config.rate_ext();
+    let capacity_ext = permutation_config.capacity_ext();
+    let mut inputs = vec![None; width_ext];
+
+    // An injection level holds the running hash at chunk 0 and the injected digest at chunk 1;
+    // a `step = 2` bridge holds the running hash and one sibling across chunks 0,1. Both leave
+    // chunks 2,3 unused. A `step = 4` level fills all four chunks (no pads).
+    let active_chunks = if injected_digest.is_some() { 2 } else { step };
+
+    if let Some(digest) = injected_digest {
+        if digest.len() != capacity_ext {
+            return Err(CircuitBuilderError::Poseidon2ConfigMismatch {
+                expected: format!("injected digest len == capacity_ext ({capacity_ext})"),
+                got: format!("injected digest len = {}", digest.len()),
+            });
+        }
+        let base = capacity_ext;
+        for (j, &target) in digest.iter().enumerate() {
+            inputs[base + j] = Some(target);
+        }
+    }
+
+    for chunk_k in active_chunks..4 {
+        let base = chunk_k * capacity_ext;
+        for slot in inputs[base..base + capacity_ext].iter_mut() {
+            *slot = Some(zero);
+        }
+    }
+
+    circuit.add_perm(
+        permutation_config,
+        &PermCall {
+            new_start: false,
+            merkle_path: true,
+            mmcs_bit: Some(direction[0]),
+            mmcs_bit2: Some(direction[1]),
+            inputs,
+            out_ctl: vec![is_final; rate_ext],
+            return_all_outputs: false,
+            mmcs_index_sum: None,
+        },
+    )
+}
+
+/// Validate the per-level shape of an arity-4 batch and split `index_bits` into Merkle-path bits
+/// (low) and cap-selector bits (high), returning `(selected_root, path_bits, schedule, leaf_rows)`.
+#[allow(clippy::type_complexity)]
+fn arity4_prepare<EF: Field>(
+    circuit: &mut CircuitBuilder<EF>,
+    permutation_config: PermConfig,
+    commitment_cap: &[Vec<Target>],
+    dimensions: &[Dimensions],
+    index_bits: &[Target],
+) -> Result<(Vec<Target>, Vec<Arity4PathStep>, Vec<usize>), CircuitBuilderError> {
+    if !permutation_config.is_arity4_shape() {
+        return Err(CircuitBuilderError::Poseidon2ConfigMismatch {
+            expected: "width_ext == 4 * capacity_ext for 4-to-1 MMCS".into(),
+            got: format!(
+                "width_ext = {}, capacity_ext = {}",
+                permutation_config.width_ext(),
+                permutation_config.capacity_ext()
+            ),
+        });
+    }
+
+    let cap_log2 = validate_commitment_cap_len(commitment_cap)?;
+
+    let num_roots = commitment_cap.len();
+
+    // Run the shared scalar visitor before defining zero targets or selecting a
+    // cap entry.  The schedule and leaf rows below only materialize its already
+    // checked integer decisions.
+    let leaf_rows = arity4_leaf_rows(dimensions)?;
+    let schedule = arity4_path_schedule(dimensions, num_roots)?;
+
+    // The cap strips whole compression steps, so the path can consume more direction bits than
+    // `index_bits` holds (the surplus high positions are implicit zeros). The leftover index bits,
+    // zero-extended to `cap_log2`, select the cap entry.
+    let path_bit_total = schedule.iter().try_fold(0usize, |total, step| {
+        total
+            .checked_add(if step.step == 4 { 2 } else { 1 })
+            .ok_or_else(|| CircuitBuilderError::InvalidMerkleCap {
+                details: "arity-4 path bit count overflows".into(),
+            })
+    })?;
+    let cap_index_bits: Vec<Target> = if cap_log2 == 0 {
+        Vec::new()
+    } else {
+        let zero = circuit.define_const(EF::ZERO);
+        (0..cap_log2)
+            .map(|i| {
+                path_bit_total
+                    .checked_add(i)
+                    .and_then(|index| index_bits.get(index).copied())
+                    .unwrap_or(zero)
+            })
+            .collect()
+    };
+
+    let selected_root = select_cap_entry(circuit, commitment_cap, &cap_index_bits);
+
+    Ok((selected_root, schedule, leaf_rows))
+}
+
+/// Walk the arity-4 schedule, emitting one compression row per level (plus an injection row
+/// where the schedule injects a matrix), and connect the recovered root to `selected_root`.
+fn arity4_emit_path<EF: Field>(
+    circuit: &mut CircuitBuilder<EF>,
+    permutation_config: PermConfig,
+    schedule: &[Arity4PathStep],
+    index_bits: &[Target],
+    leaf_digest: &[Target],
+    injected_digests: &[Vec<Target>],
+    selected_root: &[Target],
+) -> Result<Vec<NonPrimitiveOpId>, CircuitBuilderError> {
+    let mut output: Vec<Option<Target>> = leaf_digest.iter().copied().map(Some).collect();
+    let mut op_ids = Vec::new();
+
+    let zero = circuit.define_const(EF::ZERO);
+    let mut bits_consumed = 0usize;
+    let mut injected_digest_idx = 0usize;
+    let n_steps = schedule.len();
+
+    for (i, path_step) in schedule.iter().enumerate() {
+        let step = path_step.step;
+        let step_bits = if step == 4 { 2 } else { 1 };
+        let direction = if step == 4 {
+            [
+                index_bits.get(bits_consumed).copied().unwrap_or(zero),
+                index_bits.get(bits_consumed + 1).copied().unwrap_or(zero),
+            ]
+        } else {
+            [index_bits.get(bits_consumed).copied().unwrap_or(zero), zero]
+        };
+        bits_consumed += step_bits;
+
+        let has_injection = !path_step.injection_rows.is_empty();
+        let is_last_step = i == n_steps - 1;
+
+        let (op_id, maybe_output) = add_arity4_compression_row(
+            circuit,
+            permutation_config,
+            direction,
+            step,
+            None,
+            is_last_step && !has_injection,
+            zero,
+        )?;
+        for _ in 0..(step - 1) {
+            op_ids.push(op_id);
+        }
+        output = maybe_output;
+
+        if has_injection {
+            let injected_digest = &injected_digests[injected_digest_idx];
+            injected_digest_idx += 1;
+            let (_, maybe_output) = add_arity4_compression_row(
+                circuit,
+                permutation_config,
+                [zero, zero],
+                step,
+                Some(injected_digest),
+                is_last_step,
+                zero,
+            )?;
+            output = maybe_output;
+        }
+    }
+
+    let output = output
+        .into_iter()
+        .take(permutation_config.capacity_ext())
+        .map(|x| x.ok_or(CircuitBuilderError::MissingOutput))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (o, r) in output.iter().zip(selected_root.iter()) {
+        circuit.connect(*o, *r);
+    }
+    Ok(op_ids)
+}
+
+/// Arity-4 counterpart of [`verify_batch_circuit`].
+///
+/// Verifies an opened batch against a Merkle cap produced by a 4-to-1 MMCS
+/// (`MerkleTreeMmcs<…, 4, DIGEST_ELEMS>` with a single wide permutation serving both the leaf
+/// sponge and the 4-to-1 compression). `permutation_config` must satisfy
+/// `width_ext == 4 * capacity_ext` (e.g. `KOALA_BEAR_D1_W32` / `KOALA_BEAR_D4_W32`).
+///
+/// `index_bits` is the little-endian leaf index; each level consumes `log2(step)` bits, with
+/// `(index_bits[c], index_bits[c+1])` forming the `(low, high)` chunk selector for a `step = 4`
+/// level. Mixed-height batches are supported via the per-level injection schedule; multi-chunk
+/// leaf hashing is handled by the wide sponge. `commitment_cap[*]` and the recovered root are
+/// `capacity_ext` extension targets.
+pub fn verify_batch_circuit_arity4<F, EF>(
+    circuit: &mut CircuitBuilder<EF>,
+    permutation_config: impl Into<PermConfig>,
+    commitment_cap: &[Vec<Target>],
+    dimensions: &[Dimensions],
+    index_bits: &[Target],
+    opened_base_coeffs: &[Vec<Target>],
+) -> Result<Vec<NonPrimitiveOpId>, CircuitBuilderError>
+where
+    F: Field + TwoAdicField + PrimeField64,
+    EF: ExtensionField<F>,
+{
+    let permutation_config: PermConfig = permutation_config.into();
+    if dimensions.len() != opened_base_coeffs.len() {
+        return Err(CircuitBuilderError::WrongBatchSize {
+            expected: dimensions.len(),
+            got: opened_base_coeffs.len(),
+        });
+    }
+
+    let (selected_root, schedule, leaf_rows) = arity4_prepare::<EF>(
+        circuit,
+        permutation_config,
+        commitment_cap,
+        dimensions,
+        index_bits,
+    )?;
+
+    let mut injected_digests = Vec::new();
+    for step in &schedule {
+        if step.injection_rows.is_empty() {
+            continue;
+        }
+        let injected_leaf_data: Vec<Target> = step
+            .injection_rows
+            .iter()
+            .flat_map(|&mat_idx| opened_base_coeffs[mat_idx].iter().copied())
+            .collect();
+        injected_digests.push(add_arity4_leaf_digest_from_base::<F, EF>(
+            circuit,
+            permutation_config,
+            &injected_leaf_data,
+            false,
+        )?);
+    }
+
+    // Hash the initial leaf layer last so the first compression row chains directly from it; the
+    // injected digests were precomputed above and enter as explicit inputs.
+    let leaf_data: Vec<Target> = leaf_rows
+        .iter()
+        .flat_map(|&mat_idx| opened_base_coeffs[mat_idx].iter().copied())
+        .collect();
+    let leaf_digest =
+        add_arity4_leaf_digest_from_base::<F, EF>(circuit, permutation_config, &leaf_data, true)?;
+
+    arity4_emit_path::<EF>(
+        circuit,
+        permutation_config,
+        &schedule,
+        index_bits,
+        &leaf_digest,
+        &injected_digests,
+        &selected_root,
+    )
+}
+
+/// Arity-4 counterpart of [`verify_batch_circuit_from_extension_opened`].
+///
+/// Same shape as [`verify_batch_circuit_arity4`], but accepts already-extension opened values —
+/// used by the FRI commit phase. For a D=1 permutation in a higher-degree extension, each element
+/// is flattened to its base coefficients before hashing (matching native `ExtensionMmcs`).
+pub fn verify_batch_circuit_from_extension_opened_arity4<F, EF>(
+    circuit: &mut CircuitBuilder<EF>,
+    permutation_config: impl Into<PermConfig>,
+    commitment_cap: &[Vec<Target>],
+    dimensions: &[Dimensions],
+    index_bits: &[Target],
+    opened_extension_values: &[Vec<Target>],
+) -> Result<Vec<NonPrimitiveOpId>, CircuitBuilderError>
+where
+    F: Field + TwoAdicField + PrimeField64,
+    EF: ExtensionField<F>,
+{
+    let permutation_config: PermConfig = permutation_config.into();
+    if dimensions.len() != opened_extension_values.len() {
+        return Err(CircuitBuilderError::WrongBatchSize {
+            expected: dimensions.len(),
+            got: opened_extension_values.len(),
+        });
+    }
+
+    let (selected_root, schedule, leaf_rows) = arity4_prepare::<EF>(
+        circuit,
+        permutation_config,
+        commitment_cap,
+        dimensions,
+        index_bits,
+    )?;
+
+    let ext_degree = <EF as BasedVectorSpace<F>>::DIMENSION;
+    let flatten_to_base = permutation_config.d() == 1 && ext_degree > 1;
+
+    let leaf_digest_from_ext = |circuit: &mut CircuitBuilder<EF>,
+                                mats: &[usize],
+                                merkle_seed: bool|
+     -> Result<Vec<Target>, CircuitBuilderError> {
+        if flatten_to_base {
+            // Force fresh per-limb decomposition: a folded-codeword leaf value can carry EF-select
+            // provenance whose coefficient-wise expansion would leave the internal subtraction's
+            // difference limb without a `WitnessChecks` creator. Routing every limb through fresh
+            // coefficients keeps the bus balanced for the D=1 extension-opened leaf.
+            let prev_skip = circuit.set_decompose_skip_select_provenance(true);
+            let mut data = Vec::new();
+            for &mat_idx in mats {
+                for &t in &opened_extension_values[mat_idx] {
+                    let coeffs = circuit.decompose_ext_to_base_coeffs::<F>(t);
+                    match coeffs {
+                        Ok(c) => data.extend(c),
+                        Err(e) => {
+                            circuit.set_decompose_skip_select_provenance(prev_skip);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            circuit.set_decompose_skip_select_provenance(prev_skip);
+            add_arity4_leaf_digest_from_base::<F, EF>(
+                circuit,
+                permutation_config,
+                &data,
+                merkle_seed,
+            )
+        } else {
+            let data: Vec<Target> = mats
+                .iter()
+                .flat_map(|&mat_idx| opened_extension_values[mat_idx].iter().copied())
+                .collect();
+            add_hash_packed_ext_leaf::<F, EF>(circuit, permutation_config, &data, merkle_seed)
+        }
+    };
+
+    let mut injected_digests = Vec::new();
+    for step in &schedule {
+        if step.injection_rows.is_empty() {
+            continue;
+        }
+        injected_digests.push(leaf_digest_from_ext(circuit, &step.injection_rows, false)?);
+    }
+
+    let leaf_digest = leaf_digest_from_ext(circuit, &leaf_rows, true)?;
+
+    arity4_emit_path::<EF>(
+        circuit,
+        permutation_config,
+        &schedule,
+        index_bits,
+        &leaf_digest,
+        &injected_digests,
+        &selected_root,
+    )
+}
+
+/// Set the sibling private data for one arity-4 MMCS opening proof.
+///
+/// Each compression op-id is repeated once per sibling in `op_ids` (3× for a `step = 4` level,
+/// 1× for a `step = 2` bridge). Consecutive equal op-ids are grouped, their sibling digests packed
+/// into a single payload, and short groups padded with zero limbs up to `3 · capacity_ext`.
+fn set_arity4_opening_private_data<F, EF, const DIGEST_ELEMS: usize>(
+    runner: &mut CircuitRunner<'_, EF>,
+    op_ids: &[NonPrimitiveOpId],
+    op_idx: &mut usize,
+    opening_proof: &[[F; DIGEST_ELEMS]],
+    permutation_config: PermConfig,
+) -> Result<(), &'static str>
+where
+    F: Field,
+    EF: ExtensionField<F> + BasedVectorSpace<F>,
+{
+    let siblings = convert_merkle_proof_to_siblings::<F, EF, DIGEST_ELEMS>(opening_proof);
+    let sibling_limb_len = siblings.first().map(Vec::len).unwrap_or(0);
+    let mut sibling_idx = 0usize;
+    while sibling_idx < siblings.len() {
+        if *op_idx >= op_ids.len() {
+            return Err("More arity-4 siblings in proof than op_ids provided");
+        }
+        let op_id = op_ids[*op_idx];
+        let mut flat = Vec::new();
+        let mut siblings_for_op = 0usize;
+        while *op_idx < op_ids.len() && op_ids[*op_idx] == op_id {
+            if sibling_idx >= siblings.len() {
+                return Err("Arity-4 op_id group has more entries than proof siblings");
+            }
+            flat.extend(siblings[sibling_idx].iter().copied());
+            sibling_idx += 1;
+            *op_idx += 1;
+            siblings_for_op += 1;
+            if siblings_for_op > 3 {
+                return Err("Arity-4 op_id group cannot contain more than 3 siblings");
+            }
+        }
+        for _ in siblings_for_op..3 {
+            flat.extend(vec![EF::ZERO; sibling_limb_len]);
+        }
+        runner
+            .set_private_data(op_id, perm_private_data(permutation_config, flat))
+            .map_err(|_| "Failed to set private data for arity-4 MMCS")?;
+    }
+
+    Ok(())
+}
+
+/// Arity-4 counterpart of [`set_fri_mmcs_private_data`].
+///
+/// Each arity-4 MMCS opening contributes one compression op-id per Merkle level (repeated once per
+/// proof sibling). This packs each restored sibling group into the private payload consumed by the
+/// corresponding compression row.
+pub fn set_fri_mmcs_private_data_arity4<F, EF, const DIGEST_ELEMS: usize>(
+    runner: &mut CircuitRunner<'_, EF>,
+    op_ids: &[NonPrimitiveOpId],
+    query_paths: &[FriQueryPaths<F, DIGEST_ELEMS>],
+    permutation_config: impl Into<PermConfig>,
+) -> Result<(), &'static str>
+where
+    F: Field,
+    EF: ExtensionField<F> + BasedVectorSpace<F>,
+{
+    let permutation_config: PermConfig = permutation_config.into();
+    let mut op_idx = 0;
+
+    for query in query_paths {
+        for path in &query.input {
+            set_arity4_opening_private_data::<F, EF, DIGEST_ELEMS>(
+                runner,
+                op_ids,
+                &mut op_idx,
+                path,
+                permutation_config,
+            )?;
+        }
+
+        for path in &query.commit_phase {
+            set_arity4_opening_private_data::<F, EF, DIGEST_ELEMS>(
+                runner,
+                op_ids,
+                &mut op_idx,
+                path,
+                permutation_config,
+            )?;
+        }
+    }
+
+    if op_idx != op_ids.len() {
+        return Err("Fewer arity-4 siblings in proof than op_ids provided");
+    }
+
+    Ok(())
+}
+
+/// Restore every STIR query's Merkle authentication path from one WHIR opening's shared,
+/// pruned multiproof.
+///
+/// A WHIR commitment holds a single matrix and the opening carries every queried row
+/// explicitly, so recomputing the sibling digests the multiproof omitted needs nothing beyond
+/// the verifier's own tree geometry and its queried indices. An extension-field opening's rows
+/// are flattened to base field and its width widened by `EF::DIMENSION`, matching the
+/// `ExtensionMmcs` the native verifier authenticates such a round with.
+///
+/// `dimensions` is the committed matrix's shape in the opening's own field:
+/// `height = domain_size >> folding_factor`, `width = 1 << folding_factor`.
+pub fn restore_whir_query_paths<P, PW, EF, H, C, const N: usize, const DIGEST_ELEMS: usize>(
+    mmcs: &MerkleTreeMmcs<P, PW, H, C, N, DIGEST_ELEMS>,
+    openings: &QueryOpenings<P::Value, EF, PrunedMerklePaths<PW::Value, DIGEST_ELEMS>>,
+    dimensions: &[Dimensions],
+    indices: &[usize],
+) -> Result<Vec<Vec<[PW::Value; DIGEST_ELEMS]>>, MerkleTreeError>
+where
+    P: PackedValue,
+    P::Value: Field,
+    PW: PackedValue,
+    PW::Value: Eq + Clone,
+    EF: ExtensionField<P::Value>,
+    H: CryptographicHasher<P::Value, [PW::Value; DIGEST_ELEMS]>
+        + CryptographicHasher<P, [PW; DIGEST_ELEMS]>
+        + Sync,
+    C: PseudoCompressionFunction<[PW::Value; DIGEST_ELEMS], N>
+        + PseudoCompressionFunction<[PW; DIGEST_ELEMS], N>
+        + Sync,
+    [PW::Value; DIGEST_ELEMS]: Serialize + for<'de> Deserialize<'de>,
+{
+    let (opened_values, proof, width_scale) = match openings {
+        QueryOpenings::Base(opening) => (
+            opening
+                .rows
+                .iter()
+                .map(|row| vec![row.clone()])
+                .collect::<Vec<_>>(),
+            &opening.proof,
+            1,
+        ),
+        QueryOpenings::Extension(opening) => (
+            opening
+                .rows
+                .iter()
+                .map(|row| vec![EF::flatten_to_base(row.clone())])
+                .collect::<Vec<_>>(),
+            &opening.proof,
+            EF::DIMENSION,
+        ),
+    };
+
+    let base_dimensions: Vec<Dimensions> = dimensions
+        .iter()
+        .map(|dims| Dimensions {
+            width: dims.width * width_scale,
+            height: dims.height,
+        })
+        .collect();
+
+    Ok(mmcs
+        .restore_and_recompute_paths(&base_dimensions, indices, &opened_values, proof)?
+        .into_iter()
+        .map(|path| path.siblings)
+        .collect())
+}
+
+/// Set private data for WHIR MMCS verification operations.
+///
+/// Feeds each STIR query's restored Merkle sibling chain to the circuit operations returned by
+/// [`crate::pcs::whir::verify_whir_circuit`]. A WHIR round authenticates all of its queries with
+/// one shared, pruned multiproof
+/// ([`p3_whir::pcs::proof::SharedProofOpening::proof`]); the chains here are the per-query
+/// authentication paths that multiproof stands for, as
+/// `MerkleTreeMmcs::restore_and_recompute_paths` reconstructs them from the round's queried
+/// indices and its explicitly opened rows.
+///
+/// # Parameters
+/// - `round_paths`: `round_paths[round][query]` — the chain for that round's `query`-th STIR query
+/// - `final_paths`: `final_paths[query]` — the chain for the `query`-th final STIR query
+///
+/// # Operation ID order
+///
+/// Matches the order in which `verify_whir_circuit` emits `NonPrimitiveOpId`s:
+/// 1. For each intermediate round (in round order), for each STIR query:
+///    sibling digests along the Merkle path, leaf-to-root.
+/// 2. For each final STIR query: sibling digests along the Merkle path.
+pub fn set_whir_mmcs_private_data<F, EF, const DIGEST_ELEMS: usize>(
+    runner: &mut CircuitRunner<'_, EF>,
+    op_ids: &[NonPrimitiveOpId],
+    round_paths: &[Vec<Vec<[F; DIGEST_ELEMS]>>],
+    final_paths: &[Vec<[F; DIGEST_ELEMS]>],
+    permutation_config: impl Into<PermConfig>,
+) -> Result<(), &'static str>
+where
+    F: Field,
+    EF: ExtensionField<F> + BasedVectorSpace<F>,
+{
+    let permutation_config: PermConfig = permutation_config.into();
+    let mut op_idx = 0;
+
+    for round in round_paths {
+        for path in round {
+            set_path_private_data::<F, EF, DIGEST_ELEMS>(
+                runner,
+                op_ids,
+                &mut op_idx,
+                path,
+                permutation_config,
+                "More siblings than op_ids (round query)",
+            )?;
+        }
+    }
+
+    for path in final_paths {
+        set_path_private_data::<F, EF, DIGEST_ELEMS>(
+            runner,
+            op_ids,
+            &mut op_idx,
+            path,
+            permutation_config,
+            "More siblings than op_ids (final query)",
+        )?;
+    }
+
+    if op_idx != op_ids.len() {
+        return Err("Fewer siblings in proof than op_ids provided");
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use p3_challenger::CanSampleBits;
+    use p3_circuit::ops::mmcs::format_openings;
+    use p3_circuit::ops::{Poseidon2Config, generate_poseidon2_trace, generate_recompose_trace};
+    use p3_commit::{Mmcs, Pcs};
+    use p3_matrix::Matrix;
+    use p3_matrix::dense::{DenseMatrix, RowMajorMatrix};
+    use p3_poseidon2_circuit_air::KoalaBearD4Width16;
+    use p3_test_utils::koala_bear_params::*;
+    use p3_util::log2_ceil_usize;
+    use rand::SeedableRng;
+    use rand::rngs::SmallRng;
+    use tracing_forest::ForestLayer;
+    use tracing_forest::util::LevelFilter;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::{EnvFilter, Registry};
+
+    use super::*;
+
+    type F = KoalaBear;
+    type CF = BinomialExtensionField<F, 4>;
+
+    fn base_digest_to_ext(digest: &[F], permutation_config: impl Into<PermConfig>) -> Vec<CF> {
+        let permutation_config: PermConfig = permutation_config.into();
+        assert_eq!(
+            digest.len(),
+            permutation_config.rate(),
+            "unexpected base digest length"
+        );
+        digest
+            .chunks(<CF as BasedVectorSpace<F>>::DIMENSION)
+            .map(|chunk| {
+                let mut coeffs = [F::ZERO; 4];
+                for (i, &val) in chunk.iter().enumerate() {
+                    coeffs[i] = val;
+                }
+                CF::from_basis_coefficients_slice(&coeffs).expect("packed base digest")
+            })
+            .collect()
+    }
+
+    fn test_all_openings(mats: Vec<RowMajorMatrix<F>>) {
+        test_all_openings_with_cap_height(mats, 0);
+    }
+
+    fn test_all_openings_with_cap_height(mats: Vec<RowMajorMatrix<F>>, cap_height: usize) {
+        let perm = default_koalabear_poseidon2_16();
+        let hash = MyHash::new(perm.clone());
+        let compress = MyCompress::new(perm.clone());
+        let mmcs = MyMmcs::new(hash, compress, cap_height);
+
+        let dimensions = mats.iter().map(DenseMatrix::dimensions).collect_vec();
+
+        let mut heights_tallest_first = dimensions
+            .iter()
+            .enumerate()
+            .sorted_by_key(|(_, dims)| Reverse(dims.height))
+            .peekable();
+
+        let max_height = heights_tallest_first.peek().unwrap().1.height;
+
+        let (commit, prover_data) = mmcs.commit(mats);
+
+        let log_max_height = log2_ceil_usize(max_height);
+        for index in 0..max_height {
+            let mut builder = CircuitBuilder::<CF>::new();
+            let permutation_config = Poseidon2Config::KOALA_BEAR_D4_W16;
+            builder.enable_poseidon2_perm::<KoalaBearD4Width16, _>(
+                generate_poseidon2_trace::<CF, KoalaBearD4Width16>,
+                perm.clone(),
+            );
+            builder.enable_recompose::<F>(generate_recompose_trace::<F, CF>);
+
+            let batch_opening = mmcs.open_batch(index, &prover_data);
+
+            let directions = (0..log_max_height)
+                .map(|k| index >> k & 1 == 1)
+                .collect_vec();
+
+            let openings: Vec<Vec<_>> = batch_opening
+                .opened_values
+                .iter()
+                .map(|opening| {
+                    (0..opening.len())
+                        .map(|_| builder.public_input())
+                        .collect_vec()
+                })
+                .collect_vec();
+
+            let directions_expr = builder.alloc_public_inputs(log_max_height, "directions");
+
+            // Allocate cap entries: each entry has rate_ext extension targets
+            let cap_len = commit.num_roots();
+            let rate_ext = permutation_config.rate_ext();
+            let cap_exprs: Vec<Vec<_>> = (0..cap_len)
+                .map(|_| builder.alloc_public_inputs(rate_ext, "cap entry").to_vec())
+                .collect();
+
+            let permutation_mmcs_ops = verify_batch_circuit::<F, CF>(
+                &mut builder,
+                permutation_config,
+                &cap_exprs,
+                &dimensions,
+                &directions_expr,
+                &openings,
+                None,
+            )
+            .unwrap();
+
+            let circuit = builder.build().unwrap();
+            let mut runner = circuit.runner();
+
+            let directions_expr_vals = directions
+                .iter()
+                .map(|&bit| CF::from_bool(bit))
+                .collect_vec();
+
+            let mut public_inputs: Vec<CF> = batch_opening
+                .opened_values
+                .iter()
+                .flat_map(|values| values.iter().map(|&v| CF::from(v)))
+                .collect();
+            public_inputs.extend(directions_expr_vals.iter());
+            // Pack each cap entry to extension field and add as public inputs
+            for entry in commit.roots() {
+                let commit_ext = base_digest_to_ext(entry, permutation_config);
+                debug_assert_eq!(rate_ext, commit_ext.len());
+                public_inputs.extend(commit_ext);
+            }
+
+            runner.set_public_inputs(&public_inputs).unwrap();
+
+            let siblings = batch_opening
+                .opening_proof
+                .iter()
+                .map(|digest| {
+                    digest
+                        .chunks(4)
+                        .map(CF::from_basis_coefficients_slice)
+                        .collect::<Option<Vec<_>>>()
+                        .unwrap()
+                })
+                .collect_vec();
+
+            for (&op_id, sibling) in permutation_mmcs_ops.iter().zip(siblings) {
+                runner
+                    .set_private_data(op_id, perm_private_data(permutation_config, sibling))
+                    .unwrap();
+            }
+
+            let _ = runner.run().unwrap();
+        }
+    }
+
+    fn init_logger() {
+        let env_filter = EnvFilter::builder()
+            .with_default_directive(LevelFilter::INFO.into())
+            .from_env_lossy();
+
+        // Use try_init to avoid panic if logger is already initialized
+        let _ = Registry::default()
+            .with(env_filter)
+            .with(ForestLayer::default())
+            .try_init();
+    }
+
+    #[test]
+    fn commit_single_1x8() {
+        init_logger();
+        // v = [0, 1, 2, 3, 4, 5, 6, 7]
+        let v = vec![
+            F::from_u32(0),
+            F::from_u32(1),
+            F::from_u32(2),
+            F::from_u32(3),
+            F::from_u32(4),
+            F::from_u32(5),
+            F::from_u32(6),
+            F::from_u32(7),
+        ];
+
+        test_all_openings(vec![RowMajorMatrix::new_col(v)]);
+    }
+
+    #[test]
+    fn commit_single_2x2() {
+        let mat = RowMajorMatrix::new(vec![F::ZERO, F::ONE, F::TWO, F::ONE], 2);
+        test_all_openings(vec![mat]);
+    }
+
+    #[test]
+    fn commit_single_2x3() {
+        // mat = [
+        //   0 1
+        //   2 1
+        //   2 2
+        // ]
+        let mat = RowMajorMatrix::new(vec![F::ZERO, F::ONE, F::TWO, F::ONE, F::TWO, F::TWO], 2);
+        test_all_openings(vec![mat]);
+    }
+
+    #[test]
+    fn commit_mixed() {
+        // mat_1 = [
+        //   0 1
+        //   2 3
+        //   4 5
+        //   6 7
+        //   8 9
+        // ]
+        let mat_1 = RowMajorMatrix::new(
+            vec![
+                F::from_usize(0),
+                F::from_usize(1),
+                F::from_usize(2),
+                F::from_usize(3),
+                F::from_usize(4),
+                F::from_usize(5),
+                F::from_usize(6),
+                F::from_usize(7),
+                F::from_usize(8),
+                F::from_usize(9),
+            ],
+            2,
+        );
+        // mat_2 = [
+        //   10 11 12
+        //   13 14 15
+        //   16 17 18
+        // ]
+        let mat_2 = RowMajorMatrix::new(
+            vec![
+                F::from_usize(10),
+                F::from_usize(11),
+                F::from_usize(12),
+                F::from_usize(13),
+                F::from_usize(14),
+                F::from_usize(15),
+                F::from_usize(16),
+                F::from_usize(17),
+                F::from_usize(18),
+            ],
+            3,
+        );
+        test_all_openings(vec![mat_1, mat_2]);
+    }
+
+    #[test]
+    fn commit_either_order() {
+        let mut rng = SmallRng::seed_from_u64(1);
+        let input_1 = RowMajorMatrix::<F>::rand(&mut rng, 5, 8);
+        let input_2 = RowMajorMatrix::<F>::rand(&mut rng, 3, 16);
+
+        test_all_openings(vec![input_1.clone(), input_2.clone()]);
+        test_all_openings(vec![input_2, input_1]);
+    }
+
+    /// Test with batch STARK's exact height configuration: [512, 8, 4, 128, 4]
+    /// This replicates the multi-instance batch STARK trace commitment structure.
+    #[test]
+    fn commit_batch_stark_heights() {
+        init_logger();
+        let mut rng = SmallRng::seed_from_u64(42);
+
+        // Heights matching batch STARK degree_bits [7, 1, 0, 5, 0] with log_blowup=2
+        // heights = [2^(7+2), 2^(1+2), 2^(0+2), 2^(5+2), 2^(0+2)] = [512, 8, 4, 128, 4]
+        // Widths matching trace batch: [1, 1, 1, 12, 3]
+        let mat_0 = RowMajorMatrix::<F>::rand(&mut rng, 512, 1);
+        let mat_1 = RowMajorMatrix::<F>::rand(&mut rng, 8, 1);
+        let mat_2 = RowMajorMatrix::<F>::rand(&mut rng, 4, 1);
+        let mat_3 = RowMajorMatrix::<F>::rand(&mut rng, 128, 12);
+        let mat_4 = RowMajorMatrix::<F>::rand(&mut rng, 4, 3);
+
+        test_all_openings(vec![mat_0, mat_1, mat_2, mat_3, mat_4]);
+    }
+
+    /// Test with multiple matrices at the same height (4) - potential edge case
+    #[test]
+    fn commit_same_height_matrices() {
+        init_logger();
+        let mut rng = SmallRng::seed_from_u64(123);
+
+        // Two matrices with same height should be combined at the same level
+        let mat_0 = RowMajorMatrix::<F>::rand(&mut rng, 8, 4);
+        let mat_1 = RowMajorMatrix::<F>::rand(&mut rng, 4, 2);
+        let mat_2 = RowMajorMatrix::<F>::rand(&mut rng, 4, 3);
+
+        test_all_openings(vec![mat_0, mat_1, mat_2]);
+    }
+
+    #[test]
+    fn commit_with_cap_height_1() {
+        init_logger();
+        let mut rng = SmallRng::seed_from_u64(99);
+        let mat = RowMajorMatrix::<F>::rand(&mut rng, 8, 3);
+        test_all_openings_with_cap_height(vec![mat], 1);
+    }
+
+    #[test]
+    fn commit_with_cap_height_2() {
+        init_logger();
+        let mut rng = SmallRng::seed_from_u64(99);
+        let mat_0 = RowMajorMatrix::<F>::rand(&mut rng, 16, 2);
+        let mat_1 = RowMajorMatrix::<F>::rand(&mut rng, 4, 3);
+        test_all_openings_with_cap_height(vec![mat_0, mat_1], 2);
+    }
+
+    #[test]
+    fn commit_batch_stark_with_cap_height() {
+        init_logger();
+        let mut rng = SmallRng::seed_from_u64(42);
+        let mat_0 = RowMajorMatrix::<F>::rand(&mut rng, 512, 1);
+        let mat_1 = RowMajorMatrix::<F>::rand(&mut rng, 8, 1);
+        let mat_2 = RowMajorMatrix::<F>::rand(&mut rng, 4, 1);
+        let mat_3 = RowMajorMatrix::<F>::rand(&mut rng, 128, 12);
+        let mat_4 = RowMajorMatrix::<F>::rand(&mut rng, 4, 3);
+        test_all_openings_with_cap_height(vec![mat_0, mat_1, mat_2, mat_3, mat_4], 2);
+    }
+
+    #[test]
+    fn lifted_verify_with_cap_height() {
+        init_logger();
+        let mut rng = SmallRng::seed_from_u64(99);
+        let mat = RowMajorMatrix::<F>::rand(&mut rng, 8, 3);
+        test_lifted_openings_with_cap_height(vec![mat], 1);
+    }
+
+    /// When the Merkle cap spans the entire tree (`cap_height == log_max_height`), the
+    /// authentication path is empty (`path_depth == 0`) and the leaf digest is itself the
+    /// committed root. Regression test: this used to apply a spurious compression and
+    /// produce a witness conflict during MMCS verification.
+    #[test]
+    fn lifted_verify_full_cap_no_path() {
+        init_logger();
+        let mut rng = SmallRng::seed_from_u64(7);
+        // Height 8 -> log_max_height = 3; cap_height = 3 makes the cap cover every leaf.
+        let mat = RowMajorMatrix::<F>::rand(&mut rng, 8, 3);
+        test_lifted_openings_with_cap_height(vec![mat], 3);
+    }
+
+    #[test]
+    fn verify_tampered_proof_fails() {
+        let mut rng = SmallRng::seed_from_u64(1);
+        let perm = Perm::new_from_rng_128(&mut rng);
+        let hash = MyHash::new(perm.clone());
+        let compress = MyCompress::new(perm);
+        let mmcs = MyMmcs::new(hash.clone(), compress, 0);
+
+        // 4 8x1 matrixes, 4 8x2 matrixes
+        let mut mats = (0..4)
+            .map(|_| RowMajorMatrix::<F>::rand(&mut rng, 8, 1))
+            .collect_vec();
+        let large_mat_dims = (0..4).map(|_| Dimensions {
+            height: 8,
+            width: 1,
+        });
+        mats.extend((0..4).map(|_| RowMajorMatrix::<F>::rand(&mut rng, 8, 2)));
+        let small_mat_dims = (0..4).map(|_| Dimensions {
+            height: 8,
+            width: 2,
+        });
+        let dimensions = &large_mat_dims.chain(small_mat_dims).collect_vec();
+
+        let (commit, prover_data) = mmcs.commit(mats);
+
+        let mut builder = CircuitBuilder::<CF>::new();
+        let permutation_config = Poseidon2Config::KOALA_BEAR_D4_W16;
+        let perm = default_koalabear_poseidon2_16();
+        builder.enable_poseidon2_perm::<KoalaBearD4Width16, _>(
+            generate_poseidon2_trace::<CF, KoalaBearD4Width16>,
+            perm,
+        );
+        builder.enable_recompose::<F>(generate_recompose_trace::<F, CF>);
+
+        // open the 3rd row of each matrix, mess with proof, and verify
+        let index = 3;
+        let path_depth = 3;
+        let mut batch_opening = mmcs.open_batch(index, &prover_data);
+        batch_opening.opening_proof[0][0] += F::ONE;
+
+        let openings_digests = batch_opening
+            .opened_values
+            .iter()
+            .zip(dimensions)
+            .chunk_by(|(_, dimensions)| dimensions.height)
+            .into_iter()
+            .map(|(_, group)| hash.hash_iter(group.flat_map(|(x, _)| x.iter().copied())))
+            .collect_vec();
+        let dimensions = dimensions
+            .iter()
+            .chunk_by(|dimensions| dimensions.height)
+            .into_iter()
+            .map(|(height, _)| Dimensions { width: 0, height })
+            .collect_vec();
+
+        let openings = openings_digests
+            .iter()
+            .map(|mat_hash| {
+                mat_hash
+                    .iter()
+                    .map(|_| builder.public_input())
+                    .collect_vec()
+            })
+            .collect_vec();
+        let openings =
+            format_openings(&openings, &dimensions, path_depth, permutation_config).unwrap();
+        let directions_expr = builder.alloc_public_inputs(path_depth, "directions");
+        let root_exprs = builder.alloc_public_inputs(permutation_config.rate_ext(), "root");
+
+        let permutation_mmcs_ops = builder
+            .add_mmcs_verify(permutation_config, &openings, &directions_expr, &root_exprs)
+            .unwrap();
+        let circuit = builder.build().unwrap();
+        let root_widx0 = circuit.expr_to_widx[&root_exprs[0]];
+        let mut runner = circuit.runner();
+
+        let directions = (0..path_depth)
+            .map(|k| CF::from_bool(index >> k & 1 == 1))
+            .collect_vec();
+
+        let mut public_inputs = vec![];
+        public_inputs.extend(
+            openings_digests
+                .iter()
+                .flat_map(|digest| digest.map(CF::from)),
+        );
+        public_inputs.extend(directions.iter());
+        // For cap_height=0, commit has 1 entry
+        let commit_entry = &commit.roots()[0];
+        let commit_ext = base_digest_to_ext(commit_entry, permutation_config);
+        debug_assert_eq!(permutation_config.rate_ext(), commit_ext.len());
+        public_inputs.extend(commit_ext);
+
+        runner.set_public_inputs(&public_inputs).unwrap();
+
+        let siblings = batch_opening
+            .opening_proof
+            .iter()
+            .map(|digest| {
+                digest
+                    .chunks(4)
+                    .map(CF::from_basis_coefficients_slice)
+                    .collect::<Option<Vec<_>>>()
+                    .unwrap()
+            })
+            .collect_vec();
+
+        for (&op_id, sibling) in permutation_mmcs_ops.iter().zip(siblings) {
+            runner
+                .set_private_data(op_id, perm_private_data(permutation_config, sibling))
+                .unwrap();
+        }
+
+        // When we run the runner and the MMCS trace is generated, the runner detects that
+        // the root computed by the MmcsVerify gate does not match the one given as input.
+        let result = runner.run();
+
+        match result {
+            Err(p3_circuit::CircuitError::WitnessConflict { witness_id, .. }) => {
+                assert_eq!(witness_id, root_widx0, "expected root witness mismatch");
+            }
+            _ => panic!("The test was suppose to fail with a root mismatch!"),
+        }
+    }
+
+    /// Build an MMCS-verify circuit whose claimed `root` has `root_len` limbs and
+    /// return the build-time result. The Merkle path itself is well-formed; only
+    /// the root length is varied.
+    fn try_add_mmcs_verify_with_root_len(
+        root_len: usize,
+    ) -> Result<Vec<NonPrimitiveOpId>, CircuitBuilderError> {
+        let mut rng = SmallRng::seed_from_u64(1);
+        let perm = Perm::new_from_rng_128(&mut rng);
+        let hash = MyHash::new(perm.clone());
+        let compress = MyCompress::new(perm);
+        let mmcs = MyMmcs::new(hash.clone(), compress, 0);
+
+        let mats = (0..4)
+            .map(|_| RowMajorMatrix::<F>::rand(&mut rng, 8, 1))
+            .collect_vec();
+        let dimensions = &(0..4)
+            .map(|_| Dimensions {
+                height: 8,
+                width: 1,
+            })
+            .collect_vec();
+
+        let (_commit, prover_data) = mmcs.commit(mats);
+
+        let mut builder = CircuitBuilder::<CF>::new();
+        let permutation_config = Poseidon2Config::KOALA_BEAR_D4_W16;
+        let perm = default_koalabear_poseidon2_16();
+        builder.enable_poseidon2_perm::<KoalaBearD4Width16, _>(
+            generate_poseidon2_trace::<CF, KoalaBearD4Width16>,
+            perm,
+        );
+        builder.enable_recompose::<F>(generate_recompose_trace::<F, CF>);
+
+        let index = 3;
+        let path_depth = 3;
+        let batch_opening = mmcs.open_batch(index, &prover_data);
+
+        let openings_digests = batch_opening
+            .opened_values
+            .iter()
+            .zip(dimensions)
+            .chunk_by(|(_, dimensions)| dimensions.height)
+            .into_iter()
+            .map(|(_, group)| hash.hash_iter(group.flat_map(|(x, _)| x.iter().copied())))
+            .collect_vec();
+        let dimensions = dimensions
+            .iter()
+            .chunk_by(|dimensions| dimensions.height)
+            .into_iter()
+            .map(|(height, _)| Dimensions { width: 0, height })
+            .collect_vec();
+
+        let openings = openings_digests
+            .iter()
+            .map(|mat_hash| {
+                mat_hash
+                    .iter()
+                    .map(|_| builder.public_input())
+                    .collect_vec()
+            })
+            .collect_vec();
+        let openings =
+            format_openings(&openings, &dimensions, path_depth, permutation_config).unwrap();
+        let directions_expr = builder.alloc_public_inputs(path_depth, "directions");
+        let root_exprs = builder.alloc_public_inputs(root_len, "root");
+
+        builder.add_mmcs_verify(permutation_config, &openings, &directions_expr, &root_exprs)
+    }
+
+    /// A claimed root with fewer/more limbs than the computed root digest.
+    #[test]
+    fn verify_rejects_mismatched_root_length() {
+        let rate_ext = Poseidon2Config::KOALA_BEAR_D4_W16.rate_ext();
+
+        // Sanity: the correct root length builds fine.
+        try_add_mmcs_verify_with_root_len(rate_ext).expect("matching root length must build");
+
+        for bad_len in [rate_ext - 1, rate_ext + 1] {
+            let err = try_add_mmcs_verify_with_root_len(bad_len)
+                .expect_err("mismatched root length must be rejected");
+            assert!(
+                matches!(
+                    err,
+                    CircuitBuilderError::InvalidDimension { expected, actual }
+                        if expected == rate_ext && actual == bad_len
+                ),
+                "expected InvalidDimension {{ expected: {rate_ext}, actual: {bad_len} }}, got {err:?}"
+            );
+        }
+    }
+
+    /// Test MMCS verification using lifted representation (like FRI verifier does).
+    /// This tests that `pack_lifted_to_ext` + `verify_batch_circuit` produces correct results.
+    ///
+    /// The FRI verifier stores opened values as "lifted" targets (one ext target per base field value,
+    /// where the ext value is `[base_val, 0, 0, 0]`), then packs them before MMCS verification.
+    #[test]
+    fn verify_batch_with_lifted_representation() {
+        init_logger();
+
+        let perm = default_koalabear_poseidon2_16();
+        let hash = MyHash::new(perm.clone());
+        let compress = MyCompress::new(perm.clone());
+        let mmcs = MyMmcs::new(hash, compress, 0);
+
+        // Create a small matrix (similar to small FRI proofs)
+        let mat = RowMajorMatrix::new(
+            vec![
+                F::from_u32(1),
+                F::from_u32(2),
+                F::from_u32(3),
+                F::from_u32(4),
+                F::from_u32(5),
+                F::from_u32(6),
+                F::from_u32(7),
+                F::from_u32(8),
+            ],
+            4, // 2 rows, 4 columns
+        );
+
+        let dimensions = vec![mat.dimensions()];
+        let max_height = mat.height();
+        let log_max_height = log2_ceil_usize(max_height);
+
+        let (commit, prover_data) = mmcs.commit(vec![mat]);
+
+        for index in 0..max_height {
+            let mut builder = CircuitBuilder::<CF>::new();
+            let permutation_config = Poseidon2Config::KOALA_BEAR_D4_W16;
+            builder.enable_poseidon2_perm::<KoalaBearD4Width16, _>(
+                generate_poseidon2_trace::<CF, KoalaBearD4Width16>,
+                perm.clone(),
+            );
+            builder.enable_recompose::<F>(generate_recompose_trace::<F, CF>);
+
+            let batch_opening = mmcs.open_batch(index, &prover_data);
+
+            let directions = (0..log_max_height)
+                .map(|k| index >> k & 1 == 1)
+                .collect_vec();
+
+            let lifted_openings: Vec<Vec<_>> = batch_opening
+                .opened_values
+                .iter()
+                .map(|values| values.iter().map(|_| builder.public_input()).collect_vec())
+                .collect();
+
+            let directions_expr = builder.alloc_public_inputs(log_max_height, "directions");
+
+            // Allocate cap entries as LIFTED targets, then pack
+            let cap_len = commit.num_roots();
+            let mut cap_exprs = Vec::with_capacity(cap_len);
+            for _ in 0..cap_len {
+                let lifted: Vec<_> = (0..permutation_config.rate())
+                    .map(|_| builder.public_input())
+                    .collect();
+                let packed = pack_lifted_targets::<F, CF>(&mut builder, &lifted);
+                cap_exprs.push(packed);
+            }
+
+            let _permutation_mmcs_ops = verify_batch_circuit::<F, CF>(
+                &mut builder,
+                permutation_config,
+                &cap_exprs,
+                &dimensions,
+                &directions_expr,
+                &lifted_openings,
+                None,
+            )
+            .unwrap();
+
+            let circuit = builder.build().unwrap();
+            let mut runner = circuit.runner();
+
+            // Set public inputs using LIFTED representation
+            let mut public_inputs: Vec<CF> = batch_opening
+                .opened_values
+                .iter()
+                .flat_map(|values| values.iter().map(|&v| CF::from(v)))
+                .collect();
+
+            // Then: direction bits
+            public_inputs.extend(directions.iter().map(|&bit| CF::from_bool(bit)));
+
+            // Then: lifted cap entries (one EF per base field digest element per entry)
+            for entry in commit.roots() {
+                public_inputs.extend(entry.iter().map(|&v| CF::from(v)));
+            }
+
+            runner.set_public_inputs(&public_inputs).unwrap();
+
+            // Set private data for siblings
+            let siblings = batch_opening
+                .opening_proof
+                .iter()
+                .map(|digest| {
+                    digest
+                        .chunks(4)
+                        .map(CF::from_basis_coefficients_slice)
+                        .collect::<Option<Vec<_>>>()
+                        .unwrap()
+                })
+                .collect_vec();
+
+            for (&op_id, sibling) in _permutation_mmcs_ops.iter().zip(siblings) {
+                runner
+                    .set_private_data(op_id, perm_private_data(permutation_config, sibling))
+                    .unwrap();
+            }
+
+            let result = runner.run();
+            assert!(
+                result.is_ok(),
+                "MMCS verification with lifted representation failed at index {}: {:?}",
+                index,
+                result.err()
+            );
+        }
+    }
+
+    /// Helper function to pack lifted targets into extension targets.
+    /// Mimics `pack_lifted_to_ext` from FRI verifier.
+    fn pack_lifted_targets<BF, EF>(
+        builder: &mut CircuitBuilder<EF>,
+        lifted: &[crate::Target],
+    ) -> Vec<crate::Target>
+    where
+        BF: Field,
+        EF: ExtensionField<BF> + BasedVectorSpace<BF>,
+    {
+        if lifted.is_empty() {
+            return Vec::new();
+        }
+
+        let d = EF::DIMENSION;
+        let basis: Vec<EF> = (0..d)
+            .map(|i| {
+                let mut coeffs = vec![BF::ZERO; d];
+                coeffs[i] = BF::ONE;
+                EF::from_basis_coefficients_slice(&coeffs).expect("valid basis")
+            })
+            .collect();
+
+        lifted
+            .chunks(d)
+            .map(|chunk| {
+                let mut acc = builder.define_const(EF::ZERO);
+                for (i, &target) in chunk.iter().enumerate() {
+                    let basis_const = builder.define_const(basis[i]);
+                    acc = builder.mul_add(target, basis_const, acc);
+                }
+                acc
+            })
+            .collect()
+    }
+
+    /// Test helper that runs MMCS verification using lifted representation for various matrix configs.
+    fn test_lifted_openings(mats: Vec<RowMajorMatrix<F>>) {
+        test_lifted_openings_with_cap_height(mats, 0);
+    }
+
+    fn test_lifted_openings_with_cap_height(mats: Vec<RowMajorMatrix<F>>, cap_height: usize) {
+        let perm = default_koalabear_poseidon2_16();
+        let hash = MyHash::new(perm.clone());
+        let compress = MyCompress::new(perm.clone());
+        let mmcs = MyMmcs::new(hash, compress, cap_height);
+
+        let dimensions = mats.iter().map(DenseMatrix::dimensions).collect_vec();
+
+        let mut heights_tallest_first = dimensions
+            .iter()
+            .enumerate()
+            .sorted_by_key(|(_, dims)| Reverse(dims.height))
+            .peekable();
+
+        let max_height = heights_tallest_first.peek().unwrap().1.height;
+
+        let (commit, prover_data) = mmcs.commit(mats);
+
+        let log_max_height = log2_ceil_usize(max_height);
+        for index in 0..max_height {
+            let mut builder = CircuitBuilder::<CF>::new();
+            let permutation_config = Poseidon2Config::KOALA_BEAR_D4_W16;
+            builder.enable_poseidon2_perm::<KoalaBearD4Width16, _>(
+                generate_poseidon2_trace::<CF, KoalaBearD4Width16>,
+                perm.clone(),
+            );
+            builder.enable_recompose::<F>(generate_recompose_trace::<F, CF>);
+
+            let batch_opening = mmcs.open_batch(index, &prover_data);
+
+            let directions = (0..log_max_height)
+                .map(|k| index >> k & 1 == 1)
+                .collect_vec();
+
+            let lifted_openings: Vec<Vec<_>> = batch_opening
+                .opened_values
+                .iter()
+                .map(|values| values.iter().map(|_| builder.public_input()).collect_vec())
+                .collect();
+
+            let directions_expr = builder.alloc_public_inputs(log_max_height, "directions");
+
+            // Allocate cap entries as LIFTED, then pack
+            let cap_len = commit.num_roots();
+            let mut cap_exprs = Vec::with_capacity(cap_len);
+            for _ in 0..cap_len {
+                let lifted: Vec<_> = (0..permutation_config.rate())
+                    .map(|_| builder.public_input())
+                    .collect();
+                let packed = pack_lifted_targets::<F, CF>(&mut builder, &lifted);
+                cap_exprs.push(packed);
+            }
+
+            let permutation_mmcs_ops = verify_batch_circuit::<F, CF>(
+                &mut builder,
+                permutation_config,
+                &cap_exprs,
+                &dimensions,
+                &directions_expr,
+                &lifted_openings,
+                None,
+            )
+            .unwrap();
+
+            let circuit = builder.build().unwrap();
+            let mut runner = circuit.runner();
+
+            // Set public inputs using LIFTED representation
+            let mut public_inputs: Vec<CF> = batch_opening
+                .opened_values
+                .iter()
+                .flat_map(|values| values.iter().map(|&v| CF::from(v)))
+                .collect();
+
+            public_inputs.extend(directions.iter().map(|&bit| CF::from_bool(bit)));
+
+            // Lifted cap entries
+            for entry in commit.roots() {
+                public_inputs.extend(entry.iter().map(|&v| CF::from(v)));
+            }
+
+            runner.set_public_inputs(&public_inputs).unwrap();
+
+            // Set private data for siblings
+            let siblings = batch_opening
+                .opening_proof
+                .iter()
+                .map(|digest| {
+                    digest
+                        .chunks(4)
+                        .map(CF::from_basis_coefficients_slice)
+                        .collect::<Option<Vec<_>>>()
+                        .unwrap()
+                })
+                .collect_vec();
+
+            for (&op_id, sibling) in permutation_mmcs_ops.iter().zip(siblings) {
+                runner
+                    .set_private_data(op_id, perm_private_data(permutation_config, sibling))
+                    .unwrap();
+            }
+
+            let _ = runner.run().unwrap();
+        }
+    }
+
+    /// Test with very small matrix (height=2, minimal Merkle tree depth=1)
+    #[test]
+    fn lifted_verify_small_2x4() {
+        init_logger();
+        let mat = RowMajorMatrix::new(
+            (0..8).map(|i| F::from_u32(i as u32)).collect_vec(),
+            4, // 2 rows, 4 columns
+        );
+        test_lifted_openings(vec![mat]);
+    }
+
+    /// Test with non-power-of-4 width (tests truncation)
+    #[test]
+    fn lifted_verify_small_2x5() {
+        init_logger();
+        let mat = RowMajorMatrix::new(
+            (0..10).map(|i| F::from_u32(i as u32)).collect_vec(),
+            5, // 2 rows, 5 columns
+        );
+        test_lifted_openings(vec![mat]);
+    }
+
+    /// Test with multiple matrices at different heights (like FRI batches)
+    #[test]
+    fn lifted_verify_multi_height() {
+        init_logger();
+        // Two matrices: 8 rows and 4 rows (different heights)
+        let mat1 = RowMajorMatrix::new(
+            (0..16).map(|i| F::from_u32(i as u32)).collect_vec(),
+            2, // 8 rows, 2 columns
+        );
+        let mat2 = RowMajorMatrix::new(
+            (20..32).map(|i| F::from_u32(i as u32)).collect_vec(),
+            3, // 4 rows, 3 columns
+        );
+        test_lifted_openings(vec![mat1, mat2]);
+    }
+
+    /// Test with matrices at same height (combined at same level)
+    #[test]
+    fn lifted_verify_same_height() {
+        init_logger();
+        // Two matrices with same height
+        let mat1 = RowMajorMatrix::new(
+            (0..8).map(|i| F::from_u32(i as u32)).collect_vec(),
+            2, // 4 rows, 2 columns
+        );
+        let mat2 = RowMajorMatrix::new(
+            (10..22).map(|i| F::from_u32(i as u32)).collect_vec(),
+            3, // 4 rows, 3 columns
+        );
+        test_lifted_openings(vec![mat1, mat2]);
+    }
+
+    /// Test with very small column widths (1 column) - edge case from recursive_fibonacci -n 1
+    /// This tests base_widths=[1, 1, 1, 3, 3] configuration
+    ///
+    /// This test verifies that `verify_batch_circuit` correctly handles non-aligned
+    /// base field widths by using overwrite-mode hashing (matching native PaddingFreeSponge).
+    #[test]
+    fn lifted_verify_single_column_matrices() {
+        init_logger();
+        // Simulate batch 0 from fibonacci -n 1: base_widths=[1, 1, 1, 3, 3], 5 matrices
+        // With log_max_height=3, so 8 rows for the tallest matrix
+        let mat0 = RowMajorMatrix::new(
+            (0..8).map(|i| F::from_u32(i as u32)).collect_vec(),
+            1, // 8 rows, 1 column
+        );
+        let mat1 = RowMajorMatrix::new(
+            (10..18).map(|i| F::from_u32(i as u32)).collect_vec(),
+            1, // 8 rows, 1 column
+        );
+        let mat2 = RowMajorMatrix::new(
+            (20..28).map(|i| F::from_u32(i as u32)).collect_vec(),
+            1, // 8 rows, 1 column
+        );
+        let mat3 = RowMajorMatrix::new(
+            (30..54).map(|i| F::from_u32(i as u32)).collect_vec(),
+            3, // 8 rows, 3 columns
+        );
+        let mat4 = RowMajorMatrix::new(
+            (60..84).map(|i| F::from_u32(i as u32)).collect_vec(),
+            3, // 8 rows, 3 columns
+        );
+        test_lifted_openings(vec![mat0, mat1, mat2, mat3, mat4]);
+    }
+
+    /// Test with mixed heights matching fibonacci -n 1's batch 0 (with log_blowup applied)
+    /// This specifically tests the height grouping logic
+    #[test]
+    fn lifted_verify_fibonacci_batch0_config() {
+        init_logger();
+        // From fibonacci -n 1: batch 0 has 5 matrices with base_widths=[1, 1, 1, 3, 3]
+        // heights depend on domain sizes and log_blowup
+        // Let's test with different heights to trigger height grouping
+        let mat0 = RowMajorMatrix::new(
+            (0..8).map(|i| F::from_u32(i as u32)).collect_vec(),
+            1, // 8 rows, 1 column
+        );
+        let mat1 = RowMajorMatrix::new(
+            (10..14).map(|i| F::from_u32(i as u32)).collect_vec(),
+            1, // 4 rows, 1 column
+        );
+        let mat2 = RowMajorMatrix::new(
+            (20..24).map(|i| F::from_u32(i as u32)).collect_vec(),
+            1, // 4 rows, 1 column
+        );
+        let mat3 = RowMajorMatrix::new(
+            (30..54).map(|i| F::from_u32(i as u32)).collect_vec(),
+            3, // 8 rows, 3 columns
+        );
+        let mat4 = RowMajorMatrix::new(
+            (60..72).map(|i| F::from_u32(i as u32)).collect_vec(),
+            3, // 4 rows, 3 columns
+        );
+        test_lifted_openings(vec![mat0, mat1, mat2, mat3, mat4]);
+    }
+
+    #[test]
+    fn validate_commitment_cap_len_rejects_empty() {
+        let cap: Vec<()> = vec![];
+        let err = validate_commitment_cap_len(&cap).unwrap_err();
+        assert!(matches!(err, CircuitBuilderError::InvalidMerkleCap { .. }));
+    }
+
+    #[test]
+    fn validate_commitment_cap_len_rejects_non_power_of_two() {
+        // A cap must have a power-of-two length (`log2_strict_usize` would otherwise panic).
+        let cap = vec![(), (), ()];
+        let err = validate_commitment_cap_len(&cap).unwrap_err();
+        assert!(matches!(err, CircuitBuilderError::InvalidMerkleCap { .. }));
+    }
+
+    #[test]
+    fn validate_commitment_cap_len_accepts_powers_of_two() {
+        for log_len in 0..5 {
+            let cap = vec![(); 1 << log_len];
+            assert_eq!(validate_commitment_cap_len(&cap).unwrap(), log_len);
+        }
+    }
+
+    #[test]
+    fn validate_commitment_cap_rejects_cap_taller_than_tree() {
+        // A cap height greater than the tree height would underflow `tree_height - cap_height`
+        // downstream instead of being rejected as a malformed proof shape.
+        let cap = vec![(); 4]; // cap_height = 2
+        let err = validate_commitment_cap(&cap, 1).unwrap_err();
+        assert!(matches!(err, CircuitBuilderError::InvalidMerkleCap { .. }));
+    }
+
+    #[test]
+    fn validate_commitment_cap_accepts_cap_at_tree_height() {
+        let cap = vec![(); 4]; // cap_height = 2
+        assert_eq!(validate_commitment_cap(&cap, 2).unwrap(), 2);
+    }
+
+    #[test]
+    fn numeric_binary_cap_boundaries_are_allocation_free() {
+        assert_eq!(validate_commitment_cap_count(1).unwrap(), 0);
+        assert_eq!(validate_commitment_cap_count(2).unwrap(), 1);
+        assert!(validate_commitment_cap_count(0).is_err());
+        assert!(validate_commitment_cap_count(3).is_err());
+        assert!(validate_binary_cap_count(4, 1).is_err());
+        assert_eq!(validate_binary_cap_count(2, 1).unwrap(), 1);
+    }
+
+    #[test]
+    fn numeric_arity4_bridge_and_padding_rules_match_native() {
+        assert_eq!(validate_arity4_cap_geometry(&[16, 8], 1).unwrap(), 5);
+        assert_eq!(validate_arity4_cap_geometry(&[16, 8], 4).unwrap(), 3);
+        assert_eq!(validate_arity4_cap_geometry(&[2], 4).unwrap(), 0);
+        assert!(validate_arity4_cap_geometry(&[5, 6], 1).is_err());
+        assert!(validate_arity4_cap_geometry(&[8], 0).is_err());
+    }
+
+    #[test]
+    fn numeric_arity4_overflow_and_empty_boundaries_are_typed_errors() {
+        assert!(validate_arity4_cap_geometry(&[], 1).is_err());
+        assert!(validate_arity4_cap_geometry(&[0], 1).is_err());
+        assert!(validate_arity4_cap_geometry(&[usize::MAX], 1).is_err());
+        assert!(checked_next_power_of_two(usize::MAX).is_err());
+        assert!(checked_padded_len(usize::MAX).is_err());
+        assert!(checked_padded_len(usize::MAX - 2).is_err());
+        assert_eq!(checked_padded_len(usize::MAX - 3).unwrap(), usize::MAX - 3);
+    }
+
+    #[test]
+    fn arity4_zero_height_groups_preserve_legacy_events() {
+        assert!(validate_arity4_cap_geometry(&[1, 0], 1).is_err());
+        let mut events = Vec::new();
+        visit_arity4_path([8usize, 0].into_iter(), 1, |step| events.push(step))
+            .expect("legacy zero-height injection remains scalar-valid");
+        assert_eq!(
+            events.last().and_then(|step| step.injection_height),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn arity4_bucket_validation_is_linear_in_matrix_count() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        #[derive(Clone)]
+        struct Counted {
+            remaining: usize,
+            visits: Rc<Cell<usize>>,
+        }
+
+        impl Iterator for Counted {
+            type Item = usize;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                if self.remaining == 0 {
+                    return None;
+                }
+                self.remaining -= 1;
+                self.visits.set(self.visits.get() + 1);
+                Some(8)
+            }
+        }
+
+        let visits = Rc::new(Cell::new(0));
+        visit_arity4_path(
+            Counted {
+                remaining: 1024,
+                visits: visits.clone(),
+            },
+            1,
+            |_| {},
+        )
+        .expect("repeated equal-height buckets are valid");
+        assert!(visits.get() <= 1024 * (usize::BITS as usize + 1));
+    }
+
+    /// Cross-checks [`restore_fri_query_paths`] against the trusted single-query
+    /// [`p3_commit::Mmcs::verify_batch`]: every restored chain must, on its own, authenticate
+    /// its query's rows against the real commitment — proving the restored siblings are the true
+    /// ones, not merely self-consistent. This is what the in-circuit MMCS gadget relies on, since
+    /// it walks one full path per query and has no notion of a shared proof.
+    ///
+    /// The batch is mixed-height, so restoring an input path has to fold the shorter matrix's
+    /// injected digest; and the query count is high enough that the pruned proof really does omit
+    /// digests other queries' own paths cover.
+    #[test]
+    fn restore_fri_query_paths_matches_single_query_verification() {
+        type Pcs4 = p3_fri::TwoAdicFriPcs<F, Dft, MyMmcs, ChallengeMmcs>;
+
+        let perm = default_koalabear_poseidon2_16();
+        let hash = MyHash::new(perm.clone());
+        let compress = MyCompress::new(perm.clone());
+        let val_mmcs = MyMmcs::new(hash, compress, 0);
+        let fri_params = FriParameters {
+            num_queries: 6,
+            batch_proof_of_work_bits: 0,
+            commit_proof_of_work_bits: 0,
+            query_proof_of_work_bits: 0,
+            ..FriParameters::new_testing(ChallengeMmcs::new(val_mmcs.clone()), 0)
+        };
+        let pcs = Pcs4::new(Dft::default(), val_mmcs.clone(), fri_params.clone());
+
+        let mut rng = SmallRng::seed_from_u64(11);
+        let log_degrees = [5usize, 3];
+        let evals: Vec<_> = log_degrees
+            .iter()
+            .map(|&log_degree| {
+                let domain = <Pcs4 as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+                    &pcs,
+                    1 << log_degree,
+                );
+                (
+                    domain,
+                    RowMajorMatrix::<F>::rand_nonzero(&mut rng, 1 << log_degree, 3),
+                )
+            })
+            .collect();
+        let domains: Vec<_> = evals.iter().map(|(domain, _)| *domain).collect();
+
+        let (commitment, prover_data) =
+            <Pcs4 as Pcs<Challenge, Challenger>>::commit(&pcs, evals).unwrap();
+
+        let mut p_challenger = Challenger::new(perm.clone());
+        p_challenger.observe(commitment.clone());
+        let zeta: Challenge = p_challenger.sample_algebra_element();
+        let (opened_values, proof) = <Pcs4 as Pcs<Challenge, Challenger>>::open(
+            &pcs,
+            vec![(&prover_data, vec![vec![zeta]; log_degrees.len()]).into()],
+            &mut p_challenger,
+        )
+        .unwrap();
+
+        // Verifier transcript, replayed up to the point `verify_fri` starts from.
+        let mut challenger = Challenger::new(perm);
+        challenger.observe(commitment.clone());
+        let v_zeta: Challenge = challenger.sample_algebra_element();
+        assert_eq!(v_zeta, zeta);
+        let cwop: Vec<CommitmentWithOpeningPoints<_, _, _>> = vec![
+            (
+                commitment.clone(),
+                domains
+                    .iter()
+                    .zip(&opened_values[0])
+                    .map(|(domain, mat)| (*domain, vec![(zeta, mat[0].clone())]))
+                    .collect::<Vec<_>>(),
+            )
+                .into(),
+        ];
+        // The FRI PCS transcript: its domain separator, then every claimed evaluation.
+        p3_fri::PcsShape::from_claims(&fri_params, &cwop)
+            .domain_separator::<F, Challenge>()
+            .seed(&mut challenger);
+        for claim in &cwop {
+            for matrix in &claim.matrices {
+                for point in &matrix.points {
+                    challenger.observe_algebra_slice(&point.values);
+                }
+            }
+        }
+
+        let query_paths = restore_fri_query_paths(
+            &fri_params,
+            &val_mmcs,
+            &val_mmcs,
+            &proof,
+            &mut challenger.clone(),
+            &cwop,
+        )
+        .expect("restoration succeeds for an honest proof");
+        assert_eq!(query_paths.len(), fri_params.num_queries);
+
+        // Independently rederive the queried leaf indices and each round's reconstructed row, so
+        // every restored chain can be checked against the commitment it claims to open.
+        let (indices, group_indices_by_round, rows_by_round, log_global_max_height) =
+            replay_fri_queries(&fri_params, &val_mmcs, &proof, &mut challenger, &cwop);
+
+        // Input batch: compare against the paths a per-query opening would have produced.
+        let max_height = 1usize << (log_degrees[0] + fri_params.log_blowup);
+        let bits_reduced = log_global_max_height - log2_strict_usize(max_height);
+        for (query, &index) in indices.iter().enumerate() {
+            let reduced_index = index >> bits_reduced;
+            let expected = val_mmcs.open_batch(reduced_index, &prover_data).unpack().1;
+            assert_eq!(
+                query_paths[query].input[0], expected,
+                "restored input path for query {query} differs from its individual opening"
+            );
+            val_mmcs
+                .verify_batch(
+                    &commitment,
+                    &[
+                        Dimensions {
+                            width: 3,
+                            height: 1 << (log_degrees[0] + fri_params.log_blowup),
+                        },
+                        Dimensions {
+                            width: 3,
+                            height: 1 << (log_degrees[1] + fri_params.log_blowup),
+                        },
+                    ],
+                    reduced_index,
+                    p3_commit::BatchOpeningRef::new(
+                        &proof.input_openings[0].opened_values[query],
+                        &query_paths[query].input[0],
+                    ),
+                )
+                .expect("a restored input path must authenticate its query on its own");
+        }
+
+        // Commit phase: one matrix of `arity` extension columns per round, flattened to base.
+        let mut log_current_height = log_global_max_height;
+        for (round, opening) in proof.commit_phase_openings.iter().enumerate() {
+            let log_arity = crate::pcs::fri::sibling_log_arity(opening).unwrap();
+            let arity = 1usize << log_arity;
+            let log_folded_height = log_current_height - log_arity;
+            let dims = [Dimensions {
+                width: arity * <Challenge as BasedVectorSpace<F>>::DIMENSION,
+                height: 1 << log_folded_height,
+            }];
+            for query in 0..fri_params.num_queries {
+                let row = vec![Challenge::flatten_to_base(
+                    rows_by_round[round][query][0].clone(),
+                )];
+                val_mmcs
+                    .verify_batch(
+                        &proof.commit_phase_commits[round],
+                        &dims,
+                        group_indices_by_round[round][query],
+                        p3_commit::BatchOpeningRef::new(
+                            &row,
+                            &query_paths[query].commit_phase[round],
+                        ),
+                    )
+                    .expect("a restored commit-phase path must authenticate its query on its own");
+            }
+            log_current_height = log_folded_height;
+        }
+    }
+
+    /// Replays the FRI verifier's query phase, returning the sampled indices, each round's
+    /// per-query group index and reconstructed evaluation row, and the global log height.
+    #[expect(clippy::type_complexity)]
+    fn replay_fri_queries(
+        params: &FriParameters<ChallengeMmcs>,
+        input_mmcs: &MyMmcs,
+        proof: &FriProof<Challenge, ChallengeMmcs, F, Vec<BatchMultiOpening<F, MyMmcs>>>,
+        challenger: &mut Challenger,
+        cwop: &[CommitmentWithOpeningPoints<
+            Challenge,
+            <MyMmcs as Mmcs<F>>::Commitment,
+            p3_field::coset::TwoAdicMultiplicativeCoset<F>,
+        >],
+    ) -> (
+        Vec<usize>,
+        Vec<Vec<usize>>,
+        Vec<Vec<Vec<Vec<Challenge>>>>,
+        usize,
+    ) {
+        let folding: TwoAdicFriFoldingForMmcs<F, MyMmcs> = TwoAdicFriFolding(PhantomData);
+        assert!(challenger.check_witness(params.batch_proof_of_work_bits, proof.batch_pow_witness));
+        let alpha: Challenge = challenger.sample_algebra_element();
+        let mut input_log_heights: Vec<usize> = cwop
+            .iter()
+            .flat_map(|claim| {
+                claim
+                    .matrices
+                    .iter()
+                    .map(|matrix| log2_strict_usize(matrix.domain.size()) + params.log_blowup)
+            })
+            .collect();
+        input_log_heights.sort_unstable_by(|a, b| b.cmp(a));
+        input_log_heights.dedup();
+        let log_arities = p3_fri::fold_schedule(
+            &input_log_heights,
+            params.log_blowup + params.log_final_poly_len,
+            params.max_log_arity,
+        );
+        let log_global_max_height =
+            log_arities.iter().sum::<usize>() + params.log_blowup + params.log_final_poly_len;
+        FriShape::with_schedule(params, log_arities.clone(), log_global_max_height)
+            .domain_separator::<F, Challenge>()
+            .seed(challenger);
+
+        let betas: Vec<Challenge> = proof
+            .commit_phase_commits
+            .iter()
+            .zip(&proof.commit_pow_witnesses)
+            .map(|(comm, witness)| {
+                challenger.observe(comm.clone());
+                assert!(challenger.check_witness(params.commit_proof_of_work_bits, *witness));
+                challenger.sample_algebra_element()
+            })
+            .collect();
+
+        challenger.observe_algebra_slice(&proof.final_poly);
+        assert!(challenger.check_witness(params.query_proof_of_work_bits, proof.query_pow_witness));
+
+        let indices: Vec<usize> =
+            core::iter::repeat_with(|| challenger.sample_bits(log_global_max_height))
+                .take(params.num_queries)
+                .collect();
+
+        let reduced_openings = open_inputs::<F, Challenge, MyMmcs, ChallengeMmcs>(
+            params,
+            log_global_max_height,
+            &indices,
+            &proof.input_openings,
+            alpha,
+            input_mmcs,
+            cwop,
+        )
+        .expect("input openings verify");
+
+        let num_rounds = proof.commit_phase_commits.len();
+        let mut group_indices_by_round = vec![Vec::new(); num_rounds];
+        let mut rows_by_round = vec![Vec::new(); num_rounds];
+        for (query, (&index, ro)) in indices.iter().zip(reduced_openings).enumerate() {
+            let mut domain_index = index;
+            let _folded = fold_query::<_, F, Challenge, ChallengeMmcs>(
+                &folding,
+                query,
+                &mut domain_index,
+                &betas,
+                &log_arities,
+                &proof.commit_phase_openings,
+                ro,
+                log_global_max_height,
+                params.log_blowup + params.log_final_poly_len,
+                &mut group_indices_by_round,
+                &mut rows_by_round,
+            )
+            .expect("fold chain replays");
+        }
+
+        (
+            indices,
+            group_indices_by_round,
+            rows_by_round,
+            log_global_max_height,
+        )
+    }
+}

@@ -1,0 +1,1915 @@
+mod common;
+
+use std::boxed::Box;
+use std::cell::Cell;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::vec::Vec;
+
+use p3_batch_stark::ProverData;
+use p3_circuit::ops::{generate_poseidon2_trace, generate_recompose_trace};
+use p3_circuit::test_utils::{FibonacciAir, generate_trace_rows};
+use p3_circuit::{CircuitBuilder, CircuitRunner, NonPrimitiveOpId};
+use p3_circuit_prover::batch_stark_prover::{BatchStarkProver, TableProver};
+use p3_circuit_prover::common::{NpoAirBuilder, NpoPreprocessor, get_airs_and_degrees_with_prep};
+use p3_circuit_prover::{BatchStarkProof, CircuitProverData, ConstraintProfile, TablePacking};
+use p3_commit::{ExtensionMmcs, Pcs};
+use p3_dft::Radix2DitParallel;
+use p3_field::{BasedVectorSpace, Field, PrimeCharacteristicRing, PrimeField64};
+use p3_fri::{FriParameters, HidingFriPcs, TwoAdicFriPcs};
+use p3_koala_bear::{
+    Poseidon2KoalaBear, default_koalabear_poseidon2_16, default_koalabear_poseidon2_32,
+};
+use p3_lookup::logup::LogUpGadget;
+use p3_merkle_tree::MerkleTreeMmcs;
+use p3_poseidon2_circuit_air::{KoalaBearD4Width16, KoalaBearD4Width32};
+use p3_recursion::pcs::fri::{
+    FriProofTargets, HidingFriProofTargets, InputProofTargets, MerkleCapTargets,
+    RecExtensionValMmcs, RecExtensionValMmcsArity4, RecValMmcs, RecValMmcsArity4, Witness,
+};
+use p3_recursion::pcs::{
+    restore_fri_query_paths, set_fri_mmcs_private_data, set_fri_mmcs_private_data_arity4,
+};
+use p3_recursion::profile::{HashProfile, RecursionLayerProfile, TranscriptKind};
+use p3_recursion::{
+    BatchOnly, FriRecursionBackend, FriRecursionConfig, FriVerifierParams, NativeFriParams,
+    OpeningTranscript, PcsRecursionBackend, Poseidon2Config, PreparedAggregation,
+    PreparedAggregationCross, PreparedInput, PreparedPcsRecursionBackend, PreparedSource,
+    ProveNextLayerParams, RecursionInput, RecursiveAir, RecursivePcs, TrustedPreparedAggregation,
+    TrustedPreparedInput, TrustedPreparedSource, VerificationError, VerifierCircuitResult,
+    VerifierLimits, build_aggregation_layer_circuit, build_next_layer_circuit,
+    merge_hiding_random_openings, observe_opened_values, prove_aggregation_layer,
+};
+use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
+use p3_test_utils::koala_bear_params::{
+    Challenge, ChallengeMmcs, Challenger, Dft, F, MyCompress, MyHash, MyMmcs,
+};
+use p3_uni_stark::{StarkConfig, StarkGenericConfig, Val, prove, verify};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+
+fn fibonacci_output<Fld: PrimeCharacteristicRing + Copy>(
+    start_a: u64,
+    start_b: u64,
+    n: usize,
+) -> Fld {
+    let mut a = Fld::from_u64(start_a);
+    let mut b = Fld::from_u64(start_b);
+    if n == 0 {
+        return a;
+    }
+    for _ in 1..n {
+        let next = a + b;
+        a = b;
+        b = next;
+    }
+    b
+}
+
+#[derive(Default)]
+struct SideCounters {
+    validations: Cell<usize>,
+    preparations: Cell<usize>,
+    builds: Cell<usize>,
+    public_packs: Cell<usize>,
+    private_packs: Cell<usize>,
+    private_setups: Cell<usize>,
+}
+
+struct CountingVerifierResult<R> {
+    inner: R,
+    counters: Rc<SideCounters>,
+}
+
+impl<A, R> VerifierCircuitResult<common::KoalaBearD4RecursionConfig, A>
+    for CountingVerifierResult<R>
+where
+    A: RecursiveAir<F, Challenge, LogUpGadget>,
+    R: VerifierCircuitResult<common::KoalaBearD4RecursionConfig, A>,
+{
+    fn pack_public_inputs(
+        &self,
+        prev: &RecursionInput<'_, common::KoalaBearD4RecursionConfig, A>,
+    ) -> Result<Vec<Challenge>, VerificationError>
+    where
+        F: PrimeField64,
+        Challenge: BasedVectorSpace<F> + From<F>,
+    {
+        self.counters
+            .public_packs
+            .set(self.counters.public_packs.get() + 1);
+        self.inner.pack_public_inputs(prev)
+    }
+
+    fn pack_private_inputs(
+        &self,
+        prev: &RecursionInput<'_, common::KoalaBearD4RecursionConfig, A>,
+    ) -> Result<Vec<Challenge>, VerificationError>
+    where
+        F: PrimeField64,
+        Challenge: BasedVectorSpace<F> + From<F>,
+    {
+        self.counters
+            .private_packs
+            .set(self.counters.private_packs.get() + 1);
+        self.inner.pack_private_inputs(prev)
+    }
+
+    fn op_ids(&self) -> &[NonPrimitiveOpId] {
+        self.inner.op_ids()
+    }
+}
+
+#[derive(Clone)]
+struct CountingBackend {
+    inner: common::KoalaBearD4Backend,
+    uni: Rc<SideCounters>,
+    batch: Rc<SideCounters>,
+    uni_output_preparations: Rc<Cell<usize>>,
+    batch_output_preparations: Rc<Cell<usize>>,
+}
+
+macro_rules! impl_counting_backend {
+    ($air:ty, $side:ident, $preparations:ident) => {
+        impl PcsRecursionBackend<common::KoalaBearD4RecursionConfig, $air, 4> for CountingBackend {
+            type VerifierResult = CountingVerifierResult<
+                <common::KoalaBearD4Backend as PcsRecursionBackend<
+                    common::KoalaBearD4RecursionConfig,
+                    $air,
+                    4,
+                >>::VerifierResult,
+            >;
+
+            fn preflight_input(
+                &self,
+                config: &common::KoalaBearD4RecursionConfig,
+                prev: &RecursionInput<'_, common::KoalaBearD4RecursionConfig, $air>,
+            ) -> Result<(), VerificationError> {
+                <common::KoalaBearD4Backend as PcsRecursionBackend<
+                    common::KoalaBearD4RecursionConfig,
+                    $air,
+                    4,
+                >>::preflight_input(&self.inner, config, prev)
+            }
+
+            fn validate_input(
+                &self,
+                config: &common::KoalaBearD4RecursionConfig,
+                prev: &RecursionInput<'_, common::KoalaBearD4RecursionConfig, $air>,
+            ) -> Result<(), VerificationError> {
+                self.$side.validations.set(self.$side.validations.get() + 1);
+                <common::KoalaBearD4Backend as PcsRecursionBackend<
+                    common::KoalaBearD4RecursionConfig,
+                    $air,
+                    4,
+                >>::validate_input(&self.inner, config, prev)
+            }
+
+            fn prepare_circuit(
+                &self,
+                config: &common::KoalaBearD4RecursionConfig,
+                circuit: &mut CircuitBuilder<Challenge>,
+            ) -> Result<(), VerificationError> {
+                self.$side
+                    .preparations
+                    .set(self.$side.preparations.get() + 1);
+                <common::KoalaBearD4Backend as PcsRecursionBackend<
+                    common::KoalaBearD4RecursionConfig,
+                    $air,
+                    4,
+                >>::prepare_circuit(&self.inner, config, circuit)
+            }
+
+            fn build_verifier_circuit(
+                &self,
+                prev: &RecursionInput<'_, common::KoalaBearD4RecursionConfig, $air>,
+                config: &common::KoalaBearD4RecursionConfig,
+                circuit: &mut CircuitBuilder<Challenge>,
+            ) -> Result<Self::VerifierResult, VerificationError> {
+                self.$side.builds.set(self.$side.builds.get() + 1);
+                let inner = <common::KoalaBearD4Backend as PcsRecursionBackend<
+                    common::KoalaBearD4RecursionConfig,
+                    $air,
+                    4,
+                >>::build_verifier_circuit(&self.inner, prev, config, circuit)?;
+                Ok(CountingVerifierResult {
+                    inner,
+                    counters: Rc::clone(&self.$side),
+                })
+            }
+
+            fn set_private_data(
+                &self,
+                config: &common::KoalaBearD4RecursionConfig,
+                runner: &mut CircuitRunner<'_, Challenge>,
+                op_ids: &[NonPrimitiveOpId],
+                prev: &RecursionInput<'_, common::KoalaBearD4RecursionConfig, $air>,
+            ) -> Result<(), &'static str> {
+                self.$side
+                    .private_setups
+                    .set(self.$side.private_setups.get() + 1);
+                <common::KoalaBearD4Backend as PcsRecursionBackend<
+                    common::KoalaBearD4RecursionConfig,
+                    $air,
+                    4,
+                >>::set_private_data(&self.inner, config, runner, op_ids, prev)
+            }
+
+            fn set_private_data_for_result(
+                &self,
+                config: &common::KoalaBearD4RecursionConfig,
+                runner: &mut CircuitRunner<'_, Challenge>,
+                result: &Self::VerifierResult,
+                prev: &RecursionInput<'_, common::KoalaBearD4RecursionConfig, $air>,
+            ) -> Result<(), &'static str> {
+                self.$side
+                    .private_setups
+                    .set(self.$side.private_setups.get() + 1);
+                <common::KoalaBearD4Backend as PcsRecursionBackend<
+                    common::KoalaBearD4RecursionConfig,
+                    $air,
+                    4,
+                >>::set_private_data_for_result(
+                    &self.inner, config, runner, &result.inner, prev
+                )
+            }
+
+            fn non_primitive_preprocessors(&self) -> Vec<Box<dyn NpoPreprocessor<F>>> {
+                self.$preparations.set(self.$preparations.get() + 1);
+                <common::KoalaBearD4Backend as PcsRecursionBackend<
+                    common::KoalaBearD4RecursionConfig,
+                    $air,
+                    4,
+                >>::non_primitive_preprocessors(&self.inner)
+            }
+
+            fn non_primitive_provers(
+                &self,
+                ext_degree: usize,
+            ) -> Vec<Box<dyn TableProver<common::KoalaBearD4RecursionConfig>>> {
+                <common::KoalaBearD4Backend as PcsRecursionBackend<
+                    common::KoalaBearD4RecursionConfig,
+                    $air,
+                    4,
+                >>::non_primitive_provers(&self.inner, ext_degree)
+            }
+
+            fn non_primitive_air_builders(
+                &self,
+            ) -> Vec<Box<dyn NpoAirBuilder<common::KoalaBearD4RecursionConfig, 4>>> {
+                <common::KoalaBearD4Backend as PcsRecursionBackend<
+                    common::KoalaBearD4RecursionConfig,
+                    $air,
+                    4,
+                >>::non_primitive_air_builders(&self.inner)
+            }
+        }
+
+        impl PreparedPcsRecursionBackend<common::KoalaBearD4RecursionConfig, $air, 4>
+            for CountingBackend
+        {
+            type InputContract = <common::KoalaBearD4Backend as PreparedPcsRecursionBackend<
+                common::KoalaBearD4RecursionConfig,
+                $air,
+                4,
+            >>::InputContract;
+
+            fn preflight_input(
+                &self,
+                config: &common::KoalaBearD4RecursionConfig,
+                input: &PreparedInput<'_, common::KoalaBearD4RecursionConfig>,
+            ) -> Result<(), VerificationError> {
+                <common::KoalaBearD4Backend as PreparedPcsRecursionBackend<
+                    common::KoalaBearD4RecursionConfig,
+                    $air,
+                    4,
+                >>::preflight_input(&self.inner, config, input)
+            }
+
+            fn capture_input_contract(
+                &self,
+                config: &common::KoalaBearD4RecursionConfig,
+                source: &RecursionInput<'_, common::KoalaBearD4RecursionConfig, $air>,
+            ) -> Result<Self::InputContract, VerificationError> {
+                <common::KoalaBearD4Backend as PreparedPcsRecursionBackend<
+                    common::KoalaBearD4RecursionConfig,
+                    $air,
+                    4,
+                >>::capture_input_contract(&self.inner, config, source)
+            }
+
+            fn validate_prepared_input(
+                &self,
+                config: &common::KoalaBearD4RecursionConfig,
+                contract: &Self::InputContract,
+                input: &PreparedInput<'_, common::KoalaBearD4RecursionConfig>,
+            ) -> Result<(), VerificationError> {
+                <common::KoalaBearD4Backend as PreparedPcsRecursionBackend<
+                    common::KoalaBearD4RecursionConfig,
+                    $air,
+                    4,
+                >>::validate_prepared_input(&self.inner, config, contract, input)
+            }
+        }
+    };
+}
+
+impl_counting_backend!(FibonacciAir, uni, uni_output_preparations);
+impl_counting_backend!(BatchOnly, batch, batch_output_preparations);
+
+mod arity4_output {
+    use p3_test_utils::koala_bear_params::Challenger;
+
+    use super::*;
+
+    type Permutation = Poseidon2KoalaBear<32>;
+    type Hash = PaddingFreeSponge<Permutation, 32, 24, 8>;
+    type Compress = TruncatedPermutation<Permutation, 4, 8, 32>;
+    type ValMmcs =
+        MerkleTreeMmcs<<F as Field>::Packing, <F as Field>::Packing, Hash, Compress, 4, 8>;
+    type ChallengeMmcs = ExtensionMmcs<F, Challenge, ValMmcs>;
+    type Pcs4 = TwoAdicFriPcs<F, Radix2DitParallel<F>, ValMmcs, ChallengeMmcs>;
+    type NativeConfig = StarkConfig<Pcs4, Challenge, Challenger>;
+    type RecMmcs = RecValMmcsArity4<F, 8, Hash, Compress>;
+    type RecExtensionMmcs = RecExtensionValMmcsArity4<F, Challenge, 8, RecMmcs>;
+    type OpeningTargets = FriProofTargets<
+        F,
+        Challenge,
+        RecExtensionMmcs,
+        InputProofTargets<F, Challenge, RecMmcs>,
+        Witness<F>,
+    >;
+
+    #[derive(Clone)]
+    pub(super) struct Config {
+        config: Arc<NativeConfig>,
+        verifier_params: FriVerifierParams,
+        native_fri_params: NativeFriParams,
+        fri_instance: Arc<(ValMmcs, FriParameters<ChallengeMmcs>)>,
+    }
+
+    impl StarkGenericConfig for Config {
+        type Challenge = Challenge;
+        type Challenger = Challenger;
+        type Pcs = Pcs4;
+
+        fn pcs(&self) -> &Self::Pcs {
+            self.config.pcs()
+        }
+
+        fn initialise_challenger(&self) -> Self::Challenger {
+            self.config.initialise_challenger()
+        }
+    }
+
+    impl FriRecursionConfig for Config
+    where
+        Pcs4: RecursivePcs<
+                Self,
+                InputProofTargets<F, Challenge, RecMmcs>,
+                OpeningTargets,
+                MerkleCapTargets<F, 8>,
+                <Pcs4 as Pcs<Challenge, Challenger>>::Domain,
+            >,
+    {
+        type Commitment = MerkleCapTargets<F, 8>;
+        type InputProof = InputProofTargets<F, Challenge, RecMmcs>;
+        type OpeningProof = OpeningTargets;
+        type RawOpeningProof = <Pcs4 as Pcs<Challenge, Challenger>>::Proof;
+        const DIGEST_ELEMS: usize = 8;
+
+        fn native_fri_validation_params(&self) -> Option<NativeFriParams> {
+            Some(self.native_fri_params)
+        }
+
+        fn with_fri_opening_proof<'a, A, R>(
+            prev: &RecursionInput<'a, Self, A>,
+            f: impl FnOnce(&Self::RawOpeningProof) -> R,
+        ) -> R
+        where
+            A: RecursiveAir<Val<Self>, Self::Challenge, LogUpGadget>,
+        {
+            match prev {
+                RecursionInput::UniStark { proof, .. } => f(&proof.opening_proof),
+                RecursionInput::BatchStark { proof, .. } => f(&proof.proof.opening_proof),
+            }
+        }
+
+        fn prepare_circuit_for_verification(
+            &self,
+            circuit: &mut CircuitBuilder<Challenge>,
+        ) -> Result<(), VerificationError> {
+            circuit.enable_poseidon2_perm::<KoalaBearD4Width16, _>(
+                generate_poseidon2_trace::<Challenge, KoalaBearD4Width16>,
+                default_koalabear_poseidon2_16(),
+            );
+            circuit.enable_poseidon2_perm_width_32::<KoalaBearD4Width32, _>(
+                generate_poseidon2_trace::<Challenge, KoalaBearD4Width32>,
+                default_koalabear_poseidon2_32(),
+            );
+            circuit.enable_recompose::<F>(generate_recompose_trace::<F, Challenge>);
+            Ok(())
+        }
+
+        fn pcs_verifier_params(
+            &self,
+        ) -> &<Pcs4 as RecursivePcs<
+            Self,
+            InputProofTargets<F, Challenge, RecMmcs>,
+            OpeningTargets,
+            MerkleCapTargets<F, 8>,
+            <Pcs4 as Pcs<Challenge, Challenger>>::Domain,
+        >>::VerifierParams {
+            &self.verifier_params
+        }
+
+        fn set_fri_private_data(
+            config: &Self,
+            runner: &mut CircuitRunner<'_, Challenge>,
+            op_ids: &[NonPrimitiveOpId],
+            opening_proof: &Self::RawOpeningProof,
+            transcript: OpeningTranscript<Self>,
+        ) -> Result<(), &'static str> {
+            let OpeningTranscript {
+                mut challenger,
+                commitments_with_opening_points,
+            } = transcript;
+            observe_opened_values::<Self>(
+                &mut challenger,
+                &commitments_with_opening_points,
+                config.fri_instance.1.batch_proof_of_work_bits,
+            );
+            let claims: Vec<_> = commitments_with_opening_points
+                .iter()
+                .cloned()
+                .map(Into::into)
+                .collect();
+            let query_paths = restore_fri_query_paths(
+                &config.fri_instance.1,
+                &config.fri_instance.0,
+                &config.fri_instance.0,
+                opening_proof,
+                &mut challenger,
+                &claims,
+            )
+            .map_err(|_| "failed to restore arity-4 FRI query paths")?;
+            set_fri_mmcs_private_data_arity4::<F, Challenge, 8>(
+                runner,
+                op_ids,
+                &query_paths,
+                Poseidon2Config::KOALA_BEAR_D4_W32,
+            )
+        }
+    }
+
+    pub(super) fn config() -> Config {
+        let permutation = default_koalabear_poseidon2_32();
+        let val_mmcs = ValMmcs::new(
+            Hash::new(permutation.clone()),
+            Compress::new(permutation),
+            0,
+        );
+        let fri_params = FriParameters::new_testing(ChallengeMmcs::new(val_mmcs.clone()), 0);
+        let native_fri_params = NativeFriParams::try_from_native::<F, _>(&fri_params).unwrap();
+        let verifier_params = FriVerifierParams::with_mmcs(
+            native_fri_params.log_blowup(),
+            native_fri_params.log_final_poly_len(),
+            native_fri_params.max_log_arity(),
+            native_fri_params.commit_pow_bits(),
+            native_fri_params.query_pow_bits(),
+            native_fri_params.num_queries(),
+            Poseidon2Config::KOALA_BEAR_D4_W32,
+        );
+        let pcs = Pcs4::new(
+            Radix2DitParallel::default(),
+            val_mmcs.clone(),
+            fri_params.clone(),
+        );
+        Config {
+            config: Arc::new(NativeConfig::new(
+                pcs,
+                Challenger::new(default_koalabear_poseidon2_16()),
+            )),
+            verifier_params,
+            native_fri_params,
+            fri_instance: Arc::new((val_mmcs, fri_params)),
+        }
+    }
+
+    pub(super) fn verify(
+        config: Config,
+        params: &ProveNextLayerParams,
+        output: &p3_recursion::RecursionOutput<Config>,
+    ) {
+        let mut verifier =
+            BatchStarkProver::new(config).with_table_packing(params.table_packing.clone());
+        verifier.register_poseidon2_table::<4>(
+            Poseidon2Config::KOALA_BEAR_D4_W16.for_shared_challenger_table(),
+        );
+        verifier.register_poseidon2_table::<4>(Poseidon2Config::KOALA_BEAR_D4_W32);
+        verifier.register_recompose_table::<4>(true);
+        verifier
+            .verify_all_tables::<Challenge>(&output.0)
+            .expect("the arity-4 output proof verifies under its output configuration");
+    }
+}
+
+mod hiding_fri {
+    use super::*;
+
+    type HidingPcs = HidingFriPcs<F, Dft, MyMmcs, ChallengeMmcs, StdRng>;
+    type NativeConfig = StarkConfig<HidingPcs, Challenge, Challenger>;
+    type RecMmcs = RecValMmcs<F, 8, MyHash, MyCompress>;
+    type RecExtensionMmcs = RecExtensionValMmcs<F, Challenge, 8, RecMmcs>;
+    type OpeningTargets = HidingFriProofTargets<
+        F,
+        Challenge,
+        RecExtensionMmcs,
+        InputProofTargets<F, Challenge, RecMmcs>,
+        Witness<F>,
+    >;
+
+    #[derive(Clone)]
+    pub(super) struct Config {
+        config: Arc<NativeConfig>,
+        verifier_params: FriVerifierParams,
+        native_fri_params: NativeFriParams,
+        val_mmcs: MyMmcs,
+        fri_params: FriParameters<ChallengeMmcs>,
+    }
+
+    impl StarkGenericConfig for Config {
+        type Challenge = Challenge;
+        type Challenger = Challenger;
+        type Pcs = HidingPcs;
+
+        fn pcs(&self) -> &Self::Pcs {
+            self.config.pcs()
+        }
+
+        fn initialise_challenger(&self) -> Self::Challenger {
+            self.config.initialise_challenger()
+        }
+    }
+
+    impl FriRecursionConfig for Config
+    where
+        HidingPcs: RecursivePcs<
+                Self,
+                InputProofTargets<F, Challenge, RecMmcs>,
+                OpeningTargets,
+                MerkleCapTargets<F, 8>,
+                <HidingPcs as Pcs<Challenge, Challenger>>::Domain,
+            >,
+    {
+        type Commitment = MerkleCapTargets<F, 8>;
+        type InputProof = InputProofTargets<F, Challenge, RecMmcs>;
+        type OpeningProof = OpeningTargets;
+        type RawOpeningProof = <HidingPcs as Pcs<Challenge, Challenger>>::Proof;
+        const DIGEST_ELEMS: usize = 8;
+
+        fn native_fri_validation_params(&self) -> Option<NativeFriParams> {
+            Some(self.native_fri_params)
+        }
+
+        fn with_fri_opening_proof<'a, A, R>(
+            prev: &RecursionInput<'a, Self, A>,
+            f: impl FnOnce(&Self::RawOpeningProof) -> R,
+        ) -> R
+        where
+            A: RecursiveAir<Val<Self>, Self::Challenge, LogUpGadget>,
+        {
+            match prev {
+                RecursionInput::UniStark { proof, .. } => f(&proof.opening_proof),
+                RecursionInput::BatchStark { proof, .. } => f(&proof.proof.opening_proof),
+            }
+        }
+
+        fn prepare_circuit_for_verification(
+            &self,
+            circuit: &mut CircuitBuilder<Challenge>,
+        ) -> Result<(), VerificationError> {
+            circuit.enable_poseidon2_perm::<KoalaBearD4Width16, _>(
+                generate_poseidon2_trace::<Challenge, KoalaBearD4Width16>,
+                default_koalabear_poseidon2_16(),
+            );
+            circuit.enable_recompose::<F>(generate_recompose_trace::<F, Challenge>);
+            Ok(())
+        }
+
+        fn pcs_verifier_params(
+            &self,
+        ) -> &<HidingPcs as RecursivePcs<
+            Self,
+            InputProofTargets<F, Challenge, RecMmcs>,
+            OpeningTargets,
+            MerkleCapTargets<F, 8>,
+            <HidingPcs as Pcs<Challenge, Challenger>>::Domain,
+        >>::VerifierParams {
+            &self.verifier_params
+        }
+
+        fn set_fri_private_data(
+            config: &Self,
+            runner: &mut CircuitRunner<'_, Challenge>,
+            op_ids: &[NonPrimitiveOpId],
+            opening_proof: &Self::RawOpeningProof,
+            transcript: OpeningTranscript<Self>,
+        ) -> Result<(), &'static str> {
+            let OpeningTranscript {
+                mut challenger,
+                mut commitments_with_opening_points,
+            } = transcript;
+            merge_hiding_random_openings::<Self>(
+                &mut commitments_with_opening_points,
+                &opening_proof.0,
+            )
+            .map_err(|_| "failed to merge hiding FRI random openings")?;
+            observe_opened_values::<Self>(
+                &mut challenger,
+                &commitments_with_opening_points,
+                config.fri_params.batch_proof_of_work_bits,
+            );
+            let claims: Vec<_> = commitments_with_opening_points
+                .iter()
+                .cloned()
+                .map(Into::into)
+                .collect();
+            let query_paths = restore_fri_query_paths(
+                &config.fri_params,
+                &config.val_mmcs,
+                &config.val_mmcs,
+                &opening_proof.1,
+                &mut challenger,
+                &claims,
+            )
+            .map_err(|_| "failed to restore hiding FRI query paths")?;
+            set_fri_mmcs_private_data::<F, Challenge, 8>(
+                runner,
+                op_ids,
+                &query_paths,
+                Poseidon2Config::KOALA_BEAR_D4_W16,
+            )
+        }
+    }
+
+    pub(super) fn config(seed: u64) -> Config {
+        let permutation = default_koalabear_poseidon2_16();
+        let val_mmcs = MyMmcs::new(
+            MyHash::new(permutation.clone()),
+            MyCompress::new(permutation.clone()),
+            0,
+        );
+        let fri_params = FriParameters::new_testing(ChallengeMmcs::new(val_mmcs.clone()), 0);
+        let native_fri_params = NativeFriParams::try_from_native::<F, _>(&fri_params).unwrap();
+        let verifier_params = FriVerifierParams::with_mmcs(
+            native_fri_params.log_blowup(),
+            native_fri_params.log_final_poly_len(),
+            native_fri_params.max_log_arity(),
+            native_fri_params.commit_pow_bits(),
+            native_fri_params.query_pow_bits(),
+            native_fri_params.num_queries(),
+            Poseidon2Config::KOALA_BEAR_D4_W16,
+        );
+        let pcs = HidingPcs::new(
+            Dft::default(),
+            val_mmcs.clone(),
+            fri_params.clone(),
+            4,
+            StdRng::seed_from_u64(seed),
+        );
+        Config {
+            config: Arc::new(NativeConfig::new(pcs, Challenger::new(permutation))),
+            verifier_params,
+            native_fri_params,
+            val_mmcs,
+            fri_params,
+        }
+    }
+
+    pub(super) fn batch_proof(
+        config: &Config,
+        start_a: u64,
+        start_b: u64,
+    ) -> BatchStarkProof<Config> {
+        let n = 100;
+        let mut builder = CircuitBuilder::new();
+        let expected = builder.alloc_public_input("expected_result");
+        let mut a = builder.alloc_public_input("F(0)");
+        let mut b = builder.alloc_public_input("F(1)");
+        for _ in 2..=n {
+            let next = builder.add(a, b);
+            a = b;
+            b = next;
+        }
+        builder.connect(b, expected);
+        let circuit = builder.build().expect("the hiding fixture circuit builds");
+        // HidingFriPcs requires every committed table's mask to cover
+        // 2 * (extension degree * opening points + queries) values.
+        let packing = TablePacking::new(2, 4).with_min_trace_height(32);
+        let (airs_degrees, primitive_columns, non_primitive_columns) =
+            get_airs_and_degrees_with_prep::<Config, _, 1>(
+                &circuit,
+                &packing,
+                &[],
+                &[],
+                ConstraintProfile::Standard,
+            )
+            .expect("the hiding fixture tables build");
+        let (airs, degrees): (Vec<_>, Vec<_>) = airs_degrees.into_iter().unzip();
+        let ext_degrees: Vec<_> = degrees
+            .iter()
+            .map(|degree| degree + config.is_zk())
+            .collect();
+        let prover_data = ProverData::from_airs_and_degrees(config, &airs, &ext_degrees).unwrap();
+        let circuit_prover_data =
+            CircuitProverData::new(prover_data, primitive_columns, non_primitive_columns);
+        let mut runner = circuit.runner();
+        runner
+            .set_public_inputs(&[
+                fibonacci_output::<F>(start_a, start_b, n),
+                F::from_u64(start_a),
+                F::from_u64(start_b),
+            ])
+            .expect("the hiding fixture public inputs fit");
+        let traces = runner.run().expect("the hiding fixture runs");
+        let prover = BatchStarkProver::new(config.clone()).with_table_packing(packing);
+        let proof = prover
+            .prove_all_tables(&traces, &circuit_prover_data)
+            .expect("the hiding fixture proves");
+        prover
+            .verify_all_tables::<F>(&proof)
+            .expect("the hiding fixture verifies");
+        proof
+    }
+
+    pub(super) fn verify(
+        config: Config,
+        params: &ProveNextLayerParams,
+        output: &p3_recursion::RecursionOutput<Config>,
+    ) {
+        let mut verifier =
+            BatchStarkProver::new(config).with_table_packing(params.table_packing.clone());
+        verifier.register_poseidon2_table::<4>(
+            Poseidon2Config::KOALA_BEAR_D4_W16.for_shared_challenger_table(),
+        );
+        verifier.register_recompose_table::<4>(true);
+        verifier
+            .verify_all_tables::<Challenge>(&output.0)
+            .expect("the hiding aggregation proof verifies");
+    }
+}
+
+#[test]
+fn same_config_mixed_aggregation_retains_distinct_air_and_batch_shapes() {
+    let n = 1 << 10;
+    let air = FibonacciAir {};
+    let (config, backend) = common::koala_bear_d4_recursion_config_and_backend();
+    let batch_first = common::build_koala_bear_d4_first_layer_input_with_starts(0, 1);
+    let batch_second = common::build_koala_bear_d4_first_layer_input_with_starts(2, 3);
+    let table_public_inputs =
+        vec![vec![]; batch_first.base_proof.proof.opened_values.instances.len()];
+    let params = ProveNextLayerParams::default();
+
+    let left_first_pis = vec![F::ZERO, F::ONE, fibonacci_output::<F>(0, 1, n)];
+    let left_first = prove(
+        &config,
+        &air,
+        generate_trace_rows::<F>(0, 1, n),
+        &left_first_pis,
+    )
+    .unwrap();
+    verify(&config, &air, &left_first, &left_first_pis).expect("the first uni proof verifies");
+
+    let left_second_pis = vec![
+        F::from_u64(2),
+        F::from_u64(3),
+        fibonacci_output::<F>(2, 3, n),
+    ];
+    let left_second = prove(
+        &config,
+        &air,
+        generate_trace_rows::<F>(2, 3, n),
+        &left_second_pis,
+    )
+    .unwrap();
+    verify(&config, &air, &left_second, &left_second_pis).expect("the second uni proof verifies");
+
+    let prepared = PreparedAggregation::<_, FibonacciAir, BatchOnly, _, 4>::new(
+        PreparedSource::UniStark {
+            air: &air,
+            proof: &left_first,
+            public_inputs: &left_first_pis,
+            preprocessed_commit: None,
+        },
+        PreparedSource::batch(
+            &batch_first.base_proof,
+            &batch_first.base_proof.stark_common,
+            &table_public_inputs,
+        ),
+        config.clone(),
+        backend,
+        params.clone(),
+    )
+    .expect("the mixed trusted pair prepares");
+
+    let out1 = prepared
+        .prove(
+            PreparedInput::UniStark {
+                proof: &left_first,
+                public_inputs: &left_first_pis,
+                preprocessed_commit: None,
+            },
+            PreparedInput::BatchStark {
+                proof: &batch_first.base_proof,
+                common_data: &batch_first.base_proof.stark_common,
+                table_public_inputs: &table_public_inputs,
+            },
+        )
+        .expect("the first mixed pair proves");
+    let out2 = prepared
+        .prove(
+            PreparedInput::UniStark {
+                proof: &left_second,
+                public_inputs: &left_second_pis,
+                preprocessed_commit: None,
+            },
+            PreparedInput::BatchStark {
+                proof: &batch_second.base_proof,
+                common_data: &batch_second.base_proof.stark_common,
+                table_public_inputs: &table_public_inputs,
+            },
+        )
+        .expect("the second mixed pair proves");
+
+    assert!(Arc::ptr_eq(&out1.1, &out2.1));
+    verify_output(config.clone(), &params, &out1);
+    verify_output(config, &params, &out2);
+}
+
+#[test]
+fn aggregation_rejects_either_mismatch_before_packing_or_private_setup() {
+    let air = FibonacciAir {};
+    let n = 1 << 10;
+    let short_n = 1 << 9;
+    let (config, inner) = common::koala_bear_d4_recursion_config_and_backend();
+    let right_reference = common::build_koala_bear_d4_first_layer_input_with_starts(0, 1);
+    let mut right_mismatch = common::build_koala_bear_d4_first_layer_input();
+    let right_public = vec![
+        vec![];
+        right_reference
+            .base_proof
+            .proof
+            .opened_values
+            .instances
+            .len()
+    ];
+    let left_pis = vec![F::ZERO, F::ONE, fibonacci_output::<F>(0, 1, n)];
+    let left_proof = prove(&config, &air, generate_trace_rows::<F>(0, 1, n), &left_pis).unwrap();
+    let short_pis = vec![F::ZERO, F::ONE, fibonacci_output::<F>(0, 1, short_n)];
+    let short_proof = prove(
+        &config,
+        &air,
+        generate_trace_rows::<F>(0, 1, short_n),
+        &short_pis,
+    )
+    .unwrap();
+
+    let uni = Rc::new(SideCounters::default());
+    let batch = Rc::new(SideCounters::default());
+    let uni_preparations = Rc::new(Cell::new(0));
+    let batch_preparations = Rc::new(Cell::new(0));
+    let exact_final_poly = left_proof.opening_proof.final_poly.len().max(
+        right_reference
+            .base_proof
+            .proof
+            .opening_proof
+            .final_poly
+            .len(),
+    );
+    let backend = CountingBackend {
+        inner: inner.with_limits(VerifierLimits {
+            max_final_poly_evaluations: exact_final_poly,
+            ..VerifierLimits::default()
+        }),
+        uni: Rc::clone(&uni),
+        batch: Rc::clone(&batch),
+        uni_output_preparations: Rc::clone(&uni_preparations),
+        batch_output_preparations: Rc::clone(&batch_preparations),
+    };
+    let params = ProveNextLayerParams::default();
+
+    let left_input = RecursionInput::UniStark {
+        proof: &left_proof,
+        air: &air,
+        public_inputs: left_pis.clone(),
+        preprocessed_commit: None,
+    };
+    let valid_right_input: RecursionInput<'_, common::KoalaBearD4RecursionConfig, BatchOnly> =
+        RecursionInput::BatchStark {
+            proof: &right_reference.base_proof,
+            common_data: &right_reference.base_proof.stark_common,
+            table_public_inputs: right_public.clone(),
+        };
+    assert!(
+        build_aggregation_layer_circuit::<_, _, _, _, 4>(
+            &left_input,
+            &valid_right_input,
+            &config.clone().without_native_fri_snapshot(),
+            &backend,
+        )
+        .is_err(),
+        "the built-in FRI boundary must fail closed without a native snapshot"
+    );
+    assert_eq!(uni.validations.get(), 0);
+    assert_eq!(batch.validations.get(), 0);
+    assert_eq!(uni.preparations.get(), 0);
+    assert_eq!(batch.preparations.get(), 0);
+    assert_eq!(uni.builds.get(), 0);
+    assert_eq!(batch.builds.get(), 0);
+    uni.validations.set(0);
+
+    right_mismatch.base_proof.proof.opening_proof.final_poly =
+        vec![Challenge::ZERO; exact_final_poly + 1];
+    let bad_right_input: RecursionInput<'_, common::KoalaBearD4RecursionConfig, BatchOnly> =
+        RecursionInput::BatchStark {
+            proof: &right_mismatch.base_proof,
+            common_data: &right_mismatch.base_proof.stark_common,
+            table_public_inputs: right_public.clone(),
+        };
+    assert!(
+        build_aggregation_layer_circuit::<_, _, _, _, 4>(
+            &left_input,
+            &bad_right_input,
+            &config,
+            &backend,
+        )
+        .is_err()
+    );
+    assert_eq!(uni.validations.get(), 0);
+    assert_eq!(batch.validations.get(), 0);
+    assert_eq!(uni.preparations.get(), 0);
+    assert_eq!(batch.preparations.get(), 0);
+    assert_eq!(uni.builds.get(), 0);
+    assert_eq!(batch.builds.get(), 0);
+
+    uni.validations.set(0);
+    batch.validations.set(0);
+    let prepared = PreparedAggregation::<_, FibonacciAir, BatchOnly, _, 4>::new(
+        PreparedSource::UniStark {
+            air: &air,
+            proof: &left_proof,
+            public_inputs: &left_pis,
+            preprocessed_commit: None,
+        },
+        PreparedSource::batch(
+            &right_reference.base_proof,
+            &right_reference.base_proof.stark_common,
+            &right_public,
+        ),
+        config.clone(),
+        backend.clone(),
+        params.clone(),
+    )
+    .expect("the reference shapes prepare");
+
+    assert_eq!(
+        uni_preparations.get(),
+        1,
+        "same-config output dispatches through A1"
+    );
+    assert_eq!(batch_preparations.get(), 0);
+
+    let compatible_left = || PreparedInput::UniStark {
+        proof: &left_proof,
+        public_inputs: &left_pis,
+        preprocessed_commit: None,
+    };
+    let compatible_right = || PreparedInput::BatchStark {
+        proof: &right_reference.base_proof,
+        common_data: &right_reference.base_proof.stark_common,
+        table_public_inputs: &right_public,
+    };
+    let before_right_resource_rejection = (
+        uni.validations.get(),
+        batch.validations.get(),
+        uni.preparations.get(),
+        batch.preparations.get(),
+        uni.builds.get(),
+        batch.builds.get(),
+    );
+
+    let error = match prepared.prove(
+        compatible_left(),
+        PreparedInput::BatchStark {
+            proof: &right_mismatch.base_proof,
+            common_data: &right_mismatch.base_proof.stark_common,
+            table_public_inputs: &right_public,
+        },
+    ) {
+        Ok(_) => panic!("a right-side resource excess must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        VerificationError::ResourceLimitExceeded {
+            component: "final polynomial evaluations",
+            ..
+        }
+    ));
+    assert_side_counters_zero(&uni);
+    assert_side_counters_zero(&batch);
+    assert_eq!(
+        before_right_resource_rejection,
+        (
+            uni.validations.get(),
+            batch.validations.get(),
+            uni.preparations.get(),
+            batch.preparations.get(),
+            uni.builds.get(),
+            batch.builds.get(),
+        ),
+        "both borrowed resource walks finish before either side starts contextual or build work",
+    );
+
+    let error = match prepared.prove(
+        PreparedInput::UniStark {
+            proof: &short_proof,
+            public_inputs: &short_pis,
+            preprocessed_commit: None,
+        },
+        compatible_right(),
+    ) {
+        Ok(_) => panic!("a left-side shape mismatch must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        VerificationError::PreparedInputMismatch { .. }
+    ));
+    assert_side_counters_zero(&uni);
+    assert_side_counters_zero(&batch);
+
+    uni_preparations.set(0);
+    batch_preparations.set(0);
+    let cross = PreparedAggregationCross::<_, _, FibonacciAir, BatchOnly, _, 4>::new(
+        PreparedSource::UniStark {
+            air: &air,
+            proof: &left_proof,
+            public_inputs: &left_pis,
+            preprocessed_commit: None,
+        },
+        PreparedSource::batch(
+            &right_reference.base_proof,
+            &right_reference.base_proof.stark_common,
+            &right_public,
+        ),
+        config.clone(),
+        config,
+        backend,
+        params,
+    )
+    .expect("the cross-config path prepares");
+    assert_eq!(uni_preparations.get(), 0);
+    assert_eq!(
+        batch_preparations.get(),
+        1,
+        "cross-config output dispatches through BatchOnly"
+    );
+    let before_cross_right_resource_rejection = (
+        uni.validations.get(),
+        batch.validations.get(),
+        uni.preparations.get(),
+        batch.preparations.get(),
+        uni.builds.get(),
+        batch.builds.get(),
+    );
+
+    let error = match cross.prove(
+        compatible_left(),
+        PreparedInput::BatchStark {
+            proof: &right_mismatch.base_proof,
+            common_data: &right_mismatch.base_proof.stark_common,
+            table_public_inputs: &right_public,
+        },
+    ) {
+        Ok(_) => panic!("a cross-config right-side resource excess must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        VerificationError::ResourceLimitExceeded {
+            component: "final polynomial evaluations",
+            ..
+        }
+    ));
+    assert_side_counters_zero(&uni);
+    assert_side_counters_zero(&batch);
+    assert_eq!(
+        before_cross_right_resource_rejection,
+        (
+            uni.validations.get(),
+            batch.validations.get(),
+            uni.preparations.get(),
+            batch.preparations.get(),
+            uni.builds.get(),
+            batch.builds.get(),
+        ),
+    );
+
+    let error = match cross.prove(
+        PreparedInput::UniStark {
+            proof: &short_proof,
+            public_inputs: &short_pis,
+            preprocessed_commit: None,
+        },
+        compatible_right(),
+    ) {
+        Ok(_) => panic!("a cross-config left-side mismatch must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        VerificationError::PreparedInputMismatch { .. }
+    ));
+    assert_side_counters_zero(&uni);
+    assert_side_counters_zero(&batch);
+}
+
+#[test]
+fn reusable_aggregation_preflights_both_replacements_before_either_pack() {
+    let air = FibonacciAir {};
+    let n = 1 << 10;
+    let (config, inner) = common::koala_bear_d4_recursion_config_and_backend();
+    let right = common::build_koala_bear_d4_first_layer_input_with_starts(0, 1);
+    let right_public = vec![vec![]; right.base_proof.proof.opened_values.instances.len()];
+    let left_public = vec![F::ZERO, F::ONE, fibonacci_output::<F>(0, 1, n)];
+    let left_proof = prove(
+        &config,
+        &air,
+        generate_trace_rows::<F>(0, 1, n),
+        &left_public,
+    )
+    .unwrap();
+    let exact_final_poly = left_proof
+        .opening_proof
+        .final_poly
+        .len()
+        .max(right.base_proof.proof.opening_proof.final_poly.len());
+    let uni = Rc::new(SideCounters::default());
+    let batch = Rc::new(SideCounters::default());
+    let backend = CountingBackend {
+        inner: inner.with_limits(VerifierLimits {
+            max_final_poly_evaluations: exact_final_poly,
+            ..VerifierLimits::default()
+        }),
+        uni: Rc::clone(&uni),
+        batch: Rc::clone(&batch),
+        uni_output_preparations: Rc::new(Cell::new(0)),
+        batch_output_preparations: Rc::new(Cell::new(0)),
+    };
+    let left_input = RecursionInput::UniStark {
+        proof: &left_proof,
+        air: &air,
+        public_inputs: left_public,
+        preprocessed_commit: None,
+    };
+    let right_input: RecursionInput<'_, common::KoalaBearD4RecursionConfig, BatchOnly> =
+        RecursionInput::BatchStark {
+            proof: &right.base_proof,
+            common_data: &right.base_proof.stark_common,
+            table_public_inputs: right_public.clone(),
+        };
+    let (circuit, (left_result, right_result)) = build_aggregation_layer_circuit::<_, _, _, _, 4>(
+        &left_input,
+        &right_input,
+        &config,
+        &backend,
+    )
+    .expect("the reference pair builds");
+
+    let mut malformed_right = common::build_koala_bear_d4_first_layer_input();
+    malformed_right.base_proof.proof.opening_proof.final_poly =
+        vec![Challenge::ZERO; exact_final_poly + 1];
+    let malformed_right_input: RecursionInput<'_, common::KoalaBearD4RecursionConfig, BatchOnly> =
+        RecursionInput::BatchStark {
+            proof: &malformed_right.base_proof,
+            common_data: &malformed_right.base_proof.stark_common,
+            table_public_inputs: right_public,
+        };
+    let error = match prove_aggregation_layer::<_, _, _, _, 4>(
+        &left_input,
+        &malformed_right_input,
+        &left_result,
+        &right_result,
+        &circuit,
+        &config,
+        &backend,
+        &ProveNextLayerParams::default(),
+    ) {
+        Ok(_) => panic!("the over-limit right replacement must reject before packing"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        VerificationError::ResourceLimitExceeded {
+            component: "final polynomial evaluations",
+            ..
+        }
+    ));
+    assert_side_counters_zero(&uni);
+    assert_side_counters_zero(&batch);
+}
+
+#[test]
+fn fri_preflight_checks_the_encoded_lde_log() {
+    let first = common::build_koala_bear_d4_first_layer_input();
+    let degree = first
+        .base_proof
+        .proof
+        .degree_bits
+        .iter()
+        .copied()
+        .max()
+        .unwrap();
+    let blowup = first
+        .layer_config
+        .native_fri_validation_params()
+        .unwrap()
+        .log_blowup();
+    assert!(blowup > 0);
+    let backend = FriRecursionBackend::<16, 8, _>::new(Poseidon2Config::KOALA_BEAR_D4_W16)
+        .for_extension_degree::<4>()
+        .with_limits(VerifierLimits {
+            max_log_domain_or_degree: degree,
+            ..VerifierLimits::default()
+        });
+    let table_public_inputs = vec![vec![]; first.base_proof.proof.opened_values.instances.len()];
+    let input: RecursionInput<'_, common::KoalaBearD4RecursionConfig, BatchOnly> =
+        RecursionInput::BatchStark {
+            proof: &first.base_proof,
+            common_data: &first.base_proof.stark_common,
+            table_public_inputs,
+        };
+
+    assert!(matches!(
+        <_ as PcsRecursionBackend<_, BatchOnly, 4>>::preflight_input(
+            &backend,
+            &first.layer_config,
+            &input,
+        ),
+        Err(VerificationError::ResourceLimitExceeded {
+            component: "log domain or degree",
+            actual,
+            limit,
+        }) if actual == degree + blowup && limit == degree
+    ));
+}
+
+fn assert_side_counters_zero(counters: &SideCounters) {
+    assert_eq!(counters.public_packs.get(), 0);
+    assert_eq!(counters.private_packs.get(), 0);
+    assert_eq!(counters.private_setups.get(), 0);
+}
+
+fn verify_output(
+    config: common::KoalaBearD4RecursionConfig,
+    params: &ProveNextLayerParams,
+    output: &p3_recursion::RecursionOutput<common::KoalaBearD4RecursionConfig>,
+) {
+    let mut verifier =
+        BatchStarkProver::new(config).with_table_packing(params.table_packing.clone());
+    verifier.register_poseidon2_table::<4>(
+        Poseidon2Config::KOALA_BEAR_D4_W16.for_shared_challenger_table(),
+    );
+    verifier.register_recompose_table::<4>(true);
+    verifier
+        .verify_all_tables::<Challenge>(&output.0)
+        .expect("the aggregation proof verifies");
+}
+
+#[test]
+fn same_config_batch_aggregation_reuses_preparation_for_varied_pairs() {
+    let left_first = common::build_koala_bear_d4_first_layer_input_with_starts(0, 1);
+    let right_first = common::build_koala_bear_d4_first_layer_input_with_starts(2, 3);
+    let left_second = common::build_koala_bear_d4_first_layer_input_with_starts(4, 5);
+    let right_second = common::build_koala_bear_d4_first_layer_input_with_starts(6, 7);
+    let public_inputs = vec![vec![]; left_first.base_proof.proof.opened_values.instances.len()];
+    let params = ProveNextLayerParams::default();
+    let config = left_first.layer_config.clone();
+
+    let prepared = PreparedAggregation::<_, BatchOnly, BatchOnly, _, 4>::new(
+        PreparedSource::batch(
+            &left_first.base_proof,
+            &left_first.base_proof.stark_common,
+            &public_inputs,
+        ),
+        PreparedSource::batch(
+            &right_first.base_proof,
+            &right_first.base_proof.stark_common,
+            &public_inputs,
+        ),
+        config.clone(),
+        left_first.backend.clone(),
+        params.clone(),
+    )
+    .expect("the honest pair prepares");
+
+    let first = prepared
+        .prove(
+            PreparedInput::BatchStark {
+                proof: &left_first.base_proof,
+                common_data: &left_first.base_proof.stark_common,
+                table_public_inputs: &public_inputs,
+            },
+            PreparedInput::BatchStark {
+                proof: &right_first.base_proof,
+                common_data: &right_first.base_proof.stark_common,
+                table_public_inputs: &public_inputs,
+            },
+        )
+        .expect("the reference pair proves");
+    drop(left_first);
+    drop(right_first);
+    let second = prepared
+        .prove(
+            PreparedInput::BatchStark {
+                proof: &left_second.base_proof,
+                common_data: &left_second.base_proof.stark_common,
+                table_public_inputs: &public_inputs,
+            },
+            PreparedInput::BatchStark {
+                proof: &right_second.base_proof,
+                common_data: &right_second.base_proof.stark_common,
+                table_public_inputs: &public_inputs,
+            },
+        )
+        .expect("the varied pair proves");
+
+    assert!(Arc::ptr_eq(&first.1, &second.1));
+    assert!(prepared.profile().is_none());
+    assert_eq!(prepared.params().table_packing, params.table_packing);
+    verify_output(config.clone(), &params, &first);
+    verify_output(config, &params, &second);
+}
+
+#[test]
+fn trusted_aggregation_retains_each_child_runtime_config_and_pins_both_roots() {
+    let left = common::build_koala_bear_d4_first_layer_input();
+    let right = common::build_koala_bear_d4_first_layer_input_with_pow_bits(0);
+    let params = ProveNextLayerParams::default();
+    let (output_config, _) = common::koala_bear_d4_recursion_config_and_backend_with_pow_bits(1);
+    assert_eq!(
+        left.verifier
+            .common_data()
+            .preprocessed
+            .as_ref()
+            .map(|group| &group.commitment),
+        right
+            .verifier
+            .common_data()
+            .preprocessed
+            .as_ref()
+            .map(|group| &group.commitment),
+        "the regression requires both child constraints to pin the same cap"
+    );
+
+    let prepared = TrustedPreparedAggregation::<_, _, BatchOnly, BatchOnly, _, 4>::new(
+        TrustedPreparedSource::BatchStark {
+            verifier: left.verifier.clone(),
+            proof: &left.base_proof,
+            statement: &[],
+        },
+        TrustedPreparedSource::BatchStark {
+            verifier: right.verifier.clone(),
+            proof: &right.base_proof,
+            statement: &[],
+        },
+        output_config.clone(),
+        left.backend.clone(),
+        params.clone(),
+    )
+    .expect("the independently configured trusted children prepare");
+
+    let output = prepared
+        .prove(
+            TrustedPreparedInput::BatchStark {
+                proof: &left.base_proof,
+                statement: &[],
+            },
+            TrustedPreparedInput::BatchStark {
+                proof: &right.base_proof,
+                statement: &[],
+            },
+        )
+        .expect("each child is replayed under its own retained runtime config");
+
+    prepared.verifier().verify(&output.0, &[]).unwrap();
+    verify_output(output_config, &params, &output);
+}
+
+#[test]
+fn trusted_heterogeneous_cross_config_aggregation_exports_ordered_statement_after_owner_drop() {
+    let n = 1 << 10;
+    let left_air = FibonacciAir {};
+    let (input_config, _) = common::koala_bear_d4_recursion_config_and_backend();
+    let left_statement = vec![F::ZERO, F::ONE, fibonacci_output::<F>(0, 1, n)];
+    let left_proof = prove(
+        &input_config,
+        &left_air,
+        generate_trace_rows::<F>(0, 1, n),
+        &left_statement,
+    )
+    .unwrap();
+    let right_fixture = common::KoalaBearD4StatementFixture::new();
+    let right_statement = [F::from_u64(11), F::from_u64(13)];
+    let right_proof = right_fixture.prove([11, 13]);
+    let replacement_statement = [F::from_u64(17), F::from_u64(19)];
+    let replacement_proof = right_fixture.prove([17, 19]);
+    let output_config = arity4_output::config();
+    let backend = FriRecursionBackend::<16, 8, _>::new(Poseidon2Config::KOALA_BEAR_D4_W16)
+        .with_extra_poseidon2_table(Poseidon2Config::KOALA_BEAR_D4_W32)
+        .for_extension_degree::<4>();
+    let owner = TrustedPreparedAggregation::<_, _, FibonacciAir, BatchOnly, _, 4>::new(
+        TrustedPreparedSource::UniStark {
+            config: input_config,
+            air: &left_air,
+            preprocessed_commit: None,
+            proof: &left_proof,
+            public_inputs: &left_statement,
+        },
+        TrustedPreparedSource::BatchStark {
+            verifier: right_fixture.verifier(),
+            proof: &right_proof,
+            statement: &right_statement,
+        },
+        output_config,
+        backend,
+        ProveNextLayerParams::default(),
+    )
+    .expect("the heterogeneous trusted pair prepares under the distinct output config");
+
+    assert!(matches!(
+        owner
+            .check_inputs(
+                &TrustedPreparedInput::UniStark {
+                    proof: &left_proof,
+                    public_inputs: &left_statement,
+                },
+                &TrustedPreparedInput::BatchStark {
+                    proof: &replacement_proof,
+                    statement: &right_statement,
+                },
+            )
+            .unwrap_err(),
+        VerificationError::InvalidProofShape(_)
+    ));
+    assert!(matches!(
+        owner
+            .check_inputs(
+                &TrustedPreparedInput::BatchStark {
+                    proof: &right_proof,
+                    statement: &right_statement,
+                },
+                &TrustedPreparedInput::UniStark {
+                    proof: &left_proof,
+                    public_inputs: &left_statement,
+                },
+            )
+            .unwrap_err(),
+        VerificationError::PreparedInputMismatch { .. }
+    ));
+    assert!(matches!(
+        owner
+            .check_inputs(
+                &TrustedPreparedInput::UniStark {
+                    proof: &left_proof,
+                    public_inputs: &left_statement,
+                },
+                &TrustedPreparedInput::UniStark {
+                    proof: &left_proof,
+                    public_inputs: &left_statement,
+                },
+            )
+            .unwrap_err(),
+        VerificationError::PreparedInputMismatch { .. }
+    ));
+    assert!(matches!(
+        owner
+            .check_inputs(
+                &TrustedPreparedInput::BatchStark {
+                    proof: &right_proof,
+                    statement: &right_statement,
+                },
+                &TrustedPreparedInput::BatchStark {
+                    proof: &right_proof,
+                    statement: &right_statement,
+                },
+            )
+            .unwrap_err(),
+        VerificationError::PreparedInputMismatch { .. }
+    ));
+
+    let output = owner
+        .prove(
+            TrustedPreparedInput::UniStark {
+                proof: &left_proof,
+                public_inputs: &left_statement,
+            },
+            TrustedPreparedInput::BatchStark {
+                proof: &right_proof,
+                statement: &right_statement,
+            },
+        )
+        .expect("the heterogeneous child statements prove in slot order");
+    let parent_verifier = owner.verifier();
+    let layout = parent_verifier
+        .aggregation_statement_layout()
+        .expect("the parent retains its heterogeneous statement boundary");
+    assert_eq!(layout.left().base_len(), 3);
+    assert_eq!(layout.right().base_len(), 2);
+    assert_eq!(layout.split_at(), 3);
+    assert_eq!(layout.output().base_len(), 5);
+
+    let mut expected = left_statement.clone();
+    expected.extend(right_statement);
+    let mut swapped = right_statement.to_vec();
+    swapped.extend(left_statement.iter().copied());
+    let mut substituted = expected.clone();
+    substituted[3] = replacement_statement[0];
+    let mut duplicated_value = expected.clone();
+    duplicated_value[4] = duplicated_value[3];
+    drop(owner);
+    drop(left_proof);
+    drop(right_proof);
+    drop(replacement_proof);
+    drop(right_fixture);
+
+    parent_verifier.verify(&output.0, &expected).unwrap();
+    assert!(parent_verifier.verify(&output.0, &swapped).is_err());
+    assert!(parent_verifier.verify(&output.0, &substituted).is_err());
+    assert!(
+        parent_verifier
+            .verify(&output.0, &duplicated_value)
+            .is_err()
+    );
+}
+
+#[test]
+fn trusted_cross_config_aggregation_verifies_arity2_inputs_and_emits_arity4_output() {
+    let left = common::build_koala_bear_d4_first_layer_input_with_starts(0, 1);
+    let right = common::build_koala_bear_d4_first_layer_input_with_starts(2, 3);
+    let output_config = arity4_output::config();
+    let backend = FriRecursionBackend::<16, 8, _>::new(Poseidon2Config::KOALA_BEAR_D4_W16)
+        .with_extra_poseidon2_table(Poseidon2Config::KOALA_BEAR_D4_W32)
+        .for_extension_degree::<4>();
+    let params = ProveNextLayerParams::default();
+
+    let prepared = TrustedPreparedAggregation::<_, _, BatchOnly, BatchOnly, _, 4>::new(
+        TrustedPreparedSource::BatchStark {
+            verifier: left.verifier.clone(),
+            proof: &left.base_proof,
+            statement: &[],
+        },
+        TrustedPreparedSource::BatchStark {
+            verifier: right.verifier.clone(),
+            proof: &right.base_proof,
+            statement: &[],
+        },
+        output_config.clone(),
+        backend,
+        params.clone(),
+    )
+    .expect("the trusted arity-2 children prepare under the independent arity-4 output config");
+    let output = prepared
+        .prove(
+            TrustedPreparedInput::BatchStark {
+                proof: &left.base_proof,
+                statement: &[],
+            },
+            TrustedPreparedInput::BatchStark {
+                proof: &right.base_proof,
+                statement: &[],
+            },
+        )
+        .expect("the trusted cross-config child pair proves");
+
+    prepared.verifier().verify(&output.0, &[]).unwrap();
+    arity4_output::verify(output_config, &params, &output);
+}
+
+#[test]
+fn same_config_profile_aggregation_reuses_preparation_for_varied_pairs() {
+    let left_first = common::build_koala_bear_d4_first_layer_input_with_starts(0, 1);
+    let right_first = common::build_koala_bear_d4_first_layer_input_with_starts(2, 3);
+    let left_second = common::build_koala_bear_d4_first_layer_input_with_starts(4, 5);
+    let right_second = common::build_koala_bear_d4_first_layer_input_with_starts(6, 7);
+    let public_inputs = vec![vec![]; left_first.base_proof.proof.opened_values.instances.len()];
+    let config = left_first.layer_config.clone();
+    let profile = RecursionLayerProfile {
+        table_packing: TablePacking::default(),
+        hash: HashProfile::default(),
+        transcript: TranscriptKind::default(),
+        constraint_profile: ConstraintProfile::RecursionOptimized,
+    };
+
+    let prepared = PreparedAggregation::<_, BatchOnly, BatchOnly, _, 4>::new_with_profile(
+        PreparedSource::batch(
+            &left_first.base_proof,
+            &left_first.base_proof.stark_common,
+            &public_inputs,
+        ),
+        PreparedSource::batch(
+            &right_first.base_proof,
+            &right_first.base_proof.stark_common,
+            &public_inputs,
+        ),
+        config,
+        left_first.backend.clone(),
+        profile.clone(),
+    )
+    .expect("the profile-owned aggregation verifier prepares");
+    let first = prepared
+        .prove(
+            PreparedInput::BatchStark {
+                proof: &left_first.base_proof,
+                common_data: &left_first.base_proof.stark_common,
+                table_public_inputs: &public_inputs,
+            },
+            PreparedInput::BatchStark {
+                proof: &right_first.base_proof,
+                common_data: &right_first.base_proof.stark_common,
+                table_public_inputs: &public_inputs,
+            },
+        )
+        .expect("the first profile-owned pair proves");
+    drop(left_first);
+    drop(right_first);
+    let second = prepared
+        .prove(
+            PreparedInput::BatchStark {
+                proof: &left_second.base_proof,
+                common_data: &left_second.base_proof.stark_common,
+                table_public_inputs: &public_inputs,
+            },
+            PreparedInput::BatchStark {
+                proof: &right_second.base_proof,
+                common_data: &right_second.base_proof.stark_common,
+                table_public_inputs: &public_inputs,
+            },
+        )
+        .expect("the second profile-owned pair proves");
+
+    assert_eq!(prepared.profile(), Some(&profile));
+    assert_eq!(prepared.params().table_packing, profile.table_packing);
+    assert_eq!(
+        prepared.params().constraint_profile,
+        profile.constraint_profile
+    );
+    assert!(Arc::ptr_eq(&first.1, &second.1));
+}
+
+#[test]
+fn cross_config_aggregation_verifies_arity2_inputs_and_emits_arity4_outputs() {
+    let left_first = common::build_koala_bear_d4_first_layer_input_with_starts(0, 1);
+    let right_first = common::build_koala_bear_d4_first_layer_input_with_starts(2, 3);
+    let left_second = common::build_koala_bear_d4_first_layer_input_with_starts(4, 5);
+    let right_second = common::build_koala_bear_d4_first_layer_input_with_starts(6, 7);
+    let table_public_inputs =
+        vec![vec![]; left_first.base_proof.proof.opened_values.instances.len()];
+    let input_config = left_first.layer_config.clone();
+    let output_config = arity4_output::config();
+    let backend = FriRecursionBackend::<16, 8, _>::new(Poseidon2Config::KOALA_BEAR_D4_W16)
+        .with_extra_poseidon2_table(Poseidon2Config::KOALA_BEAR_D4_W32)
+        .for_extension_degree::<4>();
+    let params = ProveNextLayerParams::default();
+
+    let prepared = PreparedAggregationCross::<_, _, BatchOnly, BatchOnly, _, 4>::new(
+        PreparedSource::batch(
+            &left_first.base_proof,
+            &left_first.base_proof.stark_common,
+            &table_public_inputs,
+        ),
+        PreparedSource::batch(
+            &right_first.base_proof,
+            &right_first.base_proof.stark_common,
+            &table_public_inputs,
+        ),
+        input_config,
+        output_config.clone(),
+        backend,
+        params.clone(),
+    )
+    .expect("the arity-2 verifier circuit prepares under the arity-4 output config");
+
+    let out1 = prepared
+        .prove(
+            PreparedInput::BatchStark {
+                proof: &left_first.base_proof,
+                common_data: &left_first.base_proof.stark_common,
+                table_public_inputs: &table_public_inputs,
+            },
+            PreparedInput::BatchStark {
+                proof: &right_first.base_proof,
+                common_data: &right_first.base_proof.stark_common,
+                table_public_inputs: &table_public_inputs,
+            },
+        )
+        .expect("the first cross-config pair proves");
+    drop(left_first);
+    drop(right_first);
+    let out2 = prepared
+        .prove(
+            PreparedInput::BatchStark {
+                proof: &left_second.base_proof,
+                common_data: &left_second.base_proof.stark_common,
+                table_public_inputs: &table_public_inputs,
+            },
+            PreparedInput::BatchStark {
+                proof: &right_second.base_proof,
+                common_data: &right_second.base_proof.stark_common,
+                table_public_inputs: &table_public_inputs,
+            },
+        )
+        .expect("the second cross-config pair proves");
+
+    assert!(Arc::ptr_eq(&out1.1, &out2.1));
+    assert!(prepared.profile().is_none());
+    assert_eq!(prepared.params().table_packing, params.table_packing);
+    arity4_output::verify(output_config.clone(), &params, &out1);
+    arity4_output::verify(output_config, &params, &out2);
+}
+
+#[test]
+fn cross_config_profile_aggregation_verifies_arity2_inputs_and_emits_arity4_outputs() {
+    let left = common::build_koala_bear_d4_first_layer_input_with_starts(0, 1);
+    let right = common::build_koala_bear_d4_first_layer_input_with_starts(2, 3);
+    let table_public_inputs = vec![vec![]; left.base_proof.proof.opened_values.instances.len()];
+    let input_config = left.layer_config.clone();
+    let output_config = arity4_output::config();
+    let backend = FriRecursionBackend::<16, 8, _>::new(Poseidon2Config::KOALA_BEAR_D4_W16)
+        .with_extra_poseidon2_table(Poseidon2Config::KOALA_BEAR_D4_W32)
+        .for_extension_degree::<4>();
+    let profile = RecursionLayerProfile {
+        table_packing: TablePacking::default(),
+        hash: HashProfile::default(),
+        transcript: TranscriptKind::default(),
+        constraint_profile: ConstraintProfile::Standard,
+    };
+
+    let prepared = PreparedAggregationCross::<_, _, BatchOnly, BatchOnly, _, 4>::new_with_profile(
+        PreparedSource::batch(
+            &left.base_proof,
+            &left.base_proof.stark_common,
+            &table_public_inputs,
+        ),
+        PreparedSource::batch(
+            &right.base_proof,
+            &right.base_proof.stark_common,
+            &table_public_inputs,
+        ),
+        input_config,
+        output_config.clone(),
+        backend,
+        profile.clone(),
+    )
+    .expect("the profile-owned cross-config verifier prepares");
+    let output = prepared
+        .prove(
+            PreparedInput::BatchStark {
+                proof: &left.base_proof,
+                common_data: &left.base_proof.stark_common,
+                table_public_inputs: &table_public_inputs,
+            },
+            PreparedInput::BatchStark {
+                proof: &right.base_proof,
+                common_data: &right.base_proof.stark_common,
+                table_public_inputs: &table_public_inputs,
+            },
+        )
+        .expect("the profile-owned cross-config pair proves");
+
+    assert_eq!(prepared.profile(), Some(&profile));
+    assert_eq!(prepared.params().table_packing, profile.table_packing);
+    assert_eq!(
+        prepared.params().constraint_profile,
+        profile.constraint_profile
+    );
+    arity4_output::verify(output_config, prepared.params(), &output);
+}
+
+#[test]
+fn hiding_fri_aggregation_reuses_preparation_for_varied_honest_pairs() {
+    let config = hiding_fri::config(7);
+    let backend = FriRecursionBackend::<16, 8, _>::new(Poseidon2Config::KOALA_BEAR_D4_W16)
+        .for_extension_degree::<4>();
+    let params = ProveNextLayerParams::default();
+    let left_first = hiding_fri::batch_proof(&config, 0, 1);
+    let right_first = hiding_fri::batch_proof(&config, 2, 3);
+    let left_second = hiding_fri::batch_proof(&config, 4, 5);
+    let right_second = hiding_fri::batch_proof(&config, 6, 7);
+    let table_public_inputs = vec![vec![]; left_first.proof.opened_values.instances.len()];
+
+    let prepared = PreparedAggregation::<_, BatchOnly, BatchOnly, _, 4>::new(
+        PreparedSource::batch(&left_first, &left_first.stark_common, &table_public_inputs),
+        PreparedSource::batch(
+            &right_first,
+            &right_first.stark_common,
+            &table_public_inputs,
+        ),
+        config.clone(),
+        backend,
+        params.clone(),
+    )
+    .expect("the hiding verifier pair prepares");
+
+    let out1 = prepared
+        .prove(
+            PreparedInput::BatchStark {
+                proof: &left_first,
+                common_data: &left_first.stark_common,
+                table_public_inputs: &table_public_inputs,
+            },
+            PreparedInput::BatchStark {
+                proof: &right_first,
+                common_data: &right_first.stark_common,
+                table_public_inputs: &table_public_inputs,
+            },
+        )
+        .expect("the first hiding pair proves");
+    let out2 = prepared
+        .prove(
+            PreparedInput::BatchStark {
+                proof: &left_second,
+                common_data: &left_second.stark_common,
+                table_public_inputs: &table_public_inputs,
+            },
+            PreparedInput::BatchStark {
+                proof: &right_second,
+                common_data: &right_second.stark_common,
+                table_public_inputs: &table_public_inputs,
+            },
+        )
+        .expect("the second hiding pair proves");
+
+    assert!(Arc::ptr_eq(&out1.1, &out2.1));
+    hiding_fri::verify(config.clone(), &params, &out1);
+    hiding_fri::verify(config, &params, &out2);
+}
+
+#[test]
+fn hiding_batch_random_width_is_checked_by_the_preallocation_context_pass() {
+    let config = hiding_fri::config(9);
+    let backend = FriRecursionBackend::<16, 8, _>::new(Poseidon2Config::KOALA_BEAR_D4_W16)
+        .for_extension_degree::<4>();
+    let mut proof = hiding_fri::batch_proof(&config, 0, 1);
+    let table_public_inputs = vec![vec![]; proof.proof.opened_values.instances.len()];
+
+    let (_, retained) = build_next_layer_circuit::<hiding_fri::Config, BatchOnly, _, 4>(
+        &RecursionInput::BatchStark {
+            proof: &proof,
+            common_data: &proof.stark_common,
+            table_public_inputs: table_public_inputs.clone(),
+        },
+        &config,
+        &backend,
+    )
+    .expect("the honest hiding proof has one challenge-width random row per instance");
+
+    let random = proof.proof.opened_values.instances[0]
+        .base_opened_values
+        .random
+        .as_mut()
+        .expect("hiding proof has a random opening");
+    assert_eq!(random.len(), <Challenge as BasedVectorSpace<F>>::DIMENSION);
+    random.pop();
+    let error = <_ as PcsRecursionBackend<hiding_fri::Config, BatchOnly, 4>>::validate_input(
+        &backend,
+        &config,
+        &RecursionInput::BatchStark {
+            proof: &proof,
+            common_data: &proof.stark_common,
+            table_public_inputs: table_public_inputs.clone(),
+        },
+    )
+    .expect_err("a short random row must fail before verifier target allocation");
+    assert!(matches!(error, VerificationError::InvalidProofShape(_)));
+
+    let retained_error =
+        <_ as VerifierCircuitResult<hiding_fri::Config, BatchOnly>>::pack_private_inputs(
+            &retained,
+            &RecursionInput::BatchStark {
+                proof: &proof,
+                common_data: &proof.stark_common,
+                table_public_inputs,
+            },
+        )
+        .expect_err("retained result must reject before private-value extraction");
+    assert!(matches!(
+        retained_error,
+        VerificationError::PreparedInputMismatch {
+            component: "input.stark_layout"
+        }
+    ));
+}

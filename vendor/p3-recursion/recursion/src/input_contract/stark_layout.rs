@@ -1,0 +1,662 @@
+//! Compact, lazy STARK opening-layout metadata.
+//!
+//! This module deliberately contains no commitments, proof values, targets, or
+//! AIR relation identity.  It describes only the validated statement routing
+//! needed by native transcript replay and recursive PCS assembly.
+
+use alloc::borrow::Cow;
+
+use thiserror::Error;
+
+/// The commitment roles emitted by the STARK transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitmentRole {
+    Random,
+    Trace,
+    Quotient,
+    Preprocessed,
+    Permutation,
+}
+
+/// Matrix provenance within one commitment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MatrixRoute {
+    Random { instance: usize },
+    Trace { instance: usize },
+    Quotient { instance: usize, chunk: usize },
+    Preprocessed { instance: usize, matrix: usize },
+    Permutation { instance: usize },
+}
+
+/// One lazily materialized matrix's opening geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MatrixOpeningLayout {
+    pub(crate) route: MatrixRoute,
+    /// PCS matrix domain height, not the extended LDE/MMCS height.
+    pub(crate) log_height: usize,
+    /// Base-column width before any hiding-FRI tail is merged.
+    pub(crate) width: usize,
+    pub(crate) point_count: usize,
+    /// Base trace-domain log used to compute a next-row opening, if any.
+    pub(crate) next_step_log: Option<usize>,
+}
+
+/// Per-instance dimensions used by all STARK commitment routes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InstanceLayout {
+    /// Number of base-field columns in one extension-field opening.
+    pub(crate) challenge_width: usize,
+    pub(crate) ext_log: usize,
+    pub(crate) base_log: usize,
+    pub(crate) trace_width: usize,
+    pub(crate) trace_next: bool,
+    pub(crate) pre_width: usize,
+    pub(crate) pre_next: bool,
+    pub(crate) quotient_log: usize,
+    pub(crate) quotient_chunks: usize,
+    pub(crate) permutation_width: usize,
+}
+
+/// Integer-layout validation failures.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub(crate) enum LayoutError {
+    #[error("STARK quotient chunk count overflows for log degree {log_degree}")]
+    QuotientCountOverflow { log_degree: usize },
+    #[error("STARK quotient matrix count overflows")]
+    QuotientMatrixCountOverflow,
+    #[error("preprocessed matrix route index {index} is out of bounds")]
+    PreprocessedIndexOutOfBounds { index: usize },
+    #[error("preprocessed matrix route repeats instance {index}")]
+    DuplicatePreprocessedIndex { index: usize },
+    #[error("preprocessed matrix route points to zero-width instance {index}")]
+    PreprocessedWidthZero { index: usize },
+    /// The presence flag, positive-width metadata, and instance map disagree.
+    #[error("preprocessed metadata and matrix_to_instance map are not a complete bijection")]
+    PreprocessedMetadataMismatch,
+    #[error("STARK commitment ordinal {ordinal} is out of bounds")]
+    InvalidCommitmentOrdinal { ordinal: usize },
+}
+
+/// Computes `2^log_degree` without allowing a shift panic.
+pub(crate) fn checked_power_of_two(log_degree: usize) -> Result<usize, LayoutError> {
+    let shift =
+        u32::try_from(log_degree).map_err(|_| LayoutError::QuotientCountOverflow { log_degree })?;
+    1usize
+        .checked_shl(shift)
+        .ok_or(LayoutError::QuotientCountOverflow { log_degree })
+}
+
+/// Computes the total number of quotient matrices without allocating a chunk list.
+pub(crate) fn checked_quotient_matrix_count(
+    instances: &[InstanceLayout],
+) -> Result<usize, LayoutError> {
+    instances.iter().try_fold(0usize, |total, instance| {
+        total
+            .checked_add(instance.quotient_chunks)
+            .ok_or(LayoutError::QuotientMatrixCountOverflow)
+    })
+}
+
+/// Validate the original optional preprocessing metadata and its inverse map
+/// as one complete bijection.  This deliberately runs before callers reduce
+/// `None` and `Some(width = 0)` to the same numeric width.
+pub(crate) fn validate_preprocessed_metadata(
+    metadata: &[Option<(usize, usize, usize)>],
+    matrix_to_instance: &[usize],
+    degree_bits: &[usize],
+) -> Result<(), LayoutError> {
+    if metadata.len() != degree_bits.len() || matrix_to_instance.is_empty() {
+        return Err(LayoutError::PreprocessedMetadataMismatch);
+    }
+    for &instance in matrix_to_instance {
+        if instance >= metadata.len() {
+            return Err(LayoutError::PreprocessedIndexOutOfBounds { index: instance });
+        }
+    }
+    let present = metadata.iter().filter(|entry| entry.is_some()).count();
+    if present != matrix_to_instance.len() {
+        return Err(LayoutError::PreprocessedMetadataMismatch);
+    }
+    for (instance, entry) in metadata.iter().enumerate() {
+        let Some((matrix_index, width, degree)) = entry else {
+            continue;
+        };
+        if *width == 0
+            || *degree != degree_bits[instance]
+            || *matrix_index >= matrix_to_instance.len()
+            || matrix_to_instance[*matrix_index] != instance
+        {
+            return Err(LayoutError::PreprocessedMetadataMismatch);
+        }
+    }
+    Ok(())
+}
+
+/// The shared integer opening layout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NativeStarkLayout<'a> {
+    pub(crate) instances: alloc::vec::Vec<InstanceLayout>,
+    pub(crate) preprocessed_order: Cow<'a, [usize]>,
+    pub(crate) has_random: bool,
+    pub(crate) has_preprocessed: bool,
+    pub(crate) has_permutation: bool,
+}
+
+/// Read-only public view of the compact FRI opening geometry.
+///
+/// The planner and routing metadata remain private; callers can inspect only
+/// the commitment ordinal and matrix dimensions needed by contextual checks.
+#[derive(Clone, Copy)]
+pub struct FriOpeningLayout<'a> {
+    inner: &'a NativeStarkLayout<'a>,
+}
+
+/// One matrix's compact opening geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FriMatrixGeometry {
+    log_height: usize,
+    width: usize,
+    point_count: usize,
+}
+
+impl FriMatrixGeometry {
+    pub const fn log_height(self) -> usize {
+        self.log_height
+    }
+
+    pub const fn width(self) -> usize {
+        self.width
+    }
+
+    pub const fn point_count(self) -> usize {
+        self.point_count
+    }
+}
+
+impl<'a> FriOpeningLayout<'a> {
+    #[allow(dead_code)]
+    pub(crate) const fn new(inner: &'a NativeStarkLayout<'a>) -> Self {
+        Self { inner }
+    }
+
+    pub fn commitment_count(self) -> usize {
+        self.inner.commitment_count()
+    }
+
+    pub(crate) fn matrix_count(self, ordinal: usize) -> Result<usize, LayoutError> {
+        self.inner.matrix_count(ordinal)
+    }
+
+    pub(crate) fn to_owned_layout(self) -> NativeStarkLayout<'static> {
+        self.inner.to_owned_layout()
+    }
+
+    pub(crate) fn matches_layout(self, expected: &NativeStarkLayout<'_>) -> bool {
+        self.inner == expected
+    }
+
+    pub fn matrices(self, ordinal: usize) -> impl Iterator<Item = FriMatrixGeometry> + Clone + 'a {
+        let role = self.inner.commitment_role(ordinal);
+        role.into_iter().flat_map(move |role| {
+            self.inner.matrices(role).map(|matrix| FriMatrixGeometry {
+                log_height: matrix.log_height,
+                width: matrix.width,
+                point_count: matrix.point_count,
+            })
+        })
+    }
+}
+
+impl<'a> NativeStarkLayout<'a> {
+    #[allow(dead_code)]
+    pub(crate) const fn opening_view(&'a self) -> FriOpeningLayout<'a> {
+        FriOpeningLayout::new(self)
+    }
+
+    pub(crate) fn new(
+        instances: alloc::vec::Vec<InstanceLayout>,
+        preprocessed_order: &'a [usize],
+        has_random: bool,
+        has_preprocessed: bool,
+        has_permutation: bool,
+    ) -> Result<Self, LayoutError> {
+        for (position, &index) in preprocessed_order.iter().enumerate() {
+            if index >= instances.len() {
+                return Err(LayoutError::PreprocessedIndexOutOfBounds { index });
+            }
+            if instances[index].pre_width == 0 {
+                return Err(LayoutError::PreprocessedWidthZero { index });
+            }
+            if preprocessed_order[..position].contains(&index) {
+                return Err(LayoutError::DuplicatePreprocessedIndex { index });
+            }
+        }
+        let positive_preprocessed: alloc::vec::Vec<usize> = instances
+            .iter()
+            .enumerate()
+            .filter_map(|(index, instance)| (instance.pre_width != 0).then_some(index))
+            .collect();
+        if has_preprocessed == preprocessed_order.is_empty()
+            || positive_preprocessed.len() != preprocessed_order.len()
+            || positive_preprocessed
+                .iter()
+                .any(|index| !preprocessed_order.contains(index))
+        {
+            return Err(LayoutError::PreprocessedMetadataMismatch);
+        }
+        for instance in &instances {
+            let quotient_log = instance.ext_log.checked_add(instance.quotient_log).ok_or(
+                LayoutError::QuotientCountOverflow {
+                    log_degree: instance.ext_log,
+                },
+            )?;
+            checked_power_of_two(quotient_log)?;
+        }
+        checked_quotient_matrix_count(&instances)?;
+        Ok(Self {
+            instances,
+            preprocessed_order: Cow::Borrowed(preprocessed_order),
+            has_random,
+            has_preprocessed,
+            has_permutation,
+        })
+    }
+
+    pub(crate) fn commitment_count(&self) -> usize {
+        usize::from(self.has_random)
+            + 2 // trace and quotient
+            + usize::from(self.has_preprocessed)
+            + usize::from(self.has_permutation)
+    }
+
+    pub(crate) fn matrix_count(&self, ordinal: usize) -> Result<usize, LayoutError> {
+        let role = self
+            .commitment_role(ordinal)
+            .ok_or(LayoutError::InvalidCommitmentOrdinal { ordinal })?;
+        match role {
+            CommitmentRole::Random | CommitmentRole::Trace => Ok(self.instances.len()),
+            CommitmentRole::Quotient => checked_quotient_matrix_count(&self.instances),
+            CommitmentRole::Preprocessed => Ok(self.preprocessed_order.len()),
+            CommitmentRole::Permutation => Ok(self
+                .instances
+                .iter()
+                .filter(|instance| instance.permutation_width != 0)
+                .count()),
+        }
+    }
+
+    pub(crate) fn to_owned_layout(&self) -> NativeStarkLayout<'static> {
+        NativeStarkLayout {
+            instances: self.instances.clone(),
+            preprocessed_order: Cow::Owned(self.preprocessed_order.to_vec()),
+            has_random: self.has_random,
+            has_preprocessed: self.has_preprocessed,
+            has_permutation: self.has_permutation,
+        }
+    }
+
+    pub(crate) const fn commitment_role(&self, ordinal: usize) -> Option<CommitmentRole> {
+        let mut next = 0;
+        if self.has_random {
+            if ordinal == next {
+                return Some(CommitmentRole::Random);
+            }
+            next += 1;
+        }
+        if ordinal == next {
+            return Some(CommitmentRole::Trace);
+        }
+        next += 1;
+        if ordinal == next {
+            return Some(CommitmentRole::Quotient);
+        }
+        next += 1;
+        if self.has_preprocessed {
+            if ordinal == next {
+                return Some(CommitmentRole::Preprocessed);
+            }
+            next += 1;
+        }
+        if self.has_permutation && ordinal == next {
+            return Some(CommitmentRole::Permutation);
+        }
+        None
+    }
+
+    pub(crate) const fn matrices(&self, role: CommitmentRole) -> MatrixLayoutIter<'_> {
+        MatrixLayoutIter {
+            layout: self,
+            role,
+            instance: 0,
+            chunk: 0,
+            preprocessed: 0,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct MatrixLayoutIter<'a> {
+    layout: &'a NativeStarkLayout<'a>,
+    role: CommitmentRole,
+    instance: usize,
+    chunk: usize,
+    preprocessed: usize,
+}
+
+impl Iterator for MatrixLayoutIter<'_> {
+    type Item = MatrixOpeningLayout;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if (self.role == CommitmentRole::Random && !self.layout.has_random)
+            || (self.role == CommitmentRole::Preprocessed && !self.layout.has_preprocessed)
+            || (self.role == CommitmentRole::Permutation && !self.layout.has_permutation)
+        {
+            return None;
+        }
+        match self.role {
+            CommitmentRole::Random => {
+                let instance = self.instance;
+                let info = self.layout.instances.get(instance)?;
+                self.instance += 1;
+                Some(MatrixOpeningLayout {
+                    route: MatrixRoute::Random { instance },
+                    log_height: info.ext_log,
+                    width: info.challenge_width,
+                    point_count: 1,
+                    next_step_log: None,
+                })
+            }
+            CommitmentRole::Trace => {
+                let instance = self.instance;
+                let info = self.layout.instances.get(instance)?;
+                self.instance += 1;
+                Some(MatrixOpeningLayout {
+                    route: MatrixRoute::Trace { instance },
+                    log_height: info.ext_log,
+                    width: info.trace_width,
+                    point_count: usize::from(info.trace_next) + 1,
+                    next_step_log: info.trace_next.then_some(info.base_log),
+                })
+            }
+            CommitmentRole::Quotient => loop {
+                let info = self.layout.instances.get(self.instance)?;
+                if self.chunk == info.quotient_chunks {
+                    self.instance += 1;
+                    self.chunk = 0;
+                    continue;
+                }
+                let chunk = self.chunk;
+                self.chunk += 1;
+                return Some(MatrixOpeningLayout {
+                    route: MatrixRoute::Quotient {
+                        instance: self.instance,
+                        chunk,
+                    },
+                    log_height: info.ext_log,
+                    width: info.challenge_width,
+                    point_count: 1,
+                    next_step_log: None,
+                });
+            },
+            CommitmentRole::Preprocessed => {
+                let matrix = self.preprocessed;
+                let &instance = self.layout.preprocessed_order.get(matrix)?;
+                self.preprocessed += 1;
+                let info = self.layout.instances[instance];
+                Some(MatrixOpeningLayout {
+                    route: MatrixRoute::Preprocessed { instance, matrix },
+                    log_height: info.ext_log,
+                    width: info.pre_width,
+                    point_count: usize::from(info.pre_next) + 1,
+                    next_step_log: info.pre_next.then_some(info.base_log),
+                })
+            }
+            CommitmentRole::Permutation => loop {
+                let info = self.layout.instances.get(self.instance)?;
+                let instance = self.instance;
+                self.instance += 1;
+                if info.permutation_width == 0 {
+                    continue;
+                }
+                return Some(MatrixOpeningLayout {
+                    route: MatrixRoute::Permutation { instance },
+                    log_height: info.ext_log,
+                    width: info.permutation_width,
+                    point_count: 2,
+                    next_step_log: Some(info.base_log),
+                });
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_preprocessed_metadata_rejects_zero_partial_and_mismatched_entries() {
+        let degrees = [8, 9, 10];
+        let valid = [None, Some((0, 3, 9)), Some((1, 4, 10))];
+        assert!(validate_preprocessed_metadata(&valid, &[1, 2], &degrees).is_ok());
+
+        let cases = [
+            ([None, None, None], alloc::vec![]),
+            ([Some((0, 0, 8)), None, None], alloc::vec![]),
+            ([None, Some((0, 3, 9)), Some((1, 4, 10))], alloc::vec![1]),
+            ([None, Some((0, 3, 9)), Some((1, 4, 10))], alloc::vec![]),
+            ([None, Some((1, 3, 9)), Some((0, 4, 10))], alloc::vec![1, 2]),
+            ([None, Some((0, 3, 8)), Some((1, 4, 10))], alloc::vec![1, 2]),
+            ([None, Some((0, 3, 9)), Some((1, 4, 10))], alloc::vec![1, 1]),
+        ];
+        for (metadata, map) in cases {
+            assert!(matches!(
+                validate_preprocessed_metadata(&metadata, &map, &degrees),
+                Err(LayoutError::PreprocessedMetadataMismatch)
+            ));
+        }
+
+        assert!(matches!(
+            validate_preprocessed_metadata(&valid, &[1, 3], &degrees),
+            Err(LayoutError::PreprocessedIndexOutOfBounds { index: 3 })
+        ));
+        assert!(matches!(
+            validate_preprocessed_metadata(&valid[..2], &[1], &degrees),
+            Err(LayoutError::PreprocessedMetadataMismatch)
+        ));
+    }
+
+    fn instance(quotient_chunks: usize) -> InstanceLayout {
+        InstanceLayout {
+            ext_log: 8,
+            base_log: 7,
+            challenge_width: 4,
+            trace_width: 3,
+            trace_next: true,
+            pre_width: 2,
+            pre_next: true,
+            quotient_log: 1,
+            quotient_chunks,
+            permutation_width: 1,
+        }
+    }
+
+    #[test]
+    fn routes_are_lazy_and_matrix_major() {
+        let map = [1, 0];
+        let layout = NativeStarkLayout::new(
+            alloc::vec![instance(2), instance(1)],
+            &map,
+            true,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(layout.commitment_count(), 5);
+        assert_eq!(layout.commitment_role(0), Some(CommitmentRole::Random));
+        assert_eq!(layout.commitment_role(1), Some(CommitmentRole::Trace));
+        let pre: alloc::vec::Vec<_> = layout.matrices(CommitmentRole::Preprocessed).collect();
+        assert_eq!(
+            pre[0].route,
+            MatrixRoute::Preprocessed {
+                instance: 1,
+                matrix: 0
+            }
+        );
+        assert_eq!(
+            pre[1].route,
+            MatrixRoute::Preprocessed {
+                instance: 0,
+                matrix: 1
+            }
+        );
+        assert_eq!(pre[0].point_count, 2);
+        assert_eq!(pre[0].log_height, 8);
+        let random: alloc::vec::Vec<_> = layout.matrices(CommitmentRole::Random).collect();
+        assert_eq!(random[0].width, 4);
+        let quotient: alloc::vec::Vec<_> = layout.matrices(CommitmentRole::Quotient).collect();
+        assert_eq!(quotient.len(), 3);
+        assert_eq!(quotient[0].log_height, 8);
+        let permutation: alloc::vec::Vec<_> =
+            layout.matrices(CommitmentRole::Permutation).collect();
+        assert_eq!(permutation[0].point_count, 2);
+        assert_eq!(permutation[0].next_step_log, Some(7));
+    }
+
+    #[test]
+    fn public_fri_view_is_read_only_and_ordinal_based() {
+        let layout = NativeStarkLayout::new(
+            alloc::vec![InstanceLayout {
+                pre_width: 0,
+                ..instance(1)
+            }],
+            &[],
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let view = layout.opening_view();
+        assert_eq!(view.commitment_count(), 2);
+        assert_eq!(view.matrices(0).next().unwrap().width(), 3);
+        assert!(view.matrices(99).next().is_none());
+    }
+
+    #[test]
+    fn routes_preserve_single_point_accesses_and_sparse_maps() {
+        let mut first = instance(0);
+        first.trace_next = false;
+        first.pre_width = 0;
+        first.pre_next = false;
+        first.permutation_width = 0;
+        let mut second = instance(1);
+        second.trace_next = false;
+        second.pre_width = 0;
+        second.pre_next = false;
+        let result = NativeStarkLayout::new(alloc::vec![first, second], &[1], false, true, true);
+        assert!(matches!(
+            result,
+            Err(LayoutError::PreprocessedWidthZero { index: 1 })
+        ));
+
+        second.pre_width = 2;
+        let layout =
+            NativeStarkLayout::new(alloc::vec![first, second], &[1], false, true, true).unwrap();
+
+        let trace: alloc::vec::Vec<_> = layout.matrices(CommitmentRole::Trace).collect();
+        assert_eq!(trace[0].point_count, 1);
+        assert_eq!(trace[1].point_count, 1);
+        let pre: alloc::vec::Vec<_> = layout.matrices(CommitmentRole::Preprocessed).collect();
+        assert_eq!(pre.len(), 1);
+        assert_eq!(pre[0].point_count, 1);
+        assert_eq!(
+            pre[0].route,
+            MatrixRoute::Preprocessed {
+                instance: 1,
+                matrix: 0
+            }
+        );
+        let permutation: alloc::vec::Vec<_> =
+            layout.matrices(CommitmentRole::Permutation).collect();
+        assert_eq!(permutation.len(), 1);
+        assert_eq!(
+            permutation[0].route,
+            MatrixRoute::Permutation { instance: 1 }
+        );
+        assert_eq!(permutation[0].point_count, 2);
+
+        // An increasing sparse map must not synthesize an opening for the
+        // omitted middle instance.
+        first.pre_width = 2;
+        let mut third = instance(1);
+        third.pre_width = 3;
+        third.pre_next = false;
+        let sparse = NativeStarkLayout::new(
+            alloc::vec![
+                first,
+                InstanceLayout {
+                    pre_width: 0,
+                    ..second
+                },
+                third
+            ],
+            &[0, 2],
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        let sparse_pre: alloc::vec::Vec<_> =
+            sparse.matrices(CommitmentRole::Preprocessed).collect();
+        assert_eq!(
+            sparse_pre
+                .iter()
+                .map(|opening| opening.route)
+                .collect::<alloc::vec::Vec<_>>(),
+            alloc::vec![
+                MatrixRoute::Preprocessed {
+                    instance: 0,
+                    matrix: 0
+                },
+                MatrixRoute::Preprocessed {
+                    instance: 2,
+                    matrix: 1
+                }
+            ]
+        );
+        assert_eq!(sparse_pre[0].point_count, 1);
+        assert_eq!(sparse_pre[1].point_count, 1);
+    }
+
+    #[test]
+    fn rejects_route_overflow_and_bad_maps() {
+        assert!(matches!(
+            checked_power_of_two(usize::BITS as usize),
+            Err(LayoutError::QuotientCountOverflow { .. })
+        ));
+        if usize::BITS > 32 {
+            let too_large = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
+            assert!(matches!(
+                checked_power_of_two(too_large),
+                Err(LayoutError::QuotientCountOverflow { .. })
+            ));
+        }
+        let instances = alloc::vec![instance(1)];
+        assert!(matches!(
+            NativeStarkLayout::new(instances.clone(), &[1], false, true, false),
+            Err(LayoutError::PreprocessedIndexOutOfBounds { .. })
+        ));
+        assert!(matches!(
+            NativeStarkLayout::new(instances, &[0, 0], false, true, false),
+            Err(LayoutError::DuplicatePreprocessedIndex { .. })
+        ));
+        assert!(matches!(
+            NativeStarkLayout::new(alloc::vec![instance(1)], &[], false, true, false),
+            Err(LayoutError::PreprocessedMetadataMismatch)
+        ));
+        assert!(matches!(
+            NativeStarkLayout::new(alloc::vec![instance(1)], &[], false, false, false,),
+            Err(LayoutError::PreprocessedMetadataMismatch)
+        ));
+    }
+}

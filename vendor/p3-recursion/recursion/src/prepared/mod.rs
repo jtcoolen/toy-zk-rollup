@@ -1,0 +1,533 @@
+//! Prepared-verifier native input contracts and borrowed input views.
+
+mod aggregation;
+pub(crate) mod input;
+mod layer;
+pub(crate) mod prover;
+mod trusted;
+
+#[cfg(test)]
+#[path = "../../tests/common/mod.rs"]
+pub(crate) mod test_common;
+
+use alloc::vec::Vec;
+
+pub use aggregation::{PreparedAggregation, PreparedAggregationCross};
+pub use input::{NativeCommitment, PreparedInput, PreparedSource};
+pub use layer::PreparedLayer;
+pub use p3_circuit::VerifiedStatementTargets;
+use p3_circuit::{
+    CircuitBuilder, CircuitRunner, NonPrimitiveOpId, StatementField, StatementSchema,
+};
+use p3_circuit_prover::{BatchStarkProof, CircuitVerifier, StatementLayout};
+use p3_field::Field;
+use p3_lookup::logup::LogUpGadget;
+use p3_uni_stark::{StarkGenericConfig, Val};
+pub use trusted::{
+    TrustedPreparedAggregation, TrustedPreparedInput, TrustedPreparedLayer, TrustedPreparedSource,
+};
+
+use crate::recursion::{PcsRecursionBackend, RecursionInput};
+use crate::traits::RecursiveAir;
+use crate::verifier::VerificationError;
+
+/// Kind of child relation whose public statement is exported by a trusted recursive verifier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrustedChildStatementKind {
+    Uni,
+    Batch,
+}
+
+/// Trusted description of the exact child statement targets consumed by a verifier circuit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustedChildStatementLayout {
+    kind: TrustedChildStatementKind,
+    schema: StatementSchema,
+    public_values_len: usize,
+    table_instance: Option<usize>,
+}
+
+impl TrustedChildStatementLayout {
+    pub(crate) fn uni(
+        public_values_len: usize,
+        schema: StatementSchema,
+    ) -> Result<Self, VerificationError> {
+        if schema.base_len() != public_values_len
+            || schema
+                .fields()
+                .iter()
+                .any(|field| *field != StatementField::Base)
+        {
+            return Err(VerificationError::InvalidProofShape(
+                "trusted uni statement schema must contain one Base field per AIR public value"
+                    .into(),
+            ));
+        }
+        Ok(Self {
+            kind: TrustedChildStatementKind::Uni,
+            schema,
+            public_values_len,
+            table_instance: None,
+        })
+    }
+
+    pub(crate) fn batch(layout: &StatementLayout) -> Self {
+        Self {
+            kind: TrustedChildStatementKind::Batch,
+            schema: layout.schema().clone(),
+            public_values_len: layout.schema().base_len(),
+            table_instance: layout.table_instance(),
+        }
+    }
+
+    pub const fn kind(&self) -> TrustedChildStatementKind {
+        self.kind
+    }
+
+    pub const fn schema(&self) -> &StatementSchema {
+        &self.schema
+    }
+
+    pub const fn public_values_len(&self) -> usize {
+        self.public_values_len
+    }
+
+    pub const fn table_instance(&self) -> Option<usize> {
+        self.table_instance
+    }
+}
+
+pub(crate) enum ConsumedStatementTargets<'a> {
+    Uni(&'a [crate::Target]),
+    Batch(&'a [Vec<crate::Target>]),
+}
+
+pub(crate) fn checked_statement_targets<F: Field>(
+    consumed: ConsumedStatementTargets<'_>,
+    source: &TrustedChildStatementLayout,
+    builder: &CircuitBuilder<F>,
+) -> Result<VerifiedStatementTargets<F>, VerificationError> {
+    let targets = match (consumed, source.kind) {
+        (ConsumedStatementTargets::Uni(targets), TrustedChildStatementKind::Uni) => targets,
+        (ConsumedStatementTargets::Batch(_), TrustedChildStatementKind::Uni)
+        | (ConsumedStatementTargets::Uni(_), TrustedChildStatementKind::Batch) => {
+            return Err(VerificationError::InvalidProofShape(
+                "trusted statement source kind does not match verifier result branch".into(),
+            ));
+        }
+        (ConsumedStatementTargets::Batch(_), TrustedChildStatementKind::Batch)
+            if source.table_instance.is_none() =>
+        {
+            &[]
+        }
+        (ConsumedStatementTargets::Batch(all), TrustedChildStatementKind::Batch) => all
+            .get(source.table_instance.expect("checked above"))
+            .map(Vec::as_slice)
+            .ok_or_else(|| {
+                VerificationError::InvalidProofShape(
+                    "trusted statement table instance is absent from verifier inputs".into(),
+                )
+            })?,
+    };
+    if targets.len() != source.public_values_len {
+        return Err(VerificationError::InvalidProofShape(alloc::format!(
+            "trusted statement verifier target length mismatch: expected {}, got {}",
+            source.public_values_len,
+            targets.len()
+        )));
+    }
+    // SAFETY: `targets` are selected directly from the audited verifier result built in
+    // `builder`; the checks above bind their branch, table, flattened length, and source schema.
+    unsafe {
+        VerifiedStatementTargets::new_unchecked(builder, source.schema.clone(), targets.to_vec())
+    }
+    .map_err(VerificationError::CircuitBuilder)
+}
+
+/// Explicit opt-in for recursive commitment targets whose complete native identity can be
+/// constrained to constants.
+///
+/// [`crate::verifier::ObservableCommitment`] is deliberately insufficient: transcript
+/// observation does not promise that the exposed targets are a complete, injective commitment
+/// encoding. Trusted recursion backends require this stronger audited capability.
+pub trait ConstrainConstantCommitment<F: Field>: crate::traits::Recursive<F> {
+    /// Constrain every target encoding `self` to the corresponding limb of `expected`.
+    fn constrain_constant(
+        &self,
+        circuit: &mut CircuitBuilder<F>,
+        expected: &Self::Input,
+    ) -> Result<(), VerificationError>;
+}
+
+/// Explicit backend opt-in for safe prepared-verifier circuit reuse.
+///
+/// Implementations are trusted to capture every native input property that can affect target
+/// allocation or compiled verifier behavior. A backend implementing only
+/// [`PcsRecursionBackend`] continues to work with uncached APIs and is deliberately excluded from
+/// prepared owners.
+///
+/// ```compile_fail
+/// use p3_lookup::logup::LogUpGadget;
+/// use p3_recursion::{PcsRecursionBackend, PreparedPcsRecursionBackend, RecursiveAir};
+/// use p3_uni_stark::{StarkGenericConfig, Val};
+///
+/// fn generic_backend_is_not_implicitly_prepared<SC, A, B, const D: usize>()
+/// where
+///     SC: StarkGenericConfig,
+///     A: RecursiveAir<Val<SC>, SC::Challenge, LogUpGadget>,
+///     B: PcsRecursionBackend<SC, A, D>,
+/// {
+///     fn needs_opt_in<SC, A, B, const D: usize>()
+///     where
+///         SC: StarkGenericConfig,
+///         A: RecursiveAir<Val<SC>, SC::Challenge, LogUpGadget>,
+///         B: PreparedPcsRecursionBackend<SC, A, D>,
+///     {}
+///     needs_opt_in::<SC, A, B, D>();
+/// }
+/// ```
+///
+/// A generic caller that requests the explicit prepared-backend contract compiles:
+///
+/// ```
+/// use p3_lookup::logup::LogUpGadget;
+/// use p3_recursion::{PreparedPcsRecursionBackend, RecursiveAir};
+/// use p3_uni_stark::{StarkGenericConfig, Val};
+///
+/// fn accepts_explicit_opt_in<SC, A, B, const D: usize>()
+/// where
+///     SC: StarkGenericConfig,
+///     A: RecursiveAir<Val<SC>, SC::Challenge, LogUpGadget>,
+///     B: PreparedPcsRecursionBackend<SC, A, D>,
+/// {
+/// }
+/// ```
+pub trait PreparedPcsRecursionBackend<SC, A, const D: usize>:
+    PcsRecursionBackend<SC, A, D>
+where
+    SC: StarkGenericConfig,
+    A: RecursiveAir<Val<SC>, SC::Challenge, LogUpGadget>,
+{
+    /// Complete native contract used to authorize reuse.
+    type InputContract;
+
+    /// Borrowed resource preflight hook for prepared owners. Implementations
+    /// should run it before shape capture or any source cloning.
+    fn preflight_input(
+        &self,
+        _config: &SC,
+        _input: &PreparedInput<'_, SC>,
+    ) -> Result<(), VerificationError> {
+        Ok(())
+    }
+
+    /// Capture and validate the trusted construction reference.
+    fn capture_input_contract(
+        &self,
+        config: &SC,
+        source: &RecursionInput<'_, SC, A>,
+    ) -> Result<Self::InputContract, VerificationError>;
+
+    /// Validate a later witness-only input against a captured contract.
+    fn validate_prepared_input(
+        &self,
+        config: &SC,
+        contract: &Self::InputContract,
+        input: &PreparedInput<'_, SC>,
+    ) -> Result<(), VerificationError>;
+}
+
+/// Explicit backend opt-in for prepared circuits that pin a child verifier's trusted
+/// preprocessing commitment inside the recursive circuit.
+///
+/// This contract deliberately has no default implementation and is not blanket-implemented for
+/// prepared backends. An implementation must identify the preprocessing target for every input
+/// branch and constrain its complete encoding to the retained native commitment.
+pub trait TrustedPcsRecursionBackend<SC, A, const D: usize>:
+    PreparedPcsRecursionBackend<SC, A, D>
+where
+    SC: StarkGenericConfig,
+    A: RecursiveAir<Val<SC>, SC::Challenge, LogUpGadget>,
+{
+    /// Walk all adversarial batch witness resources before descriptor-derived allocation, cloning,
+    /// native verification, plugin construction, or packing.
+    fn preflight_trusted_batch(
+        &self,
+        verifier: &CircuitVerifier<SC>,
+        proof: &BatchStarkProof<SC>,
+    ) -> Result<(), VerificationError>;
+
+    /// Capture allocation-relevant input shape from retained batch-verifier authority while
+    /// keeping only its audited Statement values runtime-dynamic.
+    fn capture_trusted_batch_input_contract(
+        &self,
+        verifier: &CircuitVerifier<SC>,
+        proof: &BatchStarkProof<SC>,
+        expected_statement: &[Val<SC>],
+    ) -> Result<Self::InputContract, VerificationError>;
+
+    /// Validate a later trusted batch witness against the retained dynamic-statement contract.
+    fn validate_trusted_batch_input(
+        &self,
+        verifier: &CircuitVerifier<SC>,
+        contract: &Self::InputContract,
+        proof: &BatchStarkProof<SC>,
+        expected_statement: &[Val<SC>],
+    ) -> Result<(), VerificationError>;
+
+    /// Build the batch verifier branch from retained descriptor/common authority.
+    fn build_trusted_batch_verifier_circuit(
+        &self,
+        verifier: &CircuitVerifier<SC>,
+        proof: &BatchStarkProof<SC>,
+        statement: &[Val<SC>],
+        circuit: &mut CircuitBuilder<SC::Challenge>,
+    ) -> Result<Self::VerifierResult, VerificationError>;
+
+    /// Populate backend-private witness data using transcript replay under the retained child
+    /// verifier descriptor/common data.
+    fn set_private_data_for_trusted_batch(
+        &self,
+        verifier: &CircuitVerifier<SC>,
+        proof: &BatchStarkProof<SC>,
+        statement: &[Val<SC>],
+        runner: &mut CircuitRunner<'_, SC::Challenge>,
+        op_ids: &[NonPrimitiveOpId],
+    ) -> Result<(), VerificationError>;
+
+    /// Return the exact existing AIR-public targets consumed by `result`, checked against the
+    /// retained trusted child statement layout and bound to the originating `builder` capability.
+    fn verified_statement_targets(
+        &self,
+        result: &Self::VerifierResult,
+        source: &TrustedChildStatementLayout,
+        builder: &CircuitBuilder<SC::Challenge>,
+    ) -> Result<VerifiedStatementTargets<SC::Challenge>, VerificationError>;
+
+    /// Constrain the preprocessing commitment allocated by `result` to `expected`, including
+    /// enforcing equal presence and the complete commitment's exact root/limb cardinality.
+    fn constrain_trusted_preprocessing(
+        &self,
+        circuit: &mut CircuitBuilder<SC::Challenge>,
+        result: &Self::VerifierResult,
+        expected: Option<&NativeCommitment<SC>>,
+    ) -> Result<(), VerificationError>;
+}
+
+#[cfg(test)]
+mod trusted_commitment_tests {
+    use alloc::vec;
+
+    use p3_baby_bear::BabyBear;
+    use p3_circuit::CircuitBuilder;
+    use p3_field::PrimeCharacteristicRing;
+    use p3_symmetric::MerkleCap;
+
+    use super::ConstrainConstantCommitment;
+    use crate::pcs::fri::MerkleCapTargets;
+    use crate::traits::Recursive;
+
+    #[test]
+    fn complete_commitment_pins_every_cap_root_and_digest_limb() {
+        type Targets = MerkleCapTargets<BabyBear, 2>;
+
+        let expected = MerkleCap::<BabyBear, [BabyBear; 2]>::new(vec![
+            [BabyBear::from_u32(1), BabyBear::from_u32(2)],
+            [BabyBear::from_u32(3), BabyBear::from_u32(4)],
+        ]);
+        let mut builder = CircuitBuilder::<BabyBear>::new();
+        let targets = <Targets as Recursive<BabyBear>>::new(&mut builder, &expected);
+        targets.constrain_constant(&mut builder, &expected).unwrap();
+        let circuit = builder.build().unwrap();
+        let honest = <Targets as Recursive<BabyBear>>::get_values(&expected);
+        let mut runner = circuit.runner();
+        runner.set_public_inputs(&honest).unwrap();
+        runner.run().unwrap();
+
+        for limb in 0..honest.len() {
+            let mut wrong = honest.clone();
+            wrong[limb] += BabyBear::ONE;
+            let mut runner = circuit.runner();
+            runner.set_public_inputs(&wrong).unwrap();
+            assert!(runner.run().is_err(), "unbound cap limb {limb}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod verified_statement_target_tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use p3_baby_bear::BabyBear;
+    use p3_circuit::ops::NpoTypeId;
+    use p3_circuit::{CircuitBuilder, Op, StatementField, StatementSchema};
+    use p3_field::extension::BinomialExtensionField;
+
+    use super::{
+        ConsumedStatementTargets, TrustedChildStatementLayout, VerifiedStatementTargets,
+        checked_statement_targets,
+    };
+
+    /// Returning host copies, allocating lookalike inputs, or relabelling the source schema would
+    /// make the selected IDs or finalized schema differ here.
+    #[test]
+    fn checked_statement_targets_retain_consumed_ids_and_source_schema() {
+        type Ext4 = BinomialExtensionField<BabyBear, 4>;
+
+        let schema =
+            StatementSchema::try_new(vec![StatementField::Base, StatementField::Base]).unwrap();
+        let source = TrustedChildStatementLayout::uni(2, schema.clone()).unwrap();
+
+        let mut wrapper = CircuitBuilder::<Ext4>::new();
+        let consumed = vec![wrapper.public_input(), wrapper.public_input()];
+        let verified =
+            checked_statement_targets(ConsumedStatementTargets::Uni(&consumed), &source, &wrapper)
+                .unwrap();
+
+        verified.install::<BabyBear>(&mut wrapper).unwrap();
+        let circuit = wrapper.build().unwrap();
+        let statement_inputs = circuit
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::NonPrimitiveOpWithExecutor {
+                    inputs, executor, ..
+                } if *executor.op_type() == NpoTypeId::statement() => Some(&inputs[0]),
+                _ => None,
+            })
+            .unwrap();
+        let expected = consumed
+            .iter()
+            .map(|target| circuit.expr_to_widx[target])
+            .collect::<Vec<_>>();
+        assert_eq!(statement_inputs, &expected);
+        assert_eq!(circuit.statement_schema(), Some(&schema));
+    }
+
+    /// Selecting all batch public targets, the wrong table, or a same-kind vector of the wrong
+    /// length would make at least one of these checks fail.
+    #[test]
+    fn checked_batch_statement_targets_select_only_the_trusted_table() {
+        let schema = StatementSchema::try_new(vec![
+            StatementField::Extension { degree: 2 },
+            StatementField::Base,
+        ])
+        .unwrap();
+        let source = TrustedChildStatementLayout {
+            kind: super::TrustedChildStatementKind::Batch,
+            schema: schema.clone(),
+            public_values_len: 3,
+            table_instance: Some(1),
+        };
+        let mut builder = CircuitBuilder::<BabyBear>::new();
+        let tables = vec![
+            vec![builder.public_input()],
+            vec![
+                builder.public_input(),
+                builder.public_input(),
+                builder.public_input(),
+            ],
+            vec![builder.public_input()],
+        ];
+
+        let verified =
+            checked_statement_targets(ConsumedStatementTargets::Batch(&tables), &source, &builder)
+                .unwrap();
+
+        assert!(
+            checked_statement_targets(
+                ConsumedStatementTargets::Uni(&tables[1]),
+                &source,
+                &builder,
+            )
+            .is_err()
+        );
+        let short_tables = vec![vec![], vec![builder.public_input()]];
+        assert!(
+            checked_statement_targets(
+                ConsumedStatementTargets::Batch(&short_tables),
+                &source,
+                &builder,
+            )
+            .is_err()
+        );
+        verified.install::<BabyBear>(&mut builder).unwrap();
+        let circuit = builder.build().unwrap();
+        let statement_inputs = circuit
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::NonPrimitiveOpWithExecutor {
+                    inputs, executor, ..
+                } if *executor.op_type() == NpoTypeId::statement() => Some(&inputs[0]),
+                _ => None,
+            })
+            .unwrap();
+        let expected = tables[1]
+            .iter()
+            .map(|target| circuit.expr_to_widx[target])
+            .collect::<Vec<_>>();
+        assert_eq!(statement_inputs, &expected);
+        assert_eq!(circuit.statement_schema(), Some(&schema));
+    }
+
+    #[test]
+    fn ordered_verified_targets_install_one_left_then_right_statement_sink() {
+        type Ext4 = BinomialExtensionField<BabyBear, 4>;
+
+        let mut builder = CircuitBuilder::<Ext4>::new();
+        let left_targets = vec![builder.public_input(), builder.public_input()];
+        let right_targets = vec![builder.public_input()];
+        let left_schema =
+            StatementSchema::try_new(vec![StatementField::Extension { degree: 2 }]).unwrap();
+        let right_schema = StatementSchema::try_new(vec![StatementField::Base]).unwrap();
+        // SAFETY: both vectors are exact existing flattened targets from this builder.
+        let left = unsafe {
+            VerifiedStatementTargets::new_unchecked(
+                &builder,
+                left_schema.clone(),
+                left_targets.clone(),
+            )
+        }
+        .unwrap();
+        // SAFETY: both vectors are exact existing flattened targets from this builder.
+        let right = unsafe {
+            VerifiedStatementTargets::new_unchecked(
+                &builder,
+                right_schema.clone(),
+                right_targets.clone(),
+            )
+        }
+        .unwrap();
+
+        let layout = VerifiedStatementTargets::install_ordered_aggregation::<BabyBear>(
+            left,
+            right,
+            &mut builder,
+        )
+        .unwrap();
+        let circuit = builder.build().unwrap();
+        let sinks = circuit
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::NonPrimitiveOpWithExecutor {
+                    inputs, executor, ..
+                } if *executor.op_type() == NpoTypeId::statement() => Some(inputs[0].as_slice()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let expected = left_targets
+            .into_iter()
+            .chain(right_targets)
+            .map(|target| circuit.expr_to_widx[&target])
+            .collect::<Vec<_>>();
+
+        assert_eq!(sinks, vec![expected.as_slice()]);
+        assert_eq!(layout.left(), &left_schema);
+        assert_eq!(layout.right(), &right_schema);
+        assert_eq!(layout.split_at(), 2);
+        assert_eq!(circuit.aggregation_statement_layout(), Some(&layout));
+    }
+}

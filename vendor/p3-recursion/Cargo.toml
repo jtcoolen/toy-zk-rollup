@@ -1,0 +1,118 @@
+
+[workspace]
+resolver = "2"
+members = [
+    "circuit",
+    "circuit-prover",
+    "poseidon-circuit-cols",
+    "poseidon1-circuit-air",
+    "poseidon2-circuit-air",
+    "recursion",
+    "test-utils",
+]
+
+[workspace.package]
+description = "Plonky3 native support for recursive proof composition"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Plonky3/Plonky3-recursion"
+homepage = "https://github.com/Plonky3/Plonky3-recursion"
+keywords = ["cryptography", "SNARK", "PLONK", "FRI", "plonky3"]
+categories = ["cryptography::cryptocurrencies"]
+
+[workspace.lints]
+rust.rust_2018_idioms = { level = "deny", priority = -1 }
+rust.unused_must_use = "deny"
+rust.rust_2024_incompatible_pat = "warn"
+rustdoc.all = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# Some pedantic lints
+semicolon_if_nothing_returned = "warn"
+match_bool = "warn"
+needless_pass_by_value = "warn"
+
+redundant_pub_crate = "allow"
+too_long_first_doc_paragraph = "allow"
+unused_peekable = "allow"
+tuple_array_conversions = "allow"
+transmute_undefined_repr = "allow"
+cognitive_complexity = "allow"
+
+[workspace.dependencies]
+
+# Other common dependencies
+clap = { version = "4.6", features = ["derive"] }
+hashbrown = "0.17.1"
+itertools = { version = "0.15.0", default-features = false, features = ["use_alloc"] }
+libmimalloc-sys = { version = "0.1", default-features = false, features = ["extended"] }
+mimalloc = { version = "0.1", default-features = false }
+
+# Plonky3 dependencies - shared across all crates
+p3-air = "0.8.0"
+p3-baby-bear = "0.8.0"
+p3-batch-stark = "0.8.0"
+p3-binary-field = "0.8.0"
+p3-blake3 = "0.8.0"
+p3-blake3-air = "0.8.0"
+p3-challenger = "0.8.0"
+p3-circle = "0.8.0"
+
+# Local dependencies
+p3-circuit = { path = "circuit", version = "0.1.0" }
+p3-circuit-prover = { path = "circuit-prover", version = "0.1.0" }
+p3-commit = "0.8.0"
+p3-dft = "0.8.0"
+p3-field = "0.8.0"
+p3-fri = "0.8.0"
+p3-goldilocks = "0.8.0"
+p3-keccak = "0.8.0"
+p3-keccak-air = "0.8.0"
+p3-koala-bear = "0.8.0"
+p3-lookup = "0.8.0"
+p3-matrix = "0.8.0"
+p3-maybe-rayon = "0.8.0"
+p3-merkle-tree = "0.8.0"
+p3-monty-31 = "0.8.0"
+p3-multilinear-util = "0.8.0"
+p3-poseidon-circuit-cols = { path = "poseidon-circuit-cols", version = "0.1.0" }
+p3-poseidon1 = "0.8.0"
+p3-poseidon1-air = "0.8.0"
+p3-poseidon1-circuit-air = { path = "poseidon1-circuit-air", version = "0.1.0" }
+p3-poseidon2 = "0.8.0"
+p3-poseidon2-air = "0.8.0"
+p3-poseidon2-circuit-air = { path = "poseidon2-circuit-air", version = "0.1.0" }
+p3-recursion = { path = "recursion", version = "0.1.0" }
+p3-sumcheck = "0.8.0"
+p3-symmetric = "0.8.0"
+p3-test-utils = { path = "test-utils", version = "0.1.0" }
+p3-uni-stark = "0.8.0"
+p3-util = "0.8.0"
+p3-whir = "0.8.0"
+proptest = { version = "1.11", default-features = true }
+rand = { version = "0.10.1", default-features = false }
+rayon = "1.12"
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+smallvec = { version = "1.15", default-features = false }
+spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
+strum = { version = "0.28.0", default-features = false }
+strum_macros = "0.28.0"
+thiserror = { version = "2.0", default-features = false }
+tracing = { version = "0.1.44", default-features = false, features = ["attributes"] }
+tracing-forest = "0.3.1"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["alloc"] }
+unroll = { version = "0.1.5", default-features = false }
+
+[profile.profiling]
+inherits = "release"
+debug = true
+
+[profile.optimized]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+opt-level = 3

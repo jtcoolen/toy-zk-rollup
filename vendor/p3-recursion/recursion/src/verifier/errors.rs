@@ -1,0 +1,103 @@
+//! Error types for recursive verification.
+
+use alloc::string::String;
+
+use p3_circuit::{CircuitBuilderError, CircuitError};
+use thiserror::Error;
+
+use crate::generation::GenerationError;
+use crate::pcs::whir::params::WhirVerifierParamsError;
+
+/// Errors that can occur during recursive STARK verification.
+#[derive(Debug, Error)]
+pub enum VerificationError {
+    /// The proof structure is invalid (wrong dimensions, missing data, etc.)
+    #[error("Invalid proof shape: {0}")]
+    InvalidProofShape(String),
+
+    /// A native input is well formed but cannot reuse a prepared verifier's circuit shape.
+    #[error("prepared input does not match {component}")]
+    PreparedInputMismatch { component: &'static str },
+
+    /// A well-formed input exceeds the verifier-owned operational budget.
+    ///
+    /// This is deliberately a typed, allocation-free error: callers can make a
+    /// policy decision without parsing an owned diagnostic string, and the
+    /// verifier never has to clone untrusted metadata merely to report a limit.
+    #[error("verifier resource limit exceeded for {component}: {actual} > {limit}")]
+    ResourceLimitExceeded {
+        component: &'static str,
+        actual: usize,
+        limit: usize,
+    },
+
+    /// A checked resource count or geometry operation overflowed `usize`.
+    #[error("verifier resource arithmetic overflow for {component}")]
+    ResourceArithmeticOverflow { component: &'static str },
+
+    /// ZK randomization is inconsistent (random commitment exists but no opened values)
+    #[error("Missing random opened values for existing random commitment")]
+    RandomizationError,
+
+    /// Error from the circuit execution layer
+    #[error("Circuit error: {0}")]
+    Circuit(#[from] CircuitError),
+
+    /// Error from the circuit builder layer
+    #[error("Circuit builder error: {0}")]
+    CircuitBuilder(#[from] CircuitBuilderError),
+
+    /// Error from challenge generation
+    #[error("Generation error: {0}")]
+    Generation(#[from] GenerationError),
+
+    /// Error deriving in-circuit WHIR verifier parameters from a `WhirConfig`
+    #[error("WHIR verifier params error: {0}")]
+    WhirVerifierParams(#[from] WhirVerifierParamsError),
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::string::ToString;
+
+    use p3_circuit::{CircuitBuilderError, CircuitError};
+
+    use super::*;
+    use crate::generation::GenerationError;
+
+    #[test]
+    fn test_invalid_proof_shape_display() {
+        let msg = VerificationError::InvalidProofShape("bad".into()).to_string();
+        assert!(msg.contains("bad") || msg.contains("Invalid"));
+    }
+
+    #[test]
+    fn test_randomization_error_display() {
+        assert!(!VerificationError::RandomizationError.to_string().is_empty());
+    }
+
+    #[test]
+    fn test_display_contains_descriptive_text() {
+        assert!(
+            !VerificationError::InvalidProofShape("x".into())
+                .to_string()
+                .is_empty()
+        );
+        assert!(!VerificationError::RandomizationError.to_string().is_empty());
+        assert!(
+            !VerificationError::Circuit(CircuitError::DivisionByZero)
+                .to_string()
+                .is_empty()
+        );
+        assert!(
+            !VerificationError::CircuitBuilder(CircuitBuilderError::MissingOutput)
+                .to_string()
+                .is_empty()
+        );
+        assert!(
+            !VerificationError::Generation(GenerationError::MissingParameterError)
+                .to_string()
+                .is_empty()
+        );
+    }
+}

@@ -1,0 +1,75 @@
+//! Recursive proof verification for Plonky3 STARKs.
+
+#![no_std]
+
+extern crate alloc;
+#[cfg(test)]
+extern crate self as p3_recursion;
+#[cfg(test)]
+extern crate std;
+
+pub mod artifact;
+pub mod backend;
+pub mod builtin_config;
+pub mod challenger;
+pub mod challenger_perm;
+pub mod generation;
+pub mod input_contract;
+pub mod pcs;
+pub mod prelude;
+pub mod prepared;
+pub mod profile;
+pub mod public_inputs;
+pub mod recursion;
+pub mod traits;
+pub mod transcript;
+pub mod types;
+pub mod verifier;
+
+/// Implement for your StarkConfig (or a wrapper holding FRI verifier params) to use [`FriRecursionBackend`].
+pub use backend::fri::FriRecursionConfig;
+/// FRI PCS backend for the unified recursion API. Use with [`prove_next_layer`] and a config implementing [`FriRecursionConfig`].
+pub use backend::{
+    FriRecursionBackend, FriRecursionBackendD5, FriRecursionBackendForExt,
+    replay_batch_layer_transcript, replay_recursion_input_transcript,
+};
+pub use challenger::CircuitChallenger;
+pub use challenger_perm::ChallengerPermConfig;
+pub use generation::{
+    GenerationError, OpeningTranscript, PcsGeneration, generate_batch_challenges,
+    merge_hiding_random_openings, observe_opened_values, replay_batch_stark_transcript,
+    replay_uni_stark_transcript,
+};
+pub use p3_circuit::ops;
+pub use p3_circuit::ops::{PermConfig, Poseidon2Config};
+pub use pcs::fri::{FriInputError, FriVerifierParams, FriVerifierParamsError, NativeFriParams};
+pub use prepared::{
+    NativeCommitment, PreparedAggregation, PreparedAggregationCross, PreparedInput, PreparedLayer,
+    PreparedPcsRecursionBackend, PreparedSource, TrustedChildStatementKind,
+    TrustedChildStatementLayout, TrustedPcsRecursionBackend, TrustedPreparedAggregation,
+    TrustedPreparedInput, TrustedPreparedLayer, TrustedPreparedSource, VerifiedStatementTargets,
+};
+pub use profile::{FixedPointError, RecursionLayerProfile, solve_fixed_point};
+pub use public_inputs::{
+    BatchStarkVerifierInputsBuilder, CommitmentOpening, FriVerifierInputs, PublicInputBuilder,
+    StarkVerifierInputs, StarkVerifierInputsBuilder, construct_batch_stark_verifier_inputs,
+};
+/// Unified recursion API: single entry point for proving the next layer over a uni-stark or batch-stark proof.
+pub use recursion::{
+    BatchOnly, PcsRecursionBackend, ProveNextLayerParams, RecursionInput, RecursionOutput,
+    VerifierCircuitResult, build_aggregation_layer_circuit, build_and_prove_aggregation_layer,
+    build_and_prove_aggregation_layer_cross, build_and_prove_next_layer, build_next_layer_circuit,
+    prove_aggregation_layer, prove_aggregation_layer_cross, prove_next_layer,
+};
+pub use traits::{
+    CheckedRecursive, PreparedRecursive, Recursive, RecursiveAir, RecursiveChallenger,
+    RecursiveExtensionMmcs, RecursiveMmcs, RecursivePcs,
+};
+pub use types::{
+    BatchProofTargets, CommitmentTargets, CommonDataTargets, OpenedValuesTargets, ProofTargets,
+    RecursiveLagrangeSelectors, StarkChallenges, Target,
+};
+pub use verifier::{
+    InputResourceUsage, ObservableCommitment, VerificationError, VerifierLimits,
+    verify_batch_circuit, verify_p3_uni_proof_circuit,
+};

@@ -1,0 +1,346 @@
+mod common;
+
+use p3_batch_stark::ProverData;
+use p3_circuit::CircuitBuilder;
+use p3_circuit::ops::{generate_poseidon2_trace, generate_recompose_trace};
+use p3_circuit_prover::batch_stark_prover::{
+    poseidon2_air_builders_for_configs, recompose_air_builders,
+};
+use p3_circuit_prover::common::{NpoPreprocessor, get_airs_and_degrees_with_prep};
+use p3_circuit_prover::{
+    BatchStarkProof, BatchStarkProver, CircuitProverData, ConstraintProfile, Poseidon2Preprocessor,
+    RecomposePreprocessor, TablePacking,
+};
+use p3_lookup::logup::LogUpGadget;
+use p3_poseidon2_circuit_air::KoalaBearD4Width16;
+use p3_recursion::pcs::fri::{FriVerifierParams, InputProofTargets, MerkleCapTargets, RecValMmcs};
+use p3_recursion::pcs::{restore_fri_query_paths, set_fri_mmcs_private_data};
+use p3_recursion::verifier::verify_p3_batch_proof_circuit;
+use p3_recursion::{
+    OpeningTranscript, Poseidon2Config, VerificationError, observe_opened_values,
+    replay_batch_layer_transcript,
+};
+use p3_test_utils::koala_bear_params::*;
+use tracing_forest::ForestLayer;
+use tracing_forest::util::LevelFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Registry};
+
+use crate::common::InnerFriGeneric;
+
+type InnerFri = InnerFriGeneric<MyConfig, MyHash, MyCompress, DIGEST_ELEMS>;
+
+fn init_logger() {
+    let env_filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
+
+    Registry::default()
+        .with(env_filter)
+        .with(ForestLayer::default())
+        .init();
+}
+
+fn prove_fibonacci_batch(n: usize) -> (BatchStarkProof<MyConfig>, CircuitProverData<MyConfig>) {
+    let mut builder = CircuitBuilder::new();
+
+    let expected_result = builder.alloc_public_input("expected_result");
+    let mut a = builder.alloc_const(F::ZERO, "F(0)");
+    let mut b = builder.alloc_const(F::ONE, "F(1)");
+    for _ in 2..=n {
+        let next = builder.add(a, b);
+        a = b;
+        b = next;
+    }
+    builder.connect(b, expected_result);
+
+    let table_packing = TablePacking::new(2, 4);
+    let config = make_test_config();
+    let circuit = builder.build().unwrap();
+    let (airs_degrees, primitive_columns, non_primitive_columns) =
+        get_airs_and_degrees_with_prep::<MyConfig, _, 1>(
+            &circuit,
+            &table_packing,
+            &[],
+            &[],
+            ConstraintProfile::Standard,
+        )
+        .unwrap();
+    let (airs, degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
+    let mut runner = circuit.runner();
+    runner
+        .set_public_inputs(&[compute_fibonacci_classical(n)])
+        .unwrap();
+    let traces = runner.run().unwrap();
+
+    let prover_data = ProverData::from_airs_and_degrees(&config, &airs, &degrees).unwrap();
+    let circuit_prover_data =
+        CircuitProverData::new(prover_data, primitive_columns, non_primitive_columns);
+    let prover = BatchStarkProver::new(config).with_table_packing(table_packing);
+    let proof = prover
+        .prove_all_tables(&traces, &circuit_prover_data)
+        .unwrap();
+    prover.verify_all_tables::<F>(&proof).unwrap();
+    (proof, circuit_prover_data)
+}
+
+#[test]
+fn test_fibonacci_batch_verifier() {
+    init_logger();
+
+    let n: usize = 100;
+    let lookup_gadget = LogUpGadget::new();
+    let (batch_stark_proof, circuit_prover_data) = prove_fibonacci_batch(n);
+    let common = circuit_prover_data.common_data();
+
+    // Now verify the batch STARK proof recursively
+    // Use same permutation as proving to ensure Fiat-Shamir transcript compatibility
+    let scalars = test_fri_scalars();
+    let fri_verifier_params = FriVerifierParams::with_mmcs(
+        scalars.log_blowup,
+        scalars.log_final_poly_len,
+        scalars.max_log_arity,
+        scalars.commit_pow_bits,
+        scalars.query_pow_bits,
+        scalars.num_queries,
+        Poseidon2Config::KOALA_BEAR_D4_W16,
+    );
+    let config = make_test_config();
+
+    // Extract proof components
+    let batch_proof = &batch_stark_proof.proof;
+
+    const TRACE_D: usize = 1; // Proof traces are in base field
+
+    // Public values (empty for all 5 circuit tables: Witness, Const, Public, Alu, Poseidon2)
+    let num_tables = common
+        .preprocessed
+        .as_ref()
+        .map(|g| g.instances.len())
+        .unwrap_or(0);
+    let pis: Vec<Vec<F>> = vec![vec![]; num_tables];
+
+    // Build the recursive verification circuit
+    let mut circuit_builder = CircuitBuilder::new();
+    let poseidon2_perm = default_koalabear_poseidon2_16();
+    circuit_builder.enable_poseidon2_perm::<KoalaBearD4Width16, _>(
+        generate_poseidon2_trace::<Challenge, KoalaBearD4Width16>,
+        poseidon2_perm,
+    );
+    circuit_builder.enable_recompose::<F>(generate_recompose_trace::<F, Challenge>);
+
+    // Attach verifier without manually building circuit_airs
+    let (verifier_inputs, mmcs_op_ids) = verify_p3_batch_proof_circuit::<
+        MyConfig,
+        MerkleCapTargets<F, DIGEST_ELEMS>,
+        InputProofTargets<F, Challenge, RecValMmcs<F, DIGEST_ELEMS, MyHash, MyCompress>>,
+        InnerFri,
+        LogUpGadget,
+        _,
+        WIDTH,
+        RATE,
+        TRACE_D,
+    >(
+        &config,
+        &mut circuit_builder,
+        &batch_stark_proof,
+        &fri_verifier_params,
+        common,
+        &lookup_gadget,
+        Poseidon2Config::KOALA_BEAR_D4_W16,
+        &[],
+    )
+    .unwrap();
+
+    // Build the circuit
+    let verification_circuit = circuit_builder.build().unwrap();
+    let expected_public_input_len = verification_circuit.public_flat_len;
+
+    // Pack values using the builder
+    let (public_inputs, private_inputs) = verifier_inputs.pack_values(&pis, batch_proof, common);
+
+    assert_eq!(public_inputs.len(), expected_public_input_len);
+    assert!(!public_inputs.is_empty());
+
+    let verification_table_packing = TablePacking::new(1, 8);
+    let poseidon2_config = Poseidon2Config::KOALA_BEAR_D4_W16;
+    let npo_prep: Vec<Box<dyn NpoPreprocessor<F>>> = vec![
+        Box::new(Poseidon2Preprocessor),
+        Box::new(RecomposePreprocessor::new(true)),
+    ];
+    let mut air_builders = poseidon2_air_builders_for_configs::<_, 4>(vec![
+        poseidon2_config.for_challenger(),
+        poseidon2_config,
+    ]);
+    air_builders.extend(recompose_air_builders(1, true));
+    let (
+        verification_airs_degrees,
+        verification_primitive_columns,
+        verification_non_primitive_columns,
+    ) = get_airs_and_degrees_with_prep::<MyConfig, _, 4>(
+        &verification_circuit,
+        &verification_table_packing,
+        &npo_prep,
+        &air_builders,
+        ConstraintProfile::Standard,
+    )
+    .unwrap();
+    let (verification_airs, verification_degrees): (Vec<_>, Vec<usize>) =
+        verification_airs_degrees.into_iter().unzip();
+
+    // Now run the circuit to generate traces
+    let mut runner = verification_circuit.runner();
+    runner.set_public_inputs(&public_inputs).unwrap();
+    runner.set_private_inputs(&private_inputs).unwrap();
+
+    // Set MMCS private data for the verification circuit. The FRI proof shares one pruned
+    // Merkle multiproof across all queries, so the per-query chains the circuit walks are
+    // restored from the proof's own verifier transcript first.
+    let OpeningTranscript {
+        mut challenger,
+        commitments_with_opening_points,
+    } = replay_batch_layer_transcript::<MyConfig, TRACE_D>(
+        &config,
+        &batch_stark_proof,
+        common,
+        &[],
+    )
+    .unwrap();
+    let (val_mmcs, fri_params) = test_fri_instance();
+    observe_opened_values::<MyConfig>(
+        &mut challenger,
+        &commitments_with_opening_points,
+        fri_params.batch_proof_of_work_bits,
+    );
+    let claims: Vec<_> = commitments_with_opening_points
+        .iter()
+        .cloned()
+        .map(Into::into)
+        .collect();
+    let query_paths = restore_fri_query_paths(
+        &fri_params,
+        &val_mmcs,
+        &val_mmcs,
+        &batch_stark_proof.proof.opening_proof,
+        &mut challenger,
+        &claims,
+    )
+    .unwrap();
+    set_fri_mmcs_private_data::<F, Challenge, DIGEST_ELEMS>(
+        &mut runner,
+        &mmcs_op_ids,
+        &query_paths,
+        Poseidon2Config::KOALA_BEAR_D4_W16,
+    )
+    .unwrap();
+
+    // Run the circuit to generate traces
+    let verification_traces = runner.run().unwrap();
+
+    // Create a new config and prover for the verification circuit
+    let config3 = make_test_config();
+
+    let verification_prover_data =
+        ProverData::from_airs_and_degrees(&config3, &verification_airs, &verification_degrees)
+            .unwrap();
+    let verification_circuit_prover_data = CircuitProverData::new(
+        verification_prover_data,
+        verification_primitive_columns,
+        verification_non_primitive_columns,
+    );
+
+    let mut verification_prover =
+        BatchStarkProver::new(config3).with_table_packing(verification_table_packing);
+    verification_prover.register_poseidon2_table::<4>(poseidon2_config.for_challenger());
+    verification_prover.register_poseidon2_table::<4>(poseidon2_config);
+    verification_prover.register_recompose_table::<4>(true);
+
+    // Prove the verification circuit
+    let verification_proof = verification_prover
+        .prove_all_tables(&verification_traces, &verification_circuit_prover_data)
+        .expect("Failed to prove verification circuit");
+
+    // Verify the proof of the verification circuit
+    verification_prover
+        .verify_all_tables::<Challenge>(&verification_proof)
+        .expect("Failed to verify proof of verification circuit");
+}
+
+#[test]
+fn test_highlevel_batch_verifier_rejects_instance_count_mismatch_before_allocation() {
+    let (mut batch_stark_proof, circuit_prover_data) = prove_fibonacci_batch(8);
+    batch_stark_proof
+        .proof
+        .opened_values
+        .instances
+        .pop()
+        .expect("Fibonacci proof has multiple instances");
+
+    let scalars = test_fri_scalars();
+    let fri_verifier_params = FriVerifierParams::with_mmcs(
+        scalars.log_blowup,
+        scalars.log_final_poly_len,
+        scalars.max_log_arity,
+        scalars.commit_pow_bits,
+        scalars.query_pow_bits,
+        scalars.num_queries,
+        Poseidon2Config::KOALA_BEAR_D4_W16,
+    );
+    let config = make_test_config();
+    let lookup_gadget = LogUpGadget::new();
+    let mut circuit_builder = CircuitBuilder::new();
+    let before = circuit_builder.public_input();
+
+    let result = verify_p3_batch_proof_circuit::<
+        MyConfig,
+        MerkleCapTargets<F, DIGEST_ELEMS>,
+        InputProofTargets<F, Challenge, RecValMmcs<F, DIGEST_ELEMS, MyHash, MyCompress>>,
+        InnerFri,
+        LogUpGadget,
+        _,
+        WIDTH,
+        RATE,
+        1,
+    >(
+        &config,
+        &mut circuit_builder,
+        &batch_stark_proof,
+        &fri_verifier_params,
+        circuit_prover_data.common_data(),
+        &lookup_gadget,
+        Poseidon2Config::KOALA_BEAR_D4_W16,
+        &[],
+    );
+    let after = circuit_builder.public_input();
+
+    let err = match result {
+        Err(err) => err,
+        Ok(_) => panic!("mismatched instance count must be rejected"),
+    };
+    assert!(matches!(
+        err,
+        VerificationError::InvalidProofShape(ref message) if message.contains("instances")
+    ));
+    assert_eq!(after.0, before.0 + 1);
+}
+
+fn compute_fibonacci_classical(n: usize) -> F {
+    if n == 0 {
+        return F::ZERO;
+    }
+    if n == 1 {
+        return F::ONE;
+    }
+
+    let mut a = F::ZERO;
+    let mut b = F::ONE;
+
+    for _i in 2..=n {
+        let next = a + b;
+        a = b;
+        b = next;
+    }
+
+    b
+}

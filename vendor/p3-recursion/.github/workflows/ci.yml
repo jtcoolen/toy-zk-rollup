@@ -1,0 +1,226 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "*" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0 # reduce disk bloat
+
+jobs:
+  build_and_test:
+    name: Build and Test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: ubuntu-latest
+            features: "+avx2"
+    runs-on: ${{ matrix.os }}
+    if: "! contains(toJSON(github.event.commits.*.message), '[skip-ci]')"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test benchmark script
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
+      - uses: dtolnay/rust-toolchain@stable
+        id: rs-stable
+
+      - name: Set flags (AVX2)
+        if: ${{ matrix.features }}
+        run: |
+          echo "RUSTFLAGS=-Ctarget-feature=${{ matrix.features }}" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.os }}-${{ matrix.features }}
+          cache-on-failure: true
+
+      # nextest schedules every test from every binary in one pool instead of
+      # running binaries one at a time, so idle cores get filled by other
+      # crates' tests while a single long-running test is still executing.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Disk usage (before)
+        run: |
+          set -eux
+          df -h
+          du -sh target || true
+          du -sh ~/.cargo/registry ~/.cargo/git || true
+
+      - name: Test (workspace)
+        run: cargo nextest run --workspace --all-targets
+
+      - name: Test (workspace, all-features)
+        run: cargo nextest run --workspace --all-targets --all-features
+
+      - name: Check (release)
+        run: cargo check --verbose --workspace --all-targets --release
+
+      - name: Test challenger rejection oracles (release)
+        if: ${{ !matrix.features }}
+        run: |
+          cargo test --verbose --release -p p3-recursion --test challenger_sponge_binding
+          cargo test --verbose --release -p p3-recursion --test challenger_base_sponge_binding
+          cargo test --verbose --release -p p3-circuit-prover --test assurance_algebraic
+          cargo test --verbose --release -p p3-circuit-prover --lib batch_stark_prover::tests::verify_all_tables_rejects_a_forged_constant_value -- --exact
+          cargo test --verbose --release -p p3-circuit-prover --lib batch_stark_prover::tests::verify_all_tables_rejects_alu_bus_only_operand_swap -- --exact
+          cargo test --verbose --release -p p3-circuit-prover --lib batch_stark_prover::tests::verify_all_tables_rejects_forged_horner_chain_head_seed -- --exact
+          cargo test --verbose --release -p p3-circuit-prover --lib batch_stark_prover::tests::assurance_trusted_verifier_rejects_seeded_same_shape_foreign_relations -- --exact
+          cargo test --verbose --release -p p3-circuit-prover --test trusted_statement assurance_
+          cargo test --verbose --release -p p3-recursion --lib prepared::trusted::tests::assurance_trusted_aggregation_rejects_seeded_statement_boundary_and_output_substitutions -- --exact
+          cargo test --verbose --release -p p3-recursion --test test_lookups test_wrong_multiplicities -- --exact
+          cargo test --verbose --release -p p3-recursion --test zk_hiding_mmcs test_batch_verifier_hiding_mmcs -- --exact
+
+      - name: Test documentation
+        # nextest doesn't run doctests, so cover them with plain `cargo test`.
+        run: cargo test --verbose --workspace --doc
+
+      - name: Run basic examples
+        run: |
+          cargo run --package p3-circuit-prover --example fibonacci
+          cargo run --package p3-circuit-prover --example poseidon2_perm_chain
+          cargo run --package p3-circuit-prover --example poseidon2_perm_merkle
+
+      - name: Run allocation_log example with debugging feature and debug logging
+        env:
+          RUST_LOG: debug
+        run: cargo run --package p3-circuit --example allocation_log --features debugging
+
+      - name: Build benchmarks without running
+        run: cargo bench --no-run --workspace
+
+      - name: Disk usage (after)
+        if: always()
+        run: |
+          set -eux
+          df -h
+          du -sh target || true
+          du -sh ~/.cargo/registry ~/.cargo/git || true
+
+  recursive_examples:
+    name: Recursive Examples
+    runs-on: ubuntu-latest
+    if: "! contains(toJSON(github.event.commits.*.message), '[skip-ci]')"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        id: rs-stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: recursive-examples
+          cache-on-failure: true
+
+      - name: Disk usage (before)
+        run: |
+          set -eux
+          df -h
+          du -sh target || true
+          du -sh ~/.cargo/registry ~/.cargo/git || true
+
+      - name: Run recursive examples (recursive_fibonacci is run in performance checks already)
+        run: |
+          cargo run --release --features parallel --example recursive_aggregation -- --field koala-bear --num-recursive-layers 2
+          cargo run --release --features parallel --example recursive_keccak -- --field baby-bear -n 10 --num-recursive-layers 2
+
+      - name: Disk usage (after)
+        if: always()
+        run: |
+          set -eux
+          df -h
+          du -sh target || true
+          du -sh ~/.cargo/registry ~/.cargo/git || true
+
+  check_embedded:
+    name: Build embedded
+    runs-on: ubuntu-latest
+    if: "! contains(toJSON(github.event.commits.*.message), '[skip-ci]')"
+
+    env:
+      target: thumbv7em-none-eabi
+      CARGO_TARGET_DIR: target-embedded
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.target }}
+        id: rs-stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: embedded-${{ env.target }}
+          cache-on-failure: true
+
+      - name: Disk usage (before)
+        run: |
+          set -eux
+          df -h
+          du -sh "${CARGO_TARGET_DIR}" || true
+          du -sh ~/.cargo/registry ~/.cargo/git || true
+
+      - name: Build
+        run: |
+          cargo build --verbose --target ${{ env.target }} -p p3-circuit
+          cargo build --verbose --target ${{ env.target }} -p p3-circuit-prover
+          cargo build --verbose --target ${{ env.target }} -p p3-poseidon1-circuit-air
+          cargo build --verbose --target ${{ env.target }} -p p3-poseidon2-circuit-air
+          cargo build --verbose --target ${{ env.target }} -p p3-recursion
+          cargo build --verbose --target ${{ env.target }} -p p3-test-utils
+
+      - name: Disk usage (after)
+        if: always()
+        run: |
+          set -eux
+          df -h
+          du -sh "${CARGO_TARGET_DIR}" || true
+          du -sh ~/.cargo/registry ~/.cargo/git || true
+
+  lint:
+    name: Formatting and Clippy
+    runs-on: ubuntu-latest
+    if: "! contains(toJSON(github.event.commits.*.message), '[skip-ci]')"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+        id: rs-stable
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+          cache-on-failure: true
+
+      - name: Install cargo-sort
+        run: cargo install cargo-sort
+
+      - name: Sort Cargo.toml
+        run: cargo +stable sort --workspace --grouped --check
+
+      - name: Clippy
+        run: cargo +stable clippy --all-targets -- -D warnings
+
+      - name: Clippy (all-features)
+        run: cargo +stable clippy --all-targets --all-features -- -D warnings
+
+      - name: Format
+        run: cargo +nightly fmt --all -- --check

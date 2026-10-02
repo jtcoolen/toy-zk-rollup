@@ -1,0 +1,1590 @@
+use alloc::boxed::Box;
+use alloc::string::ToString;
+use alloc::vec::Vec;
+use core::any::{Any, TypeId};
+
+use hashbrown::HashMap;
+use p3_circuit::ops::{NonPrimitivePreprocessedMap, NpoTypeId, PrimitiveOpType};
+use p3_circuit::{AggregationStatementLayout, Circuit, CircuitError, StatementSchema};
+use p3_field::{Algebra, ExtensionField, Field, PrimeCharacteristicRing, PrimeField64};
+use p3_uni_stark::{StarkGenericConfig, SymbolicExpression, SymbolicExpressionExt, Val};
+use p3_util::log2_ceil_usize;
+
+use crate::air::{AluAir, AluExtMulKind, ConstAir, PublicAir};
+use crate::config::StarkField;
+use crate::field_params::ExtractBinomialW;
+use crate::{
+    AirVariant, ConstraintProfile, DynamicAirEntry, NUM_PRIMITIVE_TABLES, ProofMetadataError,
+    RowCounts, TablePacking,
+};
+
+/// Force a table's lane count to 1 when it holds only dummy data.
+///
+/// Multi-lane padding interacts incorrectly with lookup constraints during recursive
+/// verification when a table has no real operations, so lanes are reduced to 1 (with a
+/// warning) in that case.
+pub(crate) fn reduce_lanes_if_dummy(
+    table: &str,
+    only_dummy: bool,
+    configured_lanes: usize,
+) -> usize {
+    if only_dummy && configured_lanes > 1 {
+        tracing::warn!(
+            "{table} table holds only dummy operations but lanes={configured_lanes} > 1. \
+             Reducing to lanes=1 to avoid recursive verification issues.",
+        );
+        1
+    } else {
+        configured_lanes
+    }
+}
+
+/// Plugin trait for NPO-owned preprocessing over generic circuits.
+///
+/// Each implementation can update `PreprocessedColumns` (ext_reads, multiplicities, etc.)
+/// and return base-field non-primitive preprocessed rows for its own `NpoTypeId`s.
+///
+/// The [`Any`] bound is intentional and therefore requires implementations to be `'static`:
+/// plugins should own their configuration (or share it through an owning pointer) rather than
+/// borrow it. Trusted preparation uses the concrete type identity of the built-in Statement
+/// preprocessor, so a same-name or delegating wrapper cannot acquire Statement authority.
+pub trait NpoPreprocessor<F>: Send + Sync + Any
+where
+    F: StarkField + PrimeField64,
+{
+    /// Run plugin-owned preprocessing over a generic circuit.
+    ///
+    /// `circuit` and `preprocessed` are type-erased; implementations downcast to the
+    /// `PreprocessedColumns<ExtF>` shapes they support and return an empty map otherwise.
+    fn preprocess(
+        &self,
+        circuit: &dyn Any,
+        preprocessed: &mut dyn Any,
+    ) -> Result<NonPrimitivePreprocessedMap<F>, CircuitError>;
+}
+
+/// Builds (AIR, degree) from preprocessed base data for a given NPO op_type.
+/// Used by `get_airs_and_degrees_with_prep` so that AIR construction is plugin-driven
+/// without requiring generic methods on the preprocessor trait (object safety).
+///
+/// The [`Any`] bound deliberately makes implementations `'static`; implementations should own
+/// their state (or place it behind an owning pointer). The trusted Statement path checks the
+/// concrete identity of the built-in builder, preventing wrappers that merely delegate to it
+/// from minting dynamic Statement metadata.
+pub trait NpoAirBuilder<SC, const D: usize>: Send + Sync + Any
+where
+    SC: StarkGenericConfig,
+    SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SymbolicExpression<Val<SC>>>,
+{
+    /// Number of operations packed into a single AIR row for this NPO.
+    ///
+    /// Must match the `lanes` value returned by the corresponding [`TableProver`] implementation.
+    /// Defaults to 1.
+    fn lanes(&self) -> usize {
+        1
+    }
+
+    /// Attempt to build an AIR and compute its degree from committed preprocessed data.
+    ///
+    /// The `lanes` argument is `self.lanes()` forwarded by the framework.
+    fn try_build(
+        &self,
+        op_type: &NpoTypeId,
+        prep_base: &[Val<SC>],
+        min_height: usize,
+        lanes: usize,
+        constraint_profile: ConstraintProfile,
+    ) -> Option<(CircuitTableAir<SC, D>, usize)>;
+
+    /// Explicit audit marker for builders whose legacy `rows` value is the padded AIR height.
+    fn trusted_rows_are_padded_height(&self) -> bool {
+        false
+    }
+
+    /// Build this table for the trusted preparation path and emit its exact proof metadata.
+    ///
+    /// The default keeps existing custom builders available to the legacy low-level API while
+    /// requiring an explicit audit before they can participate in trusted preparation.
+    fn try_build_trusted(
+        &self,
+        op_type: &NpoTypeId,
+        prep_base: &[Val<SC>],
+        min_height: usize,
+        lanes: usize,
+        constraint_profile: ConstraintProfile,
+    ) -> Option<BuiltNpoTable<SC, D>> {
+        if !self.trusted_rows_are_padded_height() {
+            return None;
+        }
+        let built = self.try_build(op_type, prep_base, min_height, lanes, constraint_profile)?;
+        Some(BuiltNpoTable::poseidon(op_type.clone(), lanes, built))
+    }
+}
+
+/// Enum wrapper to allow heterogeneous table AIRs in a single batch STARK aggregation.
+///
+/// This enables different AIR types to be collected into a single vector for
+/// batch STARK proving/verification while maintaining type safety.
+pub enum CircuitTableAir<SC, const D: usize>
+where
+    SC: StarkGenericConfig,
+    SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SymbolicExpression<Val<SC>>>,
+{
+    Const(ConstAir<Val<SC>, D>),
+    Public(PublicAir<Val<SC>, D>),
+    /// Unified ALU table for all arithmetic operations
+    Alu(AluAir<Val<SC>, D>),
+    Dynamic(DynamicAirEntry<SC>),
+}
+
+impl<SC, const D: usize> Clone for CircuitTableAir<SC, D>
+where
+    SC: StarkGenericConfig,
+    SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SymbolicExpression<Val<SC>>>,
+{
+    fn clone(&self) -> Self {
+        match self {
+            Self::Const(air) => Self::Const(air.clone()),
+            Self::Public(air) => Self::Public(air.clone()),
+            Self::Alu(air) => Self::Alu(air.clone()),
+            Self::Dynamic(air) => Self::Dynamic(air.clone()),
+        }
+    }
+}
+
+/// Exact, fixed metadata for a non-primitive table in a trusted circuit relation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NpoRelation<F: Copy> {
+    op_type: NpoTypeId,
+    rows: usize,
+    lanes: usize,
+    air_variant: AirVariant,
+    public_values: NpoPublicValues<F>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum NpoPublicValues<F: Copy> {
+    Static(Vec<F>),
+    Statement { public_len: usize },
+}
+
+impl<F: Copy> NpoRelation<F> {
+    pub const fn new(
+        op_type: NpoTypeId,
+        rows: usize,
+        lanes: usize,
+        air_variant: AirVariant,
+        public_values: Vec<F>,
+    ) -> Self {
+        Self {
+            op_type,
+            rows,
+            lanes,
+            air_variant,
+            public_values: NpoPublicValues::Static(public_values),
+        }
+    }
+
+    pub const fn op_type(&self) -> &NpoTypeId {
+        &self.op_type
+    }
+
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub const fn lanes(&self) -> usize {
+        self.lanes
+    }
+
+    pub const fn air_variant(&self) -> AirVariant {
+        self.air_variant
+    }
+
+    pub fn public_values(&self) -> &[F] {
+        match &self.public_values {
+            NpoPublicValues::Static(values) => values,
+            NpoPublicValues::Statement { .. } => &[],
+        }
+    }
+
+    pub(crate) const fn audited_statement(
+        op_type: NpoTypeId,
+        rows: usize,
+        lanes: usize,
+        air_variant: AirVariant,
+        public_len: usize,
+    ) -> Self {
+        Self {
+            op_type,
+            rows,
+            lanes,
+            air_variant,
+            public_values: NpoPublicValues::Statement { public_len },
+        }
+    }
+
+    pub(crate) const fn public_values_len(&self) -> usize {
+        match &self.public_values {
+            NpoPublicValues::Static(values) => values.len(),
+            NpoPublicValues::Statement { public_len } => *public_len,
+        }
+    }
+
+    pub(crate) fn accepts_public_values(&self, values: &[F]) -> bool
+    where
+        F: PartialEq,
+    {
+        match &self.public_values {
+            NpoPublicValues::Static(expected) => expected == values,
+            NpoPublicValues::Statement { public_len } => values.len() == *public_len,
+        }
+    }
+
+    pub(crate) const fn is_audited_statement(&self) -> bool {
+        matches!(self.public_values, NpoPublicValues::Statement { .. })
+    }
+
+    pub(crate) fn preparation_public_values(&self) -> Vec<F>
+    where
+        F: Default,
+    {
+        match &self.public_values {
+            NpoPublicValues::Static(values) => values.clone(),
+            NpoPublicValues::Statement { public_len } => core::iter::repeat_with(F::default)
+                .take(*public_len)
+                .collect(),
+        }
+    }
+}
+
+/// Verifier-owned schema and exact batch position of the audited Statement table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatementLayout {
+    schema: StatementSchema,
+    table_instance: Option<usize>,
+}
+
+/// A library-owned non-primitive AIR that V1 verifier artifacts may reconstruct.
+///
+/// This deliberately has no custom/plugin variant: callers importing artifact data can only
+/// request AIR implementations whose semantics are fixed by this library version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuiltinArtifactAir {
+    Recompose,
+    RecomposeWithCoefficientLookups,
+    Poseidon1(p3_circuit::ops::Poseidon1Config),
+    Poseidon2(p3_circuit::ops::Poseidon2Config),
+}
+
+/// Checked input describing one built-in NPO in an independently trusted verifier artifact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BuiltinArtifactNpo<F: Copy> {
+    Static {
+        air: BuiltinArtifactAir,
+        rows: usize,
+        lanes: usize,
+        air_variant: AirVariant,
+        public_values: Vec<F>,
+    },
+    Statement {
+        public_width: usize,
+    },
+}
+
+impl<F: Copy> BuiltinArtifactNpo<F> {
+    pub const fn static_values(
+        air: BuiltinArtifactAir,
+        rows: usize,
+        lanes: usize,
+        air_variant: AirVariant,
+        public_values: Vec<F>,
+    ) -> Self {
+        Self::Static {
+            air,
+            rows,
+            lanes,
+            air_variant,
+            public_values,
+        }
+    }
+
+    /// Describe the sole built-in Statement AIR position.
+    ///
+    /// This value does not itself grant dynamic statement authority. That marker is minted only
+    /// by `CircuitVerifier::from_independently_trusted_builtin_artifact` after validating the
+    /// complete relation, schema, common-data routing, and constructed Statement AIR.
+    pub const fn statement(public_width: usize) -> Self {
+        Self::Statement { public_width }
+    }
+}
+
+/// Complete relation inputs decoded from independently provisioned trusted artifact bytes.
+///
+/// The fields stay private so downstream crates cannot partially initialize this value. The
+/// constructor performs allocation-free structural checks; the `CircuitVerifier` constructor
+/// performs the configuration-, AIR-, and common-data-dependent checks before accepting it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustedBuiltinArtifactRelation<F: Copy> {
+    pub(crate) table_packing: TablePacking,
+    pub(crate) rows: RowCounts,
+    pub(crate) ext_degree: usize,
+    pub(crate) reduction: AluExtMulKind<F>,
+    pub(crate) alu_variant: AirVariant,
+    pub(crate) constraint_profile: ConstraintProfile,
+    pub(crate) non_primitives: Vec<BuiltinArtifactNpo<F>>,
+    pub(crate) statement_schema: StatementSchema,
+    pub(crate) statement_table_instance: Option<usize>,
+    pub(crate) aggregation_statement_layout: Option<AggregationStatementLayout>,
+    pub(crate) trace_degree_bits: Vec<usize>,
+}
+
+impl<F: Copy> TrustedBuiltinArtifactRelation<F> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        table_packing: TablePacking,
+        rows: RowCounts,
+        ext_degree: usize,
+        reduction: AluExtMulKind<F>,
+        alu_variant: AirVariant,
+        constraint_profile: ConstraintProfile,
+        non_primitives: Vec<BuiltinArtifactNpo<F>>,
+        statement_schema: StatementSchema,
+        statement_table_instance: Option<usize>,
+        aggregation_statement_layout: Option<AggregationStatementLayout>,
+        trace_degree_bits: Vec<usize>,
+    ) -> Result<Self, ProofMetadataError> {
+        table_packing.validate()?;
+        rows.validate()?;
+        if !matches!(ext_degree, 1 | 2 | 4 | 5 | 6 | 8) {
+            return Err(ProofMetadataError::UnsupportedExtDegree(ext_degree));
+        }
+        let expected_instances = NUM_PRIMITIVE_TABLES
+            .checked_add(non_primitives.len())
+            .ok_or(ProofMetadataError::TrustedArtifactRelation(
+                "table count overflow",
+            ))?;
+        if trace_degree_bits.len() != expected_instances {
+            return Err(ProofMetadataError::TrustedArtifactRelation(
+                "trace-degree count does not match table count",
+            ));
+        }
+        let statement_index = statement_table_instance
+            .and_then(|instance| instance.checked_sub(NUM_PRIMITIVE_TABLES));
+        let mut dynamic_positions = non_primitives
+            .iter()
+            .enumerate()
+            .filter_map(|(index, npo)| {
+                matches!(npo, BuiltinArtifactNpo::Statement { .. }).then_some(index)
+            });
+        let first_dynamic_position = dynamic_positions.next();
+        let has_second_dynamic_position = dynamic_positions.next().is_some();
+        if statement_schema.base_len() == 0 {
+            if statement_table_instance.is_some() || first_dynamic_position.is_some() {
+                return Err(ProofMetadataError::TrustedArtifactRelation(
+                    "empty schema must not carry a Statement table",
+                ));
+            }
+        } else if first_dynamic_position != statement_index
+            || has_second_dynamic_position
+            || statement_index.is_none()
+        {
+            return Err(ProofMetadataError::TrustedArtifactRelation(
+                "Statement table position does not match the schema layout",
+            ));
+        } else if !matches!(
+            non_primitives.get(statement_index.unwrap()),
+            Some(BuiltinArtifactNpo::Statement { public_width })
+                if *public_width == statement_schema.base_len()
+        ) {
+            return Err(ProofMetadataError::TrustedArtifactRelation(
+                "Statement AIR width does not match the schema",
+            ));
+        }
+        if aggregation_statement_layout
+            .as_ref()
+            .is_some_and(|layout| layout.output() != &statement_schema)
+        {
+            return Err(ProofMetadataError::TrustedArtifactRelation(
+                "aggregation output schema does not match the Statement schema",
+            ));
+        }
+        for npo in &non_primitives {
+            if let BuiltinArtifactNpo::Static { rows, lanes, .. } = npo
+                && (*rows == 0 || *lanes == 0)
+            {
+                return Err(ProofMetadataError::TrustedArtifactRelation(
+                    "static NPO rows and lanes must be non-zero",
+                ));
+            }
+        }
+        Ok(Self {
+            table_packing,
+            rows,
+            ext_degree,
+            reduction,
+            alu_variant,
+            constraint_profile,
+            non_primitives,
+            statement_schema,
+            statement_table_instance,
+            aggregation_statement_layout,
+            trace_degree_bits,
+        })
+    }
+}
+
+#[cfg(test)]
+mod trusted_artifact_relation_tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use p3_baby_bear::BabyBear;
+    use p3_circuit::{StatementField, StatementSchema};
+
+    use super::{BuiltinArtifactAir, BuiltinArtifactNpo, TrustedBuiltinArtifactRelation};
+    use crate::{
+        AirVariant, ConstraintProfile, NUM_PRIMITIVE_TABLES, ProofMetadataError, RowCounts,
+        TablePacking,
+    };
+
+    fn statement_relation(
+        non_primitives: Vec<BuiltinArtifactNpo<BabyBear>>,
+        statement_index: usize,
+    ) -> Result<TrustedBuiltinArtifactRelation<BabyBear>, ProofMetadataError> {
+        let trace_degree_bits = vec![0; NUM_PRIMITIVE_TABLES + non_primitives.len()];
+        TrustedBuiltinArtifactRelation::try_new(
+            TablePacking::default(),
+            RowCounts::new([1, 1, 1]),
+            1,
+            crate::air::AluExtMulKind::Base,
+            AirVariant::Baseline,
+            ConstraintProfile::Standard,
+            non_primitives,
+            StatementSchema::try_new(vec![StatementField::Base]).unwrap(),
+            Some(NUM_PRIMITIVE_TABLES + statement_index),
+            None,
+            trace_degree_bits,
+        )
+    }
+
+    #[test]
+    fn trusted_constructor_requires_one_statement_at_the_declared_position() {
+        statement_relation(vec![BuiltinArtifactNpo::statement(1)], 0).unwrap();
+
+        let duplicate = statement_relation(
+            vec![
+                BuiltinArtifactNpo::statement(1),
+                BuiltinArtifactNpo::statement(1),
+            ],
+            0,
+        );
+        assert!(matches!(
+            duplicate,
+            Err(ProofMetadataError::TrustedArtifactRelation(
+                "Statement table position does not match the schema layout"
+            ))
+        ));
+
+        let wrong_position = statement_relation(
+            vec![
+                BuiltinArtifactNpo::static_values(
+                    BuiltinArtifactAir::Recompose,
+                    1,
+                    1,
+                    AirVariant::Baseline,
+                    Vec::new(),
+                ),
+                BuiltinArtifactNpo::statement(1),
+            ],
+            0,
+        );
+        assert!(matches!(
+            wrong_position,
+            Err(ProofMetadataError::TrustedArtifactRelation(
+                "Statement table position does not match the schema layout"
+            ))
+        ));
+    }
+}
+
+impl StatementLayout {
+    pub(crate) const fn new(schema: StatementSchema, table_instance: Option<usize>) -> Self {
+        Self {
+            schema,
+            table_instance,
+        }
+    }
+
+    pub const fn schema(&self) -> &StatementSchema {
+        &self.schema
+    }
+
+    pub const fn table_instance(&self) -> Option<usize> {
+        self.table_instance
+    }
+}
+
+/// Verifier-authoritative relation finalized before the preprocessing commitment is made.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CircuitRelation<F: Copy> {
+    table_packing: TablePacking,
+    rows: RowCounts,
+    ext_degree: usize,
+    reduction: AluExtMulKind<F>,
+    alu_variant: AirVariant,
+    constraint_profile: ConstraintProfile,
+    non_primitives: Vec<NpoRelation<F>>,
+    statement_layout: StatementLayout,
+    aggregation_statement_layout: Option<AggregationStatementLayout>,
+    trace_degree_bits: Vec<usize>,
+}
+
+impl<F: Copy> CircuitRelation<F> {
+    pub(crate) fn from_trusted_builtin_artifact(
+        parts: TrustedBuiltinArtifactRelation<F>,
+        non_primitives: Vec<NpoRelation<F>>,
+    ) -> Self {
+        Self {
+            table_packing: parts.table_packing,
+            rows: parts.rows,
+            ext_degree: parts.ext_degree,
+            reduction: parts.reduction,
+            alu_variant: parts.alu_variant,
+            constraint_profile: parts.constraint_profile,
+            non_primitives,
+            statement_layout: StatementLayout::new(
+                parts.statement_schema,
+                parts.statement_table_instance,
+            ),
+            aggregation_statement_layout: parts.aggregation_statement_layout,
+            trace_degree_bits: parts.trace_degree_bits,
+        }
+    }
+
+    pub const fn table_packing(&self) -> &TablePacking {
+        &self.table_packing
+    }
+
+    pub const fn rows(&self) -> &RowCounts {
+        &self.rows
+    }
+
+    pub const fn ext_degree(&self) -> usize {
+        self.ext_degree
+    }
+
+    pub const fn reduction(&self) -> AluExtMulKind<F> {
+        self.reduction
+    }
+
+    pub const fn alu_variant(&self) -> AirVariant {
+        self.alu_variant
+    }
+
+    pub const fn constraint_profile(&self) -> ConstraintProfile {
+        self.constraint_profile
+    }
+
+    pub fn non_primitives(&self) -> &[NpoRelation<F>] {
+        &self.non_primitives
+    }
+
+    pub const fn statement_layout(&self) -> &StatementLayout {
+        &self.statement_layout
+    }
+
+    /// Checked semantic left/right boundary when this relation aggregates two statements.
+    pub const fn aggregation_statement_layout(&self) -> Option<&AggregationStatementLayout> {
+        self.aggregation_statement_layout.as_ref()
+    }
+
+    pub fn trace_degree_bits(&self) -> &[usize] {
+        &self.trace_degree_bits
+    }
+}
+
+/// Named result produced by an audited NPO builder for trusted preparation.
+pub struct BuiltNpoTable<SC: StarkGenericConfig, const D: usize>
+where
+    SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SymbolicExpression<Val<SC>>>,
+{
+    pub air: CircuitTableAir<SC, D>,
+    pub base_degree_bits: usize,
+    pub descriptor: NpoRelation<Val<SC>>,
+}
+
+impl<SC: StarkGenericConfig, const D: usize> BuiltNpoTable<SC, D>
+where
+    SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SymbolicExpression<Val<SC>>>,
+{
+    pub const fn new(
+        air: CircuitTableAir<SC, D>,
+        base_degree_bits: usize,
+        descriptor: NpoRelation<Val<SC>>,
+    ) -> Self {
+        Self {
+            air,
+            base_degree_bits,
+            descriptor,
+        }
+    }
+
+    /// Built-in Poseidon tables use their fully padded AIR height as legacy `rows` metadata.
+    pub fn poseidon(
+        op_type: NpoTypeId,
+        lanes: usize,
+        (air, base_degree_bits): (CircuitTableAir<SC, D>, usize),
+    ) -> Self {
+        Self::new(
+            air,
+            base_degree_bits,
+            NpoRelation::new(
+                op_type,
+                1usize << base_degree_bits,
+                lanes,
+                AirVariant::Baseline,
+                Vec::new(),
+            ),
+        )
+    }
+}
+
+/// Complete static table preparation, before `ProverData` consumes the AIRs exactly once.
+pub(crate) struct FinalizedCircuitTables<SC: StarkGenericConfig, const D: usize>
+where
+    SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SymbolicExpression<Val<SC>>>,
+{
+    airs_and_base_degree_bits: CircuitAirsWithDegrees<SC, D>,
+    relation: CircuitRelation<Val<SC>>,
+    primitive_columns: Vec<Vec<Val<SC>>>,
+    non_primitive_columns: NonPrimitivePreprocessedMap<Val<SC>>,
+}
+
+impl<SC: StarkGenericConfig, const D: usize> FinalizedCircuitTables<SC, D>
+where
+    SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SymbolicExpression<Val<SC>>>,
+{
+    #[cfg(test)]
+    pub(crate) const fn airs_and_base_degree_bits(&self) -> &CircuitAirsWithDegrees<SC, D> {
+        &self.airs_and_base_degree_bits
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn relation(&self) -> &CircuitRelation<Val<SC>> {
+        &self.relation
+    }
+
+    pub(crate) fn into_parts(self) -> FinalizedCircuitTableParts<SC, D> {
+        (
+            self.airs_and_base_degree_bits,
+            self.relation,
+            self.primitive_columns,
+            self.non_primitive_columns,
+        )
+    }
+}
+
+/// Type alias for a vector of circuit table AIRs paired with their respective degrees (log of their trace height).
+type CircuitAirsWithDegrees<SC, const D: usize> = Vec<(CircuitTableAir<SC, D>, usize)>;
+
+type FinalizedCircuitTableParts<SC, const D: usize> = (
+    CircuitAirsWithDegrees<SC, D>,
+    CircuitRelation<Val<SC>>,
+    Vec<Vec<Val<SC>>>,
+    NonPrimitivePreprocessedMap<Val<SC>>,
+);
+
+#[derive(Clone, Copy)]
+struct CircuitTableBuildOptions {
+    constraint_profile: ConstraintProfile,
+    alu_variant: AirVariant,
+    is_zk: bool,
+    trusted: bool,
+}
+
+/// Output of [`get_airs_and_degrees_with_prep`]: AIRs with degrees, primitive columns, and non-primitive columns.
+type PrepOutput<SC, const D: usize> = (
+    CircuitAirsWithDegrees<SC, D>,
+    Vec<Vec<Val<SC>>>,
+    NonPrimitivePreprocessedMap<Val<SC>>,
+);
+
+pub fn get_airs_and_degrees_with_prep<
+    SC: StarkGenericConfig + 'static + Send + Sync,
+    ExtF: Field + ExtensionField<Val<SC>> + ExtractBinomialW<Val<SC>>,
+    const D: usize,
+>(
+    circuit: &Circuit<ExtF>,
+    packing: &TablePacking,
+    non_primitive_preprocessors: &[Box<dyn NpoPreprocessor<Val<SC>>>],
+    non_primitive_air_builders: &[Box<dyn NpoAirBuilder<SC, D>>],
+    constraint_profile: ConstraintProfile,
+) -> Result<PrepOutput<SC, D>, CircuitError>
+where
+    SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SymbolicExpression<Val<SC>>>,
+    Val<SC>: StarkField,
+{
+    let finalized = build_circuit_tables(
+        circuit,
+        packing,
+        non_primitive_preprocessors,
+        non_primitive_air_builders,
+        CircuitTableBuildOptions {
+            constraint_profile,
+            alu_variant: AirVariant::Optimized,
+            is_zk: false,
+            trusted: false,
+        },
+    )?;
+    let (airs, _, primitive, non_primitive) = finalized.into_parts();
+    Ok((airs, primitive, non_primitive))
+}
+
+pub(crate) fn finalize_circuit_tables<
+    SC: StarkGenericConfig + 'static + Send + Sync,
+    ExtF: Field + ExtensionField<Val<SC>> + ExtractBinomialW<Val<SC>>,
+    const D: usize,
+>(
+    circuit: &Circuit<ExtF>,
+    packing: &TablePacking,
+    non_primitive_preprocessors: &[Box<dyn NpoPreprocessor<Val<SC>>>],
+    non_primitive_air_builders: &[Box<dyn NpoAirBuilder<SC, D>>],
+    constraint_profile: ConstraintProfile,
+    alu_variant: AirVariant,
+    is_zk: bool,
+) -> Result<FinalizedCircuitTables<SC, D>, CircuitError>
+where
+    SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SymbolicExpression<Val<SC>>>,
+    Val<SC>: StarkField,
+{
+    build_circuit_tables(
+        circuit,
+        packing,
+        non_primitive_preprocessors,
+        non_primitive_air_builders,
+        CircuitTableBuildOptions {
+            constraint_profile,
+            alu_variant,
+            is_zk,
+            trusted: true,
+        },
+    )
+}
+
+fn build_circuit_tables<
+    SC: StarkGenericConfig + 'static + Send + Sync,
+    ExtF: Field + ExtensionField<Val<SC>> + ExtractBinomialW<Val<SC>>,
+    const D: usize,
+>(
+    circuit: &Circuit<ExtF>,
+    packing: &TablePacking,
+    non_primitive_preprocessors: &[Box<dyn NpoPreprocessor<Val<SC>>>],
+    non_primitive_air_builders: &[Box<dyn NpoAirBuilder<SC, D>>],
+    options: CircuitTableBuildOptions,
+) -> Result<FinalizedCircuitTables<SC, D>, CircuitError>
+where
+    SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SymbolicExpression<Val<SC>>>,
+    Val<SC>: StarkField,
+{
+    let CircuitTableBuildOptions {
+        constraint_profile,
+        alu_variant,
+        is_zk,
+        trusted,
+    } = options;
+
+    // Reject a misconfigured packing (e.g. a per-table override below the global
+    // min-height floor) before any table height derived from it is used to build or
+    // pad the preprocessed trace, rather than only catching it later via
+    // `BatchStarkProof::validate`.
+    packing.validate()?;
+
+    let mut preprocessed = circuit.generate_preprocessed_columns::<D>()?;
+    let statement_id = NpoTypeId::statement();
+    let canonical_statement_preprocessed = trusted
+        .then(|| preprocessed.non_primitive.get(&statement_id).cloned())
+        .flatten();
+
+    // Check if Public/Alu tables are empty and lanes > 1.
+    // Using lanes > 1 with empty tables causes issues in recursive verification
+    // due to a bug in how multi-lane padding interacts with lookup constraints.
+    // We automatically reduce lanes to 1 in these cases with a warning.
+    // IMPORTANT: This must be synchronized with prove_all_tables in batch_stark_prover.rs
+    let public_idx = PrimitiveOpType::Public as usize;
+    let alu_idx = PrimitiveOpType::Alu as usize;
+
+    let const_rows = preprocessed.primitive[PrimitiveOpType::Const as usize].len();
+    let public_rows = preprocessed.primitive[public_idx].len();
+    let effective_public_lanes =
+        reduce_lanes_if_dummy("Public", public_rows <= 1, packing.public_lanes());
+
+    let alu_raw_rows = preprocessed.primitive[alu_idx].len() / 12;
+    let alu_empty = alu_raw_rows == 0;
+    let effective_alu_lanes = reduce_lanes_if_dummy("ALU", alu_raw_rows <= 1, packing.alu_lanes());
+
+    let effective_packing = packing
+        .clone()
+        .with_public_alu_lanes(effective_public_lanes, effective_alu_lanes);
+
+    let w_binomial = ExtF::extract_w();
+
+    // First, get base field elements for the preprocessed primitive values.
+    let mut base_prep: Vec<Vec<Val<SC>>> = preprocessed
+        .primitive
+        .iter()
+        .map(|vals| {
+            vals.iter()
+                .map(|v| v.as_base().ok_or(CircuitError::InvalidPreprocessedValues))
+                .collect::<Result<Vec<_>, CircuitError>>()
+        })
+        .collect::<Result<Vec<_>, CircuitError>>()?;
+
+    // Let plugins handle non-primitive preprocessing (ext_reads, multiplicities, etc.).
+    let mut non_primitive_base: NonPrimitivePreprocessedMap<Val<SC>> = HashMap::new();
+    let circuit_any: &dyn Any = circuit;
+    let preprocessed_any: &mut dyn Any = &mut preprocessed;
+    for plugin in non_primitive_preprocessors {
+        let plugin_prep = plugin.preprocess(circuit_any, preprocessed_any)?;
+        if trusted
+            && plugin_prep.contains_key(&statement_id)
+            && plugin.as_ref().type_id()
+                != TypeId::of::<crate::batch_stark_prover::StatementPreprocessor>()
+        {
+            return Err(CircuitError::InvalidTablePacking(
+                "only the built-in Statement preprocessor may register statement preprocessing"
+                    .to_string(),
+            ));
+        }
+        non_primitive_base.extend(plugin_prep);
+    }
+    if trusted
+        && preprocessed.non_primitive.get(&statement_id)
+            != canonical_statement_preprocessed.as_ref()
+    {
+        return Err(CircuitError::InvalidTablePacking(
+            "trusted NPO preprocessing changed the circuit-minted Statement mapping".to_string(),
+        ));
+    }
+
+    // Get min_height from packing configuration and pass it to AIRs
+    let min_height = packing.min_trace_height();
+
+    // Helper to compute degree that respects a per-table minimum height override, falling
+    // back to the global `min_height` when no override is set for that table. When
+    // `packing.is_strict()` is set, a table that naturally outgrows its configured height
+    // is rejected instead of silently clamped (padded) up to fit.
+    let compute_degree = |num_rows: usize,
+                          table_override: Option<usize>,
+                          table_name: &str|
+     -> Result<usize, CircuitError> {
+        let natural_height = num_rows.next_power_of_two();
+        let effective_min = table_override.unwrap_or(min_height).next_power_of_two();
+        if packing.is_strict() && natural_height > effective_min {
+            return Err(CircuitError::from(ProofMetadataError::ProfileOverflow {
+                table: table_name.to_string(),
+                needed: natural_height,
+                allowed: effective_min,
+            }));
+        }
+        Ok(log2_ceil_usize(natural_height.max(effective_min)))
+    };
+
+    let reduction =
+        AluExtMulKind::resolve(D, w_binomial, D == 5 && ExtF::alu_is_quintic_trinomial()).expect(
+            "ALU preprocessed path needs binomial W when D>1 and the element field is not the \
+         quintic-trinomial ALU variant",
+        );
+
+    let mut table_preps: Vec<(CircuitTableAir<SC, D>, usize)> =
+        Vec::with_capacity(base_prep.len() + non_primitive_base.len());
+    let mut npo_relations = Vec::with_capacity(non_primitive_base.len());
+
+    #[allow(clippy::needless_range_loop)]
+    for idx in 0..base_prep.len() {
+        let table = PrimitiveOpType::from(idx);
+        match table {
+            PrimitiveOpType::Alu => {
+                // ALU preprocessed per op from circuit.rs: 12 values
+                // [sel_add_vs_mul, sel_bool, sel_muladd, sel_horner, a_idx, b_idx, c_idx, out_idx,
+                //  mult_a_eff, b_is_creator, mult_c_eff, out_is_creator]
+                //
+                // mult_a_eff / mult_c_eff: -1 (reader or later unconstrained), or +N (first
+                // unconstrained creator). We convert to 12 values for AluAir (same order, mult_c_eff last).
+                let lane_12 = 12_usize;
+                let neg_one = <Val<SC>>::ZERO - <Val<SC>>::ONE;
+
+                let mut chunks = base_prep[idx].chunks_exact(lane_12);
+                let mut prep_13col: Vec<Val<SC>> = Vec::with_capacity(
+                    chunks.len() * lane_12 + if alu_empty { 0 } else { lane_12 },
+                );
+                for chunk in &mut chunks {
+                    let sel1 = chunk[0];
+                    let sel2 = chunk[1];
+                    let sel3 = chunk[2];
+                    let sel4 = chunk[3];
+                    let a_idx = chunk[4];
+                    let b_idx = chunk[5];
+                    let c_idx = chunk[6];
+                    let out_idx = chunk[7];
+                    let a_state = chunk[8].as_canonical_u64();
+                    let b_is_creator = chunk[9].as_canonical_u64() != 0;
+                    let c_state = chunk[10].as_canonical_u64();
+                    let out_is_creator = chunk[11].as_canonical_u64() != 0;
+
+                    // mult_a = -1 for all active rows; active = -mult_a = 1 always.
+                    // Effective a-lookup mult = mult_a * a_reader_col (in get_alu_index_lookups).
+                    // Effective c-lookup mult = mult_a * c_reader_col (in get_alu_index_lookups).
+                    //
+                    // a_state / c_state encoding:
+                    //   0 → skip: col = 0, eff = 0
+                    //   1 → reader: col = 1, eff = (-1)*1 = -1
+                    //   2 → private creator: col = -(n_reads), eff = (-1)*(-(n_reads)) = +n_reads
+                    let mult_a = neg_one;
+                    let a_reader_col = match a_state {
+                        0 => <Val<SC>>::ZERO,
+                        1 => <Val<SC>>::ONE,
+                        2 => {
+                            let a_wid = a_idx.as_canonical_u64() as usize / D;
+                            let n_reads = preprocessed.ext_reads.get(a_wid).copied().unwrap_or(0);
+                            <Val<SC>>::ZERO - <Val<SC>>::from_u32(n_reads)
+                        }
+                        _ => <Val<SC>>::ZERO,
+                    };
+                    let c_reader_col = match c_state {
+                        0 => <Val<SC>>::ZERO,
+                        1 => <Val<SC>>::ONE,
+                        2 => {
+                            let c_wid = c_idx.as_canonical_u64() as usize / D;
+                            let n_reads = preprocessed.ext_reads.get(c_wid).copied().unwrap_or(0);
+                            <Val<SC>>::ZERO - <Val<SC>>::from_u32(n_reads)
+                        }
+                        _ => <Val<SC>>::ZERO,
+                    };
+
+                    // b: creator if b_is_creator, reader otherwise.
+                    let mult_b = if b_is_creator {
+                        let b_wid = b_idx.as_canonical_u64() as usize / D;
+                        let n_reads = preprocessed.ext_reads.get(b_wid).copied().unwrap_or(0);
+                        <Val<SC>>::from_u32(n_reads)
+                    } else {
+                        neg_one
+                    };
+
+                    // out: creator if out_is_creator, reader otherwise.
+                    let mult_out = if out_is_creator {
+                        let out_wid = out_idx.as_canonical_u64() as usize / D;
+                        let n_reads = preprocessed.ext_reads.get(out_wid).copied().unwrap_or(0);
+                        <Val<SC>>::from_u32(n_reads)
+                    } else {
+                        neg_one
+                    };
+
+                    prep_13col.extend([
+                        mult_a,
+                        sel1,
+                        sel2,
+                        sel3,
+                        sel4,
+                        a_idx,
+                        b_idx,
+                        c_idx,
+                        out_idx,
+                        mult_b,
+                        mult_out,
+                        a_reader_col,
+                        c_reader_col,
+                    ]);
+                }
+                debug_assert!(chunks.remainder().is_empty());
+
+                // If ALU was empty, add a dummy row (all zeros = padding, no logup contribution).
+                if alu_empty {
+                    prep_13col.extend([<Val<SC>>::ZERO; 13]);
+                }
+
+                let num_ops = prep_13col.len() / 13;
+                let horner_k = packing.horner_packed_steps();
+                // Store the converted 13-col format before building the AIR.
+                base_prep[idx] = prep_13col;
+                let alu_air = AluAir::from_reduction_with_preprocessed(
+                    num_ops,
+                    effective_alu_lanes,
+                    reduction,
+                    base_prep[idx].clone(),
+                    horner_k,
+                )
+                .with_min_height(packing.alu_min_height().unwrap_or(min_height));
+                let num_entries = alu_air.scheduled_entry_count();
+                let num_rows = num_entries.div_ceil(effective_alu_lanes);
+                let alu_degree = compute_degree(num_rows, packing.alu_min_height(), "ALU")?;
+                table_preps.push((CircuitTableAir::Alu(alu_air), alu_degree));
+            }
+            PrimitiveOpType::Public => {
+                // Public preprocessed per op from circuit.rs: 1 value (D-scaled out_idx).
+                // Convert to [ext_mult, out_idx] pairs using ext_reads.
+                let mut prep_2col: Vec<Val<SC>> = Vec::with_capacity(base_prep[idx].len() * 2);
+                for &out_idx in &base_prep[idx] {
+                    let out_wid =
+                        (<Val<SC> as PrimeField64>::as_canonical_u64(&out_idx) as usize) / D;
+                    let n_reads = preprocessed.ext_reads.get(out_wid).copied().unwrap_or(0);
+                    prep_2col.push(<Val<SC>>::from_u32(n_reads));
+                    prep_2col.push(out_idx);
+                }
+
+                let num_ops = prep_2col.len() / 2;
+                // Store the converted 2-col format before building the AIR.
+                base_prep[idx] = prep_2col;
+                let public_air = PublicAir::new_with_preprocessed(
+                    num_ops,
+                    effective_public_lanes,
+                    base_prep[idx].clone(),
+                )
+                .with_min_height(packing.public_min_height().unwrap_or(min_height));
+                let num_rows = num_ops.div_ceil(effective_public_lanes);
+                let public_degree =
+                    compute_degree(num_rows, packing.public_min_height(), "PUBLIC")?;
+                table_preps.push((CircuitTableAir::Public(public_air), public_degree));
+            }
+            PrimitiveOpType::Const => {
+                // Const preprocessed per op from circuit.rs: 1 index (D-scaled out_idx) plus
+                // one entry in `preprocessed.const_values` (the constant's own value, same
+                // order). Convert to [ext_mult, out_idx, value_0, ..., value_{D-1}] rows using
+                // ext_reads and the constant's basis-coefficient decomposition.
+                let row_width = 2 + D;
+                let mut prep_rows: Vec<Val<SC>> =
+                    Vec::with_capacity(base_prep[idx].len() * row_width);
+                for (&out_idx, val) in base_prep[idx].iter().zip(preprocessed.const_values.iter()) {
+                    let out_wid = out_idx.as_canonical_u64() as usize / D;
+                    let n_reads = preprocessed.ext_reads.get(out_wid).copied().unwrap_or(0);
+                    prep_rows.push(<Val<SC>>::from_u32(n_reads));
+                    prep_rows.push(out_idx);
+                    let coeffs = val.as_basis_coefficients_slice();
+                    debug_assert_eq!(
+                        coeffs.len(),
+                        D,
+                        "constant value coefficient count must match D"
+                    );
+                    prep_rows.extend_from_slice(coeffs);
+                }
+
+                let height = prep_rows.len() / row_width;
+                // Store the converted row format before building the AIR.
+                base_prep[idx] = prep_rows;
+                let const_air = ConstAir::new_with_preprocessed(height, base_prep[idx].clone())
+                    .with_min_height(packing.const_min_height().unwrap_or(min_height));
+                let const_degree = compute_degree(height, packing.const_min_height(), "CONST")?;
+                table_preps.push((CircuitTableAir::Const(const_air), const_degree));
+            }
+        }
+    }
+
+    // Iterate air builders first (fixed registration order) so that the
+    // resulting AIR ordering matches the prover's non_primitive_provers order.
+    for builder in non_primitive_air_builders {
+        for (op_type, prep_base) in non_primitive_base.iter() {
+            // TablePacking overrides the builder's own default lane count.
+            let lanes = packing
+                .npo_lanes(op_type)
+                .unwrap_or_else(|| builder.lanes());
+            let npo_min_height = packing.npo_min_height(op_type).unwrap_or(min_height);
+            let built = if trusted {
+                builder.try_build_trusted(
+                    op_type,
+                    prep_base,
+                    npo_min_height,
+                    lanes,
+                    constraint_profile,
+                )
+            } else {
+                builder
+                    .try_build(
+                        op_type,
+                        prep_base,
+                        npo_min_height,
+                        lanes,
+                        constraint_profile,
+                    )
+                    .map(|(air, base_degree_bits)| BuiltNpoTable {
+                        air,
+                        base_degree_bits,
+                        descriptor: NpoRelation::new(
+                            op_type.clone(),
+                            1,
+                            lanes,
+                            AirVariant::Baseline,
+                            Vec::new(),
+                        ),
+                    })
+            };
+            if let Some(BuiltNpoTable {
+                air,
+                base_degree_bits: degree,
+                descriptor,
+            }) = built
+            {
+                if trusted
+                    && descriptor.is_audited_statement()
+                    && builder.as_ref().type_id()
+                        != TypeId::of::<crate::batch_stark_prover::StatementAirBuilder<D>>()
+                {
+                    return Err(CircuitError::InvalidTablePacking(
+                        "only the built-in Statement AIR builder may mint dynamic statement policy"
+                            .to_string(),
+                    ));
+                }
+                // Every current `NpoAirBuilder` impl computes `degree` as
+                // `log2_ceil(max(natural_rows.next_pow2, npo_min_height.next_pow2))`, so the
+                // built height exceeds the allowed height iff the table's natural row count
+                // outgrew its configured minimum -- the same condition `compute_degree`
+                // checks for the primitive tables, recovered here without needing
+                // `try_build`'s internal `num_rows`.
+                let allowed = npo_min_height.next_power_of_two();
+                let built_height = 1usize << degree;
+                if packing.is_strict() && built_height > allowed {
+                    return Err(CircuitError::from(ProofMetadataError::ProfileOverflow {
+                        table: op_type.to_string(),
+                        needed: built_height,
+                        allowed,
+                    }));
+                }
+                table_preps.push((air, degree));
+                npo_relations.push(descriptor);
+                break;
+            }
+        }
+    }
+
+    if trusted && npo_relations.len() != non_primitive_base.len() {
+        return Err(CircuitError::InvalidTablePacking(
+            "trusted preparation requires exact metadata from every non-primitive AIR builder"
+                .to_string(),
+        ));
+    }
+
+    let statement_schema = circuit.statement_schema().cloned().unwrap_or_default();
+    let named_statement = npo_relations
+        .iter()
+        .enumerate()
+        .filter(|(_, relation)| relation.op_type() == &NpoTypeId::statement())
+        .collect::<Vec<_>>();
+    let statement_layout = if !trusted {
+        StatementLayout::new(statement_schema, None)
+    } else if statement_schema.base_len() == 0 {
+        if !named_statement.is_empty() {
+            return Err(CircuitError::InvalidTablePacking(
+                "the reserved Statement table may only be registered by a nonempty circuit statement"
+                    .to_string(),
+            ));
+        }
+        StatementLayout::new(statement_schema, None)
+    } else {
+        if named_statement.len() != 1 || !named_statement[0].1.is_audited_statement() {
+            return Err(CircuitError::InvalidTablePacking(
+                "the circuit statement requires exactly one audited built-in Statement table"
+                    .to_string(),
+            ));
+        }
+        let (index, relation) = named_statement[0];
+        if relation.public_values_len() != statement_schema.base_len() {
+            return Err(CircuitError::InvalidTablePacking(
+                "the audited Statement public-value width differs from its circuit schema"
+                    .to_string(),
+            ));
+        }
+        StatementLayout::new(statement_schema, Some(NUM_PRIMITIVE_TABLES + index))
+    };
+    let aggregation_statement_layout = circuit
+        .aggregation_statement_layout()
+        .map(|layout| {
+            AggregationStatementLayout::try_new(
+                layout.left().clone(),
+                layout.right().clone(),
+                layout.split_at(),
+                layout.output().clone(),
+            )
+            .map_err(|error| CircuitError::InvalidTablePacking(error.to_string()))
+        })
+        .transpose()?;
+    if aggregation_statement_layout
+        .as_ref()
+        .is_some_and(|layout| layout.output() != statement_layout.schema())
+    {
+        return Err(CircuitError::InvalidTablePacking(
+            "aggregation statement output schema differs from the finalized Statement relation"
+                .to_string(),
+        ));
+    }
+
+    let trace_degree_bits = table_preps
+        .iter()
+        .map(|(_, degree)| degree + usize::from(is_zk))
+        .collect();
+    let relation = CircuitRelation {
+        table_packing: effective_packing,
+        rows: RowCounts::new([const_rows.max(1), public_rows.max(1), alu_raw_rows.max(1)]),
+        ext_degree: D,
+        reduction,
+        alu_variant,
+        constraint_profile,
+        non_primitives: npo_relations,
+        statement_layout,
+        aggregation_statement_layout,
+        trace_degree_bits,
+    };
+
+    Ok(FinalizedCircuitTables {
+        airs_and_base_degree_bits: table_preps,
+        relation,
+        primitive_columns: base_prep,
+        non_primitive_columns: non_primitive_base,
+    })
+}
+
+#[cfg(test)]
+mod per_table_height_tests {
+    use p3_air::BaseAir;
+    use p3_circuit::CircuitBuilder;
+    use p3_field::PrimeCharacteristicRing;
+    use p3_matrix::Matrix;
+    use p3_test_utils::koala_bear_params::{F, MyConfig};
+
+    use super::{CircuitTableAir, get_airs_and_degrees_with_prep};
+    use crate::TablePacking;
+
+    #[test]
+    fn alu_min_height_override_forces_alu_table_taller_than_natural() {
+        let mut builder = CircuitBuilder::<F>::new();
+        let a = builder.define_const(F::from_u32(2));
+        let b = builder.define_const(F::from_u32(3));
+        let _c = builder.mul(a, b); // one ALU op -> natural height 1 (padded to 2 minimum)
+        let circuit = builder.build().unwrap();
+
+        let packing = TablePacking::new(1, 1).with_alu_min_height(64);
+        let (airs_degrees, _, _) = get_airs_and_degrees_with_prep::<MyConfig, F, 1>(
+            &circuit,
+            &packing,
+            &[],
+            &[],
+            Default::default(),
+        )
+        .unwrap();
+
+        let alu_degree = airs_degrees
+            .iter()
+            .find_map(|(air, degree)| matches!(air, CircuitTableAir::Alu(_)).then_some(*degree))
+            .expect("ALU air present");
+        assert_eq!(1usize << alu_degree, 64);
+    }
+
+    /// Guards against the exact divergence this task exists to prevent: the height each
+    /// primitive AIR reports via its returned `degree` must equal the actual height of the
+    /// preprocessed trace it builds (`BaseAir::preprocessed_trace`). `ProverData::from_airs_and_degrees`
+    /// (in `p3-batch-stark`) asserts this invariant when committing prep data; a per-table
+    /// override that only fed `compute_degree` but not the AIR's own `with_min_height(..)` call
+    /// would silently violate it the moment the two heights differ.
+    #[test]
+    fn const_public_alu_min_height_overrides_are_independent_and_consistent() {
+        let mut builder = CircuitBuilder::<F>::new();
+        let expected = builder.alloc_public_input("expected");
+        let a = builder.define_const(F::from_u32(2));
+        let b = builder.define_const(F::from_u32(3));
+        let c = builder.mul(a, b);
+        builder.connect(c, expected);
+        let circuit = builder.build().unwrap();
+
+        let packing = TablePacking::new(1, 1)
+            .with_const_min_height(8)
+            .with_public_min_height(16)
+            .with_alu_min_height(32);
+        let (airs_degrees, _, _) = get_airs_and_degrees_with_prep::<MyConfig, F, 1>(
+            &circuit,
+            &packing,
+            &[],
+            &[],
+            Default::default(),
+        )
+        .unwrap();
+
+        for (air, degree) in &airs_degrees {
+            let expected_height = match air {
+                CircuitTableAir::Const(_) => 8usize,
+                CircuitTableAir::Public(_) => 16usize,
+                CircuitTableAir::Alu(_) => 32usize,
+                CircuitTableAir::Dynamic(_) => continue,
+            };
+            assert_eq!(
+                1usize << degree,
+                expected_height,
+                "returned degree does not match the configured per-table override"
+            );
+
+            let prep_height = air
+                .preprocessed_trace()
+                .expect("primitive tables always carry preprocessed data")
+                .height();
+            assert_eq!(
+                prep_height, expected_height,
+                "preprocessed trace height must match the returned degree"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod trusted_preparation_tests {
+    use alloc::vec::Vec;
+
+    use p3_circuit::{CircuitBuilder, StatementSchema};
+    use p3_field::PrimeCharacteristicRing;
+    use p3_test_utils::koala_bear_params::{F, MyConfig};
+
+    use super::finalize_circuit_tables;
+    use crate::{AirVariant, ConstraintProfile, PrimitiveTable, TablePacking};
+
+    /// Regression target: changing the static ALU predicate back to `is_empty()` would leave
+    /// this one-operation circuit at four lanes during setup, while proving reduces it to one.
+    #[test]
+    fn trusted_preparation_finalizes_dummy_and_single_alu_lanes_before_commitment() {
+        let mut builder = CircuitBuilder::<F>::new();
+        let a = builder.define_const(F::from_u32(2));
+        let b = builder.define_const(F::from_u32(3));
+        let _ = builder.mul(a, b);
+        let circuit = builder.build().unwrap();
+
+        let finalized = finalize_circuit_tables::<MyConfig, F, 1>(
+            &circuit,
+            &TablePacking::new(4, 4),
+            &[],
+            &[],
+            ConstraintProfile::Standard,
+            AirVariant::Optimized,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(finalized.relation().table_packing().public_lanes(), 1);
+        assert_eq!(finalized.relation().table_packing().alu_lanes(), 1);
+        assert_eq!(finalized.relation().rows()[PrimitiveTable::Alu], 1);
+        assert_eq!(
+            finalized.relation().trace_degree_bits(),
+            finalized
+                .airs_and_base_degree_bits()
+                .iter()
+                .map(|(_, degree)| *degree)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn trusted_preparation_retains_an_explicit_empty_aggregation_boundary() {
+        let mut builder = CircuitBuilder::<F>::new();
+        builder
+            .set_statement_exports::<F>(&[])
+            .expect("the empty statement is explicitly defined");
+        let layout = builder
+            .set_aggregation_statement_layout(
+                StatementSchema::default(),
+                StatementSchema::default(),
+            )
+            .expect("two empty child schemas form one empty aggregation statement");
+        let circuit = builder.build().unwrap();
+
+        let finalized = finalize_circuit_tables::<MyConfig, F, 1>(
+            &circuit,
+            &TablePacking::new(1, 1),
+            &[],
+            &[],
+            ConstraintProfile::Standard,
+            AirVariant::Optimized,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            finalized.relation().aggregation_statement_layout(),
+            Some(&layout)
+        );
+        assert_eq!(
+            finalized.relation().statement_layout().schema(),
+            layout.output()
+        );
+        assert_eq!(
+            finalized.relation().statement_layout().table_instance(),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod strict_overflow_tests {
+    use p3_circuit::{CircuitBuilder, CircuitError};
+    use p3_field::PrimeCharacteristicRing;
+    use p3_test_utils::koala_bear_params::{F, MyConfig};
+
+    use super::get_airs_and_degrees_with_prep;
+    use crate::TablePacking;
+
+    /// Asserts `result` is `Err(CircuitError::ProfileOverflow { table, .. })` with the given
+    /// table name, printing a descriptive message (not just `is_err()`) on any other outcome.
+    fn assert_overflows_on(
+        result: Result<super::PrepOutput<MyConfig, 1>, CircuitError>,
+        expected_table: &str,
+    ) {
+        match result {
+            Err(CircuitError::ProfileOverflow { table, .. }) => {
+                assert_eq!(table, expected_table);
+            }
+            Ok(_) => panic!("expected ProfileOverflow on {expected_table}, got Ok"),
+            Err(other) => {
+                panic!(
+                    "expected ProfileOverflow on {expected_table}, got a different error: {other}"
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn strict_packing_rejects_a_table_that_outgrows_its_configured_height() {
+        // A chain of 20 ALU (mul) ops: each step's output feeds the next `mul`, so every
+        // op has a distinct operand and none constant-fold or CSE-collapse, while only ONE
+        // const and ONE public input are ever defined. This isolates the overflow to ALU:
+        // CONST's and PUBLIC's natural heights (1 each) stay far under the global floor,
+        // while ALU's natural height (20 -> pow2 32) exceeds its own override.
+        let mut builder = CircuitBuilder::<F>::new();
+        let c = builder.define_const(F::from_u32(3));
+        let mut acc = builder.public_input();
+        for _ in 0..20 {
+            acc = builder.mul(acc, c);
+        }
+        let _ = acc;
+        let circuit = builder.build().unwrap();
+
+        let packing = TablePacking::new(1, 1)
+            .with_min_trace_height(4) // comfortably covers CONST/PUBLIC's natural height of 1
+            .with_alu_min_height(8) // >= the floor (passes validate()), but < ALU's natural 32
+            .with_strict_heights();
+
+        let result = get_airs_and_degrees_with_prep::<MyConfig, F, 1>(
+            &circuit,
+            &packing,
+            &[],
+            &[],
+            Default::default(),
+        );
+
+        assert_overflows_on(result, "ALU");
+    }
+
+    #[test]
+    fn strict_packing_reports_const_as_the_overflowing_table() {
+        // 10 distinct consts, never read by any ALU op: CONST's natural height (10 -> 16)
+        // exceeds the global floor, while PUBLIC/ALU are both empty (dummy-padded to 1 row).
+        let mut builder = CircuitBuilder::<F>::new();
+        for i in 0u32..10 {
+            let _ = builder.define_const(F::from_u32(i + 2));
+        }
+        let circuit = builder.build().unwrap();
+
+        let packing = TablePacking::new(1, 1)
+            .with_min_trace_height(4)
+            .with_strict_heights();
+
+        let result = get_airs_and_degrees_with_prep::<MyConfig, F, 1>(
+            &circuit,
+            &packing,
+            &[],
+            &[],
+            Default::default(),
+        );
+
+        assert_overflows_on(result, "CONST");
+    }
+
+    #[test]
+    fn strict_packing_reports_public_as_the_overflowing_table() {
+        // 10 distinct public inputs: PUBLIC's natural height (10 -> 16) exceeds the global
+        // floor, while CONST/ALU are both empty (dummy-padded to 1 row).
+        let mut builder = CircuitBuilder::<F>::new();
+        for _ in 0u32..10 {
+            let _ = builder.public_input();
+        }
+        let circuit = builder.build().unwrap();
+
+        let packing = TablePacking::new(1, 1)
+            .with_min_trace_height(4)
+            .with_strict_heights();
+
+        let result = get_airs_and_degrees_with_prep::<MyConfig, F, 1>(
+            &circuit,
+            &packing,
+            &[],
+            &[],
+            Default::default(),
+        );
+
+        assert_overflows_on(result, "PUBLIC");
+    }
+
+    #[test]
+    fn non_strict_packing_still_clamps_up_as_before() {
+        let mut builder = CircuitBuilder::<F>::new();
+        let x = builder.public_input();
+        let c = builder.define_const(F::from_u32(2));
+        let _ = builder.mul(x, c);
+        let circuit = builder.build().unwrap();
+
+        let packing = TablePacking::new(1, 1).with_alu_min_height(2); // no with_strict_heights()
+
+        let result = get_airs_and_degrees_with_prep::<MyConfig, F, 1>(
+            &circuit,
+            &packing,
+            &[],
+            &[],
+            Default::default(),
+        );
+
+        assert!(result.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod validate_in_prove_path_tests {
+    use p3_circuit::CircuitBuilder;
+    use p3_field::PrimeCharacteristicRing;
+    use p3_test_utils::koala_bear_params::{F, MyConfig};
+
+    use super::get_airs_and_degrees_with_prep;
+    use crate::TablePacking;
+
+    /// A per-table override below the global `min_trace_height` floor must be rejected
+    /// where proving actually starts, not only later via `BatchStarkProof::validate` at
+    /// verification time -- by then an inconsistent preprocessed-column commitment may
+    /// already have been built.
+    #[test]
+    fn get_airs_and_degrees_with_prep_rejects_below_floor_override_before_building_prep() {
+        let mut builder = CircuitBuilder::<F>::new();
+        let a = builder.define_const(F::from_u32(2));
+        let b = builder.define_const(F::from_u32(3));
+        let _ = builder.mul(a, b);
+        let circuit = builder.build().unwrap();
+
+        let packing = TablePacking::new(1, 1)
+            .with_min_trace_height(32)
+            .with_alu_min_height(4); // valid power of two, but below the 32 floor
+
+        let result = get_airs_and_degrees_with_prep::<MyConfig, F, 1>(
+            &circuit,
+            &packing,
+            &[],
+            &[],
+            Default::default(),
+        );
+
+        assert!(
+            result.is_err(),
+            "a below-floor per-table override must be rejected before prep is built, \
+             not silently used to commit an inconsistent preprocessed trace"
+        );
+    }
+}

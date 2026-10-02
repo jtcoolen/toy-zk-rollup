@@ -1,0 +1,602 @@
+mod common;
+
+use p3_circuit::CircuitBuilder;
+use p3_circuit::ops::{generate_poseidon2_trace, generate_recompose_trace};
+use p3_circuit::test_utils::{FibonacciAir, generate_trace_rows};
+use p3_commit::Pcs;
+use p3_field::PrimeCharacteristicRing;
+use p3_poseidon2_circuit_air::BabyBearD4Width16;
+use p3_recursion::backend::replay_recursion_input_transcript;
+use p3_recursion::pcs::fri::MerkleCapTargets;
+use p3_recursion::pcs::set_whir_mmcs_private_data;
+use p3_recursion::pcs::whir::uni::{
+    WhirRoundPaths, WhirUniProofTargets, WhirUniVerifierParams, restore_whir_recursion_paths,
+    whir_round_paths_op_count,
+};
+use p3_recursion::public_inputs::StarkVerifierInputsBuilder;
+use p3_recursion::recursion::RecursionInput;
+use p3_recursion::traits::RecursivePcs;
+use p3_recursion::{Poseidon2Config, VerificationError, verify_p3_uni_proof_circuit};
+use p3_sumcheck::layout::{Layout, PrefixProver};
+use p3_uni_stark::{StarkGenericConfig, prove, verify};
+use p3_whir::pcs::proof::QueryOpenings;
+
+use crate::common::whir_config::{
+    BB_DIGEST_ELEMS, BbEF, BbF, BbMmcs, BbWhirConfig, BbWhirPcs, bb_whir_mmcs, bb_whir_perm,
+    bb_whir_protocol_params,
+};
+
+/// The WHIR PCS must satisfy the exact `RecursivePcs` bound
+/// `verify_p3_uni_proof_circuit` requires; this fails to compile otherwise.
+#[test]
+fn whir_pcs_satisfies_the_recursive_pcs_bound() {
+    fn assert_bound<P>()
+    where
+        P: RecursivePcs<
+                BbWhirConfig,
+                (),
+                WhirUniProofTargets<BbF, BbEF, BbMmcs, BB_DIGEST_ELEMS>,
+                MerkleCapTargets<BbF, BB_DIGEST_ELEMS>,
+                <BbWhirPcs as Pcs<BbEF, <BbWhirConfig as StarkGenericConfig>::Challenger>>::Domain,
+            >,
+    {
+    }
+    assert_bound::<BbWhirPcs>();
+}
+
+/// Everything a recursive WHIR test needs for one instance.
+pub struct WhirSetup {
+    pub config: BbWhirConfig,
+    pub air: FibonacciAir,
+    pub pis: Vec<BbF>,
+    pub proof: p3_uni_stark::Proof<BbWhirConfig>,
+    pub round_log_inv_rates: Vec<usize>,
+}
+
+/// The value [`generate_trace_rows::<BbF>(0, 1, n)`]'s last row claims as its
+/// output, i.e. `F(n)` for the sequence started at `F(0) = 0`, `F(1) = 1`.
+fn fibonacci_output(n: usize) -> BbF {
+    let (mut a, mut b) = (BbF::ZERO, BbF::ONE);
+    for _ in 1..n {
+        let next = a + b;
+        a = b;
+        b = next;
+    }
+    b
+}
+
+/// Proves a Fibonacci instance under WHIR with the given round schedule.
+pub fn build_whir_setup(log_n: usize, round_log_inv_rates: Vec<usize>) -> WhirSetup {
+    let n = 1 << log_n;
+    let trace = generate_trace_rows::<BbF>(0, 1, n);
+    let pis = vec![BbF::ZERO, BbF::ONE, fibonacci_output(n)];
+    let air = FibonacciAir {};
+    let config = crate::common::whir_config::bb_whir_config(round_log_inv_rates.clone());
+    let proof = prove(&config, &air, trace, &pis).unwrap();
+    assert!(verify(&config, &air, &proof, &pis).is_ok());
+    WhirSetup {
+        config,
+        air,
+        pis,
+        proof,
+        round_log_inv_rates,
+    }
+}
+
+/// Builds and runs the mandatory-MMCS recursive verifier circuit for `proof` and `pis`.
+pub fn run_whir_recursive_verifier(
+    setup: &WhirSetup,
+    proof: &p3_uni_stark::Proof<BbWhirConfig>,
+    pis: &[BbF],
+) -> Result<(), VerificationError> {
+    let paths = restore_whir_uni_paths(setup, proof, &setup.pis);
+    run_whir_recursive_verifier_with_mmcs(setup, proof, pis, &paths)
+}
+
+/// A WHIR-backed uni-STARK proof verifies inside the recursive circuit.
+#[test]
+fn whir_fibonacci_recursive_verifier() -> Result<(), VerificationError> {
+    let setup = build_whir_setup(10, vec![4]);
+    run_whir_recursive_verifier(&setup, &setup.proof, &setup.pis)
+}
+
+/// Wrong public inputs must break a circuit constraint, not merely a native check.
+#[test]
+#[should_panic(expected = "WitnessConflict")]
+fn whir_fibonacci_recursive_verifier_rejects_wrong_public_inputs() {
+    let setup = build_whir_setup(10, vec![4]);
+    let mut wrong = setup.pis.clone();
+    wrong[2] += BbF::ONE;
+    run_whir_recursive_verifier(&setup, &setup.proof, &wrong).unwrap();
+}
+
+/// A tampered opened value (proof data, not a caller-supplied public input)
+/// must also break a circuit constraint.
+///
+/// This exercises a different code path than
+/// `whir_fibonacci_recursive_verifier_rejects_wrong_public_inputs`: the
+/// quotient commitment's own WHIR opening-claim binding (`add_claim_at`'s
+/// absorption of the claimed evaluation into the transcript, and the
+/// resulting `claimed_eval` checked against the proof's fixed initial
+/// sumcheck data), rather than the outer STARK's public-value transcript
+/// absorption. See the Phase 4 report for the witness-id evidence pinning
+/// exactly where this fails and why it is not the outer AIR-level
+/// `circuit.connect(folded_mul, quotient)` check.
+#[test]
+#[should_panic(expected = "WitnessConflict")]
+fn whir_fibonacci_recursive_verifier_rejects_tampered_opened_value() {
+    let mut setup = build_whir_setup(10, vec![4]);
+    setup.proof.opened_values.quotient_chunks[0][0] += BbEF::ONE;
+    let pis = setup.pis.clone();
+    run_whir_recursive_verifier(&setup, &setup.proof, &pis).unwrap();
+}
+
+/// Test-local wrapper: builds the `RecursionInput`/transcript plumbing
+/// `restore_whir_recursion_paths` needs, from this file's own `WhirSetup` shape.
+///
+/// `restore_whir_recursion_paths` is generic over the base-field Merkle tree's own
+/// components (`P`/`PW`/`H`/`C`/`N`) rather than over a single `Mmcs`-bound type — see its doc
+/// comment for why — so this wrapper leaves them to be inferred from `BbMmcs`, the concrete
+/// alias this test file's proofs use.
+pub fn restore_whir_uni_paths(
+    setup: &WhirSetup,
+    proof: &p3_uni_stark::Proof<BbWhirConfig>,
+    pis: &[BbF],
+) -> Vec<WhirRoundPaths<BbF, BB_DIGEST_ELEMS>> {
+    let mmcs = bb_whir_mmcs();
+    let protocol_params = bb_whir_protocol_params(setup.round_log_inv_rates.clone());
+    let recursion_input = RecursionInput::UniStark {
+        proof,
+        air: &setup.air,
+        public_inputs: pis.to_vec(),
+        preprocessed_commit: None,
+    };
+    let transcript = replay_recursion_input_transcript(&setup.config, &recursion_input, &[])
+        .expect("an honest proof's transcript replays");
+    restore_whir_recursion_paths::<BbWhirConfig, _, _, _, _, _, BB_DIGEST_ELEMS>(
+        &mmcs,
+        transcript,
+        &proof.opening_proof,
+        &protocol_params,
+        4,
+        PrefixProver::<BbF, BbEF>::variable_order(),
+    )
+    .expect("an honest proof's transcript replays")
+}
+
+/// Recursive verification with in-circuit Merkle checking enabled.
+pub fn run_whir_recursive_verifier_with_mmcs(
+    setup: &WhirSetup,
+    proof: &p3_uni_stark::Proof<BbWhirConfig>,
+    pis: &[BbF],
+    paths: &[WhirRoundPaths<BbF, BB_DIGEST_ELEMS>],
+) -> Result<(), VerificationError> {
+    let mut builder = CircuitBuilder::new();
+    builder.enable_poseidon2_perm::<BabyBearD4Width16, _>(
+        generate_poseidon2_trace::<BbEF, BabyBearD4Width16>,
+        bb_whir_perm(),
+    );
+    builder.enable_recompose::<BbF>(generate_recompose_trace::<BbF, BbEF>);
+
+    let params = WhirUniVerifierParams::<BbF>::new(
+        bb_whir_protocol_params(setup.round_log_inv_rates.clone()),
+        PrefixProver::<BbF, BbEF>::variable_order(),
+        Poseidon2Config::BABY_BEAR_D4_W16,
+    )
+    .expect("valid WHIR test configuration");
+
+    let verifier_inputs = StarkVerifierInputsBuilder::<
+        BbWhirConfig,
+        MerkleCapTargets<BbF, BB_DIGEST_ELEMS>,
+        WhirUniProofTargets<BbF, BbEF, BbMmcs, BB_DIGEST_ELEMS>,
+    >::allocate(&mut builder, proof, None, pis.len());
+
+    let op_ids = verify_p3_uni_proof_circuit::<
+        FibonacciAir,
+        BbWhirConfig,
+        MerkleCapTargets<BbF, BB_DIGEST_ELEMS>,
+        (),
+        WhirUniProofTargets<BbF, BbEF, BbMmcs, BB_DIGEST_ELEMS>,
+        _,
+        16,
+        8,
+    >(
+        &setup.config,
+        &setup.air,
+        &mut builder,
+        &verifier_inputs.proof_targets,
+        &verifier_inputs.air_public_targets,
+        &None,
+        &params,
+        Poseidon2Config::BABY_BEAR_D4_W16,
+    )?;
+
+    let circuit = builder.build()?;
+    let mut runner = circuit.runner();
+    let (public_inputs, private_inputs) = verifier_inputs.pack_values(pis, proof, &None);
+    runner
+        .set_public_inputs(&public_inputs)
+        .map_err(VerificationError::Circuit)?;
+    runner
+        .set_private_inputs(&private_inputs)
+        .map_err(VerificationError::Circuit)?;
+
+    // `verify_whir_uni_circuit` emits each commitment's ops contiguously and in
+    // commit order, so the op-id list splits by each commitment's sibling count.
+    let mut offset = 0usize;
+    for round_paths in paths {
+        let count = whir_round_paths_op_count(round_paths);
+        set_whir_mmcs_private_data::<BbF, BbEF, BB_DIGEST_ELEMS>(
+            &mut runner,
+            &op_ids[offset..offset + count],
+            &round_paths.rounds,
+            &round_paths.final_paths,
+            Poseidon2Config::BABY_BEAR_D4_W16,
+        )
+        .map_err(|e| VerificationError::InvalidProofShape(e.to_string()))?;
+        offset += count;
+    }
+    assert_eq!(offset, op_ids.len(), "op-id accounting must be exact");
+
+    runner.run().map_err(VerificationError::Circuit)?;
+    Ok(())
+}
+
+/// A WHIR proof verifies in-circuit with real Merkle path checking.
+#[test]
+fn whir_fibonacci_recursive_verifier_with_mmcs() -> Result<(), VerificationError> {
+    let setup = build_whir_setup(10, vec![4]);
+    let paths = restore_whir_uni_paths(&setup, &setup.proof, &setup.pis);
+    run_whir_recursive_verifier_with_mmcs(&setup, &setup.proof, &setup.pis, &paths)
+}
+
+/// The same round trip at a second arity (stacked N=12) where the final
+/// phase's true folding factor and `final_sumcheck_rounds` do *not* coincide
+/// — the exact arity-coverage gap Step 0's fix closes. Turning on real MMCS
+/// verification is what makes a wrong final-phase shape (rather than just a
+/// desynced transcript) fail loudly here.
+#[test]
+fn whir_fibonacci_recursive_verifier_with_mmcs_at_a_second_arity() -> Result<(), VerificationError>
+{
+    let setup = build_whir_setup(11, vec![4]);
+    let paths = restore_whir_uni_paths(&setup, &setup.proof, &setup.pis);
+    run_whir_recursive_verifier_with_mmcs(&setup, &setup.proof, &setup.pis, &paths)
+}
+
+/// A third arity (stacked N=13), the other one the Step 0 fix's reviewer
+/// specifically identified as exercising the final-phase formula bug.
+#[test]
+fn whir_fibonacci_recursive_verifier_with_mmcs_at_a_third_arity() -> Result<(), VerificationError> {
+    let setup = build_whir_setup(12, vec![4]);
+    let paths = restore_whir_uni_paths(&setup, &setup.proof, &setup.pis);
+    run_whir_recursive_verifier_with_mmcs(&setup, &setup.proof, &setup.pis, &paths)
+}
+
+/// A tampered STIR query leaf must fail the circuit's own Merkle constraints,
+/// with genuine sibling witnesses supplied so only the leaf is wrong.
+///
+/// `p3_uni_stark::Proof` does not implement `Clone`, so this restores the
+/// honest paths first (capturing the honest sibling digests into an
+/// independently-owned `WhirRoundPaths`), then tampers `setup.proof` in
+/// place — the paths used for MMCS verification are therefore genuinely
+/// honest even though the leaf value fed into the same query is not.
+#[test]
+#[should_panic(expected = "WitnessConflict")]
+fn whir_recursive_verifier_rejects_a_tampered_query_leaf() {
+    let mut setup = build_whir_setup(10, vec![4]);
+    let paths = restore_whir_uni_paths(&setup, &setup.proof, &setup.pis);
+
+    match &mut setup.proof.opening_proof.rounds[0].whir.rounds[0].openings {
+        QueryOpenings::Base(opening) => {
+            opening.rows[0][0] += BbF::ONE;
+        }
+        QueryOpenings::Extension(opening) => {
+            opening.rows[0][0] += BbEF::ONE;
+        }
+    }
+    let pis = setup.pis.clone();
+    run_whir_recursive_verifier_with_mmcs(&setup, &setup.proof, &pis, &paths).unwrap();
+}
+
+/// A tampered Merkle sibling digest must fail the circuit's own Merkle
+/// constraints, with an entirely honest proof and honest queried indices —
+/// only the restored sibling chain itself is wrong.
+///
+/// The leaf-tamper test above cannot, on its own, distinguish "the circuit's
+/// Merkle-path check caught this" from "some other, unrelated check happened
+/// to catch it too": a corrupted leaf value also desyncs the arithmetic
+/// values `verify_whir_circuit`'s final consistency check depends on. A
+/// sibling digest, by contrast, is a private input that reaches the circuit
+/// only through Merkle-path verification — it plays no part in any leaf
+/// value, `fold_vals`, or `claimed_eval` computation — so a rejection here
+/// can only come from the circuit's own root-equality connect.
+#[test]
+#[should_panic(expected = "WitnessConflict")]
+fn whir_recursive_verifier_rejects_a_tampered_sibling_digest() {
+    let setup = build_whir_setup(10, vec![4]);
+    let mut paths = restore_whir_uni_paths(&setup, &setup.proof, &setup.pis);
+
+    paths[0].rounds[0][0][0][0] += BbF::ONE;
+
+    run_whir_recursive_verifier_with_mmcs(&setup, &setup.proof, &setup.pis, &paths).unwrap();
+}
+
+/// A tampered trace commitment desynchronises the Fiat-Shamir transcript from
+/// the values the prover used, so a downstream circuit constraint fails —
+/// with in-circuit Merkle verification enabled and genuine sibling witnesses
+/// (restored from the honest proof before the mutation) supplied, so only
+/// the committed root itself is wrong.
+#[test]
+#[should_panic(expected = "WitnessConflict")]
+fn whir_recursive_verifier_rejects_a_tampered_trace_commitment() {
+    let mut setup = build_whir_setup(10, vec![4]);
+    let paths = restore_whir_uni_paths(&setup, &setup.proof, &setup.pis);
+
+    let mut roots = setup.proof.commitments.trace.into_roots();
+    roots[0][0] += BbF::ONE;
+    setup.proof.commitments.trace = roots.into();
+
+    run_whir_recursive_verifier_with_mmcs(&setup, &setup.proof, &setup.pis, &paths).unwrap();
+}
+
+/// A tampered opened trace value breaks the `bound * scale == claimed`
+/// binding that ties the STARK's claim to what the WHIR argument proves,
+/// with in-circuit Merkle verification enabled and genuine sibling witnesses
+/// supplied.
+#[test]
+#[should_panic(expected = "WitnessConflict")]
+fn whir_recursive_verifier_rejects_a_tampered_opened_trace_value() {
+    let mut setup = build_whir_setup(10, vec![4]);
+    let paths = restore_whir_uni_paths(&setup, &setup.proof, &setup.pis);
+
+    setup.proof.opened_values.trace_local[0] += BbEF::ONE;
+
+    run_whir_recursive_verifier_with_mmcs(&setup, &setup.proof, &setup.pis, &paths).unwrap();
+}
+
+/// A tampered bound multilinear value breaks the same binding from the other
+/// side: the proof's own claimed evaluation no longer rescales to the
+/// STARK's opened value.
+#[test]
+#[should_panic(expected = "WitnessConflict")]
+fn whir_recursive_verifier_rejects_a_tampered_bound_eval() {
+    let mut setup = build_whir_setup(10, vec![4]);
+    let paths = restore_whir_uni_paths(&setup, &setup.proof, &setup.pis);
+
+    let batch = &mut setup.proof.opening_proof.rounds[0].evals[0];
+    let mut current = batch.current().to_vec();
+    current[0] += BbEF::ONE;
+    let next = batch.next().to_vec();
+    *batch = p3_sumcheck::OpeningBatch::new(current, next);
+
+    run_whir_recursive_verifier_with_mmcs(&setup, &setup.proof, &setup.pis, &paths).unwrap();
+}
+
+/// A tampered final polynomial breaks WHIR's final consistency identity.
+#[test]
+#[should_panic(expected = "WitnessConflict")]
+fn whir_recursive_verifier_rejects_a_tampered_final_poly() {
+    let mut setup = build_whir_setup(10, vec![4]);
+    let paths = restore_whir_uni_paths(&setup, &setup.proof, &setup.pis);
+
+    setup.proof.opening_proof.rounds[0]
+        .whir
+        .final_poly
+        .as_mut()
+        .expect("final polynomial")
+        .as_mut_slice()[0] += BbEF::ONE;
+
+    run_whir_recursive_verifier_with_mmcs(&setup, &setup.proof, &setup.pis, &paths).unwrap();
+}
+
+/// A tampered sumcheck round polynomial desyncs the transcript from the
+/// values the prover used, so the tamper is caught downstream, at the same
+/// witness slot (confirmed by witness-id comparison) as
+/// `whir_recursive_verifier_rejects_a_tampered_sibling_digest`'s MMCS
+/// root-equality check — not, as the name alone might suggest, an
+/// independent check of the sumcheck's own folded claim.
+#[test]
+#[should_panic(expected = "WitnessConflict")]
+fn whir_recursive_verifier_rejects_a_tampered_sumcheck_round() {
+    let mut setup = build_whir_setup(10, vec![4]);
+    let paths = restore_whir_uni_paths(&setup, &setup.proof, &setup.pis);
+
+    setup.proof.opening_proof.rounds[0]
+        .whir
+        .initial_sumcheck
+        .polynomial_evaluations[0][0] += BbEF::ONE;
+
+    run_whir_recursive_verifier_with_mmcs(&setup, &setup.proof, &setup.pis, &paths).unwrap();
+}
+
+/// Two intermediate WHIR rounds exercise the multi-iteration round loop and
+/// its rolling `prev_cap`, where each round's Merkle root-equality check is
+/// bound against the previous round's own commitment cap rather than the
+/// initial one.
+#[test]
+fn whir_recursive_verifier_two_rounds() -> Result<(), VerificationError> {
+    let setup = build_whir_setup(14, vec![4, 4]);
+    let paths = restore_whir_uni_paths(&setup, &setup.proof, &setup.pis);
+    run_whir_recursive_verifier_with_mmcs(&setup, &setup.proof, &setup.pis, &paths)
+}
+
+/// A tampered query leaf in the second round must still be rejected — though
+/// not necessarily by round 1's own Merkle check specifically: a corrupted
+/// leaf also desyncs the arithmetic values the WHIR argument's final
+/// consistency check depends on, so this alone cannot distinguish that check
+/// from the sibling-digest test below, which isolates it. See that test's
+/// doc comment for the distinction.
+///
+/// `p3_uni_stark::Proof` does not implement `Clone`, so — matching
+/// `whir_recursive_verifier_rejects_a_tampered_query_leaf`'s pattern — the
+/// honest paths are restored first, then `setup.proof` is tampered in place.
+#[test]
+#[should_panic(expected = "WitnessConflict")]
+fn whir_recursive_verifier_two_rounds_rejects_a_tampered_round1_leaf() {
+    let mut setup = build_whir_setup(14, vec![4, 4]);
+    let paths = restore_whir_uni_paths(&setup, &setup.proof, &setup.pis);
+
+    match &mut setup.proof.opening_proof.rounds[0].whir.rounds[1].openings {
+        QueryOpenings::Base(opening) => opening.rows[0][0] += BbF::ONE,
+        QueryOpenings::Extension(opening) => opening.rows[0][0] += BbEF::ONE,
+    }
+    run_whir_recursive_verifier_with_mmcs(&setup, &setup.proof, &setup.pis, &paths).unwrap();
+}
+
+/// A tampered Merkle sibling digest in round 1 must fail the circuit's own
+/// Merkle constraints, with an entirely honest proof and honest queried
+/// indices — only the restored sibling chain itself is wrong.
+///
+/// The leaf-tamper test above cannot, on its own, distinguish "round 1's own
+/// Merkle-path check caught this" from "some other check happened to catch
+/// it too": a corrupted round-1 leaf value also desyncs the arithmetic
+/// values the WHIR argument's final consistency check depends on, so a
+/// leaf-only tamper is rejected even with in-circuit MMCS verification
+/// entirely disabled. A sibling digest, by contrast, is a private input that
+/// reaches the circuit only through Merkle-path verification — it plays no
+/// part in any leaf value, `fold_vals`, or `claimed_eval` computation — so a
+/// rejection here can only come from round 1's own root-equality connect,
+/// mirroring `whir_recursive_verifier_rejects_a_tampered_sibling_digest`'s
+/// round-0 coverage (Task 14) at round 1 instead.
+#[test]
+#[should_panic(expected = "WitnessConflict")]
+fn whir_recursive_verifier_two_rounds_rejects_a_tampered_round1_sibling_digest() {
+    let setup = build_whir_setup(14, vec![4, 4]);
+    let mut paths = restore_whir_uni_paths(&setup, &setup.proof, &setup.pis);
+
+    paths[0].rounds[1][0][0][0] += BbF::ONE;
+
+    run_whir_recursive_verifier_with_mmcs(&setup, &setup.proof, &setup.pis, &paths).unwrap();
+}
+
+mod koala_bear {
+    use p3_circuit::CircuitBuilder;
+    use p3_circuit::ops::{generate_poseidon2_trace, generate_recompose_trace};
+    use p3_circuit::test_utils::{FibonacciAir, generate_trace_rows};
+    use p3_field::PrimeCharacteristicRing;
+    use p3_poseidon2_circuit_air::KoalaBearD4Width16;
+    use p3_recursion::backend::replay_recursion_input_transcript;
+    use p3_recursion::pcs::fri::MerkleCapTargets;
+    use p3_recursion::pcs::set_whir_mmcs_private_data;
+    use p3_recursion::pcs::whir::uni::{
+        WhirUniProofTargets, WhirUniVerifierParams, restore_whir_recursion_paths,
+        whir_round_paths_op_count,
+    };
+    use p3_recursion::public_inputs::StarkVerifierInputsBuilder;
+    use p3_recursion::recursion::RecursionInput;
+    use p3_recursion::{Poseidon2Config, VerificationError, verify_p3_uni_proof_circuit};
+    use p3_sumcheck::layout::{Layout, PrefixProver};
+    use p3_uni_stark::{prove, verify};
+
+    use crate::common::whir_config::{
+        KB_DIGEST_ELEMS, KbEF, KbF, KbMmcs, KbWhirConfig, kb_whir_config, kb_whir_mmcs,
+        kb_whir_perm, kb_whir_protocol_params,
+    };
+
+    /// Full recursive verification over KoalaBear, including its own MMCS paths.
+    #[test]
+    fn whir_fibonacci_recursive_verifier_koala_bear() -> Result<(), VerificationError> {
+        let trace = generate_trace_rows::<KbF>(0, 1, 1 << 10);
+        let pis = vec![KbF::ZERO, KbF::ONE, fibonacci_output(1 << 10)];
+        let air = FibonacciAir {};
+        let config = kb_whir_config(vec![4]);
+        let proof = prove(&config, &air, trace, &pis).unwrap();
+        assert!(verify(&config, &air, &proof, &pis).is_ok());
+
+        let mut builder = CircuitBuilder::new();
+        builder.enable_poseidon2_perm::<KoalaBearD4Width16, _>(
+            generate_poseidon2_trace::<KbEF, KoalaBearD4Width16>,
+            kb_whir_perm(),
+        );
+        builder.enable_recompose::<KbF>(generate_recompose_trace::<KbF, KbEF>);
+
+        let params = WhirUniVerifierParams::<KbF>::new(
+            kb_whir_protocol_params(vec![4]),
+            PrefixProver::<KbF, KbEF>::variable_order(),
+            Poseidon2Config::KOALA_BEAR_D4_W16,
+        )
+        .expect("valid WHIR test configuration");
+
+        let verifier_inputs = StarkVerifierInputsBuilder::<
+            KbWhirConfig,
+            MerkleCapTargets<KbF, KB_DIGEST_ELEMS>,
+            WhirUniProofTargets<KbF, KbEF, KbMmcs, KB_DIGEST_ELEMS>,
+        >::allocate(&mut builder, &proof, None, pis.len());
+
+        let op_ids = verify_p3_uni_proof_circuit::<
+            FibonacciAir,
+            KbWhirConfig,
+            MerkleCapTargets<KbF, KB_DIGEST_ELEMS>,
+            (),
+            WhirUniProofTargets<KbF, KbEF, KbMmcs, KB_DIGEST_ELEMS>,
+            _,
+            16,
+            8,
+        >(
+            &config,
+            &air,
+            &mut builder,
+            &verifier_inputs.proof_targets,
+            &verifier_inputs.air_public_targets,
+            &None,
+            &params,
+            Poseidon2Config::KOALA_BEAR_D4_W16,
+        )?;
+
+        let circuit = builder.build()?;
+        let mut runner = circuit.runner();
+        let (public_inputs, private_inputs) = verifier_inputs.pack_values(&pis, &proof, &None);
+        runner
+            .set_public_inputs(&public_inputs)
+            .map_err(VerificationError::Circuit)?;
+        runner
+            .set_private_inputs(&private_inputs)
+            .map_err(VerificationError::Circuit)?;
+
+        let protocol_params = kb_whir_protocol_params(vec![4]);
+        let recursion_input = RecursionInput::UniStark {
+            proof: &proof,
+            air: &air,
+            public_inputs: pis,
+            preprocessed_commit: None,
+        };
+        let transcript = replay_recursion_input_transcript(&config, &recursion_input, &[])?;
+        let paths = restore_whir_recursion_paths::<KbWhirConfig, _, _, _, _, _, KB_DIGEST_ELEMS>(
+            &kb_whir_mmcs(),
+            transcript,
+            &proof.opening_proof,
+            &protocol_params,
+            4,
+            PrefixProver::<KbF, KbEF>::variable_order(),
+        )?;
+        let mut offset = 0;
+        for round_paths in &paths {
+            let count = whir_round_paths_op_count(round_paths);
+            set_whir_mmcs_private_data::<KbF, KbEF, KB_DIGEST_ELEMS>(
+                &mut runner,
+                &op_ids[offset..offset + count],
+                &round_paths.rounds,
+                &round_paths.final_paths,
+                Poseidon2Config::KOALA_BEAR_D4_W16,
+            )
+            .map_err(|error| VerificationError::InvalidProofShape(error.to_string()))?;
+            offset += count;
+        }
+        assert_eq!(offset, op_ids.len());
+        runner.run().map_err(VerificationError::Circuit)?;
+        Ok(())
+    }
+
+    /// The value [`generate_trace_rows::<KbF>(0, 1, n)`]'s last row claims as
+    /// its output, i.e. `F(n)` for the sequence started at `F(0) = 0`,
+    /// `F(1) = 1`, over `KbF`.
+    fn fibonacci_output(n: usize) -> KbF {
+        let (mut a, mut b) = (KbF::ZERO, KbF::ONE);
+        for _ in 1..n {
+            let next = a + b;
+            a = b;
+            b = next;
+        }
+        b
+    }
+}

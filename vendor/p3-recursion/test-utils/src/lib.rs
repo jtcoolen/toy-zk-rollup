@@ -1,0 +1,700 @@
+//! Test utilities for Plonky3 recursion crates.
+
+#![no_std]
+
+extern crate alloc;
+
+pub mod corpus;
+pub mod rejection_oracle;
+
+use core::marker::PhantomData;
+
+/// Maximum allowed constraint degree for AIR constraints.
+pub const MAX_TEST_CONSTRAINT_DEGREE: usize = 3;
+
+/// Scalar FRI parameters matching [`FriParameters::new_testing`] with `log_final_poly_len = 0`.
+///
+/// Tests that need `FriVerifierParams` cannot get them from a `p3-test-utils` helper, because
+/// `FriVerifierParams` lives in `p3-recursion`, which already depends on `p3-test-utils` (a
+/// dependency cycle). This struct lets such tests derive `FriVerifierParams` from a single
+/// canonical source without rebuilding the MMCS/PCS wiring.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TestFriScalars {
+    pub log_blowup: usize,
+    pub log_final_poly_len: usize,
+    pub max_log_arity: usize,
+    pub commit_pow_bits: usize,
+    pub query_pow_bits: usize,
+    pub num_queries: usize,
+}
+
+/// Returns the [`TestFriScalars`] used by the `make_test_config` helpers, read back from
+/// [`FriParameters::new_testing`] so the two never drift.
+pub const fn test_fri_scalars() -> TestFriScalars {
+    let params = FriParameters::<()>::new_testing((), 0);
+    TestFriScalars {
+        log_blowup: params.log_blowup,
+        log_final_poly_len: params.log_final_poly_len,
+        max_log_arity: params.max_log_arity,
+        commit_pow_bits: params.commit_proof_of_work_bits,
+        query_pow_bits: params.query_proof_of_work_bits,
+        num_queries: params.num_queries,
+    }
+}
+
+pub use p3_challenger::DuplexChallenger;
+pub use p3_commit::ExtensionMmcs;
+pub use p3_dft::Radix2DitParallel;
+pub use p3_field::extension::BinomialExtensionField;
+use p3_field::extension::{QuinticTrinomialExtendable, QuinticTrinomialExtensionField};
+pub use p3_field::{BasedVectorSpace, Field, PrimeCharacteristicRing};
+pub use p3_fri::{FriParameters, TwoAdicFriPcs};
+pub use p3_lookup::Lookups;
+pub use p3_merkle_tree::MerkleTreeMmcs;
+use p3_symmetric::Permutation;
+pub use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
+pub use p3_uni_stark::StarkConfig;
+
+/// Lifts a base-field permutation to [`QuinticTrinomialExtensionField`] lanes: each lane is
+/// permuted by reading its constant basis coefficient, applying the inner permutation on base
+/// field words, then re-embedding with only that coefficient nonzero.
+#[derive(Clone)]
+pub struct LiftPermToQuintic<F, P, const W: usize> {
+    perm: P,
+    _base: PhantomData<F>,
+}
+
+impl<F, P, const W: usize> LiftPermToQuintic<F, P, W> {
+    #[inline]
+    pub const fn new(perm: P) -> Self {
+        Self {
+            perm,
+            _base: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn into_inner(self) -> P {
+        self.perm
+    }
+}
+
+impl<F, P, const W: usize> Permutation<[QuinticTrinomialExtensionField<F>; W]>
+    for LiftPermToQuintic<F, P, W>
+where
+    F: PrimeCharacteristicRing + QuinticTrinomialExtendable,
+    P: Permutation<[F; W]>,
+{
+    fn permute(
+        &self,
+        input: [QuinticTrinomialExtensionField<F>; W],
+    ) -> [QuinticTrinomialExtensionField<F>; W] {
+        let bases: [F; W] = core::array::from_fn(|i| {
+            <QuinticTrinomialExtensionField<F> as BasedVectorSpace<F>>::as_basis_coefficients_slice(
+                &input[i],
+            )[0]
+        });
+        let out = self.perm.permute(bases);
+        core::array::from_fn(|i| {
+            QuinticTrinomialExtensionField::new([out[i], F::ZERO, F::ZERO, F::ZERO, F::ZERO])
+        })
+    }
+}
+
+/// Macro to generate a constraint degree test for an AIR.
+///
+/// Usage: `assert_air_constraint_degree!(air, "AirName");`
+#[macro_export]
+macro_rules! assert_air_constraint_degree {
+    ($air:expr, $air_name:expr) => {{
+        use p3_air::{AirLayout, BaseAir};
+        use p3_batch_stark::symbolic::get_symbolic_constraints;
+        use p3_lookup::Lookups;
+        use p3_lookup::logup::LogUpGadget;
+
+        type F = p3_baby_bear::BabyBear;
+        type EF = p3_field::extension::BinomialExtensionField<F, 4>;
+        let air = $air;
+
+        let preprocessed_width = air.preprocessed_trace().map(|m| m.width()).unwrap_or(0);
+        let lookups: Lookups<F> = Lookups::from_air::<EF, _>(&air);
+        let lookup_gadget = LogUpGadget::new();
+        let layout = AirLayout {
+            preprocessed_width,
+            main_width: BaseAir::<F>::width(&air),
+            num_public_values: BaseAir::<F>::num_public_values(&air),
+            permutation_width: 0,
+            num_permutation_challenges: 0,
+            num_permutation_values: 0,
+            num_periodic_columns: 0,
+        };
+
+        let (base_constraints, extension_constraints) =
+            get_symbolic_constraints::<F, EF, _, _>(&air, layout, &lookups, &lookup_gadget);
+
+        for (i, constraint) in base_constraints.iter().enumerate() {
+            let degree = constraint.degree_multiple();
+            assert!(
+                degree <= $crate::MAX_TEST_CONSTRAINT_DEGREE,
+                "{} base constraint {} has degree {} which exceeds maximum of {}",
+                $air_name,
+                i,
+                degree,
+                $crate::MAX_TEST_CONSTRAINT_DEGREE
+            );
+        }
+
+        for (i, constraint) in extension_constraints.iter().enumerate() {
+            let degree = constraint.degree_multiple();
+            assert!(
+                degree <= $crate::MAX_TEST_CONSTRAINT_DEGREE,
+                "{} extension constraint {} has degree {} which exceeds maximum of {}",
+                $air_name,
+                i,
+                degree,
+                $crate::MAX_TEST_CONSTRAINT_DEGREE
+            );
+        }
+    }};
+}
+
+/// Single-AIR satisfaction helpers for **local AIR constraints only**.
+///
+/// These helpers call `air.eval` with empty permutation/challenge data. They do not construct or
+/// validate the global lookup multiset and therefore do **not** validate lookup/CTL balance.
+pub mod air_satisfaction {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    use p3_air::{Air, BaseAir, DebugConstraintBuilder};
+    use p3_field::{ExtensionField, Field};
+    use p3_matrix::Matrix;
+    use p3_matrix::dense::{RowMajorMatrix, RowMajorMatrixView};
+    use p3_matrix::stack::ViewPair;
+
+    /// Evaluate the AIR constraints for one row. Returns `Some(failures)` if the row
+    /// violates any constraint, `None` if it satisfies all of them.
+    fn eval_air_row<F, EF, A>(
+        air: &A,
+        main: &RowMajorMatrix<F>,
+        preprocessed: &Option<RowMajorMatrix<F>>,
+        public_values: &[F],
+        row: usize,
+        height: usize,
+    ) -> Option<String>
+    where
+        F: Field,
+        EF: ExtensionField<F>,
+        A: for<'a> Air<DebugConstraintBuilder<'a, F, EF>>,
+    {
+        let next = (row + 1) % height;
+        let local = main.row_slice(row).unwrap();
+        let next_row = main.row_slice(next).unwrap();
+        let main_pair = ViewPair::new(
+            RowMajorMatrixView::new_row(&*local),
+            RowMajorMatrixView::new_row(&*next_row),
+        );
+
+        let (prep_local, prep_next) = preprocessed.as_ref().map_or((None, None), |p| {
+            (
+                Some(p.row_slice(row).unwrap()),
+                Some(p.row_slice(next).unwrap()),
+            )
+        });
+        let prep_pair = match (prep_local.as_ref(), prep_next.as_ref()) {
+            (Some(l), Some(n)) => ViewPair::new(
+                RowMajorMatrixView::new_row(&**l),
+                RowMajorMatrixView::new_row(&**n),
+            ),
+            _ => ViewPair::new(
+                RowMajorMatrixView::new(&[], 0),
+                RowMajorMatrixView::new(&[], 0),
+            ),
+        };
+
+        let periodic_row = air.periodic_values(row);
+        let perm_pair = ViewPair::<EF>::new(
+            RowMajorMatrixView::new(&[], 0),
+            RowMajorMatrixView::new(&[], 0),
+        );
+        let mut builder = DebugConstraintBuilder::<F, EF>::new_with_permutation(
+            row,
+            main_pair,
+            prep_pair,
+            public_values,
+            F::from_bool(row == 0),
+            F::from_bool(row == height - 1),
+            F::from_bool(row != height - 1),
+            perm_pair,
+            &[],
+            &[],
+            &periodic_row,
+        );
+        air.eval(&mut builder);
+        builder.has_failures().then(|| builder.formatted_failures())
+    }
+
+    /// Run `air.eval` on every (row, row_next) pair and return the first row that violates a
+    /// constraint, together with the formatted failure list.
+    pub fn check_air_satisfies<F, EF, A>(
+        air: &A,
+        main: &RowMajorMatrix<F>,
+        public_values: &[F],
+    ) -> Result<(), (usize, String)>
+    where
+        F: Field,
+        EF: ExtensionField<F>,
+        A: BaseAir<F> + for<'a> Air<DebugConstraintBuilder<'a, F, EF>>,
+    {
+        let height = main.height();
+        let preprocessed = air.preprocessed_trace();
+
+        if let Some(prep) = preprocessed.as_ref() {
+            assert_eq!(
+                prep.height(),
+                height,
+                "preprocessed height ({}) must match main height ({})",
+                prep.height(),
+                height
+            );
+        }
+
+        for row in 0..height {
+            if let Some(failures) =
+                eval_air_row::<F, EF, A>(air, main, &preprocessed, public_values, row, height)
+            {
+                return Err((row, failures));
+            }
+        }
+        Ok(())
+    }
+
+    /// Panicking convenience wrapper for satisfying-trace tests.
+    pub fn assert_air_satisfies<F, EF, A>(air: &A, main: &RowMajorMatrix<F>)
+    where
+        F: Field,
+        EF: ExtensionField<F>,
+        A: BaseAir<F> + for<'a> Air<DebugConstraintBuilder<'a, F, EF>>,
+    {
+        if let Err((row, failures)) = check_air_satisfies::<F, EF, A>(air, main, &[]) {
+            panic!("AIR constraint failed at row {row}: {failures}");
+        }
+    }
+
+    /// Asserts that the AIR's `eval` rejects the given main trace on at least one row. Used
+    /// for soundness tests where the trace is intentionally invalid.
+    pub fn assert_air_rejects<F, EF, A>(air: &A, main: &RowMajorMatrix<F>)
+    where
+        F: Field,
+        EF: ExtensionField<F>,
+        A: BaseAir<F> + for<'a> Air<DebugConstraintBuilder<'a, F, EF>>,
+    {
+        let height = main.height();
+        let preprocessed = air.preprocessed_trace();
+        let mut rendered: Vec<(usize, String)> = Vec::new();
+
+        for row in 0..height {
+            if let Some(failures) =
+                eval_air_row::<F, EF, A>(air, main, &preprocessed, &[], row, height)
+            {
+                rendered.push((row, failures));
+            }
+        }
+
+        assert!(
+            !rendered.is_empty(),
+            "expected at least one constraint failure on the invalid trace, but every row satisfied the AIR ({} rows, formatted: {rendered:?})",
+            height
+        );
+    }
+}
+
+/// Common parameters for the BabyBear field.
+pub mod baby_bear_params {
+    pub use p3_baby_bear::{BabyBear, Poseidon2BabyBear, default_babybear_poseidon2_16};
+
+    pub use super::*;
+
+    pub type F = BabyBear;
+    pub const D: usize = 4;
+    pub const WIDTH: usize = 16;
+    pub const RATE: usize = 8;
+    pub const DIGEST_ELEMS: usize = 8;
+    pub type Challenge = BinomialExtensionField<F, D>;
+    pub type Dft = Radix2DitParallel<F>;
+    pub type Perm = Poseidon2BabyBear<WIDTH>;
+    pub type MyHash = PaddingFreeSponge<Perm, WIDTH, RATE, DIGEST_ELEMS>;
+    pub type MyCompress = TruncatedPermutation<Perm, 2, DIGEST_ELEMS, WIDTH>;
+    pub type MyMmcs = MerkleTreeMmcs<
+        <F as Field>::Packing,
+        <F as Field>::Packing,
+        MyHash,
+        MyCompress,
+        2,
+        DIGEST_ELEMS,
+    >;
+    pub type ChallengeMmcs = ExtensionMmcs<F, Challenge, MyMmcs>;
+    pub type Challenger = DuplexChallenger<F, Perm, WIDTH, RATE>;
+    pub type MyPcs = TwoAdicFriPcs<F, Dft, MyMmcs, ChallengeMmcs>;
+    pub type MyConfig = StarkConfig<MyPcs, Challenge, Challenger>;
+
+    /// The FRI instance [`make_test_config`] commits with: the base-field Merkle MMCS and the
+    /// FRI parameters built over it.
+    ///
+    /// Restoring the per-query Merkle paths a pruned FRI proof shares needs both, and they are
+    /// not reachable through [`MyConfig`], so they are built here once for both users.
+    pub fn test_fri_instance() -> (MyMmcs, FriParameters<ChallengeMmcs>) {
+        let perm = default_babybear_poseidon2_16();
+        let val_mmcs = MyMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm), 0);
+        let fri_params = FriParameters::new_testing(ChallengeMmcs::new(val_mmcs.clone()), 0);
+        (val_mmcs, fri_params)
+    }
+
+    /// Builds the standard test `MyConfig` (testing FRI params, default permutation).
+    pub fn make_test_config() -> MyConfig {
+        let (val_mmcs, fri_params) = test_fri_instance();
+        let pcs = MyPcs::new(Dft::default(), val_mmcs, fri_params);
+        MyConfig::new(pcs, Challenger::new(default_babybear_poseidon2_16()))
+    }
+}
+
+/// Common parameters for the KoalaBear field.
+pub mod koala_bear_params {
+    pub use p3_koala_bear::{KoalaBear, Poseidon2KoalaBear, default_koalabear_poseidon2_16};
+
+    pub use super::*;
+
+    pub type F = KoalaBear;
+    pub const D: usize = 4;
+    pub const WIDTH: usize = 16;
+    pub const RATE: usize = 8;
+    pub const DIGEST_ELEMS: usize = 8;
+
+    pub type Challenge = BinomialExtensionField<F, D>;
+    pub type Dft = Radix2DitParallel<F>;
+    pub type Perm = Poseidon2KoalaBear<WIDTH>;
+    pub type MyHash = PaddingFreeSponge<Perm, WIDTH, RATE, DIGEST_ELEMS>;
+    pub type MyCompress = TruncatedPermutation<Perm, 2, DIGEST_ELEMS, WIDTH>;
+    pub type MyMmcs = MerkleTreeMmcs<
+        <F as Field>::Packing,
+        <F as Field>::Packing,
+        MyHash,
+        MyCompress,
+        2,
+        DIGEST_ELEMS,
+    >;
+    pub type ChallengeMmcs = ExtensionMmcs<F, Challenge, MyMmcs>;
+    pub type Challenger = DuplexChallenger<F, Perm, WIDTH, RATE>;
+    pub type MyPcs = TwoAdicFriPcs<F, Dft, MyMmcs, ChallengeMmcs>;
+    pub type MyConfig = StarkConfig<MyPcs, Challenge, Challenger>;
+
+    /// The FRI instance [`make_test_config`] commits with: the base-field Merkle MMCS and the
+    /// FRI parameters built over it.
+    ///
+    /// Restoring the per-query Merkle paths a pruned FRI proof shares needs both, and they are
+    /// not reachable through [`MyConfig`], so they are built here once for both users.
+    pub fn test_fri_instance() -> (MyMmcs, FriParameters<ChallengeMmcs>) {
+        let perm = default_koalabear_poseidon2_16();
+        let val_mmcs = MyMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm), 0);
+        let fri_params = FriParameters::new_testing(ChallengeMmcs::new(val_mmcs.clone()), 0);
+        (val_mmcs, fri_params)
+    }
+
+    /// Counterpart of [`test_fri_instance`] for [`make_test_config_with_pow_bits`].
+    pub fn test_fri_instance_with_pow_bits(
+        pow_bits: usize,
+    ) -> (MyMmcs, FriParameters<ChallengeMmcs>) {
+        let (val_mmcs, fri_params) = test_fri_instance();
+        (
+            val_mmcs,
+            FriParameters {
+                batch_proof_of_work_bits: 0,
+                commit_proof_of_work_bits: pow_bits,
+                query_proof_of_work_bits: pow_bits,
+                ..fri_params
+            },
+        )
+    }
+
+    /// Counterpart of [`test_fri_instance`] for [`make_test_config_with_fri`].
+    pub fn test_fri_instance_with_fri(
+        perm: &Perm,
+        log_blowup: usize,
+        max_log_arity: usize,
+    ) -> (MyMmcs, FriParameters<ChallengeMmcs>) {
+        let query_proof_of_work_bits = 16;
+        let num_queries = (100 - query_proof_of_work_bits) / log_blowup;
+        let val_mmcs = MyMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 0);
+        let fri_params = FriParameters {
+            max_log_arity,
+            log_blowup,
+            log_final_poly_len: 0,
+            num_queries,
+            batch_proof_of_work_bits: 0,
+            commit_proof_of_work_bits: 0,
+            query_proof_of_work_bits,
+            mmcs: ChallengeMmcs::new(val_mmcs.clone()),
+        };
+        (val_mmcs, fri_params)
+    }
+
+    /// Builds the standard test `MyConfig` (testing FRI params, default permutation).
+    pub fn make_test_config() -> MyConfig {
+        let (val_mmcs, fri_params) = test_fri_instance();
+        let pcs = MyPcs::new(Dft::default(), val_mmcs, fri_params);
+        MyConfig::new(pcs, Challenger::new(default_koalabear_poseidon2_16()))
+    }
+
+    /// Builds a test `MyConfig` matching [`FriParameters::new_testing`]'s shape but with
+    /// `pow_bits` applied to both `commit_proof_of_work_bits` and `query_proof_of_work_bits`.
+    /// Used by tests that need a deterministic `grind` (e.g. `pow_bits = 0`), such as ones that
+    /// compare two independently-produced proofs byte-for-byte.
+    pub fn make_test_config_with_pow_bits(pow_bits: usize) -> MyConfig {
+        let (val_mmcs, fri_params) = test_fri_instance_with_pow_bits(pow_bits);
+        let pcs = MyPcs::new(Dft::default(), val_mmcs, fri_params);
+        MyConfig::new(pcs, Challenger::new(default_koalabear_poseidon2_16()))
+    }
+
+    /// Builds a test `MyConfig` with an explicit FRI shape (`log_blowup`, `max_log_arity`),
+    /// reusing `perm` for the Fiat-Shamir challenger. Used for aggregation tests that mix
+    /// proofs with different FRI shapes.
+    pub fn make_test_config_with_fri(
+        perm: &Perm,
+        log_blowup: usize,
+        max_log_arity: usize,
+    ) -> MyConfig {
+        let (val_mmcs, fri_params) = test_fri_instance_with_fri(perm, log_blowup, max_log_arity);
+        let pcs = MyPcs::new(Dft::default(), val_mmcs, fri_params);
+        MyConfig::new(pcs, Challenger::new(perm.clone()))
+    }
+}
+
+/// KoalaBear with quintic trinomial challenge field (`D = 5`).
+pub mod koala_bear_quintic_params {
+    pub use p3_field::extension::QuinticTrinomialExtensionField;
+    pub use p3_koala_bear::{KoalaBear, Poseidon2KoalaBear, default_koalabear_poseidon2_16};
+
+    pub use super::*;
+
+    pub type F = KoalaBear;
+    pub const D: usize = 5;
+    pub const WIDTH: usize = 16;
+    pub const RATE: usize = 8;
+    pub const DIGEST_ELEMS: usize = 8;
+
+    pub type Challenge = QuinticTrinomialExtensionField<F>;
+    pub type Dft = Radix2DitParallel<F>;
+    pub type Perm = Poseidon2KoalaBear<WIDTH>;
+    pub type MyHash = PaddingFreeSponge<Perm, WIDTH, RATE, DIGEST_ELEMS>;
+    pub type MyCompress = TruncatedPermutation<Perm, 2, DIGEST_ELEMS, WIDTH>;
+    pub type MyMmcs = MerkleTreeMmcs<
+        <F as Field>::Packing,
+        <F as Field>::Packing,
+        MyHash,
+        MyCompress,
+        2,
+        DIGEST_ELEMS,
+    >;
+    pub type ChallengeMmcs = ExtensionMmcs<F, Challenge, MyMmcs>;
+    pub type Challenger = DuplexChallenger<F, Perm, WIDTH, RATE>;
+    pub type MyPcs = TwoAdicFriPcs<F, Dft, MyMmcs, ChallengeMmcs>;
+    pub type MyConfig = StarkConfig<MyPcs, Challenge, Challenger>;
+
+    /// Base Poseidon2 permutation lifted to act on [`Challenge`] lanes (constant term only).
+    pub type LiftKoalaPermForQuintic = super::LiftPermToQuintic<F, Perm, WIDTH>;
+
+    /// The FRI instance [`make_test_config`] commits with: the base-field Merkle MMCS and the
+    /// FRI parameters built over it.
+    ///
+    /// Restoring the per-query Merkle paths a pruned FRI proof shares needs both, and they are
+    /// not reachable through [`MyConfig`], so they are built here once for both users.
+    pub fn test_fri_instance() -> (MyMmcs, FriParameters<ChallengeMmcs>) {
+        let perm = default_koalabear_poseidon2_16();
+        let val_mmcs = MyMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm), 0);
+        let fri_params = FriParameters::new_testing(ChallengeMmcs::new(val_mmcs.clone()), 0);
+        (val_mmcs, fri_params)
+    }
+
+    /// Builds the standard test `MyConfig` (testing FRI params, default permutation).
+    pub fn make_test_config() -> MyConfig {
+        let (val_mmcs, fri_params) = test_fri_instance();
+        let pcs = MyPcs::new(Dft::default(), val_mmcs, fri_params);
+        MyConfig::new(pcs, Challenger::new(default_koalabear_poseidon2_16()))
+    }
+}
+
+/// Common parameters for the Goldilocks field.
+pub mod goldilocks_params {
+    pub use p3_goldilocks::{Goldilocks, Poseidon2Goldilocks};
+
+    pub use super::*;
+
+    pub type F = Goldilocks;
+    pub const D: usize = 2;
+    pub const WIDTH: usize = 8;
+    pub const RATE: usize = 4;
+    pub const DIGEST_ELEMS: usize = 4;
+
+    pub type Challenge = BinomialExtensionField<F, D>;
+    pub type Dft = Radix2DitParallel<F>;
+    pub type Perm = Poseidon2Goldilocks<WIDTH>;
+    pub type MyHash = PaddingFreeSponge<Perm, WIDTH, RATE, DIGEST_ELEMS>;
+    pub type MyCompress = TruncatedPermutation<Perm, 2, DIGEST_ELEMS, WIDTH>;
+    pub type MyMmcs = MerkleTreeMmcs<
+        <F as Field>::Packing,
+        <F as Field>::Packing,
+        MyHash,
+        MyCompress,
+        2,
+        DIGEST_ELEMS,
+    >;
+    pub type ChallengeMmcs = ExtensionMmcs<F, Challenge, MyMmcs>;
+    pub type Challenger = DuplexChallenger<F, Perm, WIDTH, RATE>;
+    pub type MyPcs = TwoAdicFriPcs<F, Dft, MyMmcs, ChallengeMmcs>;
+    pub type MyConfig = StarkConfig<MyPcs, Challenge, Challenger>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- TestFriScalars ---
+
+    #[test]
+    fn test_fri_scalars_log_blowup_positive() {
+        assert!(test_fri_scalars().log_blowup > 0);
+    }
+
+    #[test]
+    fn test_fri_scalars_query_pow_bits_nonzero() {
+        assert!(test_fri_scalars().query_pow_bits > 0);
+    }
+
+    #[test]
+    fn test_fri_scalars_is_copy() {
+        let a = test_fri_scalars();
+        let _b = a;
+        let _c = a;
+    }
+
+    #[test]
+    fn test_fri_scalars_eq() {
+        assert_eq!(test_fri_scalars(), test_fri_scalars());
+    }
+
+    #[test]
+    fn test_fri_scalars_debug() {
+        let s = alloc::format!("{:?}", test_fri_scalars());
+        assert!(!s.is_empty());
+    }
+
+    // --- LiftPermToQuintic ---
+
+    #[test]
+    fn test_lift_perm_into_inner_roundtrip() {
+        let perm = koala_bear_quintic_params::default_koalabear_poseidon2_16();
+        let lifted: koala_bear_quintic_params::LiftKoalaPermForQuintic =
+            LiftPermToQuintic::new(perm);
+        let _ = lifted.into_inner();
+    }
+
+    #[test]
+    fn test_lift_perm_new_does_not_panic() {
+        let perm = koala_bear_quintic_params::default_koalabear_poseidon2_16();
+        let _lifted: koala_bear_quintic_params::LiftKoalaPermForQuintic =
+            LiftPermToQuintic::new(perm);
+    }
+}
+
+/// Common parameters for the characteristic-2 fields and byte-oriented hashes of Plonky3 0.7/0.8.
+///
+/// The binary tower `GF(2) ⊂ … ⊂ GF(2^128)` has no Poseidon instance, so its commitments and
+/// transcripts hash bytes: a Merkle tree serializes each row, hashes it with a 32-byte hash, and
+/// compresses node pairs with the same hash, while [`BinaryChallenger`] observes and samples field
+/// elements as raw bit patterns over a byte transcript (no rejection sampling is needed, since
+/// every bit pattern is an element). This mirrors the configuration `p3-binary-pcs` tests with.
+///
+/// Each hash gets its own submodule with the same item names, so a test can swap Keccak-256 for
+/// BLAKE3 by changing one `use`.
+pub mod binary_field_params {
+    pub use p3_binary_field::{
+        BinaryChallenger, BinaryField8, BinaryField16, BinaryField32, BinaryField64,
+        BinaryField128, Gf2, Ghash128, TowerLevel,
+    };
+
+    /// The widest tower level, the field binary proofs draw their challenges from.
+    pub type F = BinaryField128;
+    /// Bytes per digest of every binary hash here.
+    pub const DIGEST_BYTES: usize = 32;
+
+    macro_rules! byte_hash_params {
+        ($(#[$doc:meta])* $module:ident, $hash:ty, $hash_value:expr) => {
+            $(#[$doc])*
+            pub mod $module {
+                use alloc::vec::Vec;
+
+                use p3_challenger::HashChallenger;
+                use p3_merkle_tree::MerkleTreeMmcs;
+                use p3_symmetric::{CompressionFunctionFromHasher, SerializingHasher};
+
+                use super::{BinaryChallenger, DIGEST_BYTES, F};
+
+                /// The byte hash itself.
+                pub type ByteHash = $hash;
+                /// Leaf hasher: serializes a row of field elements to bytes and hashes them.
+                pub type FieldHash = SerializingHasher<ByteHash>;
+                /// Node compression: hashes the concatenation of two child digests.
+                pub type Compress = CompressionFunctionFromHasher<ByteHash, 2, DIGEST_BYTES>;
+                /// Binary Merkle commitment over matrices of tower level `L`.
+                pub type LevelMmcs<L> =
+                    MerkleTreeMmcs<L, u8, FieldHash, Compress, 2, DIGEST_BYTES>;
+                /// Binary Merkle commitment over matrices of [`F`].
+                pub type Mmcs = LevelMmcs<F>;
+                /// Fiat-Shamir transcript over tower level `L`, backed by a byte transcript.
+                pub type LevelChallenger<L> =
+                    BinaryChallenger<L, HashChallenger<u8, ByteHash, DIGEST_BYTES>>;
+                /// Fiat-Shamir transcript over [`F`].
+                pub type Challenger = LevelChallenger<F>;
+
+                /// The byte hash instance.
+                pub const fn byte_hash() -> ByteHash {
+                    $hash_value
+                }
+
+                /// A Merkle commitment over tower level `L` with a single-root cap.
+                pub const fn level_mmcs<L>() -> LevelMmcs<L> {
+                    LevelMmcs::new(FieldHash::new(byte_hash()), Compress::new(byte_hash()), 0)
+                }
+
+                /// A Merkle commitment over [`F`] with a single-root cap.
+                pub const fn mmcs() -> Mmcs {
+                    level_mmcs::<F>()
+                }
+
+                /// A fresh transcript over tower level `L` with an empty initial state.
+                pub const fn level_challenger<L>() -> LevelChallenger<L> {
+                    LevelChallenger::from_hasher(Vec::new(), byte_hash())
+                }
+
+                /// A fresh transcript over [`F`] with an empty initial state.
+                pub const fn challenger() -> Challenger {
+                    level_challenger::<F>()
+                }
+            }
+        };
+    }
+
+    byte_hash_params!(
+        /// Keccak-256 commitments and transcripts over the binary tower.
+        keccak,
+        p3_keccak::Keccak256Hash,
+        p3_keccak::Keccak256Hash
+    );
+
+    byte_hash_params!(
+        /// BLAKE3 commitments and transcripts over the binary tower.
+        blake3,
+        p3_blake3::Blake3,
+        p3_blake3::Blake3
+    );
+}

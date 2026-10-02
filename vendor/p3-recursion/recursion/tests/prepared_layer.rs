@@ -1,0 +1,1067 @@
+mod common;
+
+#[path = "../examples/common/prepared_reuse.rs"]
+mod example_prepared_reuse;
+
+use std::sync::Arc;
+
+use common::whir_config::{BbEF, BbF, BbWhirConfig, bb_whir_config};
+use example_prepared_reuse::is_prepared_input_mismatch;
+use p3_circuit::test_utils::{FibonacciAir, generate_trace_rows};
+use p3_circuit::{CircuitBuilder, StatementExport};
+use p3_circuit_prover::batch_stark_prover::{
+    BatchStarkProver, StatementAirBuilder, StatementPreprocessor, StatementProver,
+};
+use p3_circuit_prover::common::{NpoAirBuilder, NpoPreprocessor};
+use p3_circuit_prover::{ConstraintProfile, TablePacking};
+use p3_field::PrimeCharacteristicRing;
+use p3_matrix::Matrix;
+use p3_recursion::backend::whir::{WhirRecursionBackend, WhirRecursionBackendForExt};
+use p3_recursion::profile::{HashProfile, RecursionLayerProfile, TranscriptKind};
+use p3_recursion::{
+    BatchOnly, Poseidon2Config, PreparedInput, PreparedLayer, PreparedSource, ProveNextLayerParams,
+    RecursionInput, RecursionOutput, TrustedPreparedInput, TrustedPreparedLayer,
+    TrustedPreparedSource, VerificationError, build_and_prove_next_layer,
+};
+use p3_test_utils::koala_bear_params::{Challenge, F};
+use p3_uni_stark::{
+    prove, prove_with_preprocessed, setup_preprocessed, verify, verify_with_preprocessed,
+};
+
+fn fibonacci_output<Fld: PrimeCharacteristicRing + Copy>(
+    start_a: u64,
+    start_b: u64,
+    n: usize,
+) -> Fld {
+    let mut a = Fld::from_u64(start_a);
+    let mut b = Fld::from_u64(start_b);
+    if n == 0 {
+        return a;
+    }
+    for _ in 1..n {
+        let next = a + b;
+        a = b;
+        b = next;
+    }
+    b
+}
+
+fn assert_preprocessing_is_retained<SC>(output: &RecursionOutput<SC>)
+where
+    SC: p3_uni_stark::StarkGenericConfig,
+    <SC::Pcs as p3_commit::Pcs<SC::Challenge, SC::Challenger>>::Commitment: PartialEq,
+{
+    assert!(
+        output
+            .0
+            .stark_common
+            .preprocessed
+            .as_ref()
+            .map(|data| &data.commitment)
+            == output
+                .1
+                .common_data()
+                .preprocessed
+                .as_ref()
+                .map(|data| &data.commitment)
+    );
+}
+
+fn verify_fri_output(
+    config: &common::KoalaBearD4RecursionConfig,
+    params: &ProveNextLayerParams,
+    output: &RecursionOutput<common::KoalaBearD4RecursionConfig>,
+) {
+    let mut verifier =
+        BatchStarkProver::new(config.clone()).with_table_packing(params.table_packing.clone());
+    verifier.register_poseidon2_table::<4>(
+        Poseidon2Config::KOALA_BEAR_D4_W16.for_shared_challenger_table(),
+    );
+    verifier.register_recompose_table::<4>(true);
+    verifier
+        .verify_all_tables::<Challenge>(&output.0)
+        .expect("the recursive proof verifies");
+
+    // The output manifest is now the single shared physical identity. A verifier configured with
+    // the historical separated challenger/ordinary identities must reject that real proof rather
+    // than silently accepting a count/order mismatch.
+    let mut legacy_verifier =
+        BatchStarkProver::new(config.clone()).with_table_packing(params.table_packing.clone());
+    legacy_verifier
+        .register_poseidon2_table::<4>(Poseidon2Config::KOALA_BEAR_D4_W16.for_challenger());
+    legacy_verifier.register_poseidon2_table::<4>(Poseidon2Config::KOALA_BEAR_D4_W16);
+    legacy_verifier.register_recompose_table::<4>(true);
+    assert!(
+        legacy_verifier
+            .verify_all_tables::<Challenge>(&output.0)
+            .is_err()
+    );
+    assert_preprocessing_is_retained(output);
+}
+
+fn verify_whir_output(
+    config: &BbWhirConfig,
+    params: &ProveNextLayerParams,
+    output: &RecursionOutput<BbWhirConfig>,
+) {
+    let mut verifier =
+        BatchStarkProver::new(config.clone()).with_table_packing(params.table_packing.clone());
+    verifier.register_poseidon2_table::<4>(
+        Poseidon2Config::BABY_BEAR_D4_W16.for_shared_challenger_table(),
+    );
+    verifier.register_recompose_table::<4>(true);
+    verifier
+        .verify_all_tables::<BbEF>(&output.0)
+        .expect("the recursive proof verifies");
+
+    let mut legacy_verifier =
+        BatchStarkProver::new(config.clone()).with_table_packing(params.table_packing.clone());
+    legacy_verifier
+        .register_poseidon2_table::<4>(Poseidon2Config::BABY_BEAR_D4_W16.for_challenger());
+    legacy_verifier.register_poseidon2_table::<4>(Poseidon2Config::BABY_BEAR_D4_W16);
+    legacy_verifier.register_recompose_table::<4>(true);
+    assert!(
+        legacy_verifier
+            .verify_all_tables::<BbEF>(&output.0)
+            .is_err()
+    );
+    assert_preprocessing_is_retained(output);
+}
+
+fn build_whir_first_layer(
+    config: &BbWhirConfig,
+    backend: &WhirRecursionBackendForExt<4>,
+    params: &ProveNextLayerParams,
+    start_a: u64,
+    start_b: u64,
+) -> RecursionOutput<BbWhirConfig> {
+    let n = 1 << 10;
+    let air = FibonacciAir {};
+    let pis = vec![
+        BbF::from_u64(start_a),
+        BbF::from_u64(start_b),
+        fibonacci_output::<BbF>(start_a, start_b, n),
+    ];
+    let proof = prove(
+        config,
+        &air,
+        generate_trace_rows::<BbF>(start_a, start_b, n),
+        &pis,
+    )
+    .unwrap();
+    verify(config, &air, &proof, &pis).expect("the native WHIR proof verifies");
+    build_and_prove_next_layer(
+        &RecursionInput::UniStark {
+            proof: &proof,
+            air: &air,
+            public_inputs: pis,
+            preprocessed_commit: None,
+        },
+        config,
+        backend,
+        params,
+    )
+    .expect("the first WHIR recursion layer proves")
+}
+
+#[test]
+fn whir_trusted_batch_statement_replay_uses_each_caller_expected_vector() {
+    let config = bb_whir_config(vec![]);
+    let backend = WhirRecursionBackend::<16, 8>::new(Poseidon2Config::BABY_BEAR_D4_W16)
+        .for_extension_degree::<4>();
+    let mut builder = CircuitBuilder::<BbEF>::new();
+    let first = builder.public_input();
+    let second = builder.public_input();
+    let schema = builder
+        .set_statement_exports::<BbF>(&[
+            StatementExport::Base(first),
+            StatementExport::Base(second),
+        ])
+        .unwrap();
+    let circuit = builder.build().unwrap();
+    let preprocessors: Vec<Box<dyn NpoPreprocessor<BbF>>> =
+        vec![Box::new(StatementPreprocessor::new(schema.clone()))];
+    let air_builders: Vec<Box<dyn NpoAirBuilder<BbWhirConfig, 4>>> =
+        vec![Box::new(StatementAirBuilder::<4>::new(schema.clone()))];
+    let mut child_prover = BatchStarkProver::new(config.clone());
+    child_prover.register_table_prover(Box::new(StatementProver::<4>::new(schema)));
+    let child_prepared = child_prover
+        .prepare_circuit::<BbEF, 4>(
+            &circuit,
+            &preprocessors,
+            &air_builders,
+            ConstraintProfile::Standard,
+        )
+        .unwrap();
+    let prove_child = |statement: [BbF; 2]| {
+        let mut runner = circuit.runner();
+        runner
+            .set_public_inputs(&statement.map(BbEF::from))
+            .unwrap();
+        child_prepared.prove(&runner.run().unwrap()).unwrap()
+    };
+    let first_statement = [BbF::from_u64(7), BbF::from_u64(9)];
+    let second_statement = [BbF::from_u64(11), BbF::from_u64(13)];
+    let first_proof = prove_child(first_statement);
+    let second_proof = prove_child(second_statement);
+    let child_verifier = child_prepared.verifier();
+    let params = ProveNextLayerParams::default();
+    let owner = TrustedPreparedLayer::<BbWhirConfig, BbWhirConfig, BatchOnly, _, 4>::new(
+        TrustedPreparedSource::BatchStark {
+            verifier: child_verifier,
+            proof: &first_proof,
+            statement: &first_statement,
+        },
+        config,
+        backend,
+        params,
+    )
+    .unwrap();
+
+    let first_output = owner
+        .prove(TrustedPreparedInput::BatchStark {
+            proof: &first_proof,
+            statement: &first_statement,
+        })
+        .unwrap();
+    let second_output = owner
+        .prove(TrustedPreparedInput::BatchStark {
+            proof: &second_proof,
+            statement: &second_statement,
+        })
+        .unwrap();
+
+    owner
+        .verifier()
+        .verify(&first_output.0, &first_statement)
+        .unwrap();
+    owner
+        .verifier()
+        .verify(&second_output.0, &second_statement)
+        .unwrap();
+}
+
+#[test]
+fn fri_uni_prepared_layer_reuses_varied_witnesses_after_reference_drop() {
+    let log_n = 10;
+    let n = 1 << log_n;
+    let air = FibonacciAir {};
+    let (config, backend) = common::koala_bear_d4_recursion_config_and_backend();
+    let params = ProveNextLayerParams::default();
+
+    let (prepared, out1) = {
+        let pis = vec![F::ZERO, F::ONE, fibonacci_output::<F>(0, 1, n)];
+        let proof = prove(&config, &air, generate_trace_rows::<F>(0, 1, n), &pis).unwrap();
+        verify(&config, &air, &proof, &pis).expect("the trusted reference proof verifies");
+        let prepared = PreparedLayer::<
+            common::KoalaBearD4RecursionConfig,
+            FibonacciAir,
+            common::KoalaBearD4Backend,
+            4,
+        >::new(
+            PreparedSource::UniStark {
+                air: &air,
+                proof: &proof,
+                public_inputs: &pis,
+                preprocessed_commit: None,
+            },
+            config.clone(),
+            backend,
+            params.clone(),
+        )
+        .expect("the trusted reference prepares");
+        let out = prepared
+            .prove(PreparedInput::UniStark {
+                proof: &proof,
+                public_inputs: &pis,
+                preprocessed_commit: None,
+            })
+            .expect("the reference witness proves");
+        (prepared, out)
+    };
+
+    let second_pis = vec![
+        F::from_u64(2),
+        F::from_u64(3),
+        fibonacci_output::<F>(2, 3, n),
+    ];
+    let second = prove(
+        &config,
+        &air,
+        generate_trace_rows::<F>(2, 3, n),
+        &second_pis,
+    )
+    .unwrap();
+    verify(&config, &air, &second, &second_pis).expect("the varied native proof verifies");
+    let out2 = prepared
+        .prove(PreparedInput::UniStark {
+            proof: &second,
+            public_inputs: &second_pis,
+            preprocessed_commit: None,
+        })
+        .expect("the varied witness proves with the prepared owner");
+
+    let verifier = prepared.verifier();
+    verifier.verify(&out1.0, &[]).unwrap();
+    verifier.verify(&out2.0, &[]).unwrap();
+    assert!(Arc::ptr_eq(&out1.1, &out2.1));
+    assert!(prepared.profile().is_none());
+    assert_eq!(
+        prepared.params().table_packing,
+        params.table_packing,
+        "the owner retains its resolved parameters"
+    );
+    verify_fri_output(&config, &params, &out1);
+    verify_fri_output(&config, &params, &out2);
+}
+
+/// Omitting the verifier-consumed public targets from the parent Statement sink, copying only the
+/// reference host values, or freezing the first statement into the key would make this fail.
+#[test]
+fn trusted_fri_uni_layer_exports_each_original_air_statement() {
+    let n = 1 << 10;
+    let air = FibonacciAir {};
+    let (config, backend) = common::koala_bear_d4_recursion_config_and_backend();
+    let params = ProveNextLayerParams::default();
+    let first_statement = vec![F::ZERO, F::ONE, fibonacci_output::<F>(0, 1, n)];
+    let first_proof = prove(
+        &config,
+        &air,
+        generate_trace_rows::<F>(0, 1, n),
+        &first_statement,
+    )
+    .unwrap();
+    let owner = TrustedPreparedLayer::<
+        common::KoalaBearD4RecursionConfig,
+        common::KoalaBearD4RecursionConfig,
+        FibonacciAir,
+        _,
+        4,
+    >::new(
+        TrustedPreparedSource::UniStark {
+            config: config.clone(),
+            air: &air,
+            preprocessed_commit: None,
+            proof: &first_proof,
+            public_inputs: &first_statement,
+        },
+        config.clone(),
+        backend.clone(),
+        params.clone(),
+    )
+    .expect("the trusted FRI leaf prepares");
+
+    let first_output = owner
+        .prove(TrustedPreparedInput::UniStark {
+            proof: &first_proof,
+            public_inputs: &first_statement,
+        })
+        .expect("the first leaf statement proves");
+    let second_statement = vec![
+        F::from_u64(2),
+        F::from_u64(3),
+        fibonacci_output::<F>(2, 3, n),
+    ];
+    let second_proof = prove(
+        &config,
+        &air,
+        generate_trace_rows::<F>(2, 3, n),
+        &second_statement,
+    )
+    .unwrap();
+    let second_output = owner
+        .prove(TrustedPreparedInput::UniStark {
+            proof: &second_proof,
+            public_inputs: &second_statement,
+        })
+        .expect("the second leaf statement proves under the same preparation");
+
+    let verifier = owner.verifier();
+    assert_eq!(verifier.statement_layout().schema().base_len(), 3);
+    verifier.verify(&first_output.0, &first_statement).unwrap();
+    verifier
+        .verify(&second_output.0, &second_statement)
+        .unwrap();
+    assert!(verifier.verify(&second_output.0, &first_statement).is_err());
+
+    let statement_table = verifier.statement_layout().table_instance().unwrap();
+    let trusted_next = first_output
+        .into_trusted_recursion_input::<BatchOnly>(&verifier, &first_statement)
+        .unwrap();
+    let RecursionInput::BatchStark {
+        table_public_inputs,
+        ..
+    } = trusted_next
+    else {
+        unreachable!()
+    };
+    assert_eq!(table_public_inputs[statement_table], first_statement);
+
+    let transported = first_output.into_recursion_input::<BatchOnly>();
+    let RecursionInput::BatchStark {
+        table_public_inputs,
+        ..
+    } = transported
+    else {
+        unreachable!()
+    };
+    assert_eq!(table_public_inputs[statement_table], first_statement);
+
+    let middle = TrustedPreparedLayer::<
+        common::KoalaBearD4RecursionConfig,
+        common::KoalaBearD4RecursionConfig,
+        BatchOnly,
+        _,
+        4,
+    >::new(
+        TrustedPreparedSource::BatchStark {
+            verifier: verifier.clone(),
+            proof: &first_output.0,
+            statement: &first_statement,
+        },
+        config.clone(),
+        backend.clone(),
+        params.clone(),
+    )
+    .expect("the first batch wrapper prepares from the retained leaf verifier");
+    let first_middle = middle
+        .prove(TrustedPreparedInput::BatchStark {
+            proof: &first_output.0,
+            statement: &first_statement,
+        })
+        .unwrap();
+    let second_middle = middle
+        .prove(TrustedPreparedInput::BatchStark {
+            proof: &second_output.0,
+            statement: &second_statement,
+        })
+        .unwrap();
+    let middle_verifier = middle.verifier();
+    middle_verifier
+        .verify(&first_middle.0, &first_statement)
+        .unwrap();
+    middle_verifier
+        .verify(&second_middle.0, &second_statement)
+        .unwrap();
+
+    let outer = TrustedPreparedLayer::<
+        common::KoalaBearD4RecursionConfig,
+        common::KoalaBearD4RecursionConfig,
+        BatchOnly,
+        _,
+        4,
+    >::new(
+        TrustedPreparedSource::BatchStark {
+            verifier: middle_verifier,
+            proof: &first_middle.0,
+            statement: &first_statement,
+        },
+        config,
+        backend,
+        params,
+    )
+    .expect("the second batch wrapper prepares from the retained middle verifier");
+    let first_outer = outer
+        .prove(TrustedPreparedInput::BatchStark {
+            proof: &first_middle.0,
+            statement: &first_statement,
+        })
+        .unwrap();
+    let second_outer = outer
+        .prove(TrustedPreparedInput::BatchStark {
+            proof: &second_middle.0,
+            statement: &second_statement,
+        })
+        .unwrap();
+    let outer_verifier = outer.verifier();
+    outer_verifier
+        .verify(&first_outer.0, &first_statement)
+        .unwrap();
+    outer_verifier
+        .verify(&second_outer.0, &second_statement)
+        .unwrap();
+    assert!(
+        outer_verifier
+            .verify(&second_outer.0, &first_statement)
+            .is_err()
+    );
+}
+
+#[test]
+fn fri_trusted_uni_retains_air_config_and_complete_preprocessed_root() {
+    let air = common::MulAir::default();
+    let (config, backend) = common::koala_bear_d4_recursion_config_and_backend();
+    let (output_config, _) = common::koala_bear_d4_recursion_config_and_backend_with_pow_bits(1);
+    let (main, _) = air.random_valid_trace::<F>(true);
+    let degree_bits = main.height().ilog2() as usize;
+    let (preprocessed, verifier_key) = setup_preprocessed(&config, &air, degree_bits)
+        .unwrap()
+        .unwrap();
+    let proof = prove_with_preprocessed(&config, &air, main, &[], Some(&preprocessed)).unwrap();
+    verify_with_preprocessed(&config, &air, &proof, &[], Some(&verifier_key)).unwrap();
+
+    let owner = TrustedPreparedLayer::<_, _, common::MulAir, _, 4>::new(
+        TrustedPreparedSource::UniStark {
+            config,
+            air: &air,
+            preprocessed_commit: Some(verifier_key.commitment),
+            proof: &proof,
+            public_inputs: &[],
+        },
+        output_config,
+        backend,
+        ProveNextLayerParams::default(),
+    )
+    .expect("the trusted uni authority and complete preprocessing root prepare");
+    let output = owner
+        .prove(TrustedPreparedInput::UniStark {
+            proof: &proof,
+            public_inputs: &[],
+        })
+        .expect("the witness-only uni input proves under retained authority");
+    owner.verifier().verify(&output.0, &[]).unwrap();
+}
+
+#[test]
+fn whir_trusted_uni_retains_air_config_and_complete_preprocessed_root() {
+    let air = common::MulAir {
+        degree: 3,
+        rows: 1 << 10,
+    };
+    let config = bb_whir_config(vec![]);
+    let backend = WhirRecursionBackend::<16, 8>::new(Poseidon2Config::BABY_BEAR_D4_W16)
+        .for_extension_degree::<4>();
+    let (main, _) = air.random_valid_trace::<BbF>(true);
+    let degree_bits = main.height().ilog2() as usize;
+    let (preprocessed, verifier_key) = setup_preprocessed(&config, &air, degree_bits)
+        .unwrap()
+        .unwrap();
+    let proof = prove_with_preprocessed(&config, &air, main, &[], Some(&preprocessed)).unwrap();
+    verify_with_preprocessed(&config, &air, &proof, &[], Some(&verifier_key)).unwrap();
+
+    let owner = TrustedPreparedLayer::<_, _, common::MulAir, _, 4>::new(
+        TrustedPreparedSource::UniStark {
+            config: config.clone(),
+            air: &air,
+            preprocessed_commit: Some(verifier_key.commitment),
+            proof: &proof,
+            public_inputs: &[],
+        },
+        config,
+        backend,
+        ProveNextLayerParams::default(),
+    )
+    .expect("the trusted WHIR uni authority and complete preprocessing root prepare");
+    let output = owner
+        .prove(TrustedPreparedInput::UniStark {
+            proof: &proof,
+            public_inputs: &[],
+        })
+        .expect("the WHIR witness-only uni input proves under retained authority");
+    owner.verifier().verify(&output.0, &[]).unwrap();
+}
+
+#[test]
+fn fri_uni_profile_prepared_layer_reuses_varied_witnesses() {
+    let log_n = 10;
+    let n = 1 << log_n;
+    let air = FibonacciAir {};
+    let (config, backend) = common::koala_bear_d4_recursion_config_and_backend();
+    let profile = RecursionLayerProfile {
+        table_packing: TablePacking::default().with_horner_pack_k(4),
+        hash: HashProfile::default(),
+        transcript: TranscriptKind::default(),
+        constraint_profile: ConstraintProfile::Standard,
+    };
+
+    let first_pis = vec![F::ZERO, F::ONE, fibonacci_output::<F>(0, 1, n)];
+    let first = prove(&config, &air, generate_trace_rows::<F>(0, 1, n), &first_pis).unwrap();
+    let prepared = PreparedLayer::<
+        common::KoalaBearD4RecursionConfig,
+        FibonacciAir,
+        common::KoalaBearD4Backend,
+        4,
+    >::new_with_profile(
+        PreparedSource::UniStark {
+            air: &air,
+            proof: &first,
+            public_inputs: &first_pis,
+            preprocessed_commit: None,
+        },
+        config.clone(),
+        backend,
+        profile.clone(),
+    )
+    .expect("the profile-owned verifier prepares");
+
+    let first_output = prepared
+        .prove(PreparedInput::UniStark {
+            proof: &first,
+            public_inputs: &first_pis,
+            preprocessed_commit: None,
+        })
+        .expect("the first profile-owned witness proves");
+    let second_pis = vec![
+        F::from_u64(2),
+        F::from_u64(3),
+        fibonacci_output::<F>(2, 3, n),
+    ];
+    let second = prove(
+        &config,
+        &air,
+        generate_trace_rows::<F>(2, 3, n),
+        &second_pis,
+    )
+    .unwrap();
+    let second_output = prepared
+        .prove(PreparedInput::UniStark {
+            proof: &second,
+            public_inputs: &second_pis,
+            preprocessed_commit: None,
+        })
+        .expect("the second profile-owned witness proves");
+
+    assert_eq!(prepared.profile(), Some(&profile));
+    assert_eq!(prepared.params().table_packing, profile.table_packing);
+    assert_eq!(
+        prepared.params().constraint_profile,
+        profile.constraint_profile
+    );
+    assert!(Arc::ptr_eq(&first_output.1, &second_output.1));
+}
+
+#[test]
+fn fri_uni_profile_owner_matches_params_owner_bytes() {
+    let n = 1 << 10;
+    let air = FibonacciAir {};
+    // Parallel PoW grinding may choose different valid nonzero witnesses. This byte-for-byte
+    // ownership comparison needs a deterministic transcript, so disable PoW for this fixture.
+    let (config, backend) = common::koala_bear_d4_recursion_config_and_backend_with_pow_bits(0);
+    let pis = vec![F::ZERO, F::ONE, fibonacci_output::<F>(0, 1, n)];
+    let proof = prove(&config, &air, generate_trace_rows::<F>(0, 1, n), &pis).unwrap();
+    let params = ProveNextLayerParams {
+        table_packing: TablePacking::default(),
+        constraint_profile: ConstraintProfile::Standard,
+    };
+    let profile = RecursionLayerProfile {
+        table_packing: params.table_packing.clone(),
+        hash: HashProfile::default(),
+        transcript: TranscriptKind::default(),
+        constraint_profile: params.constraint_profile,
+    };
+    let source = || PreparedSource::UniStark {
+        air: &air,
+        proof: &proof,
+        public_inputs: &pis,
+        preprocessed_commit: None,
+    };
+    let input = || PreparedInput::UniStark {
+        proof: &proof,
+        public_inputs: &pis,
+        preprocessed_commit: None,
+    };
+
+    let params_owner = PreparedLayer::<
+        common::KoalaBearD4RecursionConfig,
+        FibonacciAir,
+        common::KoalaBearD4Backend,
+        4,
+    >::new(source(), config.clone(), backend.clone(), params)
+    .expect("the params-owned verifier prepares");
+    let profile_owner = PreparedLayer::<
+        common::KoalaBearD4RecursionConfig,
+        FibonacciAir,
+        common::KoalaBearD4Backend,
+        4,
+    >::new_with_profile(source(), config, backend, profile)
+    .expect("the profile-owned verifier prepares");
+
+    let params_output = params_owner
+        .prove(input())
+        .expect("the params-owned witness proves");
+    let profile_output = profile_owner
+        .prove(input())
+        .expect("the profile-owned witness proves");
+    assert_eq!(
+        postcard::to_allocvec(&params_output.0).expect("serialize params-owned proof"),
+        postcard::to_allocvec(&profile_output.0).expect("serialize profile-owned proof"),
+        "identical ordinary-FRI owners must produce byte-identical proofs"
+    );
+}
+
+#[test]
+fn fri_batch_prepared_layer_reuses_prover_data() {
+    let fixture = common::build_koala_bear_d4_first_layer_input_with_starts(0, 1);
+    let second = common::build_koala_bear_d4_first_layer_input_with_starts(2, 3);
+    let table_public_inputs = vec![vec![]; fixture.base_proof.proof.opened_values.instances.len()];
+    let params = ProveNextLayerParams::default();
+    let config = fixture.layer_config.clone();
+    let (prepared, out1) = {
+        let prepared = PreparedLayer::<_, BatchOnly, _, 4>::new(
+            PreparedSource::batch(
+                &fixture.base_proof,
+                &fixture.base_proof.stark_common,
+                &table_public_inputs,
+            ),
+            config.clone(),
+            fixture.backend.clone(),
+            params.clone(),
+        )
+        .expect("an honest batch proof prepares");
+        let out = prepared
+            .prove(PreparedInput::BatchStark {
+                proof: &fixture.base_proof,
+                common_data: &fixture.base_proof.stark_common,
+                table_public_inputs: &table_public_inputs,
+            })
+            .expect("the first witness proves");
+        (prepared, out)
+    };
+    drop(fixture);
+    let out2 = prepared
+        .prove(PreparedInput::BatchStark {
+            proof: &second.base_proof,
+            common_data: &second.base_proof.stark_common,
+            table_public_inputs: &table_public_inputs,
+        })
+        .expect("the prepared verifier can be reused");
+    assert!(Arc::ptr_eq(&out1.1, &out2.1));
+    verify_fri_output(&config, &params, &out1);
+    verify_fri_output(&config, &params, &out2);
+}
+
+#[test]
+fn fri_batch_trusted_layer_uses_retained_child_verifier_and_witness_only_inputs() {
+    let first = common::build_koala_bear_d4_first_layer_input_with_starts(0, 1);
+    let second = common::build_koala_bear_d4_first_layer_input_with_starts(2, 3);
+    first
+        .verifier
+        .verify(&second.base_proof, &[])
+        .expect("the varied witness has the retained child relation");
+    assert!(
+        first
+            .base_proof
+            .stark_common
+            .preprocessed
+            .as_ref()
+            .map(|g| &g.commitment)
+            == first
+                .verifier
+                .common_data()
+                .preprocessed
+                .as_ref()
+                .map(|g| &g.commitment)
+    );
+    let params = ProveNextLayerParams::default();
+    let output_config = first.layer_config.clone();
+    let owner = TrustedPreparedLayer::<_, _, BatchOnly, _, 4>::new(
+        TrustedPreparedSource::BatchStark {
+            verifier: first.verifier.clone(),
+            proof: &first.base_proof,
+            statement: &[],
+        },
+        output_config.clone(),
+        first.backend.clone(),
+        params.clone(),
+    )
+    .expect("the retained child verifier prepares");
+
+    let first_output = owner
+        .prove(TrustedPreparedInput::BatchStark {
+            proof: &first.base_proof,
+            statement: &[],
+        })
+        .expect("the representative witness proves");
+    let second_output = owner
+        .prove(TrustedPreparedInput::BatchStark {
+            proof: &second.base_proof,
+            statement: &[],
+        })
+        .expect("a varied witness proves without replacement authority");
+
+    owner.verifier().verify(&first_output.0, &[]).unwrap();
+    owner.verifier().verify(&second_output.0, &[]).unwrap();
+    verify_fri_output(&output_config, &params, &first_output);
+    verify_fri_output(&output_config, &params, &second_output);
+}
+
+#[test]
+fn batch_example_policy_rebuilds_only_on_contract_mismatch() {
+    // This mirrors the examples' retained-owner branch: validate a borrowed input first,
+    // reuse the owner on a matching contract, and rebuild only for PreparedInputMismatch.
+    let first = common::build_koala_bear_d4_first_layer_input_with_starts(0, 1);
+    let second = common::build_koala_bear_d4_first_layer_input_with_starts(2, 3);
+    let mut mismatch = common::build_koala_bear_d4_first_layer_input();
+    let table_public_inputs = vec![vec![]; first.base_proof.proof.opened_values.instances.len()];
+    let mismatch_table = vec![vec![]; mismatch.base_proof.proof.opened_values.instances.len()];
+    let config = first.layer_config.clone();
+    let backend = first.backend.clone();
+    let params = ProveNextLayerParams::default();
+
+    let mut owner = Some(
+        PreparedLayer::<_, BatchOnly, _, 4>::new(
+            PreparedSource::batch(
+                &first.base_proof,
+                &first.base_proof.stark_common,
+                &table_public_inputs,
+            ),
+            config.clone(),
+            backend.clone(),
+            params.clone(),
+        )
+        .expect("the first trusted input prepares"),
+    );
+    let mut rebuilds = 1;
+
+    let first_input = PreparedInput::BatchStark {
+        proof: &first.base_proof,
+        common_data: &first.base_proof.stark_common,
+        table_public_inputs: &table_public_inputs,
+    };
+    owner
+        .as_ref()
+        .unwrap()
+        .check_input(&first_input)
+        .expect("the first input matches the retained contract");
+    let first_output = owner
+        .as_ref()
+        .unwrap()
+        .prove(first_input)
+        .expect("the first matching input proves");
+
+    let second_input = PreparedInput::BatchStark {
+        proof: &second.base_proof,
+        common_data: &second.base_proof.stark_common,
+        table_public_inputs: &table_public_inputs,
+    };
+    match owner.as_ref().unwrap().check_input(&second_input) {
+        Ok(()) => {}
+        Err(error) if is_prepared_input_mismatch(&error) => {
+            panic!("matching native contracts must reuse the retained owner")
+        }
+        Err(error) => panic!("unexpected matching-input validation error: {error:?}"),
+    }
+    let second_output = owner
+        .as_ref()
+        .unwrap()
+        .prove(second_input)
+        .expect("the second matching input proves");
+    assert!(Arc::ptr_eq(&first_output.1, &second_output.1));
+    assert_eq!(rebuilds, 1, "matching calls must not rebuild preparation");
+
+    let mismatched_input = PreparedInput::BatchStark {
+        proof: &mismatch.base_proof,
+        common_data: &mismatch.base_proof.stark_common,
+        table_public_inputs: &mismatch_table,
+    };
+    match owner.as_ref().unwrap().check_input(&mismatched_input) {
+        Err(error) if is_prepared_input_mismatch(&error) => {
+            owner = Some(
+                PreparedLayer::new(
+                    PreparedSource::batch(
+                        &mismatch.base_proof,
+                        &mismatch.base_proof.stark_common,
+                        &mismatch_table,
+                    ),
+                    config,
+                    backend,
+                    params,
+                )
+                .expect("the mismatched contract can be explicitly reprepared"),
+            );
+            rebuilds += 1;
+        }
+        Ok(()) => panic!("the deliberately different contract must not match"),
+        Err(error) => panic!("unexpected mismatch validation error: {error:?}"),
+    }
+    assert_eq!(
+        rebuilds, 2,
+        "only the explicit mismatch may rebuild preparation"
+    );
+
+    mismatch.base_proof.proof.degree_bits.pop();
+    let malformed_input = PreparedInput::BatchStark {
+        proof: &mismatch.base_proof,
+        common_data: &mismatch.base_proof.stark_common,
+        table_public_inputs: &mismatch_table,
+    };
+    let error = owner.as_ref().unwrap().check_input(&malformed_input);
+    match error {
+        Err(error) if is_prepared_input_mismatch(&error) => rebuilds += 1,
+        Err(VerificationError::InvalidProofShape(_)) => {}
+        Err(error) => panic!("unexpected malformed-input error: {error:?}"),
+        Ok(()) => panic!("malformed input must be rejected"),
+    }
+    assert_eq!(rebuilds, 2, "malformed input must not rebuild preparation");
+}
+
+#[test]
+fn whir_uni_prepared_layer_reuses_varied_witnesses_after_reference_drop() {
+    let n = 1 << 10;
+    let air = FibonacciAir {};
+    let config = bb_whir_config(vec![]);
+    let backend = WhirRecursionBackend::<16, 8>::new(Poseidon2Config::BABY_BEAR_D4_W16)
+        .for_extension_degree::<4>();
+    let params = ProveNextLayerParams::default();
+
+    let (prepared, out1) = {
+        let pis = vec![BbF::ZERO, BbF::ONE, fibonacci_output::<BbF>(0, 1, n)];
+        let proof = prove(&config, &air, generate_trace_rows::<BbF>(0, 1, n), &pis).unwrap();
+        verify(&config, &air, &proof, &pis).expect("the trusted WHIR proof verifies");
+        let prepared = PreparedLayer::<BbWhirConfig, FibonacciAir, _, 4>::new(
+            PreparedSource::UniStark {
+                air: &air,
+                proof: &proof,
+                public_inputs: &pis,
+                preprocessed_commit: None,
+            },
+            config.clone(),
+            backend,
+            params.clone(),
+        )
+        .expect("the trusted WHIR proof prepares");
+        let out = prepared
+            .prove(PreparedInput::UniStark {
+                proof: &proof,
+                public_inputs: &pis,
+                preprocessed_commit: None,
+            })
+            .expect("the reference WHIR witness proves");
+        (prepared, out)
+    };
+
+    let second_pis = vec![
+        BbF::from_u64(2),
+        BbF::from_u64(3),
+        fibonacci_output::<BbF>(2, 3, n),
+    ];
+    let second = prove(
+        &config,
+        &air,
+        generate_trace_rows::<BbF>(2, 3, n),
+        &second_pis,
+    )
+    .unwrap();
+    verify(&config, &air, &second, &second_pis).expect("the varied WHIR proof verifies");
+    let out2 = prepared
+        .prove(PreparedInput::UniStark {
+            proof: &second,
+            public_inputs: &second_pis,
+            preprocessed_commit: None,
+        })
+        .expect("the varied WHIR witness proves with the prepared owner");
+
+    assert!(Arc::ptr_eq(&out1.1, &out2.1));
+    verify_whir_output(&config, &params, &out1);
+    verify_whir_output(&config, &params, &out2);
+}
+
+/// Exercises the WHIR `UniStark` verifier-result branch with public values belonging to a
+/// realistic AIR. The trusted parent must expose the values consumed by that verifier rather
+/// than freezing the reference witness or emitting an empty statement.
+#[test]
+fn trusted_whir_uni_layer_exports_each_original_air_statement() {
+    let n = 1 << 10;
+    let air = FibonacciAir {};
+    let config = bb_whir_config(vec![]);
+    let backend = WhirRecursionBackend::<16, 8>::new(Poseidon2Config::BABY_BEAR_D4_W16)
+        .for_extension_degree::<4>();
+    let params = ProveNextLayerParams::default();
+    let first_statement = vec![BbF::ZERO, BbF::ONE, fibonacci_output::<BbF>(0, 1, n)];
+    let first_proof = prove(
+        &config,
+        &air,
+        generate_trace_rows::<BbF>(0, 1, n),
+        &first_statement,
+    )
+    .unwrap();
+    let owner = TrustedPreparedLayer::<BbWhirConfig, BbWhirConfig, FibonacciAir, _, 4>::new(
+        TrustedPreparedSource::UniStark {
+            config: config.clone(),
+            air: &air,
+            preprocessed_commit: None,
+            proof: &first_proof,
+            public_inputs: &first_statement,
+        },
+        config.clone(),
+        backend,
+        params,
+    )
+    .expect("the trusted WHIR leaf prepares");
+
+    let first_output = owner
+        .prove(TrustedPreparedInput::UniStark {
+            proof: &first_proof,
+            public_inputs: &first_statement,
+        })
+        .expect("the first WHIR leaf statement proves");
+    let second_statement = vec![
+        BbF::from_u64(2),
+        BbF::from_u64(3),
+        fibonacci_output::<BbF>(2, 3, n),
+    ];
+    let second_proof = prove(
+        &config,
+        &air,
+        generate_trace_rows::<BbF>(2, 3, n),
+        &second_statement,
+    )
+    .unwrap();
+    let second_output = owner
+        .prove(TrustedPreparedInput::UniStark {
+            proof: &second_proof,
+            public_inputs: &second_statement,
+        })
+        .expect("the second WHIR leaf statement proves under the same preparation");
+
+    let verifier = owner.verifier();
+    assert_eq!(verifier.statement_layout().schema().base_len(), 3);
+    verifier.verify(&first_output.0, &first_statement).unwrap();
+    verifier
+        .verify(&second_output.0, &second_statement)
+        .unwrap();
+    assert!(verifier.verify(&second_output.0, &first_statement).is_err());
+}
+
+#[test]
+fn whir_batch_prepared_layer_reuses_varied_witnesses_after_reference_drop() {
+    let config = bb_whir_config(vec![]);
+    let backend = WhirRecursionBackend::<16, 8>::new(Poseidon2Config::BABY_BEAR_D4_W16)
+        .for_extension_degree::<4>();
+    let params = ProveNextLayerParams::default();
+    let first = build_whir_first_layer(&config, &backend, &params, 0, 1);
+    let second = build_whir_first_layer(&config, &backend, &params, 2, 3);
+    verify_whir_output(&config, &params, &first);
+    verify_whir_output(&config, &params, &second);
+    let table_public_inputs = vec![vec![]; first.0.proof.opened_values.instances.len()];
+
+    let (prepared, out1) = {
+        let prepared = PreparedLayer::<BbWhirConfig, BatchOnly, _, 4>::new(
+            PreparedSource::batch(&first.0, &first.0.stark_common, &table_public_inputs),
+            config.clone(),
+            backend,
+            params.clone(),
+        )
+        .expect("the first honest WHIR batch proof prepares");
+        let out = prepared
+            .prove(PreparedInput::BatchStark {
+                proof: &first.0,
+                common_data: &first.0.stark_common,
+                table_public_inputs: &table_public_inputs,
+            })
+            .expect("the first WHIR batch witness proves");
+        (prepared, out)
+    };
+    drop(first);
+    let out2 = prepared
+        .prove(PreparedInput::BatchStark {
+            proof: &second.0,
+            common_data: &second.0.stark_common,
+            table_public_inputs: &table_public_inputs,
+        })
+        .expect("the varied WHIR batch witness proves with the prepared owner");
+
+    assert!(Arc::ptr_eq(&out1.1, &out2.1));
+    verify_whir_output(&config, &params, &out1);
+    verify_whir_output(&config, &params, &out2);
+}

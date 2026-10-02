@@ -483,7 +483,6 @@ dependencies = [
 [[package]]
 name = "p3-circuit"
 version = "0.1.0"
-source = "git+https://github.com/Plonky3/Plonky3-recursion?rev=8f9876efb26cff0f4b837555b478f043c4314240#8f9876efb26cff0f4b837555b478f043c4314240"
 dependencies = [
  "hashbrown",
  "itertools",
@@ -513,7 +512,6 @@ dependencies = [
 [[package]]
 name = "p3-circuit-prover"
 version = "0.1.0"
-source = "git+https://github.com/Plonky3/Plonky3-recursion?rev=8f9876efb26cff0f4b837555b478f043c4314240#8f9876efb26cff0f4b837555b478f043c4314240"
 dependencies = [
  "hashbrown",
  "p3-air",
@@ -797,7 +795,6 @@ dependencies = [
 [[package]]
 name = "p3-poseidon-circuit-cols"
 version = "0.1.0"
-source = "git+https://github.com/Plonky3/Plonky3-recursion?rev=8f9876efb26cff0f4b837555b478f043c4314240#8f9876efb26cff0f4b837555b478f043c4314240"
 
 [[package]]
 name = "p3-poseidon1"
@@ -830,7 +827,6 @@ dependencies = [
 [[package]]
 name = "p3-poseidon1-circuit-air"
 version = "0.1.0"
-source = "git+https://github.com/Plonky3/Plonky3-recursion?rev=8f9876efb26cff0f4b837555b478f043c4314240#8f9876efb26cff0f4b837555b478f043c4314240"
 dependencies = [
  "p3-air",
  "p3-baby-bear",
@@ -882,7 +878,6 @@ dependencies = [
 [[package]]
 name = "p3-poseidon2-circuit-air"
 version = "0.1.0"
-source = "git+https://github.com/Plonky3/Plonky3-recursion?rev=8f9876efb26cff0f4b837555b478f043c4314240#8f9876efb26cff0f4b837555b478f043c4314240"
 dependencies = [
  "p3-air",
  "p3-baby-bear",
@@ -905,7 +900,6 @@ dependencies = [
 [[package]]
 name = "p3-recursion"
 version = "0.1.0"
-source = "git+https://github.com/Plonky3/Plonky3-recursion?rev=8f9876efb26cff0f4b837555b478f043c4314240#8f9876efb26cff0f4b837555b478f043c4314240"
 dependencies = [
  "hashbrown",
  "itertools",
@@ -1150,6 +1144,7 @@ dependencies = [
  "postcard",
  "pq-hash",
  "pq-sign",
+ "prover",
  "rand",
  "serde",
  "serde_json",
