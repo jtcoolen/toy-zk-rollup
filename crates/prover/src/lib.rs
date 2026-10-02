@@ -43,6 +43,7 @@ pub mod block;
 pub mod client;
 pub mod config;
 pub mod export;
+pub mod fixed_config;
 pub mod nullifier_gadget;
 pub mod sha3_block;
 pub mod transcript_trace;

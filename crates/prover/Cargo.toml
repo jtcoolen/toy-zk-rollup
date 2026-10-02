@@ -43,6 +43,9 @@ p3-poseidon2-circuit-air = { workspace = true }
 
 rand = { workspace = true, features = ["thread_rng", "std"] }
 serde = { workspace = true }
+# Used by `fixed_config` to emit the generated schedule JSON that the
+# Solidity code generator consumes, and by the vector exporter.
+serde_json = "1"
 # The settlement proof format. `postcard` is serde over a varint-framed,
 # non-self-describing encoding, so a `#[derive(Serialize)]` proof serializes
 # with no field-name overhead — and the byte count is the calldata the chain
@@ -51,7 +54,6 @@ serde = { workspace = true }
 postcard = "1.1"
 
 [dev-dependencies]
-serde_json = "1"
 # Used by the golden-vector generator to fingerprint proof bytes with the same
 # Keccak the settlement transcript uses, so the vector's digest is meaningful
 # to the Solidity side.
