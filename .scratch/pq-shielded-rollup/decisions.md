@@ -2181,3 +2181,96 @@ false and the target-side mirror of the R openings must be implemented
 against `pcs/fri/targets.rs`. Until then the recursion circuit does not
 bind the hiding proof's random round, and the Solidity verifier must verify
 the R commitment and its openings as well.
+
+---
+
+## D-047 — Settlement Merkle tree is byte-native Keccak-256; do NOT port Keccak-f[1600] to Solidity
+
+**Status.** Supersedes the plan recorded earlier in this session (and implied by
+the D-036/D-038 gas discussion) to keep `PaddingFreeSponge<KeccakF, 25, 17, 4>`
+and replay that permutation on-chain. Implemented and green as of this commit.
+
+**Decision.** The settlement MMCS is
+
+```text
+  MerkleTreeMmcs<F, u8,
+                 SerializingHasher<Keccak256Hash>,
+                 CompressionFunctionFromHasher<Keccak256Hash, 2, 32>,
+                 2, 32>
+```
+
+i.e. leaf = `keccak256(concat of 4-byte LE `to_unique_u32` limbs)`, node =
+`keccak256(left || right)`, digest = 32 raw bytes. Both are the plain EVM
+opcode. The Rust side changed; the Solidity side gained no hash code at all.
+
+**Why the earlier plan was wrong.** The two Keccacs in this stack are not the
+same function. The transcript already uses `Keccak256Hash` (FIPS-padded,
+opcode-replayable, pinned by `TranscriptReplay`). The commitment tree used
+`PaddingFreeSponge<KeccakF, 25, 17, 4>` over u64 lanes, which shares the
+Keccak-f[1600] permutation but is NOT Keccak-256: no `0x01..0x80` padding,
+u64 lane order, 4-lane squeeze. Replaying it means hand-rolling the
+permutation in Solidity at roughly 30-50k gas per call. At round 0 the
+schedule asks for ~170 queries over ~22 levels, so a few thousand compressions
+even after pruning: 80-120M gas, over the block limit. Opcode-native is ~250
+gas per node, so the same walk is under a million.
+
+**Alternatives considered.**
+
+1. *Port Keccak-f[1600] to Solidity, keep Rust unchanged.* Rejected. It is the
+   only option that preserves the Plonky3 default, and it costs the block gas
+   limit. It also makes D-039 chunking-in-time load-bearing for a reason that
+   has nothing to do with proof size.
+2. *Reuse vendored `sol-whir-p3` `MerkleVerifier.sol`.* Rejected on
+   incompatibility, not preference: it hashes `keccak256(0x00 || BE32(v)...)`
+   for leaves, `0x01`-prefixes internal nodes, and masks digests to 20 bytes.
+   Three independent mismatches, each silent.
+3. *SHA-256 like `plutus-plonky3-exploration`.* Rejected. Cardano has a
+   SHA-256 builtin; the EVM has no SHA-256 precompile that fits this use (the
+   `0x02` precompile is 60 + 12/word and takes a length-prefixed word array,
+   and it is the wrong hash for a Keccak transcript anyway).
+4. *Switch the transcript to SHA3-256 too.* Rejected, already decided
+   (D-002/D-040): SHA3-256 has no EVM precompile at all.
+
+**What made this cheap.** The type-level probe: `MerkleTreeMmcs<F, u8, ...>`
+typechecks against `WhirUniPcs` and the settlement challenger with no other
+change, because `SerializingChallenger32` already has
+`CanObserve<MerkleCap<F, [u8; N]>>` (serializing_challenger.rs:102) which
+absorbs digest bytes directly. So the byte-native cap is absorbed byte for byte
+and the cap Solidity pins is the cap the transcript bound. No adapter, no
+new trait impl.
+
+**Consequences, all verified.**
+
+- `contracts/src/verifier/StarkMerkle.sol` is the whole on-chain commitment
+  layer: a leaf codec plus a variable-depth fold. No permutation, no sponge.
+- The STARK tree and the shielded note tree now share one fold. `MerkleProof`
+  (fixed depth 32, `bytes32` leaves) and `StarkMerkle` (depth from the path,
+  hashed rows) agree byte for byte; `StarkMerkleTest` asserts that directly so
+  they cannot drift.
+- `crates/prover/tests/mmcs_vectors.rs` generates ground truth from the real
+  `MerkleTreeMmcs` and *searches* all four fold conventions (leaf-to-root vs
+  root-to-leaf x sibling-left-on-one vs on-zero), requires exactly one to
+  reproduce the committed cap, requires it to be the same at every index, and
+  then requires it to be the one `MerkleProof.sol` implements. The convention
+  is pinned by proof rather than by reading Plonky3 source.
+- Every digest in that generator is cross-checked between `p3-keccak` and
+  `tiny-keccak` (via `pq_hash::Keccak256Commitment`). If those ever diverge,
+  nothing on-chain means anything, so the assert belongs in the generator.
+- Vendored `sol-whir-p3/merkle/MerkleVerifier.sol` and `whir/WhirStructs.sol
+  deleted: zero importers, and their prefix/mask convention is a trap for the
+  next person. The three vendored files we DO import remain byte-identical to
+  upstream so they stay diffable.
+- `spike::commitments_are_keccak_sized` now asserts 32 bytes, not 4 limbs.
+
+**What this does NOT change.** The recursion layer stays Poseidon2 with a
+field-native cap (`whir_recursion.rs`), because `WhirRecursionBackend` is
+bounded to `MerkleCap<Val, [Val; DIGEST_ELEMS]>` and a byte cap cannot satisfy
+that bound in-circuit. The two layers never meet inside one circuit, so the
+settlement layer can be byte-native while the inner layer is field-native.
+The `DIGEST_ELEMS` doc in `whir_recursion.rs` is updated to say 32 bytes.
+
+**Open cost.** Digest width went 4 limbs -> 32 bytes, so Merkle proofs in the
+proof payload are the same 32 bytes per node (they were already 32 bytes on
+the wire) but the *cap* is now 32 bytes per root instead of 4 packed limbs.
+At cap height 0 that is one 32-byte root, absorbed as 32 bytes instead of 16.
+The measured proof sizes in `prover_bench` reflect the new scheme.

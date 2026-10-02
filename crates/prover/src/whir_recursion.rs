@@ -30,8 +30,10 @@
 //!
 //! The in-circuit Poseidon2 gadget runs at width 16, rate 8, so a Merkle digest is 8
 //! base-field elements. That fixes [`DIGEST_ELEMS`] at 8 for every type in this
-//! module; the settlement layer's Keccak digest is 4 `u64` limbs instead, and the two
-//! never meet in one circuit.
+//! module; the settlement layer's digest is 32 raw Keccak-256 bytes instead, and
+//! the two never meet in one circuit. (The settlement layer used to be 4 `u64`
+//! sponge limbs; it is byte-native now so Solidity replays it with the native
+//! `keccak256` opcode — see D-047.)
 
 use p3_challenger::DuplexChallenger;
 use p3_circuit::ops::{generate_poseidon2_trace, generate_recompose_trace};

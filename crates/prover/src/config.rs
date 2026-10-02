@@ -34,10 +34,10 @@ use p3_commit::ExtensionMmcs;
 use p3_dft::Radix2DitParallel;
 use p3_field::extension::QuinticTrinomialExtensionField;
 use p3_fri::{FriParameters, TwoAdicFriPcs};
-use p3_keccak::{Keccak256Hash, KeccakF};
+use p3_keccak::Keccak256Hash;
 use p3_koala_bear::KoalaBear;
 use p3_merkle_tree::MerkleTreeMmcs;
-use p3_symmetric::{CompressionFunctionFromHasher, PaddingFreeSponge, SerializingHasher};
+use p3_symmetric::{CompressionFunctionFromHasher, SerializingHasher};
 use p3_uni_stark::StarkConfig;
 
 /// The base field: `KoalaBear`, a 31-bit `Monty` prime with a large two-adic subgroup.
@@ -50,28 +50,32 @@ pub type F = KoalaBear;
 /// security. See ticket 03.
 pub type Challenge = QuinticTrinomialExtensionField<F>;
 
-/// Keccak sponge over the 1600-bit state: 4 u64 output limbs.
-type KeccakSponge = PaddingFreeSponge<KeccakF, 25, 17, 4>;
-
-/// Maps field-element vectors into the sponge via their u64 serialization.
-type FieldHash = SerializingHasher<KeccakSponge>;
-
-/// Two-to-one compression for Merkle internal nodes.
-type Compress = CompressionFunctionFromHasher<KeccakSponge, 2, 4>;
-
-/// The Keccak Merkle tree over base-field vectors.
+/// Byte-native Keccak-256 leaf hash.
 ///
-/// `VECTOR_LEN` is how many field elements are hashed per leaf; the digest is 4
-/// u64 limbs = 32 bytes, which is exactly a Keccak-256 digest, so the Solidity
-/// side walks the same tree with `keccak256`.
-pub type Mmcs = MerkleTreeMmcs<
-    [F; p3_keccak::VECTOR_LEN],
-    [u64; p3_keccak::VECTOR_LEN],
-    FieldHash,
-    Compress,
-    2,
-    4,
->;
+/// A row serializes to bytes (`into_byte_stream` = canonical little-endian
+/// for `KoalaBear`) and hashes with FIPS-padded Keccak-256 — the *same* function
+/// the EVM's `keccak256` opcode computes. This is the property the settlement
+/// boundary needs: Solidity walks the tree with the native opcode (~250 gas per
+/// node) and never implements a permutation.
+///
+/// The previous shape (`PaddingFreeSponge<KeccakF, 25, 17, 4>` over u64 lanes)
+/// shares the Keccak-f[1600] permutation but is not Keccak-256: no FIPS
+/// padding, u64 lane order, 4-lane squeeze. Replaying it in Solidity means a
+/// hand-rolled permutation at ~30-50k gas per call, which is over the block
+/// gas limit at settlement query counts. See D-050.
+type FieldHash = SerializingHasher<Keccak256Hash>;
+
+/// Two-to-one compression: `keccak256(left || right)`, the native opcode,
+/// matching `contracts/src/MerkleProof.sol` exactly.
+type Compress = CompressionFunctionFromHasher<Keccak256Hash, 2, 32>;
+
+/// The Keccak-256 Merkle tree over base-field rows.
+///
+/// Digests are 32 raw bytes (`DIGEST_ELEMS = 32`), absorbed into the
+/// transcript as bytes by `SerializingChallenger32`'s
+/// `CanObserve<MerkleCap<F, [u8; N]>>` impl — so the cap the Solidity side
+/// pins is the cap the transcript bound, byte for byte.
+pub type Mmcs = MerkleTreeMmcs<F, u8, FieldHash, Compress, 2, 32>;
 
 /// The same tree viewed over the extension field, for FRI's commit phase.
 pub type ChallengeMmcs = ExtensionMmcs<F, Challenge, Mmcs>;
@@ -88,12 +92,11 @@ pub type Challenger = SerializingChallenger32<F, HashChallenger<u8, Keccak256Has
 /// The full STARK configuration.
 pub type Config = StarkConfig<Pcs, Challenge, Challenger>;
 
-/// Build the Keccak Merkle MMCS.
+/// Build the Keccak-256 Merkle MMCS.
 #[must_use]
 pub const fn mmcs(cap_height: usize) -> Mmcs {
-    let sponge = PaddingFreeSponge::<KeccakF, 25, 17, 4>::new(KeccakF {});
-    let field_hash = SerializingHasher::new(sponge);
-    let compress = CompressionFunctionFromHasher::new(sponge);
+    let field_hash = SerializingHasher::new(Keccak256Hash {});
+    let compress = CompressionFunctionFromHasher::new(Keccak256Hash {});
     MerkleTreeMmcs::new(field_hash, compress, cap_height)
 }
 

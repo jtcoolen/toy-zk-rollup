@@ -90,31 +90,31 @@
       "tag": null
     },
     {
-      "hex": "f2ffff0d",
+      "hex": "e1ffff5e",
       "len": 4,
       "op": "observe",
       "tag": null
     },
     {
-      "hex": "b0",
+      "hex": "d0",
       "len": 1,
       "op": "sample",
       "tag": null
     },
     {
-      "hex": "bf",
+      "hex": "f9",
       "len": 1,
       "op": "sample",
       "tag": null
     },
     {
-      "hex": "38",
+      "hex": "a2",
       "len": 1,
       "op": "sample",
       "tag": null
     },
     {
-      "hex": "68",
+      "hex": "86",
       "len": 1,
       "op": "sample",
       "tag": null
@@ -146,7 +146,7 @@
       "grind": 4
     }
   ],
-  "witness_canonical": 7,
-  "witness_montgomery_le_hex": "f2ffff0d",
+  "witness_canonical": 532676624,
+  "witness_montgomery_le_hex": "e1ffff5e",
   "zeta_canonical": 935446202
 }

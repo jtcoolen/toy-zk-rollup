@@ -38,7 +38,7 @@ contract TranscriptReplayTest is Test {
         uint256 s1 = state.sampleBase();
         assertEq(s1, 935446202, "sample 1 diverges from the Rust transcript");
         // Proof-of-work: absorbing the witness must zero the next 4 bits.
-        state.observeBytes(hex"f2ffff0d");
+        state.observeBytes(hex"e1ffff5e");
         assertEq(state.sampleBitsUnchecked(4), 0, "PoW witness does not satisfy the challenge");
     }
 }
