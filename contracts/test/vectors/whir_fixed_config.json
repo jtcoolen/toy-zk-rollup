@@ -1,0 +1,78 @@
+{
+  "num_variables": 25,
+  "max_log_domain_size": 24,
+  "commitment_ood_samples": 2,
+  "starting_folding_pow_bits": 11,
+  "terminal_num_queries": 12,
+  "terminal_pow_bits": 19,
+  "final_sumcheck_rounds": 5,
+  "final_folding_pow_bits": 0,
+  "starting_log_inv_rate": 1,
+  "security_level": 96,
+  "pow_bits": 23,
+  "n_rounds": 4,
+  "folding_schedule": [
+    4,
+    4,
+    4,
+    4,
+    4
+  ],
+  "rounds": [
+    {
+      "pow_bits": 23,
+      "folding_pow_bits": 13,
+      "num_queries": 170,
+      "ood_samples": 2,
+      "num_variables": 21,
+      "folding_factor": 4,
+      "log_inv_rate": 4,
+      "domain_size": 67108864,
+      "log_folded_domain_size": 22
+    },
+    {
+      "pow_bits": 23,
+      "folding_pow_bits": 15,
+      "num_queries": 38,
+      "ood_samples": 2,
+      "num_variables": 17,
+      "folding_factor": 4,
+      "log_inv_rate": 7,
+      "domain_size": 33554432,
+      "log_folded_domain_size": 21
+    },
+    {
+      "pow_bits": 21,
+      "folding_pow_bits": 17,
+      "num_queries": 22,
+      "ood_samples": 2,
+      "num_variables": 13,
+      "folding_factor": 4,
+      "log_inv_rate": 10,
+      "domain_size": 16777216,
+      "log_folded_domain_size": 20
+    },
+    {
+      "pow_bits": 23,
+      "folding_pow_bits": 19,
+      "num_queries": 15,
+      "ood_samples": 2,
+      "num_variables": 9,
+      "folding_factor": 4,
+      "log_inv_rate": 13,
+      "domain_size": 8388608,
+      "log_folded_domain_size": 19
+    }
+  ],
+  "final_round": {
+    "pow_bits": 19,
+    "folding_pow_bits": 0,
+    "num_queries": 12,
+    "ood_samples": 0,
+    "num_variables": 5,
+    "folding_factor": 4,
+    "log_inv_rate": 13,
+    "domain_size": 4194304,
+    "log_folded_domain_size": 18
+  }
+}
