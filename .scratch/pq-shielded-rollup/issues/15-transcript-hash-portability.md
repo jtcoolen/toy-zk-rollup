@@ -1,7 +1,7 @@
 # 15 - Transcript hash portability (escape hatch from the Poseidon2 exception)
 
 Type: research
-Status: open
+Status: resolved
 Blocked by: 05
 
 ## Question

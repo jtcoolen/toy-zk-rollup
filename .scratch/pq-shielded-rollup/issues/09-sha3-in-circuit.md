@@ -1,7 +1,7 @@
 # 09 - SHA3-256 in-circuit: patch keccak-air padding
 
 Type: research
-Status: open
+Status: resolved (shipped: crates/prover/src/sha3_block.rs, `sha3_framed` in transfer.rs; pinned against pq_hash by `sha3_statement_matches_native`)
 Blocked by: 02
 
 ## Question
