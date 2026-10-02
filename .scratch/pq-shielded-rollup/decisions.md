@@ -1,6 +1,224 @@
 # Decisions log
 
 Recorded choices with alternatives considered. Newest first.
+## D-047 — Verifier design synthesis: what the three references actually teach us
+
+**Status.** All three reference repos cloned to `.scratch/refs/` and read in
+full: `ethereum/sol-whir-p3` (MIT), `input-output-hk/plutus-plonky3-exploration`
+(Apache-2.0), `GOATNetwork/bitcoin-stark-verifier`. This entry does **not**
+re-decide anything D-036, D-038 or D-039 settled — it records the
+*engineering discipline* each repo contributes and the concrete module plan
+that follows.
+
+Builds on: D-036 (standalone WHIR path, not LeanVM), D-038 (767 KB proof,
+four top-level WHIR runs, Merkle paths are the cost), D-039 (chunk by WHIR
+round across transactions, `ChunkVerifier` + `ShieldedPool`, Fiat-Shamir as
+a running hash makes pausing sound), D-045 (canonical vs Montgomery
+statement/transport), D-046 (HVZK live, R commitment must be verified).
+
+### 1. `sol-whir-p3` — architecture to copy, protocol not to copy
+
+Confirmed D-036's near-isomorphism reading. What is worth taking beyond the
+primitives:
+
+- **Four-layer split per schedule.** `*FixedConfig` (generated constants +
+  `roundConfig(i)` table) / `VerifierCore` (protocol) / `BlobCodec` (wire)
+  / `BlobVerifierNative` (parse+verify). **The schedule is data, not
+  control flow.** Our settlement config is fixed forever, so a generated
+  config contract is the right home for it.
+- **`observePattern(challenger)` as one opaque `hex"..."` blob.** The whole
+  Fiat-Shamir domain-separation pattern absorbed in one call. If the pattern
+  changes the blob changes, and the diff is reviewable. This is the single
+  best idea in the repo and we adopt it verbatim.
+- **Three paths per schedule**: native blob (production), typed ABI
+  (`verify(commitment, statement, proof)` with structs, for debug/parity),
+  decode-and-delegate. We build the **typed path first** — our first
+  milestone is parity, not gas.
+- **Named errors for every rejection**: `FixedRoundCountMismatch`,
+  `MissingFinalQueryBatch`, `FixedStatementShapeMismatch`,
+  `FixedStatementArityMismatch`, `FixedFinalPolyLengthMismatch`,
+  `FixedRandomnessLengthMismatch`, `CommitmentMismatch(expected, actual)`.
+  A mismatch during bring-up is a named condition, not a revert to bisect.
+  Adopt wholesale.
+- **Validation at the boundary.** `validatePackedExt4{,Calldata}` range-
+  checks every field element against `p` as it is read from calldata. A
+  limb ≥ p never enters arithmetic. Adopt.
+- **Documented compiler settings with measured gas** (`solc 0.8.28`,
+  `via_ir`, 833 runs, Prague).
+
+Not transferable: the protocol itself (spartan-whir's WHIR, different
+statement shape and domain separator), and their generated config's
+provenance (`spartan-whir-export`, which we don't have).
+
+**Their EIP-170 problem is a warning, not our plan.** Their KoalaBear
+quintic is 34,898 B runtime — over the 24,576 B limit, measured with a
+raised limit. Our verifier must fit under EIP-170 or be split. The
+D-039 chunking is in *time*, not code location, so the code itself must
+still fit in one contract. Budget for that from the start.
+
+### 2. `plutus-plonky3-exploration` — the anti-drift pipeline
+
+Their whole repo is one mechanism, and it is the answer to ticket 12's
+"how do we stop Rust and Solidity drifting apart":
+
+```
+prove (Rust)  →  convert (Python)  →  verify (on-chain)
+export_proof     convert.py            aiken check
+  dumps JSON     auto-detects uni vs   emits a GENERATED test
+                 batch, writes a       literal embedding the whole
+                 test literal          proof, runs the verifier
+```
+
+**The generated test literal is never hand-edited.** Adopt as:
+`cargo run -p prover --bin export_solidity_vectors` → JSON → generated
+`forge` test file. Our current `block_vectors.json` is static and can go
+stale silently; a generated test cannot.
+
+Three more habits worth stealing outright:
+
+- **Every mirrored function cites the upstream line ranges.** "Implements
+  `verify` from uni-stark/src/verifier.rs:201–212 and 214–457." When the
+  port disagrees, the citation makes it locatable. Every Solidity function
+  that mirrors Rust names its Rust function.
+- **The transcript order is written as a comment block before the code.**
+  Their `verifier.ak` header lists the entire uni-stark absorb/sample
+  sequence. That comment *is* the spec the port must match. Cheap to write,
+  disproportionately valuable when it diverges.
+- **Specialisation is declared, not hidden.** Their table lists every
+  hard-wired parameter (field, extension, hash, PCS, challenger, FRI
+  params, sizes, ZK) and states that changing any requires coordinated
+  edits on both sides.
+
+**The trap they document that we must not miss:** in batch-stark, instance
+metadata is observed as *algebra* elements —
+`observe_base_as_algebra_element::<Ext2>(x)` embeds x and observes **both**
+coefficients, i.e. the bytes of `[x, 0]` — while public values stay base
+elements. Base-vs-extension absorption is a classic divergence source. Our
+analogue is already pinned by D-045: statement limbs canonical, transcript
+limbs Montgomery. Same class, same cure.
+
+### 3. `bitcoin-stark-verifier` — the verification *semantics*
+
+Same field as us (KoalaBear ext4), same protocol family (WHIR), so their
+correctness argument transfers directly even though the target (Bitcoin
+Script, no `OP_CAT`) does not.
+
+- **The closing identity, stated exactly:**
+  `claimed_eval == w(R) · f_M(r_fin)`
+  where `R` is the folding randomness accumulated across all sumcheck
+  rounds, `w(R)` the accumulated constraint weight at `R`, `f_M` the
+  final polynomial, `r_fin` the tail of `R`. Their verifier is organized
+  to *reach* this; `final_check()` is the explicit four-coefficient
+  extension comparison. Ours must end at the same place, and naming it
+  makes the goal testable.
+- **"An opening is one unit."** The row is bound to its leaf by
+  `merkle::hash_row`, the path recomputes the root, and **that root is
+  the absorbed commitment rather than a value taken from the witness.**
+  This is the most important line in the whole review. Our Solidity must
+  check Merkle openings against the commitment the *transcript saw*, never
+  against one the proof asserts.
+- **"Challenges are unchooseable."** Every challenge is squeezed *after*
+  the values it depends on are absorbed; supplying one instead is a
+  soundness error of exactly one. This is a property of the absorb/sample
+  *order*, and it is the property a naive port breaks. Our transcript
+  trace test (§4) is what enforces it.
+- **"Constraints are derived, not supplied."** Each round buries the OOD
+  scalars it samples, the shift points its queries produce
+  (`domain_gen^index`), and its batching challenge *below* the folding
+  randomness; the closing check lifts them back out and evaluates the
+  whole weight polynomial from them. Carrying cost `1 + n` extension
+  elements per round rather than `n·(1+arity)`. We have no stack-depth
+  problem, but the discipline transfers: **never carry forward a scalar the
+  transcript can regenerate.**
+- **`reference.rs` is the porting pattern.** They keep a plain-Rust mirror
+  of every nontrivial routine — `lagrange_weights_01inf`,
+  `extrapolate_01inf`, `sumcheck_round`, `eval_multilinear` (from
+  `multilinear-util`), `duplexing`/`squeeze` (from `DuplexChallenger`) —
+  and **test the Rust mirror against real Plonky3 before trusting the
+  script version.** For us: before a Solidity routine is trusted, its Rust
+  equivalent is tested against the real prover and its vectors are emitted.
+- **A formal "what is checked / what is not" review document.** We write
+  the equivalent (§5) rather than let a reader guess.
+
+Not applicable: Poseidon2-as-algebraic-hash (exists to avoid `OP_CAT`; we
+have native `keccak256`), `DuplexChallenger` (we use
+`SerializingChallenger32<HashChallenger<Keccak256>>`), their
+proof-specialized 198 MB script (we have loops, so we write one general
+verifier — their constraint is our freedom).
+
+### 4. The transcript trace: the one test that makes everything else cheap
+
+New this session, and the highest-leverage artifact in the plan.
+
+Instrument the settlement prover to record **every** `observe`/`sample`
+call with its value and a label, emit JSON. Drive the Solidity challenger
+with the same calls and assert the same challenge sequence, byte for byte.
+
+Why this matters more than it looks: a transcript divergence makes *every
+subsequent* challenge wrong, so the failure surfaces at the final identity
+check thousands of operations later. A trace test localizes it to the
+**first differing byte**. That is the difference between a 10-minute debug
+and a multi-day one, and it is the only practical way to verify the
+Montgomery absorption convention (D-045) end to end.
+
+Nothing builds on `Transcript.sol` or `MerkleVerifier.sol` until their
+parity tests pass against a Rust-emitted trace.
+
+### 5. Module plan (aligned with D-039's two-contract split)
+
+```
+contracts/src/verifier/
+  Transcript.sol          Keccak challenger — vendored, parity-tested
+  FieldOps.sol            KoalaBear + Ext4 — vendored
+  MerkleVerifier.sol      ADAPTED to prefix-free (D-036), parity-tested
+  WhirFixedConfig.sol     GENERATED from p3-whir WhirConfig + observePattern blob
+  SumcheckCore.sol        sumcheck rounds → folding randomness R
+  StirOpenings.sol        STIR query openings vs ABSORBED commitments
+  WhirVerifierCore.sol    proximity check → closing identity
+  ConstraintIdentity.sol  ΣαᵢCᵢ(ζ) = Z_H(ζ)·Σⱼ chunkⱼ(ζ)Qⱼ(ζ)
+                          GENERATED from SymbolicAirBuilder (D-036 item 1)
+  ProofCodec.sol          wire format
+  ChunkVerifier.sol       the D-039 session state machine
+  WhirVerifier.sol        IWhirVerifier impl over the above
+```
+
+Order of work, each step a commit that compiles and passes its own tests:
+
+1. Rust: `export_solidity_vectors` binary — fixed config JSON + proof +
+   statement + **transcript trace**.
+2. Rust: a small test config (reduced `LOG_TRACE`) whose proof is a few KB,
+   for verifier bring-up. **Do not bring up the verifier against 767 KB.**
+3. Solidity: `Transcript` + `Merkle` parity tests against the trace.
+   Gate: nothing downstream until green.
+4. Solidity: `WhirFixedConfig` generated from step 1.
+5. `SumcheckCore` → `StirOpenings` → `WhirVerifierCore`, each cited to
+   its Rust source, each with vectors from step 1.
+6. `ConstraintIdentity` generated from `SymbolicAirBuilder`.
+7. `ProofCodec` + `WhirVerifier` (typed path first).
+8. Vector tests: accept the real proof; reject every mutation class
+   (mutated commitment, mutated statement, mutated opening, truncated
+   proof, wrong round count, missing R commitment).
+9. `ChunkVerifier` session state machine per D-039; drive it across
+   transactions on a local chain.
+10. Scale to the production config; re-measure proof size against the
+    D-038 lever table.
+
+### 6. What this verifier does NOT check (the honesty section, per bitcoin-stark-verifier)
+
+- **The statement is supplied.** It *is* the claim; a different statement
+  is a different claim, not a cheaper proof of the same one. Binding the
+  statement to the state transition is `ShieldedPool`'s job and is part of
+  the security argument, not the verifier's.
+- **Not SHA3.** The shielded layer's SHA3-256 never appears on-chain
+  (D-002). Only Keccak-256 at the settlement boundary.
+- **Not the SPHINCS+ signature.** Spend authorization is the in-circuit
+  nullifier relation; the envelope is checked at admission, off-chain.
+- **Not the R-round binding inside the recursion circuit.** D-046 left
+  `NO_RANDOM_OPENED_VALUES` in `recursive_pcs.rs`; until that is replaced
+  the recursion circuit does not bind the hiding proof's random round, and
+  the Solidity verifier must verify the R commitment and its openings
+  directly.
+
 
 ## D-039 — Splitting the verifier: chunk by WHIR round across transactions, bound by the transcript
 
