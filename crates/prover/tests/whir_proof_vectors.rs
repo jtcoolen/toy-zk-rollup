@@ -196,16 +196,21 @@ fn zetas() -> Vec<Challenge> {
     // coordinates, so every equality point in the statement would land in the base
     // field and the contract's extension-field eq-eval path would go untested.
     // Real uni-stark zetas are extension samples; this matches that.
-    let zeta =
-        Challenge::from_u32(9_999) * Challenge::from_u32(1 << 20)
-            + Challenge::from_u32(7)
-            + Challenge::from_basis_coefficients_fn(|i| {
-                if i == 2 {
-                    F::from_u32(31_337)
-                } else {
-                    F::ZERO
-                }
-            });
+    // All four basis coefficients non-zero, and deliberately so. A sparse zeta makes
+    // the evaluations derived from it sparse too, and a zero limb is indistinguishable
+    // from a shape constant that happens to be zero: the cross-run classifier sees a
+    // word that never moves and files it as config-fixed, so the contract would
+    // hard-code a limb of the claimed evaluation instead of reading it from the
+    // proof. That is a soundness bug the transcript still walks cleanly, which is what
+    // makes it dangerous - see the ambiguity guard below.
+    let zeta = Challenge::from_u32(9_999) * Challenge::from_u32(1 << 20)
+        + Challenge::from_u32(7)
+        + Challenge::from_basis_coefficients_fn(|i| {
+            // The same four values 31_337 + 1_000_003 * (i + 1) produces, written
+            // out so no usize-to-u32 cast is needed to spell them.
+            const COEFFS: [u32; 4] = [1_031_340, 2_031_343, 3_031_346, 4_031_349];
+            F::from_u32(*COEFFS.get(i).unwrap_or(&1))
+        });
     let domain = TwoAdicMultiplicativeCoset::<F>::new(F::ONE, LOG_COMMITTED)
         .expect("committed height within the field's two-adicity");
     vec![zeta, zeta * Challenge::from(domain.subgroup_generator())]
@@ -626,6 +631,43 @@ fn challenge_of(constraint: &Constraint<F, Challenge>) -> Challenge {
 /// absorbing a stale commitment instead of the proof's. `classify_observations`
 /// already answers `None` for every digest position that moved between runs, so
 /// "classified fixed" alone is the whole membership rule.
+/// Fails if a config-fixed zero sits between two varying observations.
+///
+/// That pattern is the signature of a zero LIMB of a proof-derived extension element:
+/// the limbs either side belong to the same element and move, while the zero limb does
+/// not, so cross-run comparison files it as config-fixed. The contract would then
+/// absorb a hard-coded zero where it must absorb a limb of the proof's claimed
+/// evaluation - the transcript stops binding the claim, and every later sample still
+/// looks self-consistent because both sides made the same mistake.
+///
+/// A zero with a fixed neighbour on either side is a genuine shape constant and is
+/// fine; the production artifact carries 839 of them.
+///
+/// # Errors
+///
+/// Describes the first ambiguous position found.
+fn check_no_ambiguous_zeros(
+    program: &SemProgram,
+    fixed: &[Option<Vec<u32>>],
+) -> Result<(), Box<dyn Error>> {
+    let is_zero_fixed = |i: usize| {
+        matches!(
+            (&fixed[i], &program[i]),
+            (Some(words), SemEvent::ObserveBase { .. }) if words.iter().all(|&w| w == 0)
+        )
+    };
+    let varies = |i: usize| fixed[i].is_none();
+    for i in 1..program.len().saturating_sub(1) {
+        if is_zero_fixed(i) && varies(i - 1) && varies(i + 1) {
+            return Err(format!(
+                "observation {i} is a fixed zero between two varying observations: a zero                  limb of proof data would be misclassified as config-fixed, so no limb of                  any proof-derived extension element may be zero"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 fn fixed_runs(program: &SemProgram, fixed: &[Option<Vec<u32>>]) -> Vec<String> {
     let mut runs: Vec<String> = Vec::new();
     let mut current: Vec<u8> = Vec::new();
@@ -860,6 +902,7 @@ fn whir_proof_vectors() -> Result<(), Box<dyn Error>> {
     // so "fixed" has to mean "fixed in the verifier's transcript".
     let programs: Vec<SemProgram> = runs.iter().map(|r| r.program.clone()).collect();
     let (fixed, varying) = classify_observations(&programs);
+    check_no_ambiguous_zeros(&base.program, &fixed)?;
     let blobs = fixed_runs(&base.program, &fixed);
 
     log_program_summary(&base.program, &fixed, &blobs, &varying, arity, &config);
