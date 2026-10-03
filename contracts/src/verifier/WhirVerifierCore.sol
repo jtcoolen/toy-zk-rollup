@@ -4,6 +4,7 @@ pragma solidity ^0.8.28;
 import {KoalaBearExt4} from "../../lib/sol-whir-p3/field/KoalaBearExt4.sol";
 import {KeccakChallenger} from "../../lib/sol-whir-p3/transcript/KeccakChallenger.sol";
 import {StirOpenings} from "./StirOpenings.sol";
+import {WhirGadgets} from "./WhirGadgets.sol";
 import {SumcheckCore} from "./SumcheckCore.sol";
 
 /// The WHIR verifier core: the Fiat-Shamir replay of a WHIR opening proof.
@@ -513,5 +514,204 @@ library WhirVerifierCore {
         );
         out.foldedClaim = folded;
         out.randomness = randomness;
+    }
+
+    // ---------------------------------------------------------------------
+    // Final phase
+    // ---------------------------------------------------------------------
+
+    /// The final phase's structural constants.
+    struct FinalSchedule {
+        /// Words absorbed before the final polynomial's evaluations. The
+        /// WHIR transcript binds the polynomial inside its own bracket, which
+        /// appends no fixed bytes; the field stays for shapes that do.
+        uint256 finalPolyConstants;
+        /// Which round index the terminal PoW and queries are labelled with
+        /// (n_rounds), for error reporting.
+        uint256 roundIndex;
+        /// Words absorbed between the terminal query draw and the closing
+        /// sumcheck's first round (the closing sumcheck's domain separator).
+        uint256 sumcheckConstants;
+    }
+
+    /// Everything the final phase reads from the proof.
+    struct FinalInput {
+        /// The final polynomial, sent in the clear: packed extension
+        /// elements, low index first. Length must be 2^num_variables.
+        uint256[] finalPoly;
+        /// The root the terminal queries open against: the last round's
+        /// commitment, or the batch commitment when there were no rounds.
+        bytes32 lastCommitment;
+        /// The terminal proof-of-work witness and difficulty.
+        uint256 powWitness;
+        uint256 powBits;
+        /// `log_folded_domain_size` of the final round config: query bit width
+        /// and Merkle depth, as in an intermediate round.
+        uint256 logFoldedDomainSize;
+        /// Terminal query count from the schedule, never from the proof.
+        uint256 numQueries;
+        /// Terminal opened rows (extension-valued), flattened canonical limbs,
+        /// plus the same geometry as RoundInput's row fields.
+        uint256[] rowsFlat;
+        uint256 rowLimbs;
+        uint256 rowElems;
+        /// Per-query Merkle paths against `lastCommitment`.
+        bytes32[][] paths;
+        /// The last round's folding randomness: the terminal fold point.
+        uint256[] prevRandomness;
+        /// The terminal queries' domain points, lifted base scalars, in query
+        /// order: `g^index` on the folded domain. The STIR check evaluates the
+        /// public polynomial here.
+        uint256[] domainPoints;
+        /// Closing sumcheck round values and witnesses.
+        uint256[] sumcheckCA;
+        uint256[] sumcheckCInf;
+        uint256[] sumcheckPowWitnesses;
+        uint256 sumcheckPowBits;
+        /// Every folding randomness in protocol order: initial, then each
+        /// round, then the closing sumcheck's (appended by this function).
+        uint256[] allRandomness;
+        /// The constraint weights of every constraint the run accumulated,
+        /// in order, for the terminal identity.
+        WhirGadgets.ConstraintWeight[] constraints;
+    }
+
+    /// What the final phase produces.
+    struct FinalOutput {
+        /// The claim after the closing sumcheck folded it.
+        uint256 foldedClaim;
+        /// The point the closing sumcheck reduces to.
+        uint256[] randomness;
+        /// The combined constraint weight evaluated at the full folding point.
+        uint256 weight;
+        /// The final polynomial evaluated at the closing randomness.
+        uint256 finalValue;
+    }
+
+    /// A terminal query's folded row disagrees with the public polynomial.
+    error StirChallengeFailed(uint256 query);
+    /// The terminal identity failed: the claim does not equal the constraint
+    /// weight times the polynomial evaluation. This is the verifier's last
+    /// line: everything before it is Fiat-Shamir bookkeeping.
+    error TerminalClaimMismatch(uint256 expected, uint256 actual);
+    /// The folding randomness is shorter than a constraint's arity.
+    error RandomnessTooShort(uint256 need, uint256 have);
+
+    /// Replay the final phase and check the terminal identity.
+    ///
+    /// Mirrors `replay`'s final block: bind the public polynomial,
+    /// terminal PoW, terminal query indices, open each query against the last
+    /// root and fold it at the last round's randomness, then check each fold
+    /// against the public polynomial at the query's domain point (the STIR
+    /// statement verified directly - the terminal claims are NOT batched into
+    /// the running claim), run the closing sumcheck, and finally check
+    ///
+    ///     claimed == eval_constraints_poly(all_r) * final_poly(final_r)
+    ///
+    /// There is no transcript checkpoint after the closing sumcheck: the
+    /// algebra IS the checkpoint.
+    function verifyFinal(
+        Transcript memory t,
+        FinalSchedule memory s,
+        FinalInput memory input,
+        uint256 carriedClaim
+    ) internal pure returns (FinalOutput memory out) {
+        // Shape checks before any sponge work.
+        if (input.powBits == 0 && input.powWitness != 0) {
+            revert NonCanonicalPowWitness(s.roundIndex);
+        }
+        if (input.rowElems != (uint256(1) << input.prevRandomness.length)) {
+            revert RowBufferMismatch(uint256(1) << input.prevRandomness.length, input.rowElems);
+        }
+        if (input.rowsFlat.length != input.numQueries * input.rowLimbs) {
+            revert RowBufferMismatch(input.numQueries * input.rowLimbs, input.rowsFlat.length);
+        }
+        if (input.paths.length != input.numQueries || input.domainPoints.length != input.numQueries) {
+            revert RoundRowCountMismatch(input.numQueries, input.paths.length);
+        }
+
+        // --- bind the public polynomial ------------------------------------------
+        absorbConstants(t, s.finalPolyConstants);
+        for (uint256 i; i < input.finalPoly.length; ++i) {
+            observeExt(t, input.finalPoly[i]);
+        }
+
+        // --- terminal PoW and query indices ----------------------------------------
+        if (!t.state.checkWitness(input.powBits, input.powWitness)) {
+            revert NonCanonicalPowWitness(s.roundIndex);
+        }
+        uint256[] memory indices = new uint256[](input.numQueries);
+        for (uint256 q; q < input.numQueries; ++q) {
+            indices[q] = t.state.sampleBits(input.logFoldedDomainSize);
+        }
+
+        // --- open, fold, and check each query against the public polynomial ----------
+        for (uint256 q; q < input.numQueries; ++q) {
+            uint256 base = q * input.rowLimbs;
+            uint256[] memory limbs = new uint256[](input.rowLimbs);
+            uint256[] memory elems = new uint256[](input.rowElems);
+            for (uint256 j; j < input.rowLimbs; ++j) {
+                limbs[j] = input.rowsFlat[base + j];
+            }
+            for (uint256 e; e < input.rowElems; ++e) {
+                uint256[4] memory coeffs;
+                coeffs[0] = limbs[e * 4];
+                coeffs[1] = limbs[e * 4 + 1];
+                coeffs[2] = limbs[e * 4 + 2];
+                coeffs[3] = limbs[e * 4 + 3];
+                elems[e] = KoalaBearExt4.pack(coeffs);
+            }
+            uint256 fold = StirOpenings.openAndFold(
+                input.lastCommitment,
+                indices[q],
+                input.logFoldedDomainSize,
+                limbs,
+                elems,
+                input.paths[q],
+                input.prevRandomness
+            );
+            // The STIR statement: the fold must equal the public polynomial at
+            // the query's domain point. This is `SelectStatement::verify` on the
+            // univariate points - Horner over the coefficient table.
+            uint256 expectedFold = StirOpenings.horner(input.finalPoly, input.domainPoints[q]);
+            if (fold != expectedFold) {
+                revert StirChallengeFailed(q);
+            }
+        }
+
+        // --- closing sumcheck ----------------------------------------------------------
+        absorbConstants(t, s.sumcheckConstants);
+        (uint256 folded, uint256[] memory randomness) = SumcheckCore.verifyRounds(
+            t.state,
+            carriedClaim,
+            input.sumcheckCA,
+            input.sumcheckCInf,
+            input.sumcheckPowWitnesses,
+            input.sumcheckPowBits
+        );
+        out.foldedClaim = folded;
+        out.randomness = randomness;
+
+        // --- the terminal identity ----------------------------------------------------------
+        //
+        // all_r is every folding randomness in protocol order with the closing
+        // sumcheck's appended; each constraint reads the LAST k of them (Prefix
+        // order). The weight is the batched constraint polynomial; the value is
+        // the public polynomial folded at the closing randomness.
+        uint256[] memory allR = new uint256[](input.allRandomness.length + randomness.length);
+        for (uint256 i; i < input.allRandomness.length; ++i) {
+            allR[i] = input.allRandomness[i];
+        }
+        for (uint256 i; i < randomness.length; ++i) {
+            allR[input.allRandomness.length + i] = randomness[i];
+        }
+        uint256 weight = WhirGadgets.evalConstraintsPoly(allR, input.constraints, false);
+        uint256 value = KoalaBearExt4.evaluate_hypercube(input.finalPoly, randomness);
+        uint256 expected = KoalaBearExt4.mul(weight, value);
+        if (folded != expected) {
+            revert TerminalClaimMismatch(expected, folded);
+        }
+        out.weight = weight;
+        out.finalValue = value;
     }
 }

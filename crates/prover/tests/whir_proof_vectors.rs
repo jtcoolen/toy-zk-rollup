@@ -422,8 +422,30 @@ struct Replay {
     query_indices: Vec<Vec<usize>>,
     /// The point each round's sumcheck reduces to.
     round_randomness: Vec<Vec<Challenge>>,
+    /// Per-round query domain points (univariate base scalars).
+    round_domain_points: Vec<Vec<u32>>,
     /// The point the closing sumcheck reduces to, when there is one.
     final_randomness: Option<Vec<Challenge>>,
+    /// The final polynomial, sent in the clear.
+    final_poly: Vec<Challenge>,
+    /// The terminal proof-of-work witness as a canonical base u32.
+    final_pow_witness: u32,
+    /// Terminal opened rows as canonical limbs (four per extension element).
+    final_rows_ext: Vec<Vec<Challenge>>,
+    /// Per-query Merkle paths for the terminal openings.
+    final_paths: Vec<Vec<String>>,
+    /// Each terminal query's folded row at the last round's randomness.
+    final_folds: Vec<Challenge>,
+    /// The terminal queries' domain points (univariate base scalars).
+    final_domain_points: Vec<u32>,
+    /// Closing sumcheck round values: h(0) and h(infinity) per round.
+    final_sumcheck_ca: Vec<Challenge>,
+    final_sumcheck_cinf: Vec<Challenge>,
+    /// Closing sumcheck `PoW` witnesses.
+    final_sumcheck_pow_witnesses: Vec<u32>,
+    /// The claim entering and leaving the closing sumcheck.
+    claimed_before_final: Challenge,
+    claimed_after_final: Challenge,
     /// The transcript event stream this replay produced.
     program: SemProgram,
 }
@@ -442,6 +464,9 @@ struct RoundWalk {
     folds: Vec<Vec<Challenge>>,
     /// Out-of-domain points, in the order drawn.
     ood_points: Vec<Challenge>,
+    /// Per-round query domain points (univariate base scalars), in query
+    /// order: the STIR selection points this round's constraint batches.
+    domain_points: Vec<Vec<u32>>,
     /// Per-round batching challenges for the STIR selection statements.
     round_batching: Vec<Challenge>,
     /// Query indices per WHIR round.
@@ -486,6 +511,7 @@ fn replay_rounds(
         claimed_evals: Vec::new(),
         folds: Vec::new(),
         ood_points: Vec::new(),
+        domain_points: Vec::new(),
         round_batching: Vec::new(),
         query_indices: Vec::new(),
         round_randomness: Vec::new(),
@@ -582,6 +608,7 @@ fn replay_rounds(
         }
         let mut select_statement = SelectStatement::initialize(rp.num_variables);
         let mut round_folds = Vec::with_capacity(indices.len());
+        let mut round_domain_points: Vec<u32> = Vec::with_capacity(indices.len());
         for (&index, row) in indices.iter().zip(&rows) {
             let fold = Poly::new(row.clone()).eval_ext::<F>(&randomness);
             round_folds.push(fold);
@@ -591,13 +618,17 @@ fn replay_rounds(
                 rp.num_variables,
                 index,
             ) {
-                WhirQueryPoint::Univariate(var) => select_statement.add_constraint(var, fold),
+                WhirQueryPoint::Univariate(var) => {
+                    select_statement.add_constraint(var, fold);
+                    round_domain_points.push(F::as_canonical_u32(&var));
+                }
                 WhirQueryPoint::Multilinear(point) => {
                     select_statement.add_point_constraint(point, fold);
                 }
             }
         }
         walk.folds.push(round_folds);
+        walk.domain_points.push(round_domain_points);
 
         let gamma = vt.round_batching();
         walk.round_batching.push(gamma);
@@ -655,6 +686,28 @@ struct TerminalWalk {
     query_indices: Vec<usize>,
     /// The point the closing sumcheck reduces to, when there is one.
     final_randomness: Option<Vec<Challenge>>,
+    /// The final polynomial, sent in the clear: `2^num_variables` coefficients.
+    final_poly: Vec<Challenge>,
+    /// The terminal proof-of-work witness as a canonical base u32.
+    final_pow_witness: u32,
+    /// Terminal opened rows as canonical limbs (four per extension element).
+    final_rows_ext: Vec<Vec<Challenge>>,
+    /// Per-query Merkle paths for the terminal openings (against the last
+    /// round's root), rebuilt with the same walk the verifier runs.
+    final_paths: Vec<Vec<String>>,
+    /// Each terminal query's folded row at the last round's randomness.
+    final_folds: Vec<Challenge>,
+    /// The terminal queries' domain points (univariate base scalars).
+    final_domain_points: Vec<u32>,
+    /// Closing sumcheck round values: h(0) and h(infinity) per round.
+    final_sumcheck_ca: Vec<Challenge>,
+    final_sumcheck_cinf: Vec<Challenge>,
+    /// Closing sumcheck `PoW` witnesses (canonical base u32s; empty at zero
+    /// difficulty, one per round otherwise).
+    final_sumcheck_pow_witnesses: Vec<u32>,
+    /// The claim entering and leaving the closing sumcheck.
+    claimed_before_final: Challenge,
+    claimed_after_final: Challenge,
 }
 
 /// Walk the terminal phase: bind the final polynomial, check the terminal query
@@ -663,6 +716,10 @@ fn replay_terminal(
     vt: &mut SemVerifierTranscript<'_>,
     whir: &WhirProof<F, Challenge, prover::config::Mmcs>,
     config: &WhirConfig<Challenge, F, SemChallenger>,
+    dft: &Dft,
+    claimed_eval: Challenge,
+    last_randomness: &Point<Challenge>,
+    last_root: &[u8; 32],
 ) -> Result<TerminalWalk, Box<dyn Error>> {
     let n_rounds = whir.rounds.len();
     let final_poly = whir.final_poly.as_ref().ok_or("missing final polynomial")?;
@@ -671,13 +728,74 @@ fn replay_terminal(
     vt.query_pow(n_rounds, whir.final_pow_witness)
         .map_err(|e| format!("terminal query pow: {e:?}"))?;
     let query_indices = vt.query_indices(n_rounds);
+
+    // The terminal openings: extension rows against the LAST round's root,
+    // folded at the last round's randomness - the same shape as an intermediate
+    // round, except the fold is then checked against the public polynomial
+    // rather than batched into the claim.
+    let fr = config.final_round_config();
+    let opening = match &whir.final_openings {
+        QueryOpenings::Extension(o) => o,
+        QueryOpenings::Base(_) => return Err("terminal openings must be extension".into()),
+    };
+    // The extension tree IS the base tree with four times the row width: an
+    // extension leaf hashes as its four basis limbs in order, so path
+    // reconstruction runs on the base mmcs with width 4 * (1 << folding) and
+    // rows flattened to base limbs.
+    let dims = [Dimensions {
+        height: fr.domain_size >> fr.folding_factor,
+        width: (1 << fr.folding_factor) * 4,
+    }];
+    let paths = mmcs(CAP_HEIGHT)
+        .restore_and_recompute_paths(
+            &dims,
+            &query_indices,
+            &opening
+                .rows
+                .iter()
+                .map(|row| {
+                    vec![row
+                        .iter()
+                        .flat_map(|x| x.as_basis_coefficients_slice().to_vec())
+                        .collect::<Vec<_>>()]
+                })
+                .collect::<Vec<_>>(),
+            &opening.proof,
+        )
+        .map_err(|e| format!("restore terminal paths: {e:?}"))?;
+    let final_paths: Vec<Vec<String>> = paths
+        .iter()
+        .map(|p| p.siblings.iter().map(|d| hex(d)).collect())
+        .collect();
+    let final_folds: Vec<Challenge> = opening
+        .rows
+        .iter()
+        .map(|row| Poly::new(row.clone()).eval_ext::<F>(last_randomness))
+        .collect();
+    let mut final_domain_points: Vec<u32> = Vec::with_capacity(query_indices.len());
+    for &i in &query_indices {
+        match <Dft as WhirDomain<F, Challenge>>::query_point(
+            dft,
+            fr.log_folded_domain_size,
+            fr.num_variables,
+            i,
+        ) {
+            WhirQueryPoint::Univariate(var) => final_domain_points.push(F::as_canonical_u32(&var)),
+            WhirQueryPoint::Multilinear(_) => {
+                return Err("two-adic domain yields univariate query points".into());
+            }
+        }
+    }
+    let _ = last_root;
+
+    let claimed_before_final = claimed_eval;
+    let mut claimed = claimed_eval;
     let final_randomness = vt
         .delegate_final_fold(|challenger| {
-            let mut scratch = Challenge::ZERO;
             p3_sumcheck::verify_final_sumcheck_rounds(
                 whir.final_sumcheck.as_ref(),
                 challenger,
-                &mut scratch,
+                &mut claimed,
                 config.final_sumcheck_rounds(),
                 config.final_folding_pow_bits(),
                 Basis::Evaluation,
@@ -686,9 +804,33 @@ fn replay_terminal(
         .transpose()
         .map_err(|e| format!("final sumcheck: {e:?}"))?
         .map(|p| p.as_slice().to_vec());
+    let claimed_after_final = claimed;
+
+    let (final_sumcheck_ca, final_sumcheck_cinf, final_sumcheck_pow_witnesses) =
+        whir.final_sumcheck.as_ref().map_or_else(
+            || (Vec::new(), Vec::new(), Vec::new()),
+            |sc| {
+                (
+                    sc.polynomial_evaluations.iter().map(|p| p[0]).collect(),
+                    sc.polynomial_evaluations.iter().map(|p| p[1]).collect(),
+                    sc.pow_witnesses.iter().map(F::as_canonical_u32).collect(),
+                )
+            },
+        );
     Ok(TerminalWalk {
         query_indices,
         final_randomness,
+        final_poly: final_poly.as_slice().to_vec(),
+        final_pow_witness: F::as_canonical_u32(&whir.final_pow_witness),
+        final_rows_ext: opening.rows.clone(),
+        final_paths,
+        final_folds,
+        final_domain_points,
+        final_sumcheck_ca,
+        final_sumcheck_cinf,
+        final_sumcheck_pow_witnesses,
+        claimed_before_final,
+        claimed_after_final,
     })
 }
 
@@ -808,7 +950,36 @@ fn replay_verifier(run: &Run) -> Result<Replay, Box<dyn Error>> {
             .map(|p| p.siblings.iter().map(|d| hex(d)).collect())
             .collect()
     };
-    let terminal = replay_terminal(&mut vt, whir, &config)?;
+    // The terminal phase folds at the LAST round's randomness and opens against
+    // the LAST round's root; with no intermediate rounds those are the initial
+    // sumcheck's point and the batch commitment.
+    let last_randomness_vec = rounds
+        .round_randomness
+        .last()
+        .cloned()
+        .unwrap_or_else(|| initial_randomness.as_slice().to_vec());
+    let last_randomness = Point::new(last_randomness_vec);
+    let last_root_bytes: &[u8] = if whir.rounds.is_empty() {
+        run.commitment.roots()[0].as_ref()
+    } else {
+        whir.rounds
+            .last()
+            .and_then(|r| r.commitment.as_ref())
+            .expect("round commitment")
+            .roots()[0]
+            .as_ref()
+    };
+    let last_root: [u8; 32] = <[u8; 32]>::try_from(last_root_bytes).expect("32-byte root");
+    let claimed_after_rounds = rounds.folded_claims.last().copied().unwrap_or(claimed_eval);
+    let terminal = replay_terminal(
+        &mut vt,
+        whir,
+        &config,
+        &Dft::default(),
+        claimed_after_rounds,
+        &last_randomness,
+        &last_root,
+    )?;
     vt.finish();
 
     // The constraint holds only equality statements at this point - the selection
@@ -862,7 +1033,19 @@ fn replay_verifier(run: &Run) -> Result<Replay, Box<dyn Error>> {
         round_batching: rounds.round_batching,
         query_indices,
         round_randomness: rounds.round_randomness,
+        round_domain_points: rounds.domain_points,
         final_randomness: terminal.final_randomness,
+        final_poly: terminal.final_poly,
+        final_pow_witness: terminal.final_pow_witness,
+        final_rows_ext: terminal.final_rows_ext,
+        final_paths: terminal.final_paths,
+        final_folds: terminal.final_folds,
+        final_domain_points: terminal.final_domain_points,
+        final_sumcheck_ca: terminal.final_sumcheck_ca,
+        final_sumcheck_cinf: terminal.final_sumcheck_cinf,
+        final_sumcheck_pow_witnesses: terminal.final_sumcheck_pow_witnesses,
+        claimed_before_final: terminal.claimed_before_final,
+        claimed_after_final: terminal.claimed_after_final,
         program: sink.program(),
     })
 }
@@ -1221,6 +1404,8 @@ fn whir_proof_vectors() -> Result<(), Box<dyn Error>> {
             "num_round_sumcheck_rounds": replay.round_sumcheck_ca.iter().map(Vec::len).collect::<Vec<_>>(),
             "num_round_rows_base": replay.round_rows_base.len(),
             "num_round_rows_ext": replay.round_rows_ext.len(),
+            "final_poly_len": replay.final_poly.len(),
+            "num_final_sumcheck_pow_witnesses": replay.final_sumcheck_pow_witnesses.len(),
             "round0_path_depth": replay.round0_paths.first().map_or(0, Vec::len),
             "num_ood_points": replay.ood_points.len(),
         },
@@ -1257,6 +1442,20 @@ fn whir_proof_vectors() -> Result<(), Box<dyn Error>> {
             .collect::<Vec<_>>(),
         "round_params": &replay.round_params,
         "round0_paths": &replay.round0_paths,
+        "final_poly": replay.final_poly.iter().map(ext_json).collect::<Vec<_>>(),
+        "final_pow_witness": replay.final_pow_witness,
+        "final_rows_ext": replay.final_rows_ext.iter()
+            .map(|v| v.iter().map(ext_json).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        "final_paths": &replay.final_paths,
+        "final_folds": replay.final_folds.iter().map(ext_json).collect::<Vec<_>>(),
+        "final_domain_points": &replay.final_domain_points,
+        "final_sumcheck_ca": replay.final_sumcheck_ca.iter().map(ext_json).collect::<Vec<_>>(),
+        "final_sumcheck_cinf": replay.final_sumcheck_cinf.iter().map(ext_json).collect::<Vec<_>>(),
+        "final_sumcheck_pow_witnesses": &replay.final_sumcheck_pow_witnesses,
+        "round_domain_points": &replay.round_domain_points,
+        "claimed_before_final": ext_json(&replay.claimed_before_final),
+        "claimed_after_final": ext_json(&replay.claimed_after_final),
         "round_batching": replay.round_batching.iter().map(ext_json).collect::<Vec<_>>(),
         "query_indices": replay.query_indices.iter()
             .map(|v| v.iter().map(|&i| i as u64).collect::<Vec<_>>())

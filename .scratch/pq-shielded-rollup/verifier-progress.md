@@ -13,8 +13,8 @@ EIP-170 bytecode limits, and address them borrowing design from
 |---|-----------|-------|
 | M1 | Proof codec + Merkle + STIR fold + sumcheck primitives | done |
 | M2 | Initial phase port (`verifyInitial`) pinned to the prover | done, committed `93fbec3` |
-| M3 | Per-round phase port (`verifyRound`) + prover-pinned test | done (this commit) |
-| M4 | Final phase: `final_poly`, terminal claim, closing sumcheck | pending |
+| M3 | Per-round phase port (`verifyRound`) + prover-pinned test | done, committed `ea6ae3e` |
+| M4 | Final phase port (`verifyFinal`) + prover-pinned test | done (this commit) |
 | M5 | Batch STARK transcript layer (commitment/OOD/quotient/degree) | pending |
 | M6 | `ConstraintIdentity.sol` (generated AIR constraint identity) | pending |
 | M7 | `ChunkVerifier.sol` (multi-transaction sponge carry) | pending |
@@ -98,8 +98,36 @@ Blockers / open items:
    then commit M3.
 5. Start M4 (final phase) exports in the same harness.
 
+- `verifyFinal` + `WhirFinalPhase.t.sol` + terminal exports in the vector harness; 91 forge tests green.
 ## Log
 
 - `verifyRound` spliced into `WhirVerifierCore.sol`; harness exports extended;
   artifact regenerated; round test + shared initial-phase harness written.
   First `forge build` failed on the bytes/string JSON mismatch above.
+
+## M4 complete (final phase)
+
+- `WhirVerifierCore.verifyFinal` mirrors `replay`'s tail: bind the public
+  polynomial (`final_poly`), terminal PoW, terminal query indices, per-query
+  Merkle open + fold at the last round's randomness, then the STIR check
+  `fold == horner(finalPoly, domainPoint)` (the terminal claims are checked
+  DIRECTLY against the public polynomial, not batched into the claim), the
+  closing sumcheck, and the terminal identity
+  `claimed == eval_constraints_poly(all_r) * final_poly(final_r)`.
+- The extension tree IS the base tree at 4x row width: terminal path
+  reconstruction runs on the base `MerkleTreeMmcs` with
+  `width = 4 * (1 << folding_factor)` and rows flattened to base limbs.
+- `query_point` returns BASE scalars (`WhirQueryPoint::Univariate(F)`); the
+  artifact exports them canonical and the test lifts them.
+- `all_r` = initial randomness, then each round's, then the closing
+  sumcheck's; each constraint reads the LAST k (Prefix). The constraint list
+  for the terminal identity is [initial, round0..n-1] - the FINAL round's
+  STIR claims are not in it.
+- New exports: `final_poly`, `final_pow_witness`, `final_rows_ext`,
+  `final_paths`, `final_folds`, `final_domain_points`, `final_sumcheck_*`,
+  `claimed_before/after_final`, `round_domain_points`, plus counts
+  `final_poly_len` and `num_final_sumcheck_pow_witnesses`.
+- Tests: `WhirFinalPhase.t.sol` pins the closing claim, the closing
+  randomness, and (inside `verifyFinal`) the STIR check and terminal
+  identity; a tampered public polynomial reverts. 85M gas for the whole
+  WHIR core on this shape.
