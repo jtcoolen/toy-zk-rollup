@@ -252,12 +252,50 @@ fn whir_semantic_program_artifact_has_the_pinned_shape() -> Result<(), Box<dyn E
         runs,
         fixed
     );
+
+    // The binary blob is what the contract actually reads, so pin its header too.
+    // A stale blob is worse than a stale JSON: the Solidity side would follow a
+    // schedule that no longer matches the recorded program and desynchronise in a
+    // place nobody thought to look.
+    let blob_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../contracts/test/vectors/whir_transcript_program.bin");
+    let blob =
+        std::fs::read(&blob_path).map_err(|e| format!("missing {}: {e}", blob_path.display()))?;
+    assert!(blob.len() > 28, "blob is shorter than its header");
+    assert_eq!(&blob[..4], b"WSPR", "blob magic");
+    assert_eq!(u16::from_be_bytes([blob[4], blob[5]]), 1, "blob version");
+    let schedule_len = usize::from(u16::from_be_bytes([blob[6], blob[7]]));
+    assert_eq!(schedule_len, 175, "blob schedule length");
+    let be32 = |k: usize| {
+        usize::try_from(u32::from_be_bytes([
+            blob[8 + k * 4],
+            blob[9 + k * 4],
+            blob[10 + k * 4],
+            blob[11 + k * 4],
+        ]))
+        .expect("a payload length fits a usize")
+    };
+    // constants, variables, samples, uniform, witnesses
+    let lens = [be32(0), be32(1), be32(2), be32(3), be32(4)];
+    assert_eq!(lens, [7396, 2900, 896, 1558, 92], "blob payload lengths");
+    assert_eq!(
+        blob.len(),
+        28 + schedule_len * 4 + lens.iter().sum::<usize>(),
+        "blob payload lengths do not cover the file"
+    );
+    // The constant payload is the config-fixed literals, so its byte count must agree
+    // with the classification in the JSON: one word per fixed position.
+    assert_eq!(
+        lens[0],
+        fixed * 4,
+        "the blob constant table disagrees with the fixed-value classification"
+    );
+    println!("blob pinned: {schedule_len} schedule entries, {lens:?} payloads");
     Ok(())
 }
+
 /// Classify every observation position as config-fixed or proof-dependent.
-///
-/// Returns one entry per event in `runs[0]` — the value observed there when every
-/// witness observed the same thing, `None` otherwise — plus the positions that
+/// Returns one entry per event in `runs[0]` - the value observed there when every
 /// disagreed. A position that never moves is fixed by the config, so the contract
 /// carries it as a literal; one that moves is proof data read from the calldata.
 ///
@@ -298,6 +336,146 @@ fn classify_observations(runs: &[Vec<SemEvent>]) -> (Vec<Option<Vec<u32>>>, Vec<
         })
         .collect();
     (fixed_values, varying_positions)
+}
+/// Operation kinds in the compact replay blob; one byte each.
+///
+/// The Solidity verifier dispatches on these, so the numbering is part of the wire
+/// format. Changing a number here silently changes what the contract does, so the
+/// blob carries a version and the Solidity test asserts it.
+const OP_CONST_U32: u8 = 0;
+const OP_VAR_U32: u8 = 1;
+const OP_COMMITMENT: u8 = 2;
+const OP_SAMPLE_BASE: u8 = 3;
+const OP_UNIFORM_BITS: u8 = 4;
+const OP_CHECK_WITNESS: u8 = 5;
+
+/// Extend a run-length schedule by one operation, merging with the previous entry
+/// when the kind and argument match.
+fn push_run(schedule: &mut Vec<(u8, u8, usize)>, kind: u8, arg: u8) {
+    match schedule.last_mut() {
+        Some(last) if last.0 == kind && last.1 == arg => last.2 += 1,
+        _ => schedule.push((kind, arg, 1)),
+    }
+}
+
+/// The transcript program as a compact binary blob, for the Solidity side to drive.
+///
+/// Why a blob and not the JSON: the contract would have to parse 3551 JSON objects,
+/// and parsing is where a verifier picks up a bug. Here it walks a byte table.
+///
+/// Layout, header fields big-endian:
+///
+/// ```text
+/// magic "WSPR" | version u16 | schedule_len u16
+///   | const_len u32 | var_len u32 | sample_len u32 | uniform_len u32 | witness_len u32
+/// then schedule_len entries of [kind u8, arg u8, run u16], then the five payloads
+/// ```
+///
+/// The `SAMPLE_BASE` arg is the basis-coefficient count of each logged sample
+/// (1 here; a quartic extension element is four consecutive runs of it).
+///
+/// Field payloads are 4-byte LITTLE-endian words, because that is the order the
+/// transcript absorbs them in: a run of constant observations is exactly the byte
+/// string the sponge must eat, so the contract absorbs it without re-encoding.
+fn replay_blob(
+    program: &SemProgram,
+    fixed: &[Option<Vec<u32>>],
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut schedule: Vec<(u8, u8, usize)> = Vec::new();
+    let mut constants: Vec<u8> = Vec::new();
+    let mut variables: Vec<u8> = Vec::new();
+    let mut samples: Vec<u8> = Vec::new();
+    let mut uniform: Vec<u8> = Vec::new();
+    let mut witnesses: Vec<u8> = Vec::new();
+
+    for (i, event) in program.iter().enumerate() {
+        match event {
+            SemEvent::ObserveBase { value } => {
+                if let Some(v) = &fixed[i] {
+                    constants.extend_from_slice(&v[0].to_le_bytes());
+                    push_run(&mut schedule, OP_CONST_U32, 0);
+                } else {
+                    variables.extend_from_slice(&value.to_le_bytes());
+                    push_run(&mut schedule, OP_VAR_U32, 0);
+                }
+            }
+            // A commitment is proof data by construction, so it never lands in the
+            // constant table even though classify_observations could in principle
+            // call one fixed. Asserting that keeps the two writers honest.
+            SemEvent::ObserveBytes { bytes } => {
+                if fixed[i].is_some() {
+                    return Err(
+                        format!("event {i}: a commitment was classified as config-fixed").into(),
+                    );
+                }
+                variables.extend_from_slice(bytes);
+                push_run(&mut schedule, OP_COMMITMENT, 4);
+            }
+            // The recorder logs one event per BASIS COEFFICIENT, so a quartic
+            // extension element arrives as four consecutive arity-1 events. The run
+            // encoder merges them; the arg is the coefficient count per event.
+            SemEvent::SampleBase { values } => {
+                for v in values {
+                    samples.extend_from_slice(&v.to_le_bytes());
+                }
+                let arg = u8::try_from(values.len())?;
+                push_run(&mut schedule, OP_SAMPLE_BASE, arg);
+            }
+            SemEvent::SampleUniformBits { bits, value } => {
+                if *bits > 16 {
+                    return Err(
+                        format!("event {i}: {bits} uniform bits exceed the u16 payload").into(),
+                    );
+                }
+                uniform.extend_from_slice(&u16::try_from(*value)?.to_be_bytes());
+                let arg = u8::try_from(*bits)?;
+                push_run(&mut schedule, OP_UNIFORM_BITS, arg);
+            }
+            SemEvent::CheckWitness { bits, witness, ok } => {
+                if !ok {
+                    return Err(format!("event {i}: a proof-of-work witness failed").into());
+                }
+                witnesses.extend_from_slice(&witness.to_le_bytes());
+                let arg = u8::try_from(*bits)?;
+                push_run(&mut schedule, OP_CHECK_WITNESS, arg);
+            }
+            // Absent in this shape. Reaching either means the protocol changed and
+            // the blob format needs new payloads, not that we should guess them.
+            SemEvent::SampleBits { bits, .. } => {
+                return Err(
+                    format!("event {i}: SampleBits({bits}) is not in the blob format").into(),
+                );
+            }
+            SemEvent::Grind { bits, .. } => {
+                return Err(format!("event {i}: Grind({bits}) is not in the blob format").into());
+            }
+        }
+    }
+
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(b"WSPR");
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&u16::try_from(schedule.len())?.to_be_bytes());
+    for len in [
+        constants.len(),
+        variables.len(),
+        samples.len(),
+        uniform.len(),
+        witnesses.len(),
+    ] {
+        out.extend_from_slice(&u32::try_from(len)?.to_be_bytes());
+    }
+    for (kind, arg, run) in &schedule {
+        out.push(*kind);
+        out.push(*arg);
+        out.extend_from_slice(&u16::try_from(*run)?.to_be_bytes());
+    }
+    out.extend_from_slice(&constants);
+    out.extend_from_slice(&variables);
+    out.extend_from_slice(&samples);
+    out.extend_from_slice(&uniform);
+    out.extend_from_slice(&witnesses);
+    Ok(out)
 }
 #[test]
 #[ignore = "proves RUNS times; run deliberately to regenerate the semantic program"]
@@ -393,9 +571,34 @@ fn whir_semantic_program() -> Result<(), Box<dyn Error>> {
         "events": base,
         "fixed_values": fixed_values,
     });
+    // COMPLETENESS. Every byte the transcript absorbed must be accounted for by an
+    // operation. This is the check that the semantic recording loses nothing: if some
+    // observation path were unrecorded, the totals would disagree and the contract
+    // would desynchronise at a point the spec cannot even name.
+    let observed_bytes = base
+        .iter()
+        .map(|e| match e {
+            // A base observation and a witness check each absorb one 4-byte word.
+            SemEvent::ObserveBase { .. } | SemEvent::CheckWitness { .. } => 4,
+            SemEvent::ObserveBytes { bytes } => bytes.len(),
+            _ => 0,
+        })
+        .sum::<usize>();
+    assert_eq!(
+        observed_bytes, 10_388,
+        "the semantic recording no longer accounts for every absorbed byte"
+    );
+    println!("completeness: operations account for all {observed_bytes} absorbed bytes");
+
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../contracts/test/vectors/whir_semantic_program.json");
     std::fs::write(&path, serde_json::to_string_pretty(&json)?.into_bytes())?;
     println!("wrote {}", path.display());
+
+    let blob = replay_blob(base, &fixed_values)?;
+    let blob_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../contracts/test/vectors/whir_transcript_program.bin");
+    std::fs::write(&blob_path, &blob)?;
+    println!("wrote {} ({} bytes)", blob_path.display(), blob.len());
     Ok(())
 }
