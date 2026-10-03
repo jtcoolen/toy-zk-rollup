@@ -117,7 +117,7 @@ fn verify_rejects_tampered_public_value() {
 /// (`PaddingFreeSponge<KeccakF, 25, 17, 4>`) produced 4 u64 limbs, which is
 /// also 32 bytes but is NOT a Keccak-256 digest: no FIPS padding, u64 lane
 /// order, 4-lane squeeze. Replaying that on-chain means a hand-rolled
-/// permutation at ~30-50k gas per call. See D-047.
+/// permutation at ~30-50k gas per call. See D-050.
 #[test]
 fn commitments_are_keccak_sized() {
     let cfg = test_config();

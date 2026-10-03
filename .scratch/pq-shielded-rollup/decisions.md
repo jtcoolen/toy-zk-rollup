@@ -2184,7 +2184,7 @@ the R commitment and its openings as well.
 
 ---
 
-## D-047 — Settlement Merkle tree is byte-native Keccak-256; do NOT port Keccak-f[1600] to Solidity
+## D-050 — Settlement Merkle tree is byte-native Keccak-256; do NOT port Keccak-f[1600] to Solidity
 
 **Status.** Supersedes the plan recorded earlier in this session (and implied by
 the D-036/D-038 gas discussion) to keep `PaddingFreeSponge<KeccakF, 25, 17, 4>`
@@ -2274,3 +2274,153 @@ proof payload are the same 32 bytes per node (they were already 32 bytes on
 the wire) but the *cap* is now 32 bytes per root instead of 4 packed limbs.
 At cap height 0 that is one 32-byte root, absorbed as 32 bytes instead of 16.
 The measured proof sizes in `prover_bench` reflect the new scheme.
+
+---
+
+## D-051 - HVZK blinding is enforced at compile time; three measured floors
+
+**Status.** Implemented and green. Answers the standing instruction "ensure we
+only use hvzk whir zk blinding enabled".
+
+**What was already true.** The vendored recursion carries `const ZK: bool = true`
+on `WhirUniPcs` (`recursion/src/pcs/whir/uni/pcs.rs:949`), patch item 1 of
+`vendor/p3-recursion/PATCHES.md`. Both layers use that same PCS type, so both
+were already hiding. What was missing was ENFORCEMENT: nothing failed if an
+upstream bump or a re-vendor flipped it back to false.
+
+**Decision - enforce with `const` asserts in the shipped lib.**
+`crates/prover/src/lib.rs` gained a private `zk_guard` module with two
+`const _: () = assert!(<Config as StarkGenericConfig>::Pcs::ZK)` checks. `ZK` is
+an associated const, so this is a compile-time fact: flipping it makes the crate
+fail to COMPILE. A test only fires when someone runs it; for a shielded pool,
+"could not build" is the guarantee we want. `ZK` is an item of
+`p3_commit::UnivariateStarkPcs`, so that trait must be in scope to name it -
+imported inside the module with `as _` to avoid widening the root namespace.
+
+**Runtime half** (`crates/prover/tests/hvzk_blinding.rs`, 3 tests) covers what a
+constant cannot prove:
+- the proof carries `commitments.random` and `opened_values.random`, they are
+  non-empty, and at least one opened random value is non-zero - separating
+  "blinding compiled in" from "blinding allocated zeros and never sampled";
+- two proofs of the SAME statement produce different commitments - the only
+  check that catches a fixed RNG seed, since reproducible masking is worthless
+  while passing every single-proof assertion;
+- the full two-layer path builds and settles over a blinded base proof, and the
+  statement binding still rejects a tampered statement afterwards.
+
+**Finding 1 - blinding randomises the TRACE commitment, not just R.** The
+assertion "same trace must give the same trace commitment" FAILED: two proofs of
+one statement had different `commitments.trace`. Cause: the patched `commit`
+folds the mask rows into the committed matrix, so the mask lives inside the
+Merkle tree. This is a BETTER property than the one asserted - two proofs of the
+same statement are unlinkable at the commitment level, not only at the opening
+level - so the test now asserts the difference. Consequence for the node: a block
+cannot be identified by its trace commitment, and any prover-side caching keyed
+on trace commitment would be unsound.
+
+**Finding 2 - a hard floor on base-proof size for recursion.** Settling a
+256-row base proof fails with `num_queries (182) >= folded_domain_size (128);
+saturating STIR query counts are not yet supported in-circuit`
+(`recursion/src/pcs/whir/params.rs:61`). The schedule buys security with queries
+while the final folded domain shrinks with the trace, so small traces saturate.
+1024 rows works and the recursion tests already use 1024. Deployment rule: the
+per-batch AIR must be padded to at least 1024 rows, checked at config build time
+rather than discovered at settlement time.
+
+**Finding 3 - the settlement LDE cannot be shrunk to save calldata.**
+`crates/prover/tests/recursion_lde_sweep.rs` walks log_max_lde 17..22 over a
+real recursive settlement (152624 witnesses, ~2^17.2):
+
+```text
+  17..20  PANIC  PowBitsExceedBudget { required: 17, budget: 11..14 }
+  21      PANIC  PowBitsExceedBudget { required: 18, budget: 17 }
+  22      ok     2.13 s prove, 8.19 ms verify, 676708 bytes
+```
+
+So 676 KB is a FLOOR for this circuit, not slack to tune away: grinding needs
+17-18 bits and only log_max_lde 22 leaves room for them. Two secondary notes:
+the failure is a PANIC from an `unwrap` in the vendored prover rather than an
+`Err`, so the sweep needs `catch_unwind` just to map the boundary; and proof
+bytes are non-deterministic run to run (676580 vs 676708) precisely because of
+finding 1.
+
+**On the `NO_RANDOM_OPENED_VALUES` stub (D-046 open item): NOT a hole for WHIR.**
+`get_fri_random_opened_values` is only consulted when
+`PRE_OBSERVES_OPENED_VALUES` is true (`verifier/batch_stark.rs:1528`), and WHIR
+sets it false (`pcs/whir/uni/recursive_pcs.rs:384`) because WHIR interleaves its
+own opened-value observation. The R commitment IS bound in-circuit by the normal
+path: `batch_stark.rs:1275-1317` observes `random_commit` into the challenger and
+pushes it into `coms_to_verify` with its own opening points. Patch item 2 in
+PATCHES.md is stale bookkeeping and should be dropped from that list, not
+implemented.
+
+**Correction to the record.** Commit 9ffd9ed originally claimed the suite ran
+unoptimised. Wrong: `.cargo/config.toml` sets `[profile.dev] opt-level = 3` with
+`[profile.test] inherits = "dev"`, so tests have always been optimised. Measured
+effect of `--release` (thin LTO + codegen-units=1) at 2^22 rows: 10.8 s vs 13.4 s
+prove. The commit message was reworded.
+
+**Numbering note.** This file has two ordering eras: D-047/048/049 already
+existed at the top (reference synthesis, sumcheck fold, SumcheckCore limbs), so
+the two entries added in this session were numbered D-050 (byte-native Keccak
+settlement tree) and D-051 (this one). Code comments citing the Keccak switch
+were updated from D-047 to D-050; `fixed_config.rs` keeps its D-047, which
+legitimately means the reference synthesis.
+
+---
+
+## D-052 - Golden vectors were self-rewriting; add an always-on currency check
+
+**Status.** Fixed and green, with the fix itself tested by mutation.
+
+**The defect.** `crates/prover/tests/golden_vectors.rs` documents itself as
+"Ignored by default on purpose... a change shows up as a reviewable diff", but
+none of its three generator tests carried `#[ignore]`. Every `cargo test` run
+therefore REWROTE three checked-in fixtures - `field_vectors.json`,
+`transcript_vectors.json`, `block_vectors.json` - and the generated
+`contracts/test/TranscriptReplay.t.sol`. A test that regenerates its own
+expectations cannot fail, which is exactly the property the anti-drift design
+depends on. It also meant a real transcript or statement change would be
+silently absorbed into the JSON instead of showing up as a reviewable diff.
+
+**How it was noticed.** `git status` showed the vector files modified after a
+plain workspace test run, with no edit to any generator.
+
+**Decision - split generation from validation.**
+1. The three generators now carry `#[ignore]`, matching the module doc that
+   already claimed they did. Regeneration stays deliberate, so the diff is
+   reviewed.
+2. New always-on test `golden_vectors_are_current` READS the fixtures and
+   re-derives their deterministic content from the current code: the modulus
+   and Montgomery R, the field value table, the transcript program, the derived
+   alpha/zeta, the validity of the recorded PoW witness, and the block
+   statement plus its Montgomery transcript words.
+3. The block statement is re-derived WITHOUT proving, via
+   `fixtures::public_and_witnesses_from` + `build_transfer_circuit`, so the
+   check costs milliseconds instead of a proving run.
+4. `BlockFixture` is now the single definition of the block fixture, shared by
+   the generator and the check. Two copies of a fixture is how a vector ends up
+   describing a transfer the prover would never produce.
+
+**What the check deliberately does NOT pin.**
+- The PoW witness VALUE. `HashChallenger::find_witness` searches candidates in
+  parallel batches and returns the first hit with `find_map_any
+  (p3-challenger hash_challenger.rs:277)`, so which candidate is returned
+  depends on batch layout and is not stable across builds. Its VALIDITY is
+  stable, and validity is the assertion that matters - it is the same assertion
+  the generated Solidity test makes with its own `checkWitness`.
+- Proof bytes or proof length. HVZK blinding folds the mask into the committed
+  trace (D-051 finding 1), so two proofs of one statement differ at the
+  commitment level by design. Pinning them would fail for a reason that means
+  nothing, and a test that fails for no reason gets deleted.
+
+**Side effect worth recording.** The stale fixture proved it: HEAD pinned
+`witness_canonical: 532676624` while current code grinds to 7 with an identical
+pre-grind state (alpha and zeta unchanged). The committed vector had already
+drifted and nothing objected. The regenerated fixtures were re-verified on-chain
+(`forge test` on `TranscriptReplay.t.sol` passes against them).
+
+**The fix is tested by mutation.** Four independent corruptions of the fixtures
+- a statement limb, a challenge value, an invalid PoW witness, and a `pow_bits
+  mismatch - each made `golden_vectors_are_current` FAIL, and it passes again
+once restored. A guard that cannot fail is not a guard.

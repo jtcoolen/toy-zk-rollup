@@ -56,6 +56,43 @@ mod spike;
 
 pub use config::{Challenge, Challenger, Config, F};
 
+/// HVZK blinding is not optional, and this is where that is enforced.
+///
+/// A shielded pool that proves without blinding leaks its secrets through the
+/// proof itself: the opening argument hands the verifier linear combinations of
+/// witness cells at a random point, and the proof is published to everyone. So
+/// "the prover runs with ZK" cannot be a property someone assembling a config
+/// is trusted to preserve.
+///
+/// `Pcs::ZK` is a compile-time constant, which means the guarantee can be a
+/// `const` assert: an upstream bump, a re-vendor, or a local edit that flips
+/// either layer back to `false` makes this crate fail to COMPILE. That is
+/// strictly stronger than a test, which only fires when someone runs it, and
+/// stronger still than a doc comment.
+///
+/// The runtime side of the same guarantee -- that blinding actually sampled
+/// rather than zero-filled, and that it is reseeded per proof -- lives in
+/// `tests/hvzk_blinding.rs`.
+mod zk_guard {
+    // `ZK` is an associated const of `UnivariateStarkPcs`, so the trait has to
+    // be in scope to name it. Imported here rather than at the crate root so it
+    // does not widen the root namespace for a guard nobody calls.
+    use p3_commit::UnivariateStarkPcs as _;
+
+    const _: () = assert!(
+        <crate::whir::Config as p3_uni_stark::StarkGenericConfig>::Pcs::ZK,
+        "the settlement (Keccak) layer must run HVZK blinding: its proof is the one
+         that lands on-chain, so an unblinded trace opening publishes witness
+         combinations to the whole network"
+    );
+
+    const _: () = assert!(
+        <crate::whir_recursion::InnerWhirConfig as p3_uni_stark::StarkGenericConfig>::Pcs::ZK,
+        "the recursion (Poseidon2) layer must run HVZK blinding: the base proof it
+         produces is what the recursion circuit re-verifies"
+    );
+}
+
 /// Deterministic shielded fixtures.
 ///
 /// Compiled for the crate's own tests and for any downstream crate that

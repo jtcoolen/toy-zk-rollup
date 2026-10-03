@@ -54,6 +54,16 @@
 //! Ignored by default on purpose. A Solidity test that regenerated its own
 //! vectors would be testing the generator rather than the verifier. Vectors
 //! are generated deliberately and a change shows up as a reviewable diff.
+//!
+//! ## What is pinned, and what must NOT be
+//!
+//! `golden_vectors_are_current` runs on every `cargo test` and re-derives the
+//! deterministic parts of each checked-in file. It deliberately does NOT pin
+//! proof bytes, proof length, or a proof's transcript commitments: HVZK
+//! blinding folds the mask into the committed trace (D-051 finding 1), so two
+//! proofs of one statement differ at the commitment level by design. Pinning
+//! those would make the suite fail for a reason that means nothing, and a
+//! test that fails for no reason is a test that gets deleted.
 
 #![cfg(test)]
 
@@ -96,12 +106,13 @@ fn write_vector(name: &str, value: &serde_json::Value) -> Result<PathBuf, Box<dy
 /// the 16-bit limb maximum, a value whose Montgomery form has high bits set,
 /// and the largest canonical value.
 #[test]
+#[ignore = "regenerates a checked-in golden vector; run deliberately so the diff is reviewed"]
 fn field_vectors() -> Result<(), Box<dyn Error>> {
     // p - 1 fits in u32: p = 2^31 - 2^27 + 1 < 2^31, so the narrowing cast
     // below is exact and cannot truncate.
     #[allow(clippy::cast_possible_truncation)]
     const P_MINUS_ONE: u32 = (KOALABEAR_P - 1) as u32;
-    let values: Vec<u32> = vec![0, 1, 2, 7, 0xffff, 0x1234, 1_000_000, P_MINUS_ONE];
+    let values = field_value_set(P_MINUS_ONE);
     let mut out = Vec::new();
     for &v in &values {
         let m = monty(v);
@@ -129,6 +140,15 @@ fn field_vectors() -> Result<(), Box<dyn Error>> {
     println!("wrote {}", path.display());
     Ok(())
 }
+/// The value set behind `field_vectors.json`, shared with the always-on check.
+///
+/// Chosen to cover the corners: zero, one, small values, the 16-bit limb
+/// maximum, a value whose Montgomery form has high bits set, and the largest
+/// canonical value.
+fn field_value_set(p_minus_one: u32) -> Vec<u32> {
+    vec![0, 1, 2, 7, 0xffff, 0x1234, 1_000_000, p_minus_one]
+}
+
 /// One step of a transcript program.
 ///
 /// The transcript is a *program*, not a blob: a sequence of absorbs and
@@ -164,7 +184,11 @@ fn settlement_program() -> Vec<Step> {
 /// Runs the settlement program against a traced challenger, records every
 /// byte and every derived challenge, and emits both the JSON vector and a
 /// generated Solidity test that replays the same program.
+///
+/// Rewrites two checked-in files, so it is ignored. `golden_vectors_are_current`
+/// is the test that runs on every `cargo test`.
 #[test]
+#[ignore = "regenerates a checked-in golden vector AND the generated Solidity test; run deliberately"]
 fn transcript_vectors() -> Result<(), Box<dyn Error>> {
     use prover::whir::F;
 
@@ -192,18 +216,7 @@ fn transcript_vectors() -> Result<(), Box<dyn Error>> {
     let zeta = challenges[1];
     let witness = witness.expect("the program grinds");
 
-    let events: Vec<serde_json::Value> = trace
-        .events
-        .iter()
-        .map(|ev| match ev {
-            Event::Observe { tag, bytes } => serde_json::json!({
-                "op": "observe", "tag": tag, "hex": hex(bytes), "len": bytes.len(),
-            }),
-            Event::Sample { tag, bytes } => serde_json::json!({
-                "op": "sample", "tag": tag, "hex": hex(bytes), "len": bytes.len(),
-            }),
-        })
-        .collect();
+    let events = event_values(&trace.events);
 
     let path = write_vector(
         "transcript_vectors.json",
@@ -224,6 +237,22 @@ fn transcript_vectors() -> Result<(), Box<dyn Error>> {
 
     emit_solidity_transcript_test(&challenges, &hex(&witness.to_unique_u32().to_le_bytes()))?;
     Ok(())
+}
+
+/// Recorded transcript events as JSON, shared by the generator and the
+/// always-on check so both describe a trace the same way.
+fn event_values(events: &[Event]) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .map(|ev| match ev {
+            Event::Observe { tag, bytes } => serde_json::json!({
+                "op": "observe", "tag": tag, "hex": hex(bytes), "len": bytes.len(),
+            }),
+            Event::Sample { tag, bytes } => serde_json::json!({
+                "op": "sample", "tag": tag, "hex": hex(bytes), "len": bytes.len(),
+            }),
+        })
+        .collect()
 }
 
 /// The program as JSON, so the Solidity generator and any future consumer
@@ -362,6 +391,7 @@ contract TranscriptReplayTest is Test {{
 /// the statement in both forms plus the serialized proof. This is the vector
 /// that would catch a layout change, a header change, or a proof-format change.
 #[test]
+#[ignore = "regenerates a checked-in golden vector; run deliberately so the diff is reviewed"]
 fn block_vectors() -> Result<(), Box<dyn Error>> {
     use prover::client::{prove_client_transfer, ClientSpec};
     use prover::fixtures::{funded_note, seed};
@@ -442,4 +472,272 @@ fn hex(bytes: &[u8]) -> String {
             let _ = write!(acc, "{b:02x}");
             acc
         })
+}
+
+// ---------------------------------------------------------------------------
+// Always-on vector currency check
+// ---------------------------------------------------------------------------
+
+/// Reads a checked-in vector file.
+fn read_vector(name: &str) -> Result<serde_json::Value, Box<dyn Error>> {
+    let path = vectors_dir().join(name);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("{}: {e} (regenerate with --ignored)", path.display()))?;
+    Ok(serde_json::from_str(&text)?)
+}
+
+/// The block fixture behind `block_vectors.json`.
+///
+/// One definition, shared by the generator (which proves) and by the always-on
+/// check (which only needs the statement). Rebuilding the note in two places is
+/// how a vector ends up describing a transfer the prover would never produce.
+struct BlockFixture {
+    note: shielded::Note,
+    sk_d: [u8; 32],
+    path: Vec<pq_hash::Digest32>,
+    index: usize,
+    output: shielded::Note,
+    fee: u64,
+    root: pq_hash::MerkleRoot,
+}
+
+impl BlockFixture {
+    fn build() -> Self {
+        use prover::fixtures::{funded_note, seed};
+        use shielded::keys::derive_spend_pk;
+        use shielded::tree::CommitmentTree;
+
+        let (note, sk_d) = funded_note(11, 1_000);
+        let recipient = derive_spend_pk(&pq_hash::Sha3_256Shielded, &seed(9));
+        let output = shielded::Note::new(900, seed(0x51), seed(0x52), recipient);
+
+        let mut tree = CommitmentTree::new(pq_hash::Keccak256Commitment);
+        tree.append(&note.commit(&pq_hash::Keccak256Commitment));
+        let root = tree.root();
+        let path = tree.path(0).expect("path exists").siblings;
+        Self {
+            note,
+            sk_d,
+            path,
+            index: 0,
+            output,
+            fee: 100,
+            root,
+        }
+    }
+
+    fn transfer(&self) -> shielded::Transfer<'_> {
+        shielded::Transfer {
+            spends: vec![shielded::transfer::Spend {
+                note: &self.note,
+                sk_d: &self.sk_d,
+                path: &self.path,
+                index: self.index,
+            }],
+            outputs: vec![self.output],
+            fee: self.fee,
+        }
+    }
+
+    /// The statement limbs, derived WITHOUT proving.
+    ///
+    /// This is the cheap half of what `prove_client_transfer` computes, and it is
+    /// the half the contract actually verifies, so it is the half worth pinning
+    /// on every cargo test run.
+    fn statement(&self) -> Vec<prover::whir::F> {
+        let map = shielded::NullifierMap::new(pq_hash::Keccak256Commitment);
+        let transfer = self.transfer();
+        let (public, witnesses) =
+            prover::fixtures::public_and_witnesses_from(&transfer, self.root, map);
+        prover::transfer::build_transfer_circuit(&transfer, &public, &witnesses)
+            .expect("fixture circuit builds")
+            .statement()
+            .to_vec()
+    }
+}
+
+/// The checked-in vectors must still describe what THIS code produces.
+///
+/// Unlike the generators above, this runs on every cargo test. It exists
+/// because the generators rewrite their own fixtures: without this check, a
+/// change to the transcript, the field representation, or the statement layout
+/// would be absorbed silently into the JSON on the next full test run, and the
+/// Solidity side would keep passing against a vector that no longer matches
+/// the prover.
+///
+/// What it pins, and what it deliberately does not:
+///
+/// - Pins the transcript program, the derived challenges, and the VALIDITY of
+///   the recorded proof-of-work witness.
+/// - Does NOT pin the witness VALUE. Grinding is a parallel batch search whose
+///   first accepted candidate depends on batch layout (p3-challenger's
+///   `hash_challenger.rs:277` uses `find_map_any`), so the value is
+///   environment-dependent while its validity is not. Validity is both the
+///   stable assertion and the stronger one.
+/// - Does NOT pin proof bytes or proof length. HVZK blinding folds the mask
+///   into the committed trace (D-051 finding 1), so two proofs of one statement
+///   differ at the commitment level by design.
+#[test]
+fn golden_vectors_are_current() -> Result<(), Box<dyn Error>> {
+    check_field_vectors()?;
+    check_transcript_vectors()?;
+    check_block_vectors()?;
+    Ok(())
+}
+
+fn check_field_vectors() -> Result<(), Box<dyn Error>> {
+    let v = read_vector("field_vectors.json")?;
+    assert_eq!(
+        v["modulus"].as_u64().expect("modulus"),
+        KOALABEAR_P,
+        "field_vectors.json pins a different modulus than the prover uses"
+    );
+    assert_eq!(
+        v["montgomery_r"].as_u64().expect("montgomery_r"),
+        MONTGOMERY_R,
+        "field_vectors.json pins a different Montgomery R"
+    );
+
+    #[allow(clippy::cast_possible_truncation)]
+    let expected = field_value_set((KOALABEAR_P - 1) as u32);
+    let values = v["values"].as_array().expect("values array");
+    assert_eq!(
+        values.len(),
+        expected.len(),
+        "field_vectors.json value set drifted"
+    );
+    for (want, got) in expected.iter().zip(values) {
+        assert_eq!(
+            got["canonical"].as_u64().expect("canonical"),
+            u64::from(*want)
+        );
+        assert_eq!(
+            got["montgomery"].as_u64().expect("montgomery"),
+            u64::from(monty(*want)),
+            "montgomery form for {want} diverges from the prover"
+        );
+        assert_eq!(
+            got["montgomery_le_hex"].as_str().expect("hex"),
+            hex(&monty(*want).to_le_bytes()),
+            "the absorbed byte string for {want} diverges"
+        );
+    }
+    Ok(())
+}
+
+fn check_transcript_vectors() -> Result<(), Box<dyn Error>> {
+    use prover::whir::F;
+
+    let v = read_vector("transcript_vectors.json")?;
+    assert_eq!(v["hash"].as_str().expect("hash"), "keccak256");
+    assert_eq!(
+        v["program"],
+        serde_json::Value::Array(settlement_program_json()),
+        "the recorded transcript program is not the program this crate defines"
+    );
+
+    // Replay the program against a fresh traced challenger and compare the
+    // challenges it derives. Any change to the absorb order, the field
+    // representation, or the sponge shows up here.
+    let mut traced = TracedTranscript::<F>::new();
+    let mut challenges: Vec<u64> = Vec::new();
+    for step in settlement_program() {
+        match step {
+            Step::Observe(x) => traced.challenger.observe(F::from_u32(x)),
+            Step::Sample => {
+                let c: F = traced.challenger.sample();
+                challenges.push(c.as_canonical_u64());
+            }
+            // The grind is the last step. Its witness is validated below rather
+            // than re-derived, because grinding is a parallel search.
+            Step::Grind(_) => {}
+        }
+    }
+
+    let recorded: Vec<u64> = v["challenges"]
+        .as_array()
+        .expect("challenges")
+        .iter()
+        .map(|c| c.as_u64().expect("challenge is a u64"))
+        .collect();
+    assert_eq!(recorded.len(), 2, "expected alpha and zeta");
+    assert_eq!(
+        challenges, recorded,
+        "the Rust transcript no longer produces the challenges the Solidity verifier replays"
+    );
+    assert_eq!(v["alpha_canonical"].as_u64().expect("alpha"), recorded[0]);
+    assert_eq!(v["zeta_canonical"].as_u64().expect("zeta"), recorded[1]);
+
+    // The witness must still satisfy the recorded difficulty against THIS
+    // transcript state. That is the assertion the generated Solidity test makes
+    // with its own checkWitness, so both sides are held to the same standard.
+    let pow_bits =
+        usize::try_from(v["pow_bits"].as_u64().expect("pow_bits")).expect("pow_bits fits");
+    let witness_canonical =
+        u32::try_from(v["witness_canonical"].as_u64().expect("witness")).expect("a field element");
+    assert_eq!(
+        v["witness_montgomery_le_hex"]
+            .as_str()
+            .expect("witness hex"),
+        hex(&monty(witness_canonical).to_le_bytes()),
+        "the recorded witness hex is not the Montgomery LE form of the recorded value"
+    );
+
+    let witness = F::from_u32(witness_canonical);
+    assert!(
+        traced.challenger.check_witness(pow_bits, witness),
+        "the recorded proof-of-work witness no longer satisfies the challenge"
+    );
+    Ok(())
+}
+
+fn check_block_vectors() -> Result<(), Box<dyn Error>> {
+    let v = read_vector("block_vectors.json")?;
+    let fixture = BlockFixture::build();
+    let statement = fixture.statement();
+    let forms: StatementForms = statement_forms(&statement);
+
+    let recorded: Vec<u64> = v["statement"]
+        .as_array()
+        .expect("statement")
+        .iter()
+        .map(|s| s.as_u64().expect("limb is a u64"))
+        .collect();
+    // canonical is already a Vec<u64>, so this is a clone, not a conversion.
+    let now: Vec<u64> = forms.canonical.clone();
+    assert_eq!(
+        now, recorded,
+        "block_vectors.json pins a statement the current circuit no longer produces"
+    );
+    assert_eq!(
+        v["statement_len"].as_u64().expect("statement_len"),
+        u64::try_from(recorded.len()).expect("len fits u64"),
+        "statement_len disagrees with the statement array"
+    );
+
+    // The words the settlement transcript absorbs are the Montgomery form of
+    // the same limbs, so drift here means the contract and the prover disagree
+    // about what a statement byte looks like.
+    let words: Vec<u64> = v["transcript_words"]
+        .as_array()
+        .expect("transcript_words")
+        .iter()
+        .map(|w| w.as_u64().expect("word is a u64"))
+        .collect();
+    let now_words: Vec<u64> = forms
+        .transcript_words
+        .iter()
+        .map(|&w| u64::from(w))
+        .collect();
+    assert_eq!(
+        now_words, words,
+        "block_vectors.json transcript_words no longer match the Montgomery form of the statement"
+    );
+    assert_eq!(v["num_transfers"].as_u64().expect("num_transfers"), 1);
+    assert_eq!(
+        v["total_fee"].as_u64().expect("total_fee"),
+        fixture.fee,
+        "total_fee drifted from the fixture"
+    );
+    Ok(())
 }

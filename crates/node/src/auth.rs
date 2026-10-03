@@ -426,9 +426,13 @@ mod tests {
 
     #[test]
     fn base64url_round_trips_arbitrary_bytes() {
-        for len in 0..64 {
+        for len in 0..64u32 {
+            // A cheap spread of byte values, including the 0x00, 0x7f, 0x80 and
+            // 0xff edges that base64url padding bugs hide behind. Reducing mod
+            // 256 first keeps the narrowing to a checked `try_from` instead of
+            // a silent `as`.
             let data: Vec<u8> = (0..len)
-                .map(|i| u8::try_from(i * 37).unwrap_or(i as u8))
+                .map(|i| u8::try_from((i * 37) % 256).expect("reduced below 256"))
                 .collect();
             let enc = base64url(&data);
             let dec = base64url_decode(&enc).expect("decode");

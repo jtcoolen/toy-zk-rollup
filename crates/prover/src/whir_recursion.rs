@@ -33,7 +33,7 @@
 //! module; the settlement layer's digest is 32 raw Keccak-256 bytes instead, and
 //! the two never meet in one circuit. (The settlement layer used to be 4 `u64`
 //! sponge limbs; it is byte-native now so Solidity replays it with the native
-//! `keccak256` opcode — see D-047.)
+//! `keccak256` opcode — see D-050.)
 
 use p3_challenger::DuplexChallenger;
 use p3_circuit::ops::{generate_poseidon2_trace, generate_recompose_trace};

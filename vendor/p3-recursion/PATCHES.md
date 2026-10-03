@@ -34,8 +34,29 @@ mechanics, and D-046 for why.
 
 | # | File | Change |
 |---|------|--------|
-| 1 | `recursion/src/pcs/whir/uni/pcs.rs` | `const ZK: bool = false` -> `true`; hiding-aware `commit`, `commit_preprocessing`, `get_opt_randomization_poly_commitment`, and evaluation truncation. |
-| 2 | `recursion/src/pcs/whir/uni/recursive_pcs.rs` | Replace the `NO_RANDOM_OPENED_VALUES` stub with a real implementation of `get_fri_random_opened_values`. |
+| 1 | `recursion/src/pcs/whir/uni/pcs.rs` | `const ZK: bool = false` -> `true`; hiding-aware `commit`, `commit_preprocessing`, `get_opt_randomization_poly_commitment`, and evaluation truncation. **Applied.** |
+
+## Item 2: withdrawn, not a hole
+
+The original item 2 read: "Replace the `NO_RANDOM_OPENED_VALUES` stub with a real
+implementation of `get_fri_random_opened_values`" in
+`recursion/src/pcs/whir/uni/recursive_pcs.rs`. It is **not needed for WHIR**, and
+implementing it would add surface for no gain. Verified against the code:
+
+- That stub is only reached when `PRE_OBSERVES_OPENED_VALUES` is true
+  (`recursion/src/verifier/batch_stark.rs:1528`).
+- WHIR sets `PRE_OBSERVES_OPENED_VALUES = false`
+  (`recursion/src/pcs/whir/uni/recursive_pcs.rs:384`), because WHIR interleaves
+  its own opened-value observation instead of pre-observing.
+- The random commitment is bound in-circuit by the ordinary path anyway:
+  `batch_stark.rs:1275-1276` observes `random_commit` into the challenger and
+  `:1299-1317` pushes `(random_commit, random_round)` into `coms_to_verify`, so
+  the R commitment and its opening points enter the same Merkle/PoW checks as
+  every other commitment.
+
+So the stub is unreachable for the PCS we ship. Re-verify this if a future rev
+flips `PRE_OBSERVES_OPENED_VALUES` for WHIR, or if a second PCS with
+`ZK = true` is added to a batch alongside WHIR. Recorded as D-051.
 
 ## Upgrading
 
