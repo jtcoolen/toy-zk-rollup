@@ -369,12 +369,21 @@ struct Replay {
     alpha: Challenge,
     /// Batching challenge `gamma` weighting the initial constraint's statements.
     gamma: Challenge,
-    /// Initial claimed evaluation, before the sumcheck folds it.
+    /// Combined claim before the initial sumcheck folds it: exactly what
+    /// `Constraint::combine_evals` produces, i.e. the sum the first sumcheck round
+    /// must open with. The contract computes this itself from the proof's claimed
+    /// evaluations and the batching challenge, so it is the pin for that computation.
+    initial_claimed_eval: Challenge,
+    /// Initial claimed evaluation, after the sumcheck folds it.
     claimed_eval: Challenge,
     /// The point the initial sumcheck reduces the claim to.
     randomness: Vec<Challenge>,
     /// Equality points of the initial constraint, in batching-power order.
     eq_points: Vec<Point<Challenge>>,
+    /// The claimed evaluation paired with each equality point, same order.
+    eq_evals: Vec<Challenge>,
+    /// Number of constraints in each statement group.
+    eq_group_lens: Vec<usize>,
     /// Arity the initial constraint lives in.
     num_variables: usize,
     /// Out-of-domain points, in the order drawn.
@@ -547,11 +556,13 @@ fn replay_verifier(run: &Run) -> Result<Replay, Box<dyn Error>> {
 
     let shape = WhirShape::new(&config, protocol.num_openings());
     let mut vt = WhirVerifierTranscript::<SemChallenger, F, Challenge>::new(&mut ch, shape);
+    let mut initial_claimed: Option<Challenge> = None;
     let (constraint, alpha, claimed_eval, randomness) = vt.delegate_initial_fold(|challenger| {
         let alpha = layout.batching_challenge(challenger);
         let constraint = layout.constraint(alpha);
         let mut claimed = Challenge::ZERO;
         constraint.combine_evals(&mut claimed);
+        initial_claimed = Some(claimed);
         let r = whir.initial_sumcheck.verify_rounds(
             challenger,
             &mut claimed,
@@ -578,12 +589,16 @@ fn replay_verifier(run: &Run) -> Result<Replay, Box<dyn Error>> {
     // group would consume powers this flattening cannot see, so it is an error here
     // rather than a silent misalignment.
     let mut eq_points: Vec<Point<Challenge>> = Vec::new();
+    let mut eq_evals: Vec<Challenge> = Vec::new();
+    let mut eq_group_lens: Vec<usize> = Vec::new();
     for statement in constraint.statements() {
         let Statements::Eq(eq) = statement else {
             return Err("the initial constraint must hold only equality statements".into());
         };
         let eq: &EqStatement<Challenge> = eq;
+        eq_group_lens.push(eq.len());
         eq_points.extend(eq.iter().map(|(p, _)| p.clone()));
+        eq_evals.extend(eq.iter().map(|(_, e)| *e));
     }
 
     // The contract's query schedule is the per-round sets followed by the terminal
@@ -593,9 +608,12 @@ fn replay_verifier(run: &Run) -> Result<Replay, Box<dyn Error>> {
     Ok(Replay {
         alpha,
         gamma: challenge_of(&constraint),
+        initial_claimed_eval: initial_claimed.expect("the closure sets the pre-fold claim"),
         claimed_eval,
         randomness: initial_randomness.as_slice().to_vec(),
         eq_points,
+        eq_evals,
+        eq_group_lens,
         num_variables: constraint.num_variables(),
         ood_points: rounds.ood_points,
         round_batching: rounds.round_batching,
@@ -931,6 +949,15 @@ fn whir_proof_vectors() -> Result<(), Box<dyn Error>> {
             .map(|b| b.current().iter().map(ext_json).collect::<Vec<_>>())
             .collect::<Vec<_>>(),
         "initial_ood_answers": whir.initial_ood_answers.iter().map(ext_json).collect::<Vec<_>>(),
+        // The initial sumcheck's transmitted round values: h(0) and h(infinity) per
+        // round, straight off the proof's own SumcheckData.
+        "initial_sumcheck_ca": whir.initial_sumcheck.polynomial_evaluations.iter()
+            .map(|pair| ext_json(&pair[0]))
+            .collect::<Vec<_>>(),
+        "initial_sumcheck_cinf": whir.initial_sumcheck.polynomial_evaluations.iter()
+            .map(|pair| ext_json(&pair[1]))
+            .collect::<Vec<_>>(),
+        "initial_claimed_eval": ext_json(&replay.initial_claimed_eval),
         "claimed_eval": ext_json(&replay.claimed_eval),
         // The point the initial sumcheck reduces to: the first round folds here.
         "initial_randomness": replay.randomness.iter().map(ext_json).collect::<Vec<_>>(),
@@ -944,6 +971,7 @@ fn whir_proof_vectors() -> Result<(), Box<dyn Error>> {
             "num_negatives": negatives.len(),
             "num_schedule_rounds": config.n_rounds(),
             "num_initial_eq_points": replay.eq_points.len(),
+            "num_initial_eq_groups": replay.eq_group_lens.len(),
             "num_bound_eval_batches": base.proof.rounds[0].evals.len(),
         },
         "alpha": ext_json(&replay.alpha),
@@ -952,6 +980,8 @@ fn whir_proof_vectors() -> Result<(), Box<dyn Error>> {
         "initial_eq_points": replay.eq_points.iter()
             .map(|p| p.as_slice().iter().map(ext_json).collect::<Vec<_>>())
             .collect::<Vec<_>>(),
+        "initial_eq_evals": replay.eq_evals.iter().map(ext_json).collect::<Vec<_>>(),
+        "initial_eq_group_lens": &replay.eq_group_lens,
         // Everything the rest of the walk produced. The contract recomputes each of
         // these from the proof bytes and the fixed schedule; exporting them is what
         // lets the Solidity test compare step by step instead of only at the end.

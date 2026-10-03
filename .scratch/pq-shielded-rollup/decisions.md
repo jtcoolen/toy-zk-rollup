@@ -1050,3 +1050,89 @@ combination rather than after it.
 Measured: `evalConstraintsPoly` over the 6 cases at 3.17M gas, `constraintWeight`
 2.18M — both dominated by ABI decoding across the external shim, not the arithmetic.
 Inside the core these are internal calls.
+
+---
+
+## D-060 - The WHIR core takes opening points as inputs, never as blob bytes
+
+**Status**: accepted
+**Date**: 2026-10-03
+**Depends on**: D-059
+
+### Context
+
+Writing \`WhirVerifierCore.verifyInitial\` required knowing, exactly, which transcript
+absorbs are config-fixed bytes and which are proof data. Two premises I had carried
+from the earlier transcript walk turned out to be wrong, and both were caught by
+evidence rather than by reasoning.
+
+### Finding 1 - a caller-fixed opening point absorbs NOTHING
+
+\`p3_sumcheck::layout::Verifier::add_claim_at\` builds its opening shape with
+\`PointSource::Given\`, and the source comment is explicit: *"A caller-fixed point
+contributes no step. This description therefore holds no challenge."* Only the
+evaluations reach the wire.
+
+I had assumed the opening points were absorbed and tried to mark them as proof data
+in the classifier. The generator's own ambiguity guard rejected it - the point words
+were not contiguous anywhere - which is what exposed the truth. In production the
+STARK layer DRAWS the opening points after observing the commitment, so they are
+inputs to the WHIR core in any case. A core that read them from a hard-coded blob
+would verify "the proof opens at the points the blob names" instead of "the proof
+opens at the points the caller declares": the difference between a bound claim and a
+free one.
+
+The single-word VAR absorbs I had earlier labelled "point absorbs" were the
+evaluation limbs - which is exactly the set the zero-limb bug was misclassifying.
+
+### Finding 2 - the claimed-eval order is the CONSTRAINT order, not the transcript order
+
+\`layout::constraint(alpha)\` emits concrete-claim equality groups FIRST, then the
+virtual block. \`Constraint::combine_evals\` walks groups with a running exponent, so
+the combined claim is
+
+    claimed = sum_i evals[i] * gamma^i        i = 0 .. n-1, from gamma^0
+
+over \`[concrete evals..., virtual OOD answers...]\`. The TRANSCRIPT order is the
+reverse (virtual claims are registered first). Getting these two confused is
+invisible to the sponge - every sample still matches - and only shows up in the
+final algebraic identity, so the initial-phase test asserts the combined claim
+directly.
+
+Verified numerically against the prover's own \`combine_evals\` output (now exported
+as \`initial_claimed_eval\`) before a line of the Solidity dot product was written.
+\`initial_eq_group_lens\` is exported too: it is \`[2, 2, 1]\` here - one group per
+concrete claim, then the virtual block - and a group of length zero would shift the
+powers, so the flat dot product is only valid because no group is empty. The
+production shape has the same property; a shape that produced an empty group would
+need the shift handled explicitly.
+
+### The schedule is read from the artifact, not hard-coded
+
+The initial phase's constant runs are 54 / 78 / 78 / 169 / 37 words: commitment
+separator, one block per concrete claim, the virtual claim plus batching separator,
+and the sumcheck's own domain separator. The test reads the run lengths from
+\`.fixed_absorb\` rather than embedding them, so a regenerated artifact with a
+different shape fails loudly instead of silently absorbing the wrong span.
+
+### Rejected alternatives
+
+1. **Hard-code the run lengths in the test.** The whole point of the artifact is that
+   the contract and the prover agree by construction, not by my transcription.
+2. **Have the core absorb the commitment.** The STARK layer owns that absorb
+   (\`p3_sumcheck::layout::observe_commitment\`); duplicating it here would double-count
+   it in the batch transcript. The test absorbs it explicitly to document the
+   handover.
+3. **Derive the fingerprints from config instead of absorbing bytes.** Rejected in
+   D-059 and unchanged; the zero-limb incident is a second data point for why.
+
+### Consequences
+
+- \`WhirVerifierCore.verifyInitial\` is pinned by \`contracts/test/WhirInitialPhase.t.sol\`
+  on alpha, the combined claim, the folded claim, and all four reduction coordinates.
+- \`initial_claimed_eval\`, \`initial_eq_evals\`, \`initial_eq_group_lens\`,
+  \`initial_sumcheck_ca\` and \`initial_sumcheck_cinf\` are new artifact fields.
+- A real byte-order bug surfaced on the way: the constant payload is little-endian
+  u32, and a 16-bit lane swap is not a 32-bit reversal. \`observeBase\`'s
+  \`value < MODULUS\` check is what caught it - a good argument for keeping that
+  require rather than trusting the caller.
