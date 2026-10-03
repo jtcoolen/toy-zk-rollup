@@ -122,6 +122,7 @@ tests / 11 suites green.
 | Merkle | `verifier/StarkMerkle.sol` | `mmcs.json`, 4 conventions searched | done |
 | Fixed config | `verifier/WhirFixedConfig.sol` | `whir_fixed_config.json` | done |
 | STIR openings | `verifier/StirOpenings.sol` | `stir_vectors.json`, real `ExtensionMmcs` | **done this round** |
+| Multilinear gadgets | `verifier/WhirGadgets.sol` | `whir_gadgets.json`, real `eval_constraints_poly` | done |
 | WHIR core | `verifier/WhirVerifierCore.sol` | `verify_whir_circuit_engine` as spec | **next** |
 | Constraint identity | `verifier/ConstraintIdentity.sol` | generated from `SymbolicAirAirBuilder` (D-036) | open, least-trodden risk |
 | Chunk splitting | `ChunkVerifier.sol` | D-039, sponge state across transactions | open |

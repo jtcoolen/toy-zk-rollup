@@ -1,0 +1,261 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+import {KoalaBear} from "../../lib/sol-whir-p3/field/KoalaBear.sol";
+import {KoalaBearExt4} from "../../lib/sol-whir-p3/field/KoalaBearExt4.sol";
+
+/// The multilinear arithmetic the WHIR verifier core is built out of.
+///
+/// WHY THIS IS A SEPARATE LIBRARY
+///
+/// `WhirVerifierCore` will be a long function with a lot of state, and the
+/// arithmetic it performs is not specific to one place in it: the equality
+/// polynomial appears in the constraint weights, the selection polynomial appears
+/// in the constraint weights, the powers combination appears both in the round
+/// claim update and in the final weight batching. Pulling them out here means each
+/// is pinned by its own vector, so when the core misbehaves the question is which
+/// primitive, not which line.
+///
+/// EVERY FUNCTION HERE IS PINNED AGAINST THE FUNCTION THE PROVER CALLS
+///
+/// `contracts/test/vectors/whir_gadgets.json` comes from
+/// `crates/prover/tests/whir_gadget_vectors.rs`, which calls
+/// `Point::expand_from_univariate~, `Point::eval_eq~, `Point::eval_select~ and
+/// `VariableOrder::eval_constraints_poly~ directly, on real `Constraint` values
+/// holding real `EqStatement` and `SelectStatement` groups. Nothing in the file
+/// is a reimplementation of a formula read off the reference, which is the failure
+/// mode this whole port has been avoiding: a misread convention produces a
+/// plausible-looking expected value and a test that agrees with itself.
+///
+/// THE CONVENTIONS THAT ARE EASY TO READ BACKWARDS
+///
+/// - `expandFromUnivariate` is BIG-ENDIAN: coordinate 0 is `z^(2^(n-1))~, the
+///   LAST coordinate is `z`. The natural loop fills the other way.
+/// - `selectEval` consumes the point from the LAST coordinate while `var` is
+///   still `var^(2^0)`, squaring once per factor. Pairing first coordinate with
+///   first power looks equivalent and is not.
+/// - `constraintWeight` batches equality terms at `gamma^0` and selection terms
+///   at `gamma^n_eq`, THEN shifts the whole thing by `gamma^initialPower`. A
+///   round constraint carries the running claim at `gamma^0` so its fresh
+///   statements start at `gamma^1`; the initial constraint starts at `gamma^0`.
+///   Getting that wrong shifts every term by one power of a secret challenge,
+///   which no transcript can detect because the challenge is what the transcript
+///   produced.
+///
+/// All values are packed extension elements in CANONICAL coefficient form, the
+/// convention everywhere else in `src/verifier/`. The transcript wants Montgomery;
+/// that conversion belongs to the transcript layer (`SumcheckCore.toMontgomery`),
+/// not here.
+library WhirGadgets {
+    /// The extension field one, packed.
+    uint256 private constant ONE = uint256(1) << 224;
+
+    /// Raised when a point and a value disagree about how many variables they have.
+    error PointLengthMismatch(uint256 expected, uint256 actual);
+
+    /// Raised when a constraint claims more variables than the run accumulated.
+    error NotEnoughChallenges(uint256 numVariables, uint256 accumulated);
+
+    /// One constraint's weight data: everything needed to evaluate its weight
+    /// polynomial at a local folding point.
+    ///
+    /// Mirrors `ConstraintWeightData` in the reference recursion, which mirrors
+    /// `p3_sumcheck::constraints::Constraint`. `eqPoints` is the OOD group and
+    /// `selVars` the STIR group, in that order, because that is the order p3-whir
+    /// builds them and the order fixes which power of `gamma` weights which term.
+    struct ConstraintWeight {
+        /// Multilinear arity of this constraint's polynomial.
+        uint256 numVariables;
+        /// The batching challenge, packed.
+        uint256 gamma;
+        /// Exponent of `gamma` weighting the first statement: 0 for the initial
+        /// constraint, 1 for every round constraint.
+        uint256 initialPower;
+        /// OOD points, each `numVariables` coordinates.
+        uint256[][] eqPoints;
+        /// STIR domain scalars, one per query, each lifted into the extension.
+        uint256[] selVars;
+    }
+
+    /// Lift a univariate point to the `n`-dimensional multilinear point
+    /// `[z^(2^(n-1)), ..., z^2, z]`.
+    ///
+    /// `n == 0` gives an empty point, which is the correct empty product for every
+    /// consumer below - not one, and not a revert.
+    function expandFromUnivariate(uint256 z, uint256 n)
+        internal
+        pure
+        returns (uint256[] memory point)
+    {
+        point = new uint256[](n);
+        uint256 cur = z;
+        // Fill from the last coordinate backwards, so the last coordinate holds
+        // z and each earlier one holds the next square.
+        for (uint256 i = n; i > 0; --i) {
+            point[i - 1] = cur;
+            cur = KoalaBearExt4.square(cur);
+        }
+    }
+
+    /// The equality polynomial `eq(p, q) = prod_i (1 + 2 p_i q_i - p_i - q_i)`.
+    ///
+    /// Delegates rather than reimplementing: `KoalaBearExt4.eq_poly_eval` is
+    /// already the same algebraic identity `Point::eval_eq` uses, and it is
+    /// parity-tested against Rust. Two copies of a formula that must agree is a
+    /// maintenance trap; one tested copy is not.
+    ///
+    /// The empty product is one, which is what makes a zero-variable constraint
+    /// evaluate to `gamma`-weighted constants instead of zero.
+    function eqEval(uint256[] memory p_, uint256[] memory q)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (p_.length != q.length) {
+            revert PointLengthMismatch(p_.length, q.length);
+        }
+        return KoalaBearExt4.eq_poly_eval(p_, q);
+    }
+
+    /// The selection weight `select(point, z) = prod_k (point[n-1-k] *
+    /// (z^(2^k) - 1) + 1)`.
+    ///
+    /// This is the weight of a STIR claim: the opened row folded to one extension
+    /// element is claimed to equal the codeword polynomial evaluated at the domain
+    /// point `z`, and `select` is the polynomial that interpolates that statement
+    /// over the hypercube. Per coordinate it is one when `z` is 1 and `1 - point_i`
+    /// when `z` is 0, which is why it interpolates a claim about one domain point.
+    ///
+    /// `z` is a base field element in the protocol - a two-adic domain point - and
+    /// is passed lifted. Lifting is exact: the canonical embedding is a ring
+    /// homomorphism, so squaring in the extension agrees with squaring in the base
+    /// and lifting afterwards.
+    function selectEval(uint256[] memory point, uint256 z) internal pure returns (uint256) {
+        uint256 acc = ONE;
+        uint256 v = z;
+        unchecked {
+            for (uint256 i = point.length; i > 0; --i) {
+                // point[i-1] is coordinate n-1-k for k = point.length - i.
+                uint256 term = KoalaBearExt4.add(
+                    KoalaBearExt4.mul(point[i - 1], KoalaBearExt4.sub(v, ONE)),
+                    ONE
+                );
+                acc = KoalaBearExt4.mul(acc, term);
+                // The lowest coordinate consumes the last factor and needs no
+                // further power, so skip the square on the final pass. The
+                // reference squares unconditionally because a circuit gate is
+                // cheaper to keep uniform than to special-case; here a wasted
+                // extension-field square is real gas, paid once per STIR query.
+                if (i > 1) {
+                    v = KoalaBearExt4.square(v);
+                }
+            }
+        }
+        return acc;
+    }
+
+    /// `generator^index` lifted into the extension.
+    ///
+    /// The reference computes this as a product of precomputed constants, one per
+    /// set bit of the index, because it is inside an arithmetic circuit where a
+    /// per-bit multiply-add is cheaper than an exponentiation gate. Here the
+    /// exponent is a plain `uint256` and `KoalaBear.pow` is a square-and-multiply
+    /// loop over at most 32 bits, so the direct route is both cheaper and easier to
+    /// see right. The vectors pin the VALUE, not the method, which is the only
+    /// thing the protocol cares about.
+    ///
+    /// `generator` is a canonical base field element, not packed and not
+    /// Montgomery. `index` is the query index the transcript sampled.
+    function powConstBase(uint256 generator, uint256 index) internal pure returns (uint256) {
+        return KoalaBearExt4.fromBase(KoalaBear.pow(generator, index));
+    }
+
+    /// `sum_i values[i] * base^i`, by Horner from the top.
+    ///
+    /// The batching primitive: WHIR folds many claims into one by weighting each
+    /// with a successive power of a sampled challenge, so the prover cannot pick
+    /// which claims cancel. The empty combination is ZERO, not one - a loop seeded
+    /// with `ONE` instead of accumulating from the first element returns one for an
+    /// empty input, and an empty group is a real case: a round with no OOD samples.
+    function powersCombination(uint256[] memory values, uint256 base)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 acc = 0;
+        for (uint256 i = values.length; i > 0; --i) {
+            acc = KoalaBearExt4.add(KoalaBearExt4.mul(acc, base), values[i - 1]);
+        }
+        return acc;
+    }
+
+    /// One constraint's weight polynomial at `localR`.
+    ///
+    /// Equality terms take `gamma^0..`, selection terms `gamma^n_eq..`, and the
+    /// whole sum is then shifted by `gamma^initialPower`. The shift is applied
+    /// AFTER the combination, which is what makes it a single multiply rather than
+    /// a re-seeded power sequence.
+    function constraintWeight(
+        uint256[] memory localR,
+        ConstraintWeight memory c
+    )
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 nEq = c.eqPoints.length;
+        uint256[] memory values = new uint256[](nEq + c.selVars.length);
+        for (uint256 i; i < nEq; ++i) {
+            values[i] = eqEval(localR, c.eqPoints[i]);
+        }
+        for (uint256 j; j < c.selVars.length; ++j) {
+            values[nEq + j] = selectEval(localR, c.selVars[j]);
+        }
+        uint256 w = powersCombination(values, c.gamma);
+        // initialPower is 0 or 1 in this protocol; the loop keeps it general and
+        // costs nothing when it is zero.
+        for (uint256 s; s < c.initialPower; ++s) {
+            w = KoalaBearExt4.mul(w, c.gamma);
+        }
+        return w;
+    }
+
+    /// The batched constraint polynomial at the accumulated folding randomness.
+    ///
+    /// Each constraint sees only the LAST `k` of the `n` accumulated challenges,
+    /// because the earlier ones were bound by earlier rounds and are already
+    /// substituted into the claim. Under SUFFIX binding those `k` are reversed:
+    /// suffix folding binds the highest variable first, so the challenge order is
+    /// the reverse of the variable order a constraint reads.
+    ///
+    /// This is the last thing the verifier computes. The whole proof reduces to
+    /// `claimed_eval == evalConstraintsPoly(...) * evalMultilinear(finalPoly,
+    /// lastR)`, so an error here accepts or rejects every proof, always, and no
+    /// transcript replay can see it: this consumes only challenges the transcript
+    /// already produced correctly.
+    function evalConstraintsPoly(
+        uint256[] memory allR,
+        ConstraintWeight[] memory constraints,
+        bool isSuffix
+    )
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 n = allR.length;
+        uint256 total = 0;
+        for (uint256 i; i < constraints.length; ++i) {
+            uint256 k = constraints[i].numVariables;
+            if (k > n) {
+                revert NotEnoughChallenges(k, n);
+            }
+            uint256[] memory localR = new uint256[](k);
+            for (uint256 j; j < k; ++j) {
+                // Prefix: all_r[n-k+j]. Suffix: the same slice, reversed.
+                localR[j] = isSuffix ? allR[n - 1 - j] : allR[n - k + j];
+            }
+            total = KoalaBearExt4.add(total, constraintWeight(localR, constraints[i]));
+        }
+        return total;
+    }
+}
