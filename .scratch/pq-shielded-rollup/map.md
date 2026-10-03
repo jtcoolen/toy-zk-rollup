@@ -53,7 +53,7 @@ full production depth stays ticketed.
 
 - `~/.cargo` is not writable under the file sandbox → `CARGO_HOME` is set to
   `<workspace>/.cargo-home` via `.cargo/config.toml`.
-- Toolchain: Rust 1.90.0 at `~/.rustup/toolchains/1.90.0-aarch64-apple-darwin/bin`
+- Toolchain: Rust 1.98.1 at `~/.rustup/toolchains/1.98.1-aarch64-apple-darwin/bin`
   (not on `PATH`). `p3-recursion` is edition 2024 → needs ≥1.85.
 - `solc` 0.8.35 and Foundry (`forge`/`cast`/`anvil`) are available at
   `/opt/homebrew/bin` and `~/.foundry/bin`.
@@ -90,6 +90,17 @@ Three hashes, each chosen for a different cost environment. Never mix them by ac
 - [Recursion needs NO fork — VERIFIED](issues/15-transcript-hash-portability.md): `TrustedPreparedLayer<InSC, OutSC, …>` takes two *independent* config types (only `Challenge` is shared). Layer 0 runs on a Poseidon2 `DuplexChallenger` (matches the in-circuit `ChallengerPermConfig`, covered by the granted exception); the final layer runs on a Keccak transcript, which is the only transcript Solidity replays. **Confirmed by a passing test** (`recursion-test`: layer 0 proves under Poseidon2, the wrapping layer proves under Keccak, the Keccak verifier accepts). The one gap that had to be closed: the recursion layer's in-circuit Merkle gadget is Poseidon2-shaped, so both configs commit with a field-native `MerkleCap<F, [F; 8]>`, and Plonky3's Keccak `SerializingChallenger32` only observes `[u64; N]`/`[u8; N]` caps. A newtype (`KeccakOutChallenger`) absorbs each field element as little-endian `u32` — the *same bytes* `CanObserve<F>` already uses — so the wire format is unchanged and Solidity mirrors it with `abi.encodePacked` + `keccak256`. Zero patches to `p3-recursion`.
 - [EVM precompile facts corrected](issues/07-evm-settlement.md): `0x01` ecrecover, `0x02` SHA-256, `0x03` RIPEMD-160, `0x04` Identity. There is **no** keccakf1600 precompile; `keccak256` is the native **opcode `0x20`** and computes *original* Keccak (`0x01` pad) — exactly what `p3-keccak` emits. FIPS SHA3-256 (`0x06` pad) has **no** precompile, so a SHA3 transcript would be expensive on-chain while a Keccak transcript is nearly free.
 - [Recursion proof size / gas](issues/16-recursion-audit-gate.md): measured KoalaBear+D=5, log_blowup 2 — 332 KB @ 1 layer → 302 KB @ 2 → 300 KB @ 3. Converges ~300 KB ≈ **4.8M gas** in calldata before any verifier compute.
+  **SUPERSEDED by measurement (see D-051):** a real recursive settlement of a 1024-row
+  base proof is **676 KB** (≈10.8M gas in calldata), and that is a FLOOR, not slack —
+  `log_max_lde = 22` is the minimum the recursion circuit accepts (17–21 panic with
+  `PowBitsExceedBudget`) because grinding needs 17–18 bits. Base proofs below **1024
+  rows cannot be recursed at all**: the STIR query count saturates the final folded
+  domain. End to end per block: base prove 0.05 s, circuit build 0.06 s, settle prove
+  1.85 s, settle verify 8 ms — under 2 s.
+
+- [Settlement Merkle tree is byte-native Keccak-256](decisions.md): **D-050.** Leaf = `keccak256(concat of 4-byte LE limbs)`, node = `keccak256(left || right)`, digest = 32 raw bytes, replayed by the native `keccak256` opcode at ~250 gas/node. Do NOT port Keccak-f[1600] to Solidity (~30–50k gas/node) and do NOT reuse the vendored `MerkleVerifier.sol` convention (it uses `0x00`/`0x01` prefixes, BE32, and 20-byte masked digests).
+- [HVZK blinding is a compile-time guarantee](decisions.md): **D-051.** `const _: () = assert!(Pcs::ZK)` in `crates/prover/src/lib.rs` for both layers, so an upstream flip breaks the build rather than a test run. Blinding folds the mask into the committed trace, so the trace commitment is per-proof fresh and a block cannot be identified by it.
+- [Golden vectors must not self-rewrite](decisions.md): **D-052.** Generators are `#[ignore]`d; an always-on `golden_vectors_are_current` re-derives the deterministic content and fails on drift. Pinned by four mutation tests.
 
 ## Not yet specified
 
