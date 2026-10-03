@@ -1,0 +1,78 @@
+{
+  "case_count": 12,
+  "note": "postcard uses unsigned LEB128; 127 is one byte and 128 is two",
+  "values": [
+    {
+      "u32_hex": "00",
+      "u32_len": 1,
+      "u64_hex": "00",
+      "value": 0
+    },
+    {
+      "u32_hex": "01",
+      "u32_len": 1,
+      "u64_hex": "01",
+      "value": 1
+    },
+    {
+      "u32_hex": "3f",
+      "u32_len": 1,
+      "u64_hex": "3f",
+      "value": 63
+    },
+    {
+      "u32_hex": "7f",
+      "u32_len": 1,
+      "u64_hex": "7f",
+      "value": 127
+    },
+    {
+      "u32_hex": "8001",
+      "u32_len": 2,
+      "u64_hex": "8001",
+      "value": 128
+    },
+    {
+      "u32_hex": "8101",
+      "u32_len": 2,
+      "u64_hex": "8101",
+      "value": 129
+    },
+    {
+      "u32_hex": "ff01",
+      "u32_len": 2,
+      "u64_hex": "ff01",
+      "value": 255
+    },
+    {
+      "u32_hex": "ac02",
+      "u32_len": 2,
+      "u64_hex": "ac02",
+      "value": 300
+    },
+    {
+      "u32_hex": "ff7f",
+      "u32_len": 2,
+      "u64_hex": "ff7f",
+      "value": 16383
+    },
+    {
+      "u32_hex": "808001",
+      "u32_len": 3,
+      "u64_hex": "808001",
+      "value": 16384
+    },
+    {
+      "u32_hex": "ffff03",
+      "u32_len": 3,
+      "u64_hex": "ffff03",
+      "value": 65535
+    },
+    {
+      "u32_hex": "ffffffff0f",
+      "u32_len": 5,
+      "u64_hex": "ffffffff0f",
+      "value": 4294967295
+    }
+  ]
+}

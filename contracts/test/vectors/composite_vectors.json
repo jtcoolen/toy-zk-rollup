@@ -1,0 +1,81 @@
+{
+  "case_count": 2,
+  "cases": [
+    {
+      "absent": null,
+      "fixed": [
+        0,
+        1,
+        127,
+        128
+      ],
+      "flag": true,
+      "hex": "ff01ffffffff0f0101ac020000017f80010028000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021222324252627",
+      "len": 59,
+      "list": [],
+      "name": "flag_true_empty_list",
+      "present": 300,
+      "wide_last": 39,
+      "wide_len": 40
+    },
+    {
+      "absent": null,
+      "fixed": [
+        0,
+        1,
+        127,
+        128
+      ],
+      "flag": false,
+      "hex": "ff01ffffffff0f0001ac020000017f8001010728000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021222324252627",
+      "len": 60,
+      "list": [
+        7
+      ],
+      "name": "flag_false_one_item",
+      "present": 300,
+      "wide_last": 39,
+      "wide_len": 40
+    }
+  ],
+  "fields": [
+    {
+      "kind": "u8_raw",
+      "name": "tag"
+    },
+    {
+      "kind": "u32_varint",
+      "name": "small"
+    },
+    {
+      "kind": "u32_varint",
+      "name": "big"
+    },
+    {
+      "kind": "bool",
+      "name": "flag"
+    },
+    {
+      "kind": "option_u32",
+      "name": "present"
+    },
+    {
+      "kind": "option_u32",
+      "name": "absent"
+    },
+    {
+      "kind": "array_u32",
+      "len": 4,
+      "name": "fixed"
+    },
+    {
+      "kind": "vec_u32",
+      "name": "list"
+    },
+    {
+      "kind": "vec_u32",
+      "name": "wide"
+    }
+  ],
+  "note": "postcard composite shapes: Option is a tag byte, [T;N] has no length, u8 is raw"
+}

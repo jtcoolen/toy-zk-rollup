@@ -1,0 +1,24 @@
+{
+  "cap_height": 0,
+  "commitments_quotient_count": 1,
+  "commitments_quotient_digests": [
+    "54c0621a2ce80ddc7f50e5ad487d2036c2b44fc6bb2d9fa555740687a7397d0b"
+  ],
+  "commitments_random": {
+    "count": 1,
+    "digests": [
+      "594ca8602d5f8e6eb65d616cb2ad5e3a7fe857238c8ebfe98f4c4af7178d9786"
+    ]
+  },
+  "commitments_random_tag": 1,
+  "commitments_trace_count": 1,
+  "commitments_trace_digests": [
+    "27ab6343daf04fe9ffbdac96e4a594b9430b90ed69298184bd08a79224ba59d6"
+  ],
+  "cursor_after_leading": 101,
+  "hash": "keccak256",
+  "leading_hex": "0127ab6343daf04fe9ffbdac96e4a594b9430b90ed69298184bd08a79224ba59d60154c0621a2ce80ddc7f50e5ad487d2036c2b44fc6bb2d9fa555740687a7397d0b0101594ca8602d5f8e6eb65d616cb2ad5e3a7fe857238c8ebfe98f4c4af7178d978602",
+  "note": "leading fields of one real settlement proof; digests vary per run because of blinding",
+  "opened_values_trace_local_len": 2,
+  "total_len": 81961
+}
