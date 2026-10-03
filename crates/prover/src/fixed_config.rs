@@ -32,7 +32,7 @@ use p3_whir::parameters::{RoundConfig, WhirConfig};
 use serde::{Deserialize, Serialize};
 
 /// Project one `p3_whir::RoundConfig` onto the plain-data form.
-const fn round_schedule(round: &RoundConfig) -> RoundSchedule {
+const fn round_schedule(round: &RoundConfig, folded_domain_gen: u32) -> RoundSchedule {
     RoundSchedule {
         pow_bits: round.pow_bits,
         folding_pow_bits: round.folding_pow_bits,
@@ -43,6 +43,7 @@ const fn round_schedule(round: &RoundConfig) -> RoundSchedule {
         log_inv_rate: round.log_inv_rate,
         domain_size: round.domain_size,
         log_folded_domain_size: round.log_folded_domain_size,
+        folded_domain_gen,
     }
 }
 
@@ -71,6 +72,14 @@ pub struct RoundSchedule {
     pub domain_size: usize,
     /// Log of the folded evaluation domain size.
     pub log_folded_domain_size: usize,
+    /// Canonical value of the two-adic generator of the folded domain.
+    ///
+    /// The STIR query phase maps a sampled index to the domain point
+    /// `gen^index`, so the verifier needs the generator itself, not just its
+    /// order. It is `F::two_adic_generator(log_folded_domain_size)` — derived
+    /// here rather than on-chain so the constant comes from the same field
+    /// arithmetic the prover used.
+    pub folded_domain_gen: u32,
 }
 
 /// The whole settlement schedule, as data.
@@ -113,6 +122,14 @@ pub struct FixedSchedule {
     pub final_round: RoundSchedule,
 }
 
+/// The two-adic generator of a folded domain of the given log size, canonical.
+fn folded_gen<F>(log_size: usize) -> u32
+where
+    F: p3_field::PrimeField32 + p3_field::TwoAdicField,
+{
+    F::two_adic_generator(log_size).as_canonical_u32()
+}
+
 /// One `if (index == i) return RoundConfig {..}` arm per WHIR round.
 fn round_cases(rounds: &[RoundSchedule]) -> String {
     rounds
@@ -120,7 +137,7 @@ fn round_cases(rounds: &[RoundSchedule]) -> String {
         .enumerate()
         .map(|(i, r)| {
             format!(
-                "        if (index == {i}) {{\n            return RoundConfig({{ powBits: {pow}, foldingPowBits: {fpow}, numQueries: {nq}, oodSamples: {ood}, numVariables: {nv}, foldingFactor: {ff}, logInvRate: {lir}, domainSize: {dom}, logFoldedDomainSize: {lfd} }});\n        }}",
+                "        if (index == {i}) {{\n            return RoundConfig({{ powBits: {pow}, foldingPowBits: {fpow}, numQueries: {nq}, oodSamples: {ood}, numVariables: {nv}, foldingFactor: {ff}, logInvRate: {lir}, domainSize: {dom}, logFoldedDomainSize: {lfd}, foldedDomainGen: {gen} }});\n        }}",
                 i = i,
                 pow = r.pow_bits,
                 fpow = r.folding_pow_bits,
@@ -131,6 +148,7 @@ fn round_cases(rounds: &[RoundSchedule]) -> String {
                 lir = r.log_inv_rate,
                 dom = r.domain_size,
                 lfd = r.log_folded_domain_size,
+                gen = r.folded_domain_gen,
             )
         })
         .collect::<Vec<_>>()
@@ -166,14 +184,14 @@ impl FixedSchedule {
         max_log_domain_size: usize,
     ) -> Self
     where
-        F: p3_field::Field + p3_field::PrimeField32,
+        F: p3_field::Field + p3_field::PrimeField32 + p3_field::TwoAdicField,
         EF: ExtensionField<F>,
         C: FieldChallenger<F> + GrindingChallenger<Witness = F>,
     {
         let rounds = config
             .round_parameters()
             .iter()
-            .map(round_schedule)
+            .map(|r| round_schedule(r, folded_gen::<F>(r.log_folded_domain_size)))
             .collect();
         Self {
             num_variables: config.num_variables(),
@@ -190,7 +208,10 @@ impl FixedSchedule {
             n_rounds: config.n_rounds(),
             folding_schedule: config.folding_schedule().to_vec(),
             rounds,
-            final_round: round_schedule(&config.final_round_config()),
+            final_round: round_schedule(
+                &config.final_round_config(),
+                folded_gen::<F>(config.final_round_config().log_folded_domain_size),
+            ),
         }
     }
 
@@ -267,6 +288,7 @@ library WhirFixedConfig {{
         uint256 logInvRate;
         uint256 domainSize;
         uint256 logFoldedDomainSize;
+        uint256 foldedDomainGen;
     }}
 
     /// Number of variables in the original trace.
@@ -314,6 +336,9 @@ library WhirFixedConfig {{
     uint256 internal constant FINAL_DOMAIN_SIZE = {final_domain};
     uint256 internal constant FINAL_LOG_FOLDED_DOMAIN_SIZE = {final_log_folded};
 
+    /// Two-adic generator of the final folded domain.
+    uint256 internal constant FINAL_FOLDED_DOMAIN_GEN = {final_folded_gen};
+
     /// Total STIR queries across every round plus the terminal test.
     ///
     /// This is the number that drives proof size almost linearly: each
@@ -349,7 +374,8 @@ library WhirFixedConfig {{
             foldingFactor: FINAL_FOLDING_FACTOR,
             logInvRate: FINAL_LOG_INV_RATE,
             domainSize: FINAL_DOMAIN_SIZE,
-            logFoldedDomainSize: FINAL_LOG_FOLDED_DOMAIN_SIZE
+            logFoldedDomainSize: FINAL_LOG_FOLDED_DOMAIN_SIZE,
+            foldedDomainGen: FINAL_FOLDED_DOMAIN_GEN
         }});
     }}
 }}
@@ -373,6 +399,7 @@ library WhirFixedConfig {{
             final_lir = self.final_round.log_inv_rate,
             final_domain = self.final_round.domain_size,
             final_log_folded = self.final_round.log_folded_domain_size,
+            final_folded_gen = self.final_round.folded_domain_gen,
             total_queries = self.total_queries(),
             fold_cases = fold_cases,
             round_cases = round_cases,
@@ -477,6 +504,8 @@ mod tests {
                     log_inv_rate: 1,
                     domain_size: 1 << 25,
                     log_folded_domain_size: 21,
+
+                    folded_domain_gen: folded_gen::<crate::whir::F>(21),
                 },
                 RoundSchedule {
                     pow_bits: 19,
@@ -488,6 +517,8 @@ mod tests {
                     log_inv_rate: 1,
                     domain_size: 1 << 21,
                     log_folded_domain_size: 17,
+
+                    folded_domain_gen: folded_gen::<crate::whir::F>(17),
                 },
                 RoundSchedule {
                     pow_bits: 19,
@@ -499,6 +530,8 @@ mod tests {
                     log_inv_rate: 1,
                     domain_size: 1 << 17,
                     log_folded_domain_size: 13,
+
+                    folded_domain_gen: folded_gen::<crate::whir::F>(13),
                 },
             ],
             final_round: RoundSchedule {
@@ -511,6 +544,8 @@ mod tests {
                 log_inv_rate: 1,
                 domain_size: 1 << 13,
                 log_folded_domain_size: 9,
+
+                folded_domain_gen: folded_gen::<crate::whir::F>(9),
             },
         };
         assert_eq!(schedule.total_queries(), 100 + 80 + 80 + 11);
@@ -542,6 +577,8 @@ mod tests {
                 log_inv_rate: 1,
                 domain_size: 512,
                 log_folded_domain_size: 5,
+
+                folded_domain_gen: folded_gen::<crate::whir::F>(5),
             }],
             final_round: RoundSchedule {
                 pow_bits: 3,
@@ -553,6 +590,8 @@ mod tests {
                 log_inv_rate: 1,
                 domain_size: 32,
                 log_folded_domain_size: 1,
+
+                folded_domain_gen: folded_gen::<crate::whir::F>(1),
             },
         };
         let json = schedule.to_json().expect("serializes");

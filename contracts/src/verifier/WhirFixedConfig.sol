@@ -32,6 +32,7 @@ library WhirFixedConfig {
         uint256 logInvRate;
         uint256 domainSize;
         uint256 logFoldedDomainSize;
+        uint256 foldedDomainGen;
     }
 
     /// Number of variables in the original trace.
@@ -79,6 +80,9 @@ library WhirFixedConfig {
     uint256 internal constant FINAL_DOMAIN_SIZE = 4194304;
     uint256 internal constant FINAL_LOG_FOLDED_DOMAIN_SIZE = 18;
 
+    /// Two-adic generator of the final folded domain.
+    uint256 internal constant FINAL_FOLDED_DOMAIN_GEN = 1816824389;
+
     /// Total STIR queries across every round plus the terminal test.
     ///
     /// This is the number that drives proof size almost linearly: each
@@ -113,16 +117,16 @@ library WhirFixedConfig {
     /// The parameters of WHIR round `index`, in `[0, N_ROUNDS)`.
     function roundConfig(uint256 index) internal pure returns (RoundConfig memory) {
         if (index == 0) {
-            return RoundConfig({ powBits: 23, foldingPowBits: 13, numQueries: 170, oodSamples: 2, numVariables: 21, foldingFactor: 4, logInvRate: 4, domainSize: 67108864, logFoldedDomainSize: 22 });
+            return RoundConfig({ powBits: 23, foldingPowBits: 13, numQueries: 170, oodSamples: 2, numVariables: 21, foldingFactor: 4, logInvRate: 4, domainSize: 67108864, logFoldedDomainSize: 22, foldedDomainGen: 542991299 });
         }
         if (index == 1) {
-            return RoundConfig({ powBits: 23, foldingPowBits: 15, numQueries: 38, oodSamples: 2, numVariables: 17, foldingFactor: 4, logInvRate: 7, domainSize: 33554432, logFoldedDomainSize: 21 });
+            return RoundConfig({ powBits: 23, foldingPowBits: 15, numQueries: 38, oodSamples: 2, numVariables: 17, foldingFactor: 4, logInvRate: 7, domainSize: 33554432, logFoldedDomainSize: 21, foldedDomainGen: 1213133211 });
         }
         if (index == 2) {
-            return RoundConfig({ powBits: 21, foldingPowBits: 17, numQueries: 22, oodSamples: 2, numVariables: 13, foldingFactor: 4, logInvRate: 10, domainSize: 16777216, logFoldedDomainSize: 20 });
+            return RoundConfig({ powBits: 21, foldingPowBits: 17, numQueries: 22, oodSamples: 2, numVariables: 13, foldingFactor: 4, logInvRate: 10, domainSize: 16777216, logFoldedDomainSize: 20, foldedDomainGen: 1364057261 });
         }
         if (index == 3) {
-            return RoundConfig({ powBits: 23, foldingPowBits: 19, numQueries: 15, oodSamples: 2, numVariables: 9, foldingFactor: 4, logInvRate: 13, domainSize: 8388608, logFoldedDomainSize: 19 });
+            return RoundConfig({ powBits: 23, foldingPowBits: 19, numQueries: 15, oodSamples: 2, numVariables: 9, foldingFactor: 4, logInvRate: 13, domainSize: 8388608, logFoldedDomainSize: 19, foldedDomainGen: 339671193 });
         }
         revert("ROUND_INDEX");
     }
@@ -139,7 +143,8 @@ library WhirFixedConfig {
             foldingFactor: FINAL_FOLDING_FACTOR,
             logInvRate: FINAL_LOG_INV_RATE,
             domainSize: FINAL_DOMAIN_SIZE,
-            logFoldedDomainSize: FINAL_LOG_FOLDED_DOMAIN_SIZE
+            logFoldedDomainSize: FINAL_LOG_FOLDED_DOMAIN_SIZE,
+            foldedDomainGen: FINAL_FOLDED_DOMAIN_GEN
         });
     }
 }

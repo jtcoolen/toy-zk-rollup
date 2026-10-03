@@ -28,7 +28,8 @@
       "folding_factor": 4,
       "log_inv_rate": 4,
       "domain_size": 67108864,
-      "log_folded_domain_size": 22
+      "log_folded_domain_size": 22,
+      "folded_domain_gen": 542991299
     },
     {
       "pow_bits": 23,
@@ -39,7 +40,8 @@
       "folding_factor": 4,
       "log_inv_rate": 7,
       "domain_size": 33554432,
-      "log_folded_domain_size": 21
+      "log_folded_domain_size": 21,
+      "folded_domain_gen": 1213133211
     },
     {
       "pow_bits": 21,
@@ -50,7 +52,8 @@
       "folding_factor": 4,
       "log_inv_rate": 10,
       "domain_size": 16777216,
-      "log_folded_domain_size": 20
+      "log_folded_domain_size": 20,
+      "folded_domain_gen": 1364057261
     },
     {
       "pow_bits": 23,
@@ -61,7 +64,8 @@
       "folding_factor": 4,
       "log_inv_rate": 13,
       "domain_size": 8388608,
-      "log_folded_domain_size": 19
+      "log_folded_domain_size": 19,
+      "folded_domain_gen": 339671193
     }
   ],
   "final_round": {
@@ -73,6 +77,7 @@
     "folding_factor": 4,
     "log_inv_rate": 13,
     "domain_size": 4194304,
-    "log_folded_domain_size": 18
+    "log_folded_domain_size": 18,
+    "folded_domain_gen": 1816824389
   }
 }

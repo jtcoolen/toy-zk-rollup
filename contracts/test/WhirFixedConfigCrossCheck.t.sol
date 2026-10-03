@@ -3,6 +3,7 @@ pragma solidity ^0.8.28;
 
 import {Test, console} from "forge-std/Test.sol";
 import {WhirFixedConfig} from "../src/verifier/WhirFixedConfig.sol";
+import {KoalaBear} from "../lib/sol-whir-p3/field/KoalaBear.sol";
 
 /// Cross-check the generated `WhirFixedConfig` against the JSON the prover
 /// emitted from the same `FixedSchedule`.
@@ -139,6 +140,11 @@ contract WhirFixedConfigCrossCheckTest is Test {
             vm.parseJsonUint(json, ".final_round.log_folded_domain_size"),
             "final logFoldedDomainSize"
         );
+        assertEq(
+            f.foldedDomainGen,
+            vm.parseJsonUint(json, ".final_round.folded_domain_gen"),
+            "final foldedDomainGen"
+        );
     }
 
     function test_every_round_matches_json() public view {
@@ -190,7 +196,56 @@ contract WhirFixedConfigCrossCheckTest is Test {
                 vm.parseJsonUint(json, string.concat(base, ".log_folded_domain_size")),
                 "logFoldedDomainSize"
             );
+            assertEq(
+                r.foldedDomainGen,
+                vm.parseJsonUint(json, string.concat(base, ".folded_domain_gen")),
+                "foldedDomainGen"
+            );
         }
+    }
+
+    /// Each round's folded-domain generator must really generate a domain of
+    /// the size the schedule claims: order exactly 2^logFoldedDomainSize.
+    ///
+    /// Why this is a security property and not a sanity check: the STIR query
+    /// phase maps a sampled index to `gen^index`, and the verifier recomputes
+    /// that point to bind the opened leaf. A generator of the wrong order
+    /// would make the verifier evaluate the domain constraint at a point that
+    /// is not in the committed domain, so the STIR proximity test would be
+    /// performed against the wrong set of points.
+    ///
+    /// Order is exactly 2^k when `g^(2^k) == 1` and `g^(2^(k-1)) != 1`.
+    function test_folded_domain_generators_have_the_claimed_order() public pure {
+        uint256 nRounds = WhirFixedConfig.N_ROUNDS;
+        for (uint256 i; i < nRounds; ++i) {
+            _checkGeneratorOrder(WhirFixedConfig.roundConfig(i), i);
+        }
+        _checkGeneratorOrder(WhirFixedConfig.finalRoundConfig(), nRounds);
+    }
+
+    function _checkGeneratorOrder(WhirFixedConfig.RoundConfig memory r, uint256 phase)
+        private
+        pure
+    {
+        uint256 g = r.foldedDomainGen;
+        uint256 k = r.logFoldedDomainSize;
+        // g^(2^k) == 1: k repeated squarings from g.
+        uint256 acc = g;
+        uint256 half = 1;
+        for (uint256 j; j < k; ++j) {
+            if (j == k - 1) {
+                half = acc;
+            }
+            acc = KoalaBear.mul(acc, acc);
+        }
+        assertEq(acc, 1, "generator order does not divide domain size");
+        assertTrue(half != 1, "generator order is smaller than the domain");
+        assertEq(
+            KoalaBear.pow(r.foldedDomainGen, r.domainSize >> r.foldingFactor),
+            1,
+            "generator^folded_domain_size must be one"
+        );
+        assertTrue(phase < 100, "phase index sanity");
     }
 
     function test_folding_schedule_matches_json() public view {

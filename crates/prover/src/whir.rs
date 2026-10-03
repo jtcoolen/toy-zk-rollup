@@ -275,9 +275,9 @@ pub fn config(cap_height: usize, num_variables: usize) -> Result<Config, WhirCon
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
     use p3_field::PrimeCharacteristicRing;
-    use p3_matrix::dense::RowMajorMatrix;
+
+    use crate::fixtures::{fib, FibAir};
 
     #[test]
     #[ignore = "parameter sweep; run with --nocapture when sizing the on-chain schedule"]
@@ -335,56 +335,6 @@ mod tests {
             }
         }
         out
-    }
-
-    /// Fibonacci AIR: `a' = a + b`, `b' = a + 2b`, with the *final* `a` exposed
-    /// as the public output.
-    ///
-    /// The public value is bound by a constraint rather than a cell pin, because
-    /// univariate STARKs reject boundary cell pins.
-    #[derive(Clone, Copy, Debug)]
-    struct FibAir;
-
-    impl<F> BaseAir<F> for FibAir {
-        fn width(&self) -> usize {
-            2
-        }
-
-        fn num_public_values(&self) -> usize {
-            1
-        }
-    }
-
-    impl<AB: AirBuilder> Air<AB> for FibAir {
-        fn eval(&self, builder: &mut AB) {
-            let main = builder.main();
-            let (a, b) = (main.current_slice()[0], main.current_slice()[1]);
-            let (a_next, b_next) = (main.next_slice()[0], main.next_slice()[1]);
-            let two = AB::F::ONE + AB::F::ONE;
-            let out: AB::Expr = builder.public_values()[0].into();
-
-            builder.when_first_row().assert_eq(a, AB::F::ONE);
-            builder.when_first_row().assert_eq(b, AB::F::ONE);
-            builder.when_transition().assert_eq(a + b, a_next);
-            builder.when_transition().assert_eq(a + b * two, b_next);
-            builder.when_last_row().assert_eq(a, out);
-        }
-    }
-
-    /// Build the Fibonacci trace and the public output it proves.
-    ///
-    /// Row `i` is `(a_i, b_i)` following the AIR's own recurrence, so the trace
-    /// and the constraints are written from the same rule.
-    fn fib(len: usize) -> (RowMajorMatrix<F>, Vec<F>) {
-        let mut values = vec![F::ONE; len * 2];
-        for i in 1..len {
-            let a = values[(i - 1) * 2];
-            let b = values[(i - 1) * 2 + 1];
-            values[i * 2] = a + b;
-            values[i * 2 + 1] = a + (b + b);
-        }
-        let last_row_a = values[values.len() - 2];
-        (RowMajorMatrix::new(values, 2), vec![last_row_a])
     }
 
     /// Trace length used by these tests.
