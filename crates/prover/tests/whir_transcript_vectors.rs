@@ -740,6 +740,21 @@ fn absorbs_of(t: &TranscriptTrace) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Every absorb is one byte or one four-byte field element, never anything else.
+///
+/// Not a coincidence to tolerate but the shape of the transcript: the labelled layer
+/// packs everything through `FieldUnit`, so labels and field values arrive as four-byte
+/// elements and the byte-at-a-time path carries the rest. A fifth width would mean
+/// the recording captured something the verifier has no rule for.
+fn assert_absorb_widths(widths: &[usize]) {
+    for (i, w) in widths.iter().enumerate() {
+        assert!(
+            *w == 1 || *w == 4,
+            "absorb {i} is {w} bytes, which is neither a single byte nor a field element"
+        );
+    }
+}
+
 /// Asserts the load-bearing claim: the absorb subsequence is fixed by the config
 /// and the proof SHAPE, not by the proof VALUE.
 ///
@@ -848,18 +863,51 @@ fn assert_absorb_schedule(runs: &[TranscriptTrace]) {
         n_sqz
     );
 
-    // Every absorb is either one byte or a four-byte field element. That is not a
-    // coincidence to tolerate, it is the shape of the transcript: the labelled layer
-    // packs everything through FieldUnit, so labels and field values arrive as
-    // four-byte elements, and the byte-at-a-time path carries the rest. A fifth
-    // width would mean the recording captured something the verifier has no rule
-    // for.
-    for (i, l) in lens[0].iter().enumerate() {
-        assert!(
-            *l == 1 || *l == 4,
-            "absorb {i} is {l} bytes, which is neither a single byte nor a field element"
-        );
-    }
+    // WHAT IS NOT FIXED, AND WHY THAT DECIDES THE VERIFIER DESIGN.
+    //
+    // The natural hope was that a squeeze site draws a fixed number of field ELEMENTS
+    // and only the rejection waste varies, which would have made the byte counts a
+    // pinnable schedule. That hope is false, and the evidence is the probe below:
+    // recording the SAME witness twice yields different programs.
+    //
+    // The chain is short. Grinding is nondeterministic, so it emits a different witness;
+    // a different witness is a different proof; a different proof is a different sponge
+    // state; a different sponge state makes rejection sampling consume a different
+    // number of draws. So no byte count and no element count at a squeeze site can be
+    // pinned by recording, because a recording is of ONE proof and proofs are not
+    // unique for a statement.
+    //
+    // The design follows directly: the verifier implements the labelled transcript
+    // ALGORITHM, labels as constants and rejection sampling inside the samplers. It
+    // cannot replay a recorded op list, and it cannot replay a recorded byte count per
+    // sampler either.
+    //
+    // A trap worth recording while it is fresh, for whoever writes the samplers: for a
+    // bit-width sample the acceptance bound is P & !((1 << bits) - 1), which is BELOW P,
+    // not P itself, and above 24 bits one sample draws TWO field elements. So accepted
+    // elements are not recoverable from recorded bytes without knowing the site bit
+    // width, and counting words below P over-counts. Sampling forward from the sponge
+    // sidesteps the whole question.
+    let again = record_with_seed(0).expect("re-record the seed-0 witness");
+    let replay_sites = sites_of(&again);
+    let differing: Vec<usize> = (0..all_sites[0].len())
+        .filter(|&i| replay_sites[i] != all_sites[0][i])
+        .collect();
+    let squeeze_only = differing.iter().all(|&i| all_sites[0][i].0);
+    println!(
+        "same witness recorded twice: {} sites differ, all of them squeeze sites: {} ({:?})",
+        differing.len(),
+        squeeze_only,
+        differing.iter().take(6).collect::<Vec<_>>()
+    );
+    // Absorb sites MUST still agree, even between two different proofs of one witness:
+    // that is the half the verifier hardcodes. Squeeze sites are free to differ.
+    assert!(
+        squeeze_only,
+        "an absorb site changed between two recordings of one witness, so the absorb schedule is not config-fixed after all"
+    );
+
+    assert_absorb_widths(&lens[0]);
 }
 
 #[test]
