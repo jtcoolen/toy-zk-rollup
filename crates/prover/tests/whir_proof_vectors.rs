@@ -357,6 +357,11 @@ fn prove(seed: u64) -> Result<Run, Box<dyn Error>> {
 /// generator test that this replay's event stream is IDENTICAL to the native
 /// verifier's transcript pins that the walk is faithful.
 struct Replay {
+    /// Layout batching challenge `alpha`, the first extension sample the verifier
+    /// draws. The contract must recognize this draw: it rebuilds the combined
+    /// constraint from it, and a verifier that skipped it would desynchronise the
+    /// sponge for every later sample.
+    alpha: Challenge,
     /// Batching challenge `gamma` weighting the initial constraint's statements.
     gamma: Challenge,
     /// Initial claimed evaluation, before the sumcheck folds it.
@@ -537,7 +542,7 @@ fn replay_verifier(run: &Run) -> Result<Replay, Box<dyn Error>> {
 
     let shape = WhirShape::new(&config, protocol.num_openings());
     let mut vt = WhirVerifierTranscript::<SemChallenger, F, Challenge>::new(&mut ch, shape);
-    let (constraint, claimed_eval, randomness) = vt.delegate_initial_fold(|challenger| {
+    let (constraint, alpha, claimed_eval, randomness) = vt.delegate_initial_fold(|challenger| {
         let alpha = layout.batching_challenge(challenger);
         let constraint = layout.constraint(alpha);
         let mut claimed = Challenge::ZERO;
@@ -549,7 +554,7 @@ fn replay_verifier(run: &Run) -> Result<Replay, Box<dyn Error>> {
             config.starting_folding_pow_bits(),
             Basis::Evaluation,
         );
-        (constraint, claimed, r)
+        (constraint, alpha, claimed, r)
     });
     let initial_randomness = randomness.map_err(|e| format!("initial sumcheck: {e:?}"))?;
     assert_eq!(
@@ -581,6 +586,7 @@ fn replay_verifier(run: &Run) -> Result<Replay, Box<dyn Error>> {
     let mut query_indices = rounds.query_indices;
     query_indices.push(terminal.query_indices);
     Ok(Replay {
+        alpha,
         gamma: challenge_of(&constraint),
         claimed_eval,
         randomness: initial_randomness.as_slice().to_vec(),
@@ -613,17 +619,20 @@ fn challenge_of(constraint: &Constraint<F, Challenge>) -> Challenge {
 /// separators, the contract absorbs the separator bytes verbatim at the
 /// structurally known sites. The runs are exported from a real run, so nothing in
 /// the contract is transcribed from a reading of the Rust.
+///
+/// A run contains ONLY bytes the contract may hard-code. A commitment digest is
+/// proof data - it moves with every mask draw - so it never joins a run and it
+/// breaks one: a contract that absorbed a digest out of a hard-coded blob would be
+/// absorbing a stale commitment instead of the proof's. `classify_observations`
+/// already answers `None` for every digest position that moved between runs, so
+/// "classified fixed" alone is the whole membership rule.
 fn fixed_runs(program: &SemProgram, fixed: &[Option<Vec<u32>>]) -> Vec<String> {
     let mut runs: Vec<String> = Vec::new();
     let mut current: Vec<u8> = Vec::new();
     for (i, event) in program.iter().enumerate() {
         let fixed_here = match (&fixed[i], event) {
-            (Some(words), SemEvent::ObserveBase { .. }) => {
+            (Some(words), SemEvent::ObserveBase { .. } | SemEvent::ObserveBytes { .. }) => {
                 current.extend(words.iter().flat_map(|w| w.to_le_bytes()));
-                true
-            }
-            (None, SemEvent::ObserveBytes { bytes }) => {
-                current.extend(bytes.iter().copied());
                 true
             }
             _ => false,
@@ -785,6 +794,49 @@ fn log_negatives(negatives: &[serde_json::Value]) {
     }
 }
 
+/// The config shape the artifact was produced under, as JSON.
+///
+/// Exported rather than left inline because the Solidity side reads these to size its
+/// loops, and because a reader of the generator should see the SHAPE and the
+/// PROOF DATA as two separate things.
+fn shape_json(arity: usize, config: &WhirConfig<Challenge, F, SemChallenger>) -> serde_json::Value {
+    json!({
+        "log_rows": LOG_ROWS,
+        "log_committed_height": LOG_COMMITTED,
+        "width": WIDTH,
+        "stacked_num_variables": arity,
+        "folding_factor": FOLDING,
+        "security_level": SECURITY_LEVEL,
+        "pow_bits": POW_BITS,
+        "cap_height": CAP_HEIGHT,
+        "log_max_lde": LOG_MAX_LDE,
+        "n_rounds": config.n_rounds(),
+        "commitment_ood_samples": config.commitment_ood_samples(),
+        "final_sumcheck_rounds": config.final_sumcheck_rounds(),
+        "final_folding_pow_bits": config.final_folding_pow_bits(),
+        "starting_folding_pow_bits": config.starting_folding_pow_bits(),
+        "num_zetas": 2,
+        "num_opening_claims": protocol().num_openings(),
+    })
+}
+
+/// `opened[round][matrix][point][column]`, flattened to nested JSON arrays.
+fn opened_json(opened: &[Vec<Vec<Vec<Challenge>>>]) -> serde_json::Value {
+    json!(opened
+        .iter()
+        .map(|round| {
+            round
+                .iter()
+                .map(|m| {
+                    m.iter()
+                        .map(|p| p.iter().map(ext_json).collect::<Vec<_>>())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>())
+}
+
 #[test]
 #[ignore = "proves RUNS times; run deliberately to regenerate the proof vectors"]
 fn whir_proof_vectors() -> Result<(), Box<dyn Error>> {
@@ -818,24 +870,7 @@ fn whir_proof_vectors() -> Result<(), Box<dyn Error>> {
 
     let doc = json!({
         "note": "One WHIR proof at a small shape, produced and accepted by the native WhirUniPcs. Every field is read off the native types; see the module docs of crates/prover/tests/whir_proof_vectors.rs.",
-        "shape": {
-            "log_rows": LOG_ROWS,
-            "log_committed_height": LOG_COMMITTED,
-            "width": WIDTH,
-            "stacked_num_variables": arity,
-            "folding_factor": FOLDING,
-            "security_level": SECURITY_LEVEL,
-            "pow_bits": POW_BITS,
-            "cap_height": CAP_HEIGHT,
-            "log_max_lde": LOG_MAX_LDE,
-            "n_rounds": config.n_rounds(),
-            "commitment_ood_samples": config.commitment_ood_samples(),
-            "final_sumcheck_rounds": config.final_sumcheck_rounds(),
-            "final_folding_pow_bits": config.final_folding_pow_bits(),
-            "starting_folding_pow_bits": config.starting_folding_pow_bits(),
-            "num_zetas": 2,
-            "num_opening_claims": protocol().num_openings(),
-        },
+        "shape": shape_json(arity, &config),
         "schedule": schedule_json(&config),
         "proof_hex": hex(&postcard::to_allocvec(&base.proof)?),
         "commitment": hex(base.commitment.roots()[0].as_ref()),
@@ -848,17 +883,7 @@ fn whir_proof_vectors() -> Result<(), Box<dyn Error>> {
         "zetas": zetas().iter().map(ext_json).collect::<Vec<_>>(),
         "super_points": super_points().iter().map(point_json).collect::<Vec<_>>(),
         // opened[round][matrix][point][column], flattened to nested JSON arrays.
-        "opened": base.opened.iter()
-            .map(|round| {
-                round.iter()
-                    .map(|m| {
-                        m.iter()
-                            .map(|p| p.iter().map(ext_json).collect::<Vec<_>>())
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>(),
+        "opened": opened_json(&base.opened),
         "bound_evals": base.proof.rounds[0].evals.iter()
             .map(|b| b.current().iter().map(ext_json).collect::<Vec<_>>())
             .collect::<Vec<_>>(),
@@ -866,6 +891,19 @@ fn whir_proof_vectors() -> Result<(), Box<dyn Error>> {
         "claimed_eval": ext_json(&replay.claimed_eval),
         // The point the initial sumcheck reduces to: the first round folds here.
         "initial_randomness": replay.randomness.iter().map(ext_json).collect::<Vec<_>>(),
+        // Explicit counts beside every array: forge's JSON selectors have no length
+        // operator, so the Solidity side reads these instead of probing structure.
+        "counts": {
+            "num_round_commitments": base.proof.rounds[0].whir.rounds.len(),
+            "num_query_sets": replay.query_indices.len(),
+            "query_set_lens": replay.query_indices.iter().map(Vec::len).collect::<Vec<_>>(),
+            "num_fixed_absorb": blobs.len(),
+            "num_negatives": negatives.len(),
+            "num_schedule_rounds": config.n_rounds(),
+            "num_initial_eq_points": replay.eq_points.len(),
+            "num_bound_eval_batches": base.proof.rounds[0].evals.len(),
+        },
+        "alpha": ext_json(&replay.alpha),
         "gamma": ext_json(&replay.gamma),
         "initial_constraint_num_variables": replay.num_variables,
         "initial_eq_points": replay.eq_points.iter()
@@ -904,6 +942,59 @@ fn whir_proof_vectors() -> Result<(), Box<dyn Error>> {
         blob.len()
     );
     Ok(())
+}
+
+/// Asserts the exported fixed blobs tile the blob's constant payload EXACTLY: every
+/// byte the contract hard-codes appears in exactly one run, in order, and nothing
+/// else does.
+///
+/// An earlier version of `fixed_runs` merged proof-varying commitment digests into
+/// the runs, which this check catches: a digest byte is never part of the constant
+/// payload, so any run containing one desynchronises the tiling. Without it the
+/// contract would absorb a stale commitment out of a hard-coded blob - a soundness
+/// bug that every downstream transcript value would then paper over.
+fn check_fixed_runs_tile(
+    blob: &[u8],
+    const_start: usize,
+    const_len: usize,
+    doc: &serde_json::Value,
+) {
+    let mut at = const_start;
+    let runs = doc["fixed_absorb"].as_array().expect("fixed_absorb runs");
+    for run in runs {
+        let hex_str = run.as_str().expect("fixed_absorb run is a hex string");
+        assert!(hex_str.len() % 2 == 0, "odd-length hex run");
+        let bytes = hex_str.len() / 2;
+        assert!(
+            at + bytes <= const_start + const_len,
+            "fixed run overruns the payload"
+        );
+        for k in 0..bytes {
+            let want = u8::from_str_radix(&hex_str[k * 2..k * 2 + 2], 16).expect("hex digit");
+            assert_eq!(blob[at + k], want, "fixed run byte differs from the blob");
+        }
+        at += bytes;
+    }
+    assert_eq!(
+        at - const_start,
+        const_len,
+        "the fixed runs do not cover the whole constant payload"
+    );
+}
+
+/// Every negative control in the artifact must have been REJECTED by the native
+/// verifier. A contract cannot be sounder than the reference it replays, so if a
+/// tampered field slipped through here the field carries data nothing checks and the
+/// port would inherit the hole.
+fn check_negatives_rejected(doc: &serde_json::Value) {
+    for n in doc["negatives"].as_array().into_iter().flatten() {
+        assert_eq!(
+            n["rejected"].as_bool(),
+            Some(true),
+            "the native verifier accepted a tampered proof: {:?}",
+            n["label"].as_str().unwrap_or_default()
+        );
+    }
 }
 
 /// The operation an event stands for: its kind and its argument.
@@ -978,14 +1069,7 @@ fn whir_proof_vectors_artifact_has_the_pinned_shape() -> Result<(), Box<dyn Erro
         5,
         "every negative control must be present"
     );
-    for n in doc["negatives"].as_array().into_iter().flatten() {
-        assert_eq!(
-            n["rejected"].as_bool(),
-            Some(true),
-            "the native verifier accepted a tampered proof: {:?}",
-            n["label"].as_str().unwrap_or_default()
-        );
-    }
+    check_negatives_rejected(&doc);
     // The blob is what the contract actually walks, so pin its header the same way
     // the semantic-program test pins its own: a stale blob would lead the Solidity
     // side through a schedule that no longer matches the recorded program.
@@ -1024,6 +1108,7 @@ fn whir_proof_vectors_artifact_has_the_pinned_shape() -> Result<(), Box<dyn Erro
         num_fixed * 4,
         "the blob constant table disagrees with the fixed-value classification"
     );
+    check_fixed_runs_tile(&blob, 28 + schedule_len * 4, lens[0], &doc);
     println!(
         "proof vectors pinned: {schedule_len} schedule entries, {lens:?} payloads, {num_fixed} fixed observations"
     );
