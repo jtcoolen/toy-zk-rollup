@@ -2624,3 +2624,76 @@ byte-at-a-time path carries the rest. Event boundaries are therefore a granulari
 artifact - one 32-byte digest may appear as one absorb or as 32 - which is why the
 byte stream and the site sequence are the assertions that mean something, and a bare
 event count is not one of them.
+
+## D-055 - The verifier is generated from a SEMANTIC transcript program, not a byte program
+
+Date: 2026-02-11. Status: ACCEPTED, supersedes the "replay the byte program" half of D-053.
+
+**Problem.** D-053 recorded the transcript as a stream of byte events and D-054 found the
+byte stream is not replayable. The follow-up measurement killed the last hope for it: two
+recordings of the SAME witness differ at 2 sites, and both are squeeze sites
+(`whir_transcript_vectors.rs::assert_absorb_schedule`). A squeeze flushes a partially
+filled output buffer, so its absorbed size depends on how much unconsumed output was
+pending, which depends on how many rejection samples happened upstream. Rejection sampling
+is invisible at the byte level and its footprint is not stable. Byte-level recording is the
+wrong level of abstraction.
+
+**Decision.** Record at the PROTOCOL level. `crates/prover/src/semantic_trace.rs` wraps the
+production challenger and logs whole operations - observe a base element, observe a
+commitment, sample an extension element, sample N bits, sample N uniform bits, verify a
+proof-of-work witness - never bytes. `tests/whir_semantic_program.rs` proves with the
+production config, ships the proof over postcard, and verifies it through the recorder.
+Verification passing IS the proof that the recorder did not perturb the transcript.
+
+**Measured, over 4 independent witnesses - one shape, zero mismatches:**
+
+| quantity | value |
+| --- | --- |
+| operations | 3551 = 2518 observe_base + 7 observe_bytes + 224 sample + 779 uniform_bits + 23 check_witness |
+| run-length encoded operations | **147** (588 bytes as a 4-byte table) |
+| observation positions fixed by the config | **1849** (contract literals) |
+| observation positions carrying proof data | 676 (read from calldata) |
+| extension samples | 224, every run exactly 4, so always the quartic |
+| uniform-bit widths | 8, 9, 10, 11, 12 (STIR query indices) |
+| witness-check widths | 1 x8, 3 x4, 5 x4, 7 x1, 8 x6 |
+
+The shape is identical across witnesses while the byte stream is not. That is exactly the
+property needed: 147 operations is a schedule the contract carries as data, and each
+operation is implemented once as an algorithm with a real rejection sampler.
+
+**The trap that found this.** `GrindingChallenger::check_witness` has a trait default of
+observe-then-sample-bits, but `SerializingChallenger32` OVERRIDES it to squeeze the output
+buffer first, so a proof-of-work candidate is hashed against a digest of the transcript
+rather than its pending input. Inheriting the default in the recorder desynced the sponge
+and a valid proof failed with `InvalidPowWitness`. Forwarding it fixed the run.
+
+Generalised, this is the rule for any forwarding recorder: **override exactly the methods
+the inner type overrides.** A trait default written in terms of other trait methods
+composes correctly through a forwarder, because it re-enters the forwarder and each hop
+forwards; a default the inner type REPLACED does not, because the forwarder silently
+reinstates the generic behaviour. Hence `check_witness` had to be forwarded and
+`UniformGrindingChallenger` did not - `SerializingChallenger32` does not override it, so the
+default reaches `self.observe` and `self.sample_uniform_bits`, both of which forward. The
+asymmetry is invisible in the trait definitions and cost a debugging cycle.
+
+**Alternatives considered.**
+
+- *Replay the recorded byte stream* (D-053 as written). Rejected: not replayable, per the
+  squeeze finding, and a verifier that replays a recording proves nothing about transcripts
+  it did not see.
+- *Derive labels from protocol names.* Rejected: the `label` field is itself a serialized
+  pattern of big-endian u32s and the same protocol name carries a different
+  `pattern_hash` per phase (`p3-sumcheck-quadratic` differs at all 10 occurrences). Labels are
+  measured DATA, not derivable. Still true, and the constant absorbs stay hardcoded data.
+- *Byte-level recording plus logged rejection counts.* Rejected: recovers the same
+  information by reverse-engineering the sampler, is more fragile than recording the
+  operation directly, and couples the artifact to one challenger implementation.
+
+**Consequences.**
+- `contracts/test/vectors/whir_semantic_program.json` is the verifier spec. The always-on
+  `whir_semantic_program_artifact_has_the_pinned_shape` pins 3551 ops, the 7-way event mix,
+  147 RLE runs and 1849 config-fixed values, so the artifact cannot rot silently (D-052).
+- The Solidity verifier is GENERATED from this artifact: a 147-entry schedule table plus
+  the 1849 config-fixed literals, with the samplers implemented as algorithms.
+- The byte-level artifact stays as a sponge cross-check only, never as a program.
+
