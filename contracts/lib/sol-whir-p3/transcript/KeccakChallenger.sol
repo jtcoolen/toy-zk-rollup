@@ -31,6 +31,12 @@ library KeccakChallenger {
 
     function observeBase(State memory self, uint256 value) internal pure {
         require(value < KOALABEAR_MODULUS, "BASE_RANGE");
+        // Any buffered output is now invalid: p3 HashChallenger::observe clears the
+        // output buffer, so the next sample flushes rather than resuming a block that
+        // was produced before this value existed. observeBytes already does this;
+        // observeBase omitted it, which desynchronised every later sample after an
+        // observe-follows-sample. Pinned by contracts/test/WhirSemanticProgram.t.sol.
+        self.outputIndex = 0;
         _appendBaseLE(self, uint32(value));
     }
 
@@ -1032,7 +1038,19 @@ library KeccakChallenger {
             }
         }
     }
-
+    /// Verifies a proof-of-work witness: squeeze one byte, absorb the witness, and
+    /// require the next `bits` bits to be zero.
+    ///
+    /// The squeeze is load-bearing, not a no-op. p3 GrindingChallenger::check_witness
+    /// calls a private squeeze that samples and discards one byte, and in the WHIR flow
+    /// the output buffer is always empty here because the round just observed a
+    /// commitment. So the squeeze FLUSHES, folding everything observed so far into a
+    /// digest, and only then is the witness appended on top of that digest. Skipping it
+    /// hashes the witness against the previous digest instead, and rejects a valid
+    /// proof. Pinned by contracts/test/WhirSemanticProgram.t.sol, which replays 23
+    /// recorded witness checks at difficulties 1, 3, 5, 7 and 8.
+    ///
+    /// A zero-bit check accepts without touching the transcript, matching p3.
     function checkWitness(State memory self, uint256 bits, uint256 witness)
         internal
         pure
@@ -1042,8 +1060,11 @@ library KeccakChallenger {
             return true;
         }
 
+        // Discard one byte, flushing if the buffer is empty. The value is unused; the
+        // flush is the point.
+        sampleByte(self);
         observeBase(self, witness);
-        return sampleBitsUnchecked(self, bits) == 0;
+        return sampleBits(self, bits) == 0;
     }
 
     function debugInputHash(State memory self) internal pure returns (bytes32 digest) {

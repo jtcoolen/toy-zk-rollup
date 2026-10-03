@@ -2697,3 +2697,99 @@ asymmetry is invisible in the trait definitions and cost a debugging cycle.
   the 1849 config-fixed literals, with the samplers implemented as algorithms.
 - The byte-level artifact stays as a sponge cross-check only, never as a program.
 
+## D-056 - Two real bugs in the vendored challenger, found by protocol-level replay
+
+**Status.** Implemented and green. 54 forge tests, 159 Rust tests, clippy clean.
+
+**The parity test did its job.** `contracts/test/WhirSemanticProgram.t.sol` walks
+the 3,551-operation semantic program against the vendored `KeccakChallenger` and
+asserts every sampled value. It failed on the FIRST sample, and the two bugs it
+exposed were both in the vendored library, not in the recording.
+
+### Bug 1 - `observeBase` did not invalidate buffered output
+
+p3 `HashChallenger::observe` starts with `output_buffer.clear()`. The vendored
+`observeBytes` reproduced that with `outputIndex = 0`; `observeBase` did not. So
+after an `observeBase`, a following sample RESUMED a block squeezed before the
+observed value existed. Every sample after the first observe-after-sample was wrong.
+
+Worth naming why this survived: it is invisible from inside the library. No unit
+test of the challenger alone can see it, because it only manifests when a sample
+follows an observe, which is the shape of the WHIR loop and not of a sampler test.
+
+### Bug 2 - `checkWitness` skipped the squeeze
+
+p3 `SerializingChallenger32::check_witness` is
+`if bits == 0 { true } else { self.squeeze(); self.witness_passes(bits, witness) }`.
+The squeeze samples and discards ONE byte. In the WHIR flow the output buffer is
+always empty there because the round just observed a commitment, so the squeeze
+FLUSHES - it folds everything observed so far into a digest - and only then is the
+witness appended on top of that digest. Skipping it hashes the witness against the
+PREVIOUS digest and rejects a valid proof of work.
+
+This is the same class of bug as D-055: a wrapper that reimplements a method instead
+of forwarding it loses whatever the original did sideways. Here the sideways effect
+was a flush.
+
+### Canonical vs Montgomery - the asymmetry is correct, not a bug
+
+The first mismatch looked like a sponge bug and was partly a recording bug. The
+recorder stored samples with `to_unique_u32`, which is Montgomery form, while the
+sponge hands out a raw masked sample whose canonical value IS the transcript output.
+Measured: `recorded == canonical * R mod P` for every sample, R = 2^32 mod P.
+
+- OBSERVE is recorded as `to_unique_u32` (Montgomery), because that is literally the
+  byte sequence p3 absorbs: `value.to_unique_u32().to_le_bytes()`.
+- SAMPLE is recorded as `as_canonical_u32`, because that is the value the transcript
+  produced. An on-chain sampler returns the same raw value, so canonical is what lets
+  a verifier compare without knowing the Montgomery constant.
+
+Each side is recorded in the form a verifier has to reproduce. Getting this wrong is
+a silent 1-of-224-sample class of error, which is what the parity test is for.
+
+### Three independent implementations agree
+
+The Solidity challenger, a pure-Python sponge written from the p3 source (with a
+pure-Python Keccak-f[1600] written from the Keccak spec, self-tested against known
+digests), and a second Python walk over the JSON event log all reproduce all 224
+samples, 779 uniform-bit draws and 23 proof-of-work checks, and reach the same
+chaining state. None of the three is the reference for another.
+
+### The full-replay digest is NOT pinnable - pin the config-fixed prefix instead
+
+A first version pinned the chaining state after the whole replay. It broke on the
+next regeneration. Measured over three recordings of the SAME witness:
+
+- schedule: byte-identical
+- config-fixed constant payload (7,396 B): byte-identical
+- variable / sample / uniform / witness payloads: all changed
+
+That is HVZK blinding doing its job - the proof is randomised, so the transcript is
+randomised. Pinning a per-proof value makes the test fail every time the vector is
+refreshed, which teaches people to delete assertions. So:
+
+- `test_replay_semantic_program` asserts every sampled value IN THE SAME RUN, which
+  is the real parity check and needs no pin.
+- `test_config_fixed_constants_reach_pinned_state` absorbs only the 1,849 config-fixed
+  constants and pins that state. Verified stable across all three regenerations.
+  It pins exactly the part a verifier hard-codes: little-endian word encoding in
+  `observeBase`, buffer growth, and the flush-chaining rule.
+
+Alternatives rejected:
+- Pin the full-replay digest and regenerate it each time. Rejected: a pin that must
+  be updated whenever the artifact is regenerated is not a regression test.
+- Embed the 7,396 constant bytes as a Solidity literal. Rejected: 7 KB of hex in a
+  test file, duplicating an artifact already on disk.
+- Keep the blob as hex inside the JSON. Rejected: `vm.readFileBinary` exists, so the
+  hex was a second copy of the same 13,570 bytes that could drift from the .bin. It
+  HAD already drifted, which is what moved the first pin. The .bin is now the single
+  artifact the contract reads.
+
+### Vendoring policy amended
+
+PATCHES.md claimed every patch was additive, "a new function, never a modified one".
+That rule is now broken deliberately: a bug against the reference implementation is
+not something to work around by adding a correct function next to a wrong one,
+because callers pick the wrong one by accident. Patch 2 modifies two functions and
+the doc says so, with the replay test named as the guard if an upstream refresh loses
+the patch.

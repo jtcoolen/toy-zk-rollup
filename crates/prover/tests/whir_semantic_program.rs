@@ -258,7 +258,7 @@ fn whir_semantic_program_artifact_has_the_pinned_shape() -> Result<(), Box<dyn E
     // schedule that no longer matches the recorded program and desynchronise in a
     // place nobody thought to look.
     let blob_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../contracts/test/vectors/whir_transcript_program.bin");
+        .join("../../contracts/test/vectors/whir_semantic_program.bin");
     let blob =
         std::fs::read(&blob_path).map_err(|e| format!("missing {}: {e}", blob_path.display()))?;
     assert!(blob.len() > 28, "blob is shorter than its header");
@@ -597,7 +597,7 @@ fn whir_semantic_program() -> Result<(), Box<dyn Error>> {
 
     let blob = replay_blob(base, &fixed_values)?;
     let blob_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../contracts/test/vectors/whir_transcript_program.bin");
+        .join("../../contracts/test/vectors/whir_semantic_program.bin");
     std::fs::write(&blob_path, &blob)?;
     println!("wrote {} ({} bytes)", blob_path.display(), blob.len());
     Ok(())

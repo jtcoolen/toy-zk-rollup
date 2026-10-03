@@ -1,8 +1,13 @@
 # Patches to vendored sol-whir-p3
 
-Vendored from <https://github.com/ethereum/sol-whir-p3>. Kept minimal and
-additive: every change here is a new function, never a modified one, so an
-upstream refresh cannot silently change a value the verifier depends on.
+Vendored from <https://github.com/ethereum/sol-whir-p3>.
+
+Patch 1 is additive. Patch 2 MODIFIES two existing functions, which breaks the
+original "new functions only" rule, and it is worth saying why that is the right
+call anyway: both are correctness bugs against the reference implementation, so
+leaving them alone means shipping a challenger that disagrees with p3. An upstream
+refresh must re-apply patch 2; the replay test in
+`contracts/test/WhirSemanticProgram.t.sol` fails loudly if it is lost.
 
 ## 1. `transcript/KeccakChallenger.sol`: `sampleByte` / `sampleBytes`
 
@@ -34,3 +39,51 @@ it is wrong, on the first squeezed byte.
 and `outputIndex`/`outputBlock`/`inputBuffer` are manipulated exactly as
 `_sampleUint32` does. Mixing byte-level and field-level sampling on one state is
 well-defined because both consume the same cursor.
+## 2. `transcript/KeccakChallenger.sol`: `observeBase` and `checkWitness`
+
+Both were wrong relative to p3 `HashChallenger` / `SerializingChallenger32`. Neither
+bug is visible from inside the library: each only shows up once a sample follows an
+observe, which is exactly the shape of the WHIR verifier loop.
+
+### 2a. `observeBase` did not invalidate buffered output
+
+p3 `HashChallenger::observe` begins with `self.output_buffer.clear()`. The vendored
+`observeBytes` reproduced that (`self.outputIndex = 0`) but `observeBase` did not,
+so after `observeBase` a following sample RESUMED a block that had been squeezed
+before the observed value existed. Every sample after the first observe-after-sample
+was wrong. Fix: set `outputIndex = 0`.
+
+The asymmetry is not a style inconsistency in p3: `observe_slice` clears only when the
+slice is non-empty, and `observeBase` always appends four bytes, so it always clears.
+
+### 2b. `checkWitness` skipped the squeeze
+
+p3 `SerializingChallenger32::check_witness` is
+`if bits == 0 { true } else { self.squeeze(); self.witness_passes(bits, witness) }`, and that
+`squeeze()` samples and discards one byte. In the WHIR flow the output buffer is
+always empty at that point because the round just observed a commitment, so the
+squeeze FLUSHES: it folds everything observed so far into a digest, and only then is
+the witness appended on top of that digest. Without it the witness is hashed against
+the PREVIOUS digest, and a valid proof-of-work is rejected.
+
+Fix: call `sampleByte` before `observeBase`. The sampled value is discarded, as in p3.
+
+### Evidence
+
+`contracts/test/WhirSemanticProgram.t.sol` replays a 3,551-operation transcript recorded
+from a real p3 WHIR verification and asserts all 224 sampled field elements, 779
+uniform-bit draws and 23 proof-of-work checks at difficulties 1, 3, 5, 7 and 8, then
+pins the final chaining digest.
+
+The vendored sponge core itself needed no changes and is confirmed faithful by that
+replay: `_flush` chaining, `_sampleUint32` byte order, `_ensureCapacity` growth and the
+`sampleBase` rejection bound all match p3.
+
+### One thing this is NOT a patch to
+
+The recorded SAMPLES are canonical field values while the recorded OBSERVATIONS are
+Montgomery wire bytes. That is not a bug in either side: p3 absorbs `to_unique_u32`, so
+the wire form is what the transcript contains, while a sample is a raw masked sponge
+output, so its canonical value is what the transcript produced. The recorder
+(`crates/prover/src/semantic_trace.rs`) records each in the form a verifier must
+reproduce, and the parity test only passes because both are right.

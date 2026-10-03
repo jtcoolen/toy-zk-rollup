@@ -69,8 +69,14 @@ pub type Digest = Hash<F, u8, 32>;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SemEvent {
     /// Absorbed one base field element.
+    ///
+    /// Recorded as `to_unique_u32`, the internal Montgomery form, because that is
+    /// literally what goes into the sponge: p3 observes the little-endian bytes of
+    /// `value.to_unique_u32()`. Sampling is the reverse case - the sponge hands out a
+    /// raw masked sample, so `SampleBase` is canonical. The asymmetry is real, and
+    /// each side is recorded in the form a verifier has to reproduce.
     ObserveBase {
-        /// Canonical value, so the artifact reads without Montgomery form.
+        /// Wire form, matching the absorbed bytes.
         value: u32,
     },
     /// Absorbed raw bytes: a commitment digest, or a Merkle cap's digests concatenated.
@@ -231,7 +237,14 @@ where
     fn sample(&mut self) -> EF {
         let value: EF = self.inner.sample();
         let coeffs = <EF as BasedVectorSpace<F>>::as_basis_coefficients_slice(&value);
-        let values: Vec<u32> = coeffs.iter().map(PrimeField32::to_unique_u32).collect();
+        // Canonical, not the internal Montgomery form. The sponge hands out a raw
+        // masked sample and p3 turns it into a field element, so the canonical value
+        // IS what the transcript produced; Montgomery is an arithmetic detail of the
+        // field implementation. An on-chain sampler returns the same raw value, so
+        // recording canonical is what lets a verifier compare without knowing the
+        // Montgomery constant. Observing is the opposite case: p3 absorbs the
+        // Montgomery bytes, so ObserveBase stays in wire form.
+        let values: Vec<u32> = coeffs.iter().map(PrimeField32::as_canonical_u32).collect();
         self.sink.push(SemEvent::SampleBase { values });
         value
     }
