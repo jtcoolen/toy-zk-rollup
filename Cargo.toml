@@ -125,7 +125,7 @@ aes-gcm = { version = "0.11", default-features = false, features = ["aes", "allo
 # restart does not invalidate sessions, and verification is one hash.
 # `sha2` (the digest) and `zeroize` are already declared above as workspace
 # deps; the node consumes them via `workspace = true` in its own manifest.
-hmac = { version = "0.13", default-features = false }
+hmac = { version = "0.13", default-features = false, features = ["zeroize"] }
 
 # --- Node transport: HTTP + middleware ---
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }

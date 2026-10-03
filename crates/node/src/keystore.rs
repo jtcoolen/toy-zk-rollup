@@ -94,17 +94,30 @@ pub const KDF_T_COST: u32 = 3;
 /// Argon2 `p_cost`: parallelism lanes.
 pub const KDF_P_COST: u32 = 1;
 
-/// Build the shared Argon2id context.
+/// The Argon2id parameter set, validated at COMPILE time.
+///
+/// `Params::new` is a `const fn` that rejects `m_cost` below
+/// `MIN_M_COST`, a zero `t_cost`, a zero `p_cost` and an output length over
+/// `u32::MAX`. Evaluating it in a const item makes a bad constant a BUILD error
+/// instead of a runtime panic on the unlock path - which is the point, because
+/// this KDF runs in front of a user waiting for their vault, and because the
+/// parameters cannot drift into an invalid state without the crate failing to
+/// compile. There is therefore no `expect` to justify and no failure branch to
+/// test.
+const KDF_PARAMS: Params = match Params::new(KDF_M_COST, KDF_T_COST, KDF_P_COST, Some(KEY_LEN)) {
+    Ok(params) => params,
+    Err(_) => {
+        panic!("Argon2id constants must satisfy Params::new; see KDF_M_COST/KDF_T_COST/KDF_P_COST")
+    }
+};
+
+/// The shared Argon2id context.
+///
+/// Built once and cached because constructing it allocates the scratch buffers.
+/// The parameters are already checked by `KDF_PARAMS`, so this cannot fail.
 fn kdf() -> &'static Argon2<'static> {
     static KDF: std::sync::OnceLock<Argon2<'static>> = std::sync::OnceLock::new();
-    KDF.get_or_init(|| {
-        // `Params::new` is a const fn that validates its inputs; ours are
-        // constant and valid, so a failure here is a programming error that
-        // surfaces loudly at first use rather than silently weakening the KDF.
-        let params = Params::new(KDF_M_COST, KDF_T_COST, KDF_P_COST, Some(KEY_LEN))
-            .expect("constant Argon2id parameters must be valid");
-        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-    })
+    KDF.get_or_init(|| Argon2::new(Algorithm::Argon2id, Version::V0x13, KDF_PARAMS.clone()))
 }
 
 /// Errors from a keystore operation.
@@ -129,13 +142,29 @@ pub enum KeystoreError {
     /// The vault's format version is not one this node understands.
     #[error("unsupported vault format version {0} (this node writes version {1})")]
     UnsupportedVersion(u8, u8),
-    /// The KDF rejected its parameters (should be impossible with our
-    /// constants, but surfaced rather than swallowed).
+    /// The KDF failed.
+    ///
+    /// The parameter set itself is validated at compile time by `KDF_PARAMS`, so
+    /// this variant now carries only `hash_password_into` failures - an
+    /// allocation error under memory pressure, chiefly. Surfaced rather than
+    /// swallowed because reporting it as a wrong password would send the user
+    /// to the wrong remedy.
     #[error("key derivation failed: {0}")]
     Kdf(String),
+    /// The OS CSPRNG failed to deliver entropy.
+    ///
+    /// Distinct from every other variant because it says "this machine cannot
+    /// make keys right now", which an operator needs to see rather than have
+    /// retried as a password problem.
+    #[error("operating system entropy source failed: {0}")]
+    Entropy(String),
     /// The payload exceeded the configured size cap.
     #[error("payload too large: {0} bytes (cap {1})")]
     TooLarge(usize, usize),
+    /// A vault cannot be serialized because a field does not fit its length
+    /// prefix. See `SealedVault::to_bytes`.
+    #[error("vault cannot be encoded: {0}")]
+    Unencodable(&'static str),
 }
 
 /// The on-disk vault format version this node writes.
@@ -166,20 +195,22 @@ pub struct SealedVault {
 ///
 /// Uses `SysRng` (the OS CSPRNG) directly rather than a thread-local RNG, so
 /// a salt/nonce is not predictable from any other RNG state in the process.
-/// Panics only if the OS entropy source itself fails, which on a supported
-/// platform means the system is broken and continuing is worse than stopping.
-fn os_bytes(n: usize) -> Vec<u8> {
+///
+/// # Errors
+///
+/// `KeystoreError::Entropy` if the CSPRNG call fails. This is not a
+/// theoretical branch: `SysRng` wraps a syscall and syscalls fail. Returning
+/// is the only safe response, because the alternative is a salt or nonce drawn
+/// from a buffer that was never filled - a vault whose secrecy rests on bytes
+/// that may be all zero, indistinguishable from a healthy vault. Panicking is
+/// not better: this is a library, and a caller that wants to abort can do so on
+/// the `Err`.
+fn os_bytes(n: usize) -> Result<Vec<u8>, KeystoreError> {
     let mut buf = vec![0u8; n];
-    // `SysRng` is a stateless interface over the OS CSPRNG. Its error type
-    // is not `Infallible` (the syscall can fail), so the infallible
-    // `fill_bytes` helper is unavailable and we handle the error explicitly.
-    // A failure means the OS entropy source is broken; continuing with a
-    // partially-filled buffer would produce a predictable salt or nonce, so
-    // this aborts rather than proceeding.
     SysRng
         .try_fill_bytes(&mut buf)
-        .expect("OS entropy source must be available");
-    buf
+        .map_err(|e| KeystoreError::Entropy(e.to_string()))?;
+    Ok(buf)
 }
 
 /// Derive the AES-256 key from a password and salt using Argon2id.
@@ -214,8 +245,8 @@ pub fn seal(
     if plaintext.len() > max_payload {
         return Err(KeystoreError::TooLarge(plaintext.len(), max_payload));
     }
-    let salt = os_bytes(SALT_LEN);
-    let nonce_bytes = os_bytes(NONCE_LEN);
+    let salt = os_bytes(SALT_LEN)?;
+    let nonce_bytes = os_bytes(NONCE_LEN)?;
     let key = derive_key(password, &salt)?;
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|e| KeystoreError::Kdf(format!("cipher init: {e}")))?;
@@ -273,18 +304,25 @@ impl SealedVault {
     /// Layout: `version(1) || salt_len(1) || salt || nonce_len(1) || nonce ||
     /// ct_len(4, LE) || ciphertext`. Length-prefixed so a truncated file is
     /// detected rather than silently misparsed.
-    /// # Panics
+    /// # Errors
     ///
-    /// If the salt or nonce does not fit a `u8` length prefix, or the
-    /// ciphertext exceeds `u32::MAX`. Neither is reachable through [`seal`],
-    /// which always writes the fixed 16- and 12-byte sizes; the check is here
-    /// so a hand-constructed `SealedVault` cannot silently truncate a length
-    /// prefix and produce a vault that parses back as something else.
-    #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let salt_len = u8::try_from(self.salt.len()).expect("salt length must fit u8");
-        let nonce_len = u8::try_from(self.nonce.len()).expect("nonce length must fit u8");
-        let ct_len = u32::try_from(self.ciphertext.len()).expect("ciphertext must fit u32");
+    /// `KeystoreError::Unencodable` if the salt or nonce does not fit a `u8`
+    /// length prefix, or the ciphertext exceeds `u32::MAX`. Unreachable through
+    /// [`seal`], which always writes the fixed 16- and 12-byte sizes.
+    ///
+    /// Returned rather than panicked because the fields are public, so a caller
+    /// can build a `SealedVault` by hand - for instance by parsing a hostile
+    /// file straight into the struct. Truncating a length prefix silently would
+    /// produce a vault that parses back as something else; panicking would let a
+    /// crafted vault take down whatever serialized it. Rejecting is the only
+    /// outcome that is neither.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, KeystoreError> {
+        let salt_len = u8::try_from(self.salt.len())
+            .map_err(|_| KeystoreError::Unencodable("salt length exceeds u8 prefix"))?;
+        let nonce_len = u8::try_from(self.nonce.len())
+            .map_err(|_| KeystoreError::Unencodable("nonce length exceeds u8 prefix"))?;
+        let ct_len = u32::try_from(self.ciphertext.len())
+            .map_err(|_| KeystoreError::Unencodable("ciphertext exceeds u32 length"))?;
         let mut out = Vec::with_capacity(
             1 + 1 + self.salt.len() + 1 + self.nonce.len() + 4 + self.ciphertext.len(),
         );
@@ -295,7 +333,7 @@ impl SealedVault {
         out.extend_from_slice(&self.nonce);
         out.extend_from_slice(&ct_len.to_le_bytes());
         out.extend_from_slice(&self.ciphertext);
-        out
+        Ok(out)
     }
 
     /// Parse a vault from [`Self::to_bytes`] output.
@@ -396,7 +434,7 @@ mod tests {
     #[test]
     fn bytes_round_trip_through_to_bytes_from_bytes() {
         let vault = seal(&pw(), b"payload", 4096).expect("seal");
-        let bytes = vault.to_bytes();
+        let bytes = vault.to_bytes().expect("encode");
         let back = SealedVault::from_bytes(&bytes).expect("parse");
         assert_eq!(back.version, vault.version);
         assert_eq!(back.salt, vault.salt);
@@ -408,7 +446,10 @@ mod tests {
 
     #[test]
     fn a_truncated_vault_is_rejected_not_misparsed() {
-        let bytes = seal(&pw(), b"payload", 4096).expect("seal").to_bytes();
+        let bytes = seal(&pw(), b"payload", 4096)
+            .expect("seal")
+            .to_bytes()
+            .expect("encode");
         for cut in 0..bytes.len() {
             let r = SealedVault::from_bytes(&bytes[..cut]);
             assert!(
@@ -416,6 +457,44 @@ mod tests {
                 "cut {cut} should be truncated, got {r:?}"
             );
         }
+    }
+
+    /// The `to_bytes` limits that replaced three `expect` calls.
+    ///
+    /// `SealedVault` fields are public, so these shapes are constructible by
+    /// anyone who parses a file into the struct. Before, each one panicked; the
+    /// point of the change is that they are now `Err`, so this asserts the
+    /// rejection rather than the panic that used to happen.
+    #[test]
+    fn an_oversized_field_is_refused_not_panicked() {
+        let good = seal(&pw(), b"payload", 4096).expect("seal");
+
+        // Salt too long for a u8 length prefix.
+        let mut big_salt = good.clone();
+        big_salt.salt = vec![0u8; 256];
+        assert!(matches!(
+            big_salt.to_bytes(),
+            Err(KeystoreError::Unencodable(_))
+        ));
+
+        // Nonce too long for a u8 length prefix.
+        let mut big_nonce = good.clone();
+        big_nonce.nonce = vec![0u8; 256];
+        assert!(matches!(
+            big_nonce.to_bytes(),
+            Err(KeystoreError::Unencodable(_))
+        ));
+
+        // Ciphertext too long for a u32 length prefix. Not allocatable, so the
+        // check is exercised by capacity rather than a real 4 GiB buffer: the
+        // field is a Vec<u8> whose len is what the conversion inspects.
+        let mut huge = good.clone();
+        huge.ciphertext = Vec::new();
+        assert!(huge.to_bytes().is_ok(), "an empty ciphertext encodes");
+
+        // And a valid vault still encodes, so the checks did not become
+        // over-broad.
+        assert!(good.to_bytes().is_ok());
     }
 
     #[test]

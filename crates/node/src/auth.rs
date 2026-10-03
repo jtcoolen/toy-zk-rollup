@@ -98,6 +98,14 @@ pub enum AuthError {
     /// The token has passed its expiry.
     #[error("token expired at {0}")]
     Expired(u64),
+    /// The signing key was rejected by the MAC primitive.
+    ///
+    /// HMAC accepts a key of any length, so this does not fire in practice. It
+    /// exists because a constructor for a security-critical object should hand a
+    /// rejection to its caller rather than panic on a Result the compiler cannot
+    /// prove ok.
+    #[error("signing key rejected: {0}")]
+    Key(String),
     /// The presented role is below the required role.
     #[error("insufficient privileges: have {have:?}, need {need:?}")]
     Insufficient {
@@ -115,15 +123,26 @@ pub enum AuthError {
 /// the keystore (see [`crate::keystore`]) or an env var injected at boot,
 /// never from a config file in the clear.
 pub struct TokenSigner {
-    key: zeroize::Zeroizing<Vec<u8>>,
+    /// The keyed HMAC, built once at construction.
+    ///
+    /// Held pre-keyed rather than re-derived from the raw key on every call for
+    /// two reasons. It removes a `Result` from the hot path: `new_from_slice` is
+    /// infallible for HMAC but its signature cannot say so, and discharging it at
+    /// every `mac()` call means either a panic or an invented error on a function
+    /// with no other failure. And it skips recomputing the ipad/opad inner hash on
+    /// every request the node authenticates.
+    ///
+    /// `hmac` is built with its `zeroize` feature, so this state - secret-dependent,
+    /// being the signing key mixed into the block padding - is wiped when the
+    /// signer drops. That is what makes the "wiped when dropped" claim in the
+    /// type doc true rather than merely intended.
+    mac: Hmac<Sha256>,
 }
 
 impl core::fmt::Debug for TokenSigner {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // Never print the key.
-        f.debug_struct("TokenSigner")
-            .field("key_len", &self.key.len())
-            .finish_non_exhaustive()
+        // Never print key material, including the keyed state.
+        f.debug_struct("TokenSigner").finish_non_exhaustive()
     }
 }
 
@@ -134,11 +153,18 @@ impl TokenSigner {
     /// not enforce a minimum length here because HMAC is safe with any key
     /// size; the *policy* of "use 32 random bytes" belongs to whoever
     /// provisions the key, and is documented rather than asserted.
-    #[must_use]
-    pub fn new(key: Vec<u8>) -> Self {
-        Self {
-            key: zeroize::Zeroizing::new(key),
-        }
+    ///
+    /// # Errors
+    ///
+    /// `AuthError::Key` if the MAC primitive rejects the key.
+    ///
+    /// Borrows the key rather than taking it by value: the signer keeps only the
+    /// keyed MAC state and never a copy of the key, so there is nothing here for
+    /// it to wipe on the caller's behalf. Whoever provisions the key should hold
+    /// it in `zeroize::Zeroizing` and let that drop it.
+    pub fn new(key: &[u8]) -> Result<Self, AuthError> {
+        let mac = Hmac::<Sha256>::new_from_slice(key).map_err(|e| AuthError::Key(e.to_string()))?;
+        Ok(Self { mac })
     }
 
     /// Issue a token for `role` that expires at `expiry_unix`.
@@ -214,8 +240,14 @@ impl TokenSigner {
         p
     }
 
+    /// `HMAC-SHA-256` over `payload`.
+    ///
+    /// Clones the keyed state rather than rebuilding it, so this cannot fail and
+    /// has no error to invent. The clone copies a 64-byte block buffer plus the
+    /// outer state, which is cheaper than the inner hash it replaces, and the copy
+    /// is wiped with the local when `finalize` consumes it.
     fn mac(&self, payload: &[u8]) -> Vec<u8> {
-        let mut m = Hmac::<Sha256>::new_from_slice(&self.key).expect("HMAC accepts any key length");
+        let mut m = self.mac.clone();
         m.update(payload);
         m.finalize().into_bytes().to_vec()
     }
@@ -337,7 +369,9 @@ mod tests {
     use super::*;
 
     fn signer() -> TokenSigner {
-        TokenSigner::new(vec![7u8; 32])
+        // Unwrap in a test is fine: the rule guards production paths, and a
+        // rejected key would fail every assertion below anyway.
+        TokenSigner::new(&[7u8; 32]).expect("test signer key must be accepted")
     }
 
     const NOW: u64 = 1_700_000_000;
@@ -383,7 +417,7 @@ mod tests {
     #[test]
     fn a_token_from_another_key_is_rejected() {
         let a = signer();
-        let b = TokenSigner::new(vec![8u8; 32]);
+        let b = TokenSigner::new(&[8u8; 32]).expect("test signer key must be accepted");
         let t = a.issue(Role::Admin, NOW + 100);
         assert_eq!(b.verify(&t, NOW), Err(AuthError::BadSignature));
     }
