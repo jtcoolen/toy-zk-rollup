@@ -2520,3 +2520,107 @@ desynchronises every later event into garbage that still parses. Caught while
 writing it - `usize::to_le_bytes` is EIGHT bytes on a 64-bit host, so the encoder
 and decoder disagreed and the vector decoded as 2 events.
 
+
+## D-054 - The transcript is an ALGORITHM with constant labels, not a replayable op list
+
+**What D-053 left open.** D-053 recorded the WHIR verifier transcript as a byte
+program and replayed it on both sides, and noted the constraint that "a recorded
+program is sound only while the config is fixed". That framing was still too
+optimistic, and the classifier below is what found it.
+
+**The experiment.** Prove the same AIR shape with several different witnesses and
+verify each. An absorb whose bytes are identical across every run cannot depend on
+the witness, so it is fixed by the config; an absorb that differs must be carrying
+proof data. That split is exactly what a Solidity verifier needs per absorb -
+constant in the contract versus read from calldata - and the Rust source does not
+state it in a form a verifier author can consume. So it is measured, not read.
+
+To make the witness actually vary, the test AIR had to change: it pinned the first
+row to (1,1), so every seed produced one witness. The starting pair is now the
+public input, which gives one AIR shape many witnesses.
+
+**The result, and the finding.** The first version asserted the whole event stream
+is shape-stable. It FAILED: 6896 vs 6904 events for one statement shape. That is
+the protocol, not noise. KoalaBear sampling is rejection sampling - draw 32 bits,
+reject at or above the modulus, draw again - so how many draws a squeeze needs
+depends on the sponge state, which depends on the proof. The squeeze stream is
+proof-dependent in LENGTH as well as in value.
+
+Absorbs are different in kind, and that asymmetry is the useful part:
+
+    absorbs:  2765 events, IDENTICAL schedule across all runs
+    squeezes: 4131 or 4135, depending on the proof
+    classification: ~1850 config-fixed absorbs (~7400 bytes),
+                    ~915 proof-carrying absorbs (~2990 bytes)
+
+**The correction.** The verifier cannot be a replay of a recorded op list, because
+the op list is not fixed. It must implement the labelled transcript ALGORITHM, with
+the labels as constants and rejection sampling inside the samplers. The recorded
+stream stays valuable - it pins the sponge, the byte order and the label ORDER
+against a real transcript, which is what D-053 bought and what Solidity now agrees
+with - but it is a test vector, not the program.
+
+This does not weaken D-053; it says what D-053 is FOR. Without the recorded stream
+we would have no ground truth for the label order, and the reading-based version
+would have used the wrong protocol id (p3-whir v3 instead of p3-uni-stark v1).
+
+**What the classifier also settles.** `stratified_queries` is FALSE for our domain
+(the trait default, no override), so index assembly takes the identity branch: draw
+`num_queries` values of `index_bits` each. That matters because the vendored
+sol-whir-p3 sampler draws all bits in ONE call and then sorts and uniquifies - a
+different protocol version. Reusing its index layer would have been wrong, and this
+is the measurement that says so rather than a judgement call.
+
+**Upstream reuse, decided by layer.** sol-whir-p3 ships a complete, tested
+standalone WHIR verifier for KoalaBear + quartic (Ext4) - our exact field config -
+with failure fixtures. Their own AGENTS.md states the verifier assumes Keccak with
+0x00 leaf / 0x01 node prefix bytes and absorbs a `whirFsPattern` as field elements:
+the PRE-labelled whir-p3 transcript, not p3-whir 0.8.0 versioned DomainSeparator.
+So the split is:
+  - REUSE as a second implementation to cross-check arithmetic: extension-field
+    folding, multilinear evaluation, Horner, the row-evaluation kernels.
+  - DO NOT reuse: transcript layer, Merkle prefixing (D-050 already rejected it),
+    index derivation (different protocol), fixed-config constants.
+
+**Honesty about the artifact.** `whir_transcript_program.json` is a MEASUREMENT
+SUMMARY, not a pin. Grinding is nondeterministic, so the constant/variable split
+drifts by about one absorb between generations (1849/916 then 1850/915). Nothing
+asserts those counts; the assertion that matters is the one that does not drift -
+the absorb schedule is identical across runs. A future change that made the absorb
+count itself vary would be a real protocol change and would fail.
+
+**Also fixed.** The KoalaBear modulus comment said `2^31 - 2^27 + 1`, which is
+BabyBear; the value in the file, 2_130_706_433, is `2^31 - 2^24 + 1`. Checked rather
+than transcribed, and the comment now says so, because a wrong modulus makes every
+rejection-sampling bound in the verifier wrong.
+
+**Addendum, same ticket - the constructive half.** "Not a replayable op list" is only
+half a result; the other half is what IS fixed, and it took one more collapse to see
+it. Group the event stream into SITES: a maximal run of squeezes becomes one squeeze
+site, absorbs stay single sites. On that view the transcript is shape-stable:
+
+    2847 sites = 2765 absorb sites + 82 squeeze sites
+    site kinds and positions: identical across runs
+    absorb site sizes:        identical across runs
+    absorb byte stream:       identical across runs (10388 bytes)
+    squeeze site byte counts: 8 distinct values across runs - the rejection variance
+
+So the verifier is written against the SITE sequence: 82 sampler calls at positions
+fixed by the config, each drawing however many bytes rejection sampling needs. That
+is an implementable specification, and the test asserts it rather than assuming it.
+
+Two views ship in `whir_transcript_program.json` because they answer different
+questions, and conflating them is exactly what made the first assertion fail:
+`program` is the run-0 event stream (the fixture - pins sponge, byte order, label
+order; Solidity replays it byte for byte), `site_program` is the collapsed view (the
+shape; a squeeze site carries its run-0 byte COUNT, not its bytes, because the count
+is the shape and the bytes were one proof's luck). A consistency check confirms the
+two views agree on totals: 4143 squeeze bytes and 10388 absorb bytes either way.
+
+One more structural fact worth pinning: every absorb is either 1 byte or a 4-byte
+field element, never anything else. The labelled layer packs everything through
+`FieldUnit`, so labels and field values arrive as 4-byte elements, and a
+byte-at-a-time path carries the rest. Event boundaries are therefore a granularity
+artifact - one 32-byte digest may appear as one absorb or as 32 - which is why the
+byte stream and the site sequence are the assertions that mean something, and a bare
+event count is not one of them.
