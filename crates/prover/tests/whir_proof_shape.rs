@@ -88,9 +88,7 @@ fn dump_shape() {
                 p3_whir::pcs::proof::QueryOpenings::Extension(o) => o.rows.len(),
             };
             let width = match &r.openings {
-                p3_whir::pcs::proof::QueryOpenings::Base(o) => {
-                    o.rows.first().map_or(0, Vec::len)
-                }
+                p3_whir::pcs::proof::QueryOpenings::Base(o) => o.rows.first().map_or(0, Vec::len),
                 p3_whir::pcs::proof::QueryOpenings::Extension(o) => {
                     o.rows.first().map_or(0, Vec::len)
                 }
