@@ -35,3 +35,27 @@ exclude_lints = ["require-revert-in-loop"]
 #
 # Our own `src/` stays under the full strict policy.
 ignore = ["lib/sol-whir-p3/"]
+
+# Deliberately NO [fmt] section, and `forge fmt` is deliberately NOT in
+# scripts/check.sh.
+#
+# Two reasons, both measured rather than stylistic.
+#
+# 1. The committed style is hand-formatted at roughly 100 columns. `forge fmt`
+#    defaults to 120 and re-wraps signatures it considers short enough to fit on
+#    one line. No `line_length` setting reproduces the committed style: `forge
+#    fmt --check` reports 16-19 differing files at 96, 100, 104, 108, 112 and 120
+#    alike. Running it produces a churn commit that touches files unrelated to
+#    whatever was being worked on, which is exactly what happened once and had to
+#    be reverted.
+#
+# 2. Upstream sol-whir-p3's own AGENTS.md records that the installed `forge fmt`
+#    can move statements out of compact one-line `while` and `if` bodies,
+#    "changing semantics or producing invalid syntax". A formatter that can
+#    change semantics does not get to be a gate on code whose whole job is
+#    reproducing a byte-exact protocol. `lib/sol-whir-p3` is vendored for
+#    byte-identity with upstream, so it must not be reformatted at all.
+#
+# What IS enforced: `deny = "warnings"` above, plus `forge build` and `forge
+# test` in the gate. Formatting is reviewed in review, not imposed by a tool
+# that would rewrite the vendored tree.

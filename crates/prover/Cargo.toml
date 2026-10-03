@@ -59,6 +59,11 @@ postcard = "1.1"
 # to the Solidity side.
 p3-keccak = { workspace = true }
 p3-symmetric = { workspace = true }
+# The STIR vector generator (tests/stir_vectors.rs) needs `Poly::eval_ext` to
+# pin what the Solidity side calls `eval_multilinear` over a query row. That
+# lives in p3-multilinear-util, which the lib itself does not use - the prover
+# folds through p3-whir's own kernels - so this is a dev-only dependency.
+p3-multilinear-util = { workspace = true }
 # Self-dependency with `testkit` on. An integration test links against the lib
 # compiled *without* `cfg(test)`, so the fixtures gated on it are otherwise
 # invisible to `tests/`. Depending on ourselves with the feature enabled is the

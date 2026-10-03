@@ -104,6 +104,29 @@ Three hashes, each chosen for a different cost environment. Never mix them by ac
 
 ## Not yet specified
 
+- [WHIR transcript is a recorded program, then an algorithm](decisions.md): **D-053 / D-054.** p3-whir 0.8.0 uses a LABELED, VERSIONED transcript (`WhirVerifierTranscript` over `DomainSeparator`; outer separator `p3-uni-stark` v1, p3-whir's own v3). First attempt recorded every byte; that does not survive regeneration, because a squeeze flushes a partially-filled output buffer so the byte stream depends on rejection samples. What IS invariant is the OPERATION stream and the sampled VALUES, so the parity test asserts semantics: 224 samples, 779 uniform draws, 23 PoW checks (difficulties 1,3,5,7,8) replayed through the vendored challenger, cross-validated against a from-source Python Keccak-256 sponge and a Python walk of the JSON event log.
+- [The vendored challenger had two real bugs](decisions.md): **D-056.** `observeBase` failed to reset the output-buffer index, and `checkWitness` absorbed the witness without the preceding squeeze that `SerializingChallenger32::check_witness` performs. Vendoring policy amended: a patch MAY modify an upstream function when upstream is wrong against the reference — a correct function placed next to a wrong one is a trap for the next caller.
+- [STIR openings: per-query full paths](decisions.md): **D-057.** `StirOpenings.sol` authenticates an opened row and folds it. Extension leaves are keccak over `width_ext * DIMENSION` little-endian MONTGOMERY words (256 bytes for a 16-element row), not 64 and not canonical. Measured per opening at depth 6: leaf 22.3k, path 2.3k, fold 16.9k — so the amortised frontier walk is NOT worth porting, and the leaf encoding is where gas goes.
+
+### Solidity verifier status
+
+Built from `crates/prover` vector generators, never from a reimplementation. 66 forge
+tests / 11 suites green.
+
+| Layer | Contract | Ground truth | State |
+|---|---|---|---|
+| Codec | `verifier/ProofCodec.sol` | postcard varint vectors | done |
+| Field | `lib/sol-whir-p3/field/KoalaBear(Ext4).sol` | `ext4_vectors.json`, patched fold (D-048) | done |
+| Transcript | `lib/sol-whir-p3/transcript/KeccakChallenger.sol` | `whir_semantic_program.bin`, 3,551 ops | done, 2 bugs fixed |
+| Sumcheck | `verifier/SumcheckCore.sol` | `sumcheck_vectors.json`, 3 shapes | done |
+| Merkle | `verifier/StarkMerkle.sol` | `mmcs.json`, 4 conventions searched | done |
+| Fixed config | `verifier/WhirFixedConfig.sol` | `whir_fixed_config.json` | done |
+| STIR openings | `verifier/StirOpenings.sol` | `stir_vectors.json`, real `ExtensionMmcs` | **done this round** |
+| WHIR core | `verifier/WhirVerifierCore.sol` | `verify_whir_circuit_engine` as spec | **next** |
+| Constraint identity | `verifier/ConstraintIdentity.sol` | generated from `SymbolicAirAirBuilder` (D-036) | open, least-trodden risk |
+| Chunk splitting | `ChunkVerifier.sol` | D-039, sponge state across transactions | open |
+
+
 - **In-circuit SPHINCS+ cost profile.** WOTS+ chain + FORS + hypertree verification
   inside the transfer AIR will dominate circuit size. How many SHA-256 compression rows
   per spend, and whether it needs its own lookup table or shares the note-hash table, is

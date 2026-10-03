@@ -2050,6 +2050,7 @@ dependencies = [
  "p3-lookup",
  "p3-matrix",
  "p3-merkle-tree",
+ "p3-multilinear-util",
  "p3-poseidon2-circuit-air",
  "p3-recursion",
  "p3-sumcheck",

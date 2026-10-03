@@ -2793,3 +2793,93 @@ not something to work around by adding a correct function next to a wrong one,
 because callers pick the wrong one by accident. Patch 2 modifies two functions and
 the doc says so, with the replay test named as the guard if an upstream refresh loses
 the patch.
+
+
+## D-057 - STIR openings: per-query full paths, and the gas split is not what it looked like
+
+**What landed.** `contracts/src/verifier/StirOpenings.sol` plus
+`contracts/test/StirOpenings.t.sol` (10 tests) and `StirOpeningsGas.t.sol` (2),
+driven by `contracts/test/vectors/stir_vectors.json` from the new
+`crates/prover/tests/stir_vectors.rs`. The vectors commit through the real
+settlement scheme - `ExtensionMmcs<KoalaBear, BinomialExtensionField<KoalaBear,4>,
+MerkleTreeMmcs<F, u8, SerializingHasher<Keccak256>, CompressionFunctionFromHasher<Keccak256,2,32>, 2, 32>>`
+- open it with the prover's own `open_multi_batch`, and recover one complete path
+per query with `restore_and_recompute_paths`. So the expected leaves, paths, folds
+and domain points are prover output, not a second implementation of the same idea.
+
+**The leaf is the dangerous part, and it is now impossible to get wrong by accident.**
+Round 0 opens a base-field tree; every later round opens an `ExtensionMmcs`, which is
+not a different tree but the same tree over a different row type: each extension
+element is reinterpreted as DIMENSION base limbs (`verify_multi_batch` calls
+`flatten_to_base` and widens the dimensions by DIMENSION). A 16-element row is
+therefore a 64-limb row and its leaf is keccak over **256 bytes, not 64** - and those
+bytes are the little-endian Montgomery form, because the inner tree hashes
+`RawDataSerializable::into_byte_stream`, which is `to_unique_u32`. A verifier that
+hashed canonical limbs produces a perfectly valid 32-byte digest that simply is not
+the prover leaf, and nothing downstream hints that the encoding rather than the data
+was wrong. So `extLeaf` takes canonical limbs and converts internally, and
+`test_canonical_limbs_hash_differently` asserts the canonical encoding does NOT
+reproduce the prover leaf. That negative test is what makes the Montgomery discussion
+in the header falsifiable.
+
+**Fold basis, verified rather than read.** `KoalaBearExt4.evaluate_hypercube` folds
+`point[0]` across the half-size stride, i.e. against the most significant bit of the
+position within the row. p3 `eval_multilinear_recursive` consumes its point from the
+other end syntactically but lands in the same place: its `x0` is the coefficient of
+the top half. Confirmed against `Poly::eval_ext` over the generated vectors, because
+"reads the same" is the argument that was wrong about `extrapolate_012` (D-048).
+
+**Per-query full paths, deliberately.** p3 amortises openings across queries with a
+shared pruned frontier (`walk_pruned_frontier`, ~150 lines of index arithmetic).
+Verification here checks each query path alone with `StarkMerkle.computeRoot`, which
+re-hashes the siblings two paths share. Chosen because it bounds one query's work by
+a constant - which is exactly what D-039's split-across-transactions needs - and
+because the amortised walk stays a local swap with an identical contract.
+
+**The gas measurement reversed the plan for optimising this.** Measured per opening at
+depth 6 with a 16-element row (`StirOpeningsGasTest`, brackets around each part):
+
+| part | gas | what it is |
+|---|---|---|
+| leaf | 22,297 | 1 keccak over 256 bytes + 64 Montgomery conversions |
+| path | 2,347 | 6 keccaks over 64 bytes |
+| fold | 16,916 | 15 extension folds, no hashing |
+| **total** | **41,727** | parts sum to 41,560; the rest is the call frame |
+
+Two conclusions, both opposite to the design-time intuition:
+
+- **The Merkle path is almost free.** Porting the amortised frontier walk would save a
+  few thousand gas per query and cost a large, hard-to-audit state machine. Not worth
+  it - now as a measurement rather than a hunch. The test asserts
+  `pathGas < leafGas / 4` so the conclusion cannot silently rot.
+- **Hashing the wide row costs about as much as folding it.** The first `extLeaf`
+  mapped limbs to wire form into a `uint256[]` and handed it to
+  `StarkMerkle.leafFromLimbs`: 40.8k per leaf. Fusing conversion and byte encoding
+  into one pass over the final buffer: 22.3k. The 3.2 KB intermediate array and its
+  zeroing were 45% of the leaf. If openings ever need to get cheaper the target is the
+  leaf encoding and the extension arithmetic, not the tree.
+
+Alternatives rejected:
+- Port `walk_pruned_frontier` now. Rejected on the measurement above.
+- Have callers pass already-converted wire limbs to `StarkMerkle.leafFromLimbs`.
+  Rejected: it is the exact shape that fails silently, and it puts the encoding
+  decision at every call site instead of one.
+- Assert `fold == horner(final_poly, domain_point)` in this vector file. Rejected:
+  that equality is the WHIR final-phase identity, which needs a real transcript to be
+  meaningful. Both sides are emitted so the end-to-end proof test can assert it with
+  the transcript-derived randomness; a Merkle vector file is the wrong place to
+  invent folding randomness and call the identity checked.
+
+**Incidental findings worth keeping.**
+- forge JSON selectors have no array-length operator; `.length` fails with "must
+  return exactly one JSON value", which reads like a malformed file. Vector files now
+  carry explicit `num_*` counts.
+- `vm.expectRevert` needs the revert at a LOWER call depth than the cheatcode, so a
+  revert inside an inlined internal library call reports "call didn't revert at a
+  lower depth". Revert tests go through a small external harness.
+- A wide assertion loop over a JSON-parsed case hits Yul "Variable ... is 1 too deep".
+  The fix is a `Ctx memory` struct plus narrow `checkLeaf`/`checkPath`/`checkFold`
+  helpers, which also makes each failure message name its own check.
+- `gasleft()` brackets include argument expressions: the first gas test reported 76k
+  for an opening because `json.readBytes32` over a 56 KB file was an argument.
+
