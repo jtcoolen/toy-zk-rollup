@@ -32,3 +32,23 @@ No unchecked arithmetic. Explicit overflow policy. Revert on any ambiguity.
 
 No SHA3 precompile on EVM. The verifier uses `keccak256` at `0x20` exclusively —
 which is exactly why ticket 02 put Keccak in the Merkle/FRI layer.
+
+## Progress
+
+Deliverable 4 (vector tests) is the anti-drift mechanism, and it now covers the three
+things a verifier can silently get wrong:
+
+- **Wire format** — `contracts/src/verifier/ProofCodec.sol`, a postcard decoder pinned
+  against prover-emitted bytes (20 tests). Stricter than postcard on varint
+  canonicality, which costs nothing on liveness and buys proof-byte uniqueness, so
+  `keccak256(proof)` is a sound replay identity.
+- **Merkle layer** — `StarkMerkle.sol` against byte-native Keccak-256 vectors (D-050).
+- **Transcript** — the WHIR verifier's own absorb/squeeze program, RECORDED from a real
+  verify and replayed on both sides. See
+  [D-053](../decisions.md#d-053---the-labelled-whir-transcript-is-a-recorded-byte-program-not-a-solidity-port).
+  This is the piece that reading the source got wrong: the outer separator is
+  `p3-uni-stark` v1, not `p3-whir` v3.
+
+Still open here: the STIR opening check, the WHIR verifier core, the AIR quotient
+identity evaluator (D-036, the least-trodden risk), the full proof walk, and the
+chunk-by-round split across transactions (D-039).

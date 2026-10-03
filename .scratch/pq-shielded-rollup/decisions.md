@@ -2424,3 +2424,99 @@ drifted and nothing objected. The regenerated fixtures were re-verified on-chain
 - a statement limb, a challenge value, an invalid PoW witness, and a `pow_bits
   mismatch - each made `golden_vectors_are_current` FAIL, and it passes again
 once restored. A guard that cannot fail is not a guard.
+
+## D-053 - The labelled WHIR transcript is a RECORDED byte program, not a Solidity port
+
+**The problem.** p3-whir 0.8.0 does not drive a bare sponge. It drives
+`WhirVerifierTranscript` over a `DomainSeparator` (Spongefish style, IETF
+draft-irtf-cfrg-fiat-shamir): a versioned, named, labelled transcript whose seed is
+
+    [protocol_id(64) | pattern_hash(32) | label_len_be(4) | label | 0x80]
+
+packed three bytes per field element behind a length element, with every later step
+absorbing a label before its payload. None of that ordering is published as a spec -
+it is upstream control flow. A verifier that absorbs the same SET of values in a
+different order, or that skips the seed, derives completely different challenges
+while looking entirely correct in review.
+
+The only transcript test we had pinned a SYNTHETIC flat program (four observes, two
+samples, a 4-bit grind). It passed while the real protocol was unpinned. That is the
+gap this closes.
+
+**Options considered.**
+1. Port p3-challenger's `fs` pattern machinery (patterns, labels, protocol ids,
+   FieldUnit packing) to Solidity and run the labelled transcript natively.
+   Rejected: roughly a thousand lines of upstream machinery whose only job is to
+   produce a byte stream, and every line of it becomes ours to defend. It also
+   cannot be validated against anything except the Rust it imitates, which is the
+   circularity D-053 is about.
+2. Transcribe the absorb order from reading the Rust source and hardcode it.
+   Rejected, and it would have been WRONG: reading p3-whir's source says the
+   separator is version 3, name "p3-whir". The seed recorded from a real verify
+   decodes to version 1, name "p3-uni-stark" - uni-stark wraps WHIR as a
+   sub-transcript, so the OUTER transcript is uni-stark's. A verifier written from
+   the reading would have absorbed the wrong protocol id.
+3. Record the program from the real verifier and replay it on both sides. CHOSEN.
+
+**The method, and why recording the VERIFIER is the load-bearing choice.** Prove
+with the PRODUCTION config, then verify with a TRACED config whose only difference
+is the challenger type. If splicing the recorder into the challenger perturbed the
+transcript by even one byte, the challenges would desynchronise and verification
+would fail. So a green run is itself the proof that recording did not change the
+protocol. Recording the PROVER instead carries no such guarantee - a prover and a
+verifier can disagree in ways a prover-only run never notices. This is the method
+GOATNetwork/bitcoin-stark-verifier uses, and their stated reasoning is the reason it
+is the right one: every other test compares a script against a Rust reference, which
+establishes that the two agree, not that either is correct.
+
+`Proof<SC>` is keyed on SC and SC names the challenger type, so `Proof<Config>` and
+`Proof<TracedConfig>` are distinct Rust types. They bridge through
+`postcard::to_allocvec` + `from_bytes`, which doubles as evidence that the wire
+format is config-agnostic - exactly what the chain relies on.
+
+**What is pinned.** `crates/prover/tests/whir_transcript_vectors.rs` records 6895
+events from a real 16-variable / 1024-row verify. Four always-on tests: the replay
+(4131 recorded squeeze bytes reproduced from a fresh sponge), the seed STRUCTURE
+(version byte, protocol name, zero padding, label length, 0x80 terminator - asserted
+as decoded structure so an upstream change reports as "the version byte moved"
+instead of thousands of mismatched bytes), a corrupted-seed test (diverges at event
+100), and a dropped-absorb test (diverges at event 99). The generator is `#[ignore]`d
+per D-052.
+
+`contracts/test/WhirTranscriptReplay.t.sol` replays the same vector on the vendored
+Keccak sponge. Rust agrees with the vector, Solidity agrees with the vector,
+therefore Solidity agrees with Rust - with neither implementation serving as the
+other's reference.
+
+**Byte order, verified not assumed.** p3 `HashChallenger::sample` pops from the END
+of a 32-byte output buffer, so a caller receives digest[31] first. The vendored
+`_sampleUint32` consumes the block from its low end and the low byte of a uint32 is
+the lowest-addressed byte, so both read digest[31] first. Confirmed by mutation:
+reading from the high end makes the Solidity replay fail.
+
+**Vendored patch.** `KeccakChallenger.sampleByte`/`sampleBytes` added
+(`contracts/lib/sol-whir-p3/PATCHES.md`). Additive only - no existing function
+touched, so an upstream refresh cannot silently change a value the verifier depends
+on. The library previously squeezed only field elements, which consume four bytes at
+a time and reduce mod the KoalaBear modulus, so it could not reproduce an arbitrary
+recorded byte.
+
+**Three mutations confirm the Solidity test bites.** sampleByte consuming 4 bytes
+instead of 1: FAIL. Reading from the high end of the block: FAIL. `observeBytes`
+forgetting to invalidate the pending output block - the classic sponge bug, and the
+one a hand-written verifier is most likely to have: FAIL at squeeze 180.
+
+**The constraint this buys, and pays.** A recorded program is sound only while the
+config is fixed: security level, folding factor, arity slack and PoW bits all decide
+the schedule, hence the stream. Any config change MUST regenerate the vector. The
+vector records num_variables and log_rows so a mismatch is visible, and the replay
+asserts the event count. If we later need config flexibility on-chain, the answer is
+to generate the label constants at build time from the same Rust recorder rather
+than to port the pattern machinery.
+
+**Also fixed on the way.** The event length prefix was widened from 2 to 4 bytes: a
+2-byte length silently truncates any absorb over 65535 bytes, and a truncated length
+desynchronises every later event into garbage that still parses. Caught while
+writing it - `usize::to_le_bytes` is EIGHT bytes on a 64-bit host, so the encoder
+and decoder disagreed and the vector decoded as 2 events.
+

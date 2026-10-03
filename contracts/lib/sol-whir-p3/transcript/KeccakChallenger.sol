@@ -946,6 +946,39 @@ library KeccakChallenger {
         second = observeReadValidatedPackedExt5Le(self, data, offset + 20);
     }
 
+    /// Squeezes ONE byte, matching p3-challenger HashChallenger byte order.
+    ///
+    /// p3 pops from the END of a 32-byte output buffer, so the first byte a
+    /// caller receives is digest[31], then digest[30], and so on. _sampleUint32
+    /// already consumes the output block from its low end, and the low byte of a
+    /// uint32 is the byte at the lowest address, so this reads the same stream in
+    /// the same order without disturbing the field-level samplers.
+    ///
+    /// Added for transcript replay: the recorded WHIR verifier program is a
+    /// byte-level absorb/squeeze sequence, and checking Solidity against it needs
+    /// a byte-level squeeze. Field-level sampling stays the API the verifier uses.
+    /// See lib/sol-whir-p3/PATCHES.md.
+    function sampleByte(State memory self) internal pure returns (uint8) {
+        if (self.outputIndex == 0) {
+            _flush(self);
+        }
+        unchecked {
+            // Same shift _sampleUint32 applies, narrowed to one byte: the byte at
+            // offset (32 - outputIndex) from the start of the output block.
+            uint256 shift = ((DIGEST_BYTES - self.outputIndex) & 0xff) << 3;
+            self.outputIndex -= 1;
+            return uint8(uint256(self.outputBlock >> shift) & 0xff);
+        }
+    }
+
+    /// Squeezes n bytes in the same order as repeated sampleByte calls.
+    function sampleBytes(State memory self, uint256 n) internal pure returns (bytes memory out) {
+        out = new bytes(n);
+        for (uint256 i; i < n; ++i) {
+            out[i] = bytes1(sampleByte(self));
+        }
+    }
+
     function sampleBase(State memory self) internal pure returns (uint256) {
         while (true) {
             uint256 value = uint256(_sampleUint32(self)) & KOALABEAR_SAMPLE_MASK;
