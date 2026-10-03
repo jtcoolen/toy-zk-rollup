@@ -53,24 +53,30 @@
 //! the non-ignored test at the bottom re-checks their SHAPE so a stale file fails
 //! loudly instead of silently teaching the Solidity side the wrong schedule.
 
+#![recursion_limit = "256"]
+
 use p3_challenger::{CanObserve, HashChallenger, SerializingChallenger32};
 use p3_commit::{CommitmentOpening, MatrixOpening, OpeningRequest, Pcs as _, PointOpening};
 use p3_field::coset::TwoAdicMultiplicativeCoset;
 use p3_field::{BasedVectorSpace, PrimeCharacteristicRing, PrimeField32, TwoAdicField};
 use p3_keccak::Keccak256Hash;
 use p3_matrix::dense::RowMajorMatrix;
+use p3_matrix::Dimensions;
 use p3_multilinear_util::point::Point;
+use p3_multilinear_util::poly::Poly;
 use p3_recursion::pcs::whir::uni::plan::checked_stacked_num_variables;
 use p3_recursion::pcs::whir::uni::{padded_arity, univariate_eq_point, WhirUniPcs};
 use p3_sumcheck::constraints::statement::eq::EqStatement;
+use p3_sumcheck::constraints::statement::select::SelectStatement;
 use p3_sumcheck::constraints::{Constraint, Statements};
 use p3_sumcheck::layout::{Layout as _, PrefixProver, Verifier};
 use p3_sumcheck::strategy::Basis;
 use p3_sumcheck::{OpeningBatch, OpeningProtocol, TableShape, TableSpec};
+use p3_whir::domain::{WhirDomain, WhirQueryPoint};
 use p3_whir::parameters::{
     FoldingFactor, ProtocolParameters, RoundConfig, SecurityAssumption, WhirConfig,
 };
-use p3_whir::pcs::proof::{PcsProof, WhirProof};
+use p3_whir::pcs::proof::{PcsProof, QueryOpenings, WhirProof};
 use p3_whir::transcript::{WhirShape, WhirVerifierTranscript};
 use prover::config::mmcs;
 use prover::semantic_blob::{classify_observations, replay_blob};
@@ -388,6 +394,28 @@ struct Replay {
     num_variables: usize,
     /// Out-of-domain points, in the order drawn.
     ood_points: Vec<Challenge>,
+    /// The combined claim entering each round's sumcheck, after that round's
+    /// constraint folded in. The contract must reproduce this running sum.
+    round_claimed_evals: Vec<Challenge>,
+    round_folded_claims: Vec<Challenge>,
+    /// Per-round folded query evaluations (see `RoundWalk::folds`).
+    round_folds: Vec<Vec<Challenge>>,
+    /// Per-round OOD answers (proof data).
+    round_ood_answers: Vec<Vec<Challenge>>,
+    /// Per-round `PoW` witnesses as canonical base-field u32s.
+    round_pow_witnesses: Vec<u32>,
+    /// Per-round sumcheck {0,1} and {inf} evaluation pairs.
+    round_sumcheck_ca: Vec<Vec<Challenge>>,
+    round_sumcheck_cinf: Vec<Vec<Challenge>>,
+    /// Round 0 opened rows as canonical base-field limbs (flattened).
+    round_rows_base: Vec<Vec<u32>>,
+    /// Later-round opened rows as packed extension elements (flattened).
+    round_rows_ext: Vec<Vec<Challenge>>,
+    /// Per-round `[num_variables, log_folded_domain_size, ood_samples, folding_pow_bits]`.
+    round_params: Vec<[u32; 4]>,
+    /// Per-query Merkle authentication paths for the round-0 openings,
+    /// reconstructed from the pruned multiproof: level-0 sibling first.
+    round0_paths: Vec<Vec<String>>,
     /// Per-round batching challenges for the STIR selection statements.
     round_batching: Vec<Challenge>,
     /// Query indices per WHIR round, plus one final entry for the terminal round.
@@ -402,6 +430,16 @@ struct Replay {
 
 /// The output of the intermediate-round phase of a transcript walk.
 struct RoundWalk {
+    /// The combined claim after each round's `combine_evals`, i.e. the sum that
+    /// round's sumcheck must open with. Pins the round constraint's batching:
+    /// ood answers at gamma^1.., then the folded query evaluations.
+    claimed_evals: Vec<Challenge>,
+    folded_claims: Vec<Challenge>,
+    /// Each round's folded query evaluations, in query order: the opened row
+    /// folded at the previous round's randomness. The contract computes these
+    /// from the Merkle openings; pinning them here separates a fold bug from a
+    /// batching bug.
+    folds: Vec<Vec<Challenge>>,
     /// Out-of-domain points, in the order drawn.
     ood_points: Vec<Challenge>,
     /// Per-round batching challenges for the STIR selection statements.
@@ -410,6 +448,22 @@ struct RoundWalk {
     query_indices: Vec<Vec<usize>>,
     /// The point each round's sumcheck reduces to.
     round_randomness: Vec<Vec<Challenge>>,
+    /// Per-round OOD answers, in draw order (proof data, not transcript state).
+    ood_answers: Vec<Vec<Challenge>>,
+    /// Per-round `PoW` witnesses (base field).
+    pow_witnesses: Vec<F>,
+    /// Per-round sumcheck {0,1}-pair evaluations, split like the initial one.
+    sumcheck_ca: Vec<Vec<Challenge>>,
+    sumcheck_cinf: Vec<Vec<Challenge>>,
+    /// Per-round opened rows, flattened base-field limbs for round 0 and packed
+    /// extension elements for later rounds. The contract authenticates these
+    /// against the previous commitment and folds them; exporting them lets the
+    /// test check the fold separately from the Merkle path.
+    rows_base: Vec<Vec<u32>>,
+    rows_ext: Vec<Vec<Challenge>>,
+    /// Per-round round parameters the contract needs: `num_variables`,
+    /// `log_folded_domain_size`, `ood_samples`, `folding_pow_bits`.
+    params: Vec<[u32; 4]>,
 }
 
 /// Walk the intermediate WHIR rounds of the verifier transcript.
@@ -418,17 +472,38 @@ struct RoundWalk {
 /// points, check the query proof-of-work, draw the query indices, draw the round
 /// batching challenge, then fold with the round sumcheck. The contract performs the
 /// identical sequence per round, so this is the shape its loop must match.
+#[allow(clippy::too_many_lines)]
 fn replay_rounds(
     vt: &mut SemVerifierTranscript<'_>,
     whir: &WhirProof<F, Challenge, prover::config::Mmcs>,
     config: &WhirConfig<Challenge, F, SemChallenger>,
+    dft: &Dft,
+    initial_claimed: Challenge,
+    initial_randomness: &Point<Challenge>,
 ) -> Result<RoundWalk, Box<dyn Error>> {
     let mut walk = RoundWalk {
+        folded_claims: Vec::new(),
+        claimed_evals: Vec::new(),
+        folds: Vec::new(),
         ood_points: Vec::new(),
         round_batching: Vec::new(),
         query_indices: Vec::new(),
         round_randomness: Vec::new(),
+        ood_answers: Vec::new(),
+        pow_witnesses: Vec::new(),
+        sumcheck_ca: Vec::new(),
+        sumcheck_cinf: Vec::new(),
+        rows_base: Vec::new(),
+        rows_ext: Vec::new(),
+        params: Vec::new(),
     };
+    // The claim the round sumchecks fold, threaded from the initial phase
+    // exactly as the native verifier threads it: each round's constraint adds
+    // its batched expectations onto the carried claim before folding it.
+    let mut claimed_eval = initial_claimed;
+    // Round 0 folds each opened row at the INITIAL sumcheck's reduction point:
+    // the WHIR fold chain starts before any intermediate round exists.
+    let mut prev_randomness: Option<Point<Challenge>> = Some(initial_randomness.clone());
     for (round_index, (rproof, rp)) in whir
         .rounds
         .iter()
@@ -442,23 +517,125 @@ fn replay_rounds(
                 .expect("every intermediate round commits")
                 .clone(),
         );
+        // The round's equality group: OOD points drawn from the transcript,
+        // answers from the proof - the same pairs `ParsedCommitment::parse_with_round`
+        // builds inside the native verifier.
+        let mut ood_statement = EqStatement::initialize(rp.num_variables);
         for &answer in &rproof.ood_answers {
-            walk.ood_points.push(vt.ood_point());
+            // The transcript draws a univariate scalar; the constraint expands it
+            // to `rp.num_variables` coordinates, exactly as parse_with_round does.
+            let zeta = vt.ood_point();
+            walk.ood_points.push(zeta);
             vt.ood_answer(answer);
+            let point = Point::expand_from_univariate(zeta, rp.num_variables);
+            ood_statement.add_evaluated_constraint(point, answer);
         }
+        walk.ood_answers.push(rproof.ood_answers.clone());
+        walk.pow_witnesses.push(rproof.pow_witness);
+        walk.params.push([
+            // Protocol parameters, each far below u32::MAX by construction
+            // (arities <= 32, bit counts <= 32); the export is u32 because the
+            // contract reads u32 words.
+            u32::try_from(rp.num_variables).expect("num_variables fits u32"),
+            u32::try_from(rp.log_folded_domain_size).expect("log_folded_domain_size fits u32"),
+            u32::try_from(rp.ood_samples).expect("ood_samples fits u32"),
+            u32::try_from(rp.folding_pow_bits).expect("folding_pow_bits fits u32"),
+        ]);
         vt.query_pow(round_index, rproof.pow_witness)
             .map_err(|e| format!("round {round_index} query pow: {e:?}"))?;
-        walk.query_indices.push(vt.query_indices(round_index));
-        walk.round_batching.push(vt.round_batching());
-        // The round sumcheck folds a claim the contract recomputes from its round
-        // constraint, so this walk only needs the reduction point: hand it a scratch
-        // claimed sum, exactly as the recursion test's walk does.
-        let mut scratch = Challenge::ZERO;
+        let indices = vt.query_indices(round_index);
+        walk.query_indices.push(indices.clone());
+
+        // The selection group: each opened row folded at the PREVIOUS round's
+        // randomness (Prefix order, so the point is used as-is), then placed at
+        // the query's domain point. This is `verify_stir_challenges`'s fold, and
+        // the contract computes the identical fold from its Merkle openings -
+        // pinning the folds separately separates a fold bug from a batching bug.
+        let randomness = prev_randomness
+            .clone()
+            .ok_or_else(|| "no prev randomness".to_string())?;
+        let (rows, base_limbs): (Vec<Vec<Challenge>>, Vec<Vec<u32>>) = match &rproof.openings {
+            QueryOpenings::Base(o) => (
+                o.rows
+                    .iter()
+                    .map(|r| r.iter().map(|&x| x.into()).collect())
+                    .collect(),
+                o.rows
+                    .iter()
+                    .map(|r| r.iter().map(F::as_canonical_u32).collect())
+                    .collect(),
+            ),
+            QueryOpenings::Extension(o) => (o.rows.clone(), Vec::new()),
+        };
+        if base_limbs.is_empty() {
+            walk.rows_ext.extend(rows.clone());
+        } else {
+            walk.rows_base.extend(base_limbs);
+        }
+        if rows.len() != indices.len() {
+            return Err(format!(
+                "round {round_index}: {} rows for {} queries",
+                rows.len(),
+                indices.len()
+            )
+            .into());
+        }
+        let mut select_statement = SelectStatement::initialize(rp.num_variables);
+        let mut round_folds = Vec::with_capacity(indices.len());
+        for (&index, row) in indices.iter().zip(&rows) {
+            let fold = Poly::new(row.clone()).eval_ext::<F>(&randomness);
+            round_folds.push(fold);
+            match <Dft as WhirDomain<F, Challenge>>::query_point(
+                dft,
+                rp.log_folded_domain_size,
+                rp.num_variables,
+                index,
+            ) {
+                WhirQueryPoint::Univariate(var) => select_statement.add_constraint(var, fold),
+                WhirQueryPoint::Multilinear(point) => {
+                    select_statement.add_point_constraint(point, fold);
+                }
+            }
+        }
+        walk.folds.push(round_folds);
+
+        let gamma = vt.round_batching();
+        walk.round_batching.push(gamma);
+        // The native verifier batches with `Constraint::new_with_existing_claim`:
+        // the carried claim keeps gamma^0, the OOD group takes gamma^1.., the
+        // selection group follows.
+        let constraint = Constraint::new_with_existing_claim(
+            gamma,
+            rp.num_variables,
+            vec![
+                Statements::Eq(ood_statement),
+                Statements::Select(select_statement),
+            ],
+        );
+        constraint.combine_evals(&mut claimed_eval);
+        walk.claimed_evals.push(claimed_eval);
+
+        walk.sumcheck_ca.push(
+            rproof
+                .sumcheck
+                .polynomial_evaluations
+                .iter()
+                .map(|pair| pair[0])
+                .collect(),
+        );
+        walk.sumcheck_cinf.push(
+            rproof
+                .sumcheck
+                .polynomial_evaluations
+                .iter()
+                .map(|pair| pair[1])
+                .collect(),
+        );
         let r = vt
             .delegate_round_fold(|challenger| {
                 rproof.sumcheck.verify_rounds(
                     challenger,
-                    &mut scratch,
+                    &mut claimed_eval,
                     config.round_folding_factor(round_index + 1),
                     rp.folding_pow_bits,
                     Basis::Evaluation,
@@ -466,6 +643,8 @@ fn replay_rounds(
             })
             .map_err(|e| format!("round {round_index} sumcheck: {e:?}"))?;
         walk.round_randomness.push(r.as_slice().to_vec());
+        walk.folded_claims.push(claimed_eval);
+        prev_randomness = Some(r);
     }
     Ok(walk)
 }
@@ -526,6 +705,7 @@ fn replay_terminal(
 /// transcript refuses to finalize while pattern steps remain, and it panics on drop
 /// if it is not finalized. Walking it fully is also what makes the equality check
 /// against the native verifier's own transcript possible.
+#[allow(clippy::too_many_lines)]
 fn replay_verifier(run: &Run) -> Result<Replay, Box<dyn Error>> {
     let arity = stacked_arity();
     let config = whir_config(arity);
@@ -579,7 +759,55 @@ fn replay_verifier(run: &Run) -> Result<Replay, Box<dyn Error>> {
         "the initial sumcheck must fold exactly the first round's arity"
     );
 
-    let rounds = replay_rounds(&mut vt, whir, &config)?;
+    let rounds = replay_rounds(
+        &mut vt,
+        whir,
+        &config,
+        &Dft::default(),
+        // Native carries the FOLDED claim into the round loop: verify_rounds
+        // mutates claimed_eval in place, and the round constraint folds onto the
+        // folded value, not the pre-fold sum. Passing the pre-fold claim here
+        // silently shifts every round checkpoint by (folded - prefold); the
+        // round sumcheck cannot catch it because verify_rounds folds the claim
+        // forward without validating the sum - only the terminal identity does.
+        claimed_eval,
+        &initial_randomness,
+    )?;
+
+    // Per-query Merkle authentication paths for the round-0 openings, rebuilt
+    // from the pruned multiproof with the SAME walk the native verifier runs
+    // (restore_and_recompute_paths records during that walk). The contract
+    // verifies one self-sufficient path per query - StarkMerkle has no notion
+    // of a shared frontier - so the artifact must carry the expanded form.
+    let round0_paths: Vec<Vec<String>> = {
+        let rp0 = &config.round_parameters()[0];
+        let opening = match &whir.rounds[0].openings {
+            QueryOpenings::Base(o) => o,
+            QueryOpenings::Extension(_) => return Err("round 0 openings must be base field".into()),
+        };
+        let dims = [Dimensions {
+            height: rp0.domain_size >> rp0.folding_factor,
+            width: 1 << rp0.folding_factor,
+        }];
+        let paths = mmcs(CAP_HEIGHT)
+            .restore_and_recompute_paths(
+                &dims,
+                &rounds.query_indices[0],
+                // One entry PER QUERY: the opened rows of every matrix at that query.
+                // One matrix here, so each entry is a one-element batch.
+                &opening
+                    .rows
+                    .iter()
+                    .map(|row| vec![row.clone()])
+                    .collect::<Vec<_>>(),
+                &opening.proof,
+            )
+            .map_err(|e| format!("restore round-0 paths: {e:?}"))?;
+        paths
+            .iter()
+            .map(|p| p.siblings.iter().map(|d| hex(d)).collect())
+            .collect()
+    };
     let terminal = replay_terminal(&mut vt, whir, &config)?;
     vt.finish();
 
@@ -616,6 +844,21 @@ fn replay_verifier(run: &Run) -> Result<Replay, Box<dyn Error>> {
         eq_group_lens,
         num_variables: constraint.num_variables(),
         ood_points: rounds.ood_points,
+        round_claimed_evals: rounds.claimed_evals,
+        round_folded_claims: rounds.folded_claims,
+        round_folds: rounds.folds,
+        round_ood_answers: rounds.ood_answers,
+        round_pow_witnesses: rounds
+            .pow_witnesses
+            .iter()
+            .map(F::as_canonical_u32)
+            .collect(),
+        round_sumcheck_ca: rounds.sumcheck_ca,
+        round_sumcheck_cinf: rounds.sumcheck_cinf,
+        round_rows_base: rounds.rows_base,
+        round_rows_ext: rounds.rows_ext,
+        round_params: rounds.params,
+        round0_paths,
         round_batching: rounds.round_batching,
         query_indices,
         round_randomness: rounds.round_randomness,
@@ -899,6 +1142,7 @@ fn opened_json(opened: &[Vec<Vec<Vec<Challenge>>>]) -> serde_json::Value {
 
 #[test]
 #[ignore = "proves RUNS times; run deliberately to regenerate the proof vectors"]
+#[allow(clippy::too_many_lines)]
 fn whir_proof_vectors() -> Result<(), Box<dyn Error>> {
     let runs: Vec<Run> = (0..RUNS as u64).map(prove).collect::<Result<_, _>>()?;
     let base = &runs[0];
@@ -973,6 +1217,12 @@ fn whir_proof_vectors() -> Result<(), Box<dyn Error>> {
             "num_initial_eq_points": replay.eq_points.len(),
             "num_initial_eq_groups": replay.eq_group_lens.len(),
             "num_bound_eval_batches": base.proof.rounds[0].evals.len(),
+            "num_round_ood_answers": replay.round_ood_answers.iter().map(Vec::len).collect::<Vec<_>>(),
+            "num_round_sumcheck_rounds": replay.round_sumcheck_ca.iter().map(Vec::len).collect::<Vec<_>>(),
+            "num_round_rows_base": replay.round_rows_base.len(),
+            "num_round_rows_ext": replay.round_rows_ext.len(),
+            "round0_path_depth": replay.round0_paths.first().map_or(0, Vec::len),
+            "num_ood_points": replay.ood_points.len(),
         },
         "alpha": ext_json(&replay.alpha),
         "gamma": ext_json(&replay.gamma),
@@ -986,6 +1236,27 @@ fn whir_proof_vectors() -> Result<(), Box<dyn Error>> {
         // these from the proof bytes and the fixed schedule; exporting them is what
         // lets the Solidity test compare step by step instead of only at the end.
         "ood_points": replay.ood_points.iter().map(ext_json).collect::<Vec<_>>(),
+        "round_claimed_evals": replay.round_claimed_evals.iter().map(ext_json).collect::<Vec<_>>(),
+        "round_folded_claims": replay.round_folded_claims.iter().map(ext_json).collect::<Vec<_>>(),
+        "round_folds": replay.round_folds.iter()
+            .map(|v| v.iter().map(ext_json).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        "round_ood_answers": replay.round_ood_answers.iter()
+            .map(|v| v.iter().map(ext_json).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        "round_pow_witnesses": &replay.round_pow_witnesses,
+        "round_sumcheck_ca": replay.round_sumcheck_ca.iter()
+            .map(|v| v.iter().map(ext_json).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        "round_sumcheck_cinf": replay.round_sumcheck_cinf.iter()
+            .map(|v| v.iter().map(ext_json).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        "round_rows_base": &replay.round_rows_base,
+        "round_rows_ext": replay.round_rows_ext.iter()
+            .map(|v| v.iter().map(ext_json).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        "round_params": &replay.round_params,
+        "round0_paths": &replay.round0_paths,
         "round_batching": replay.round_batching.iter().map(ext_json).collect::<Vec<_>>(),
         "query_indices": replay.query_indices.iter()
             .map(|v| v.iter().map(|&i| i as u64).collect::<Vec<_>>())

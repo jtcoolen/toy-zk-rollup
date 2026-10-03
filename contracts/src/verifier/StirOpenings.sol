@@ -199,6 +199,15 @@ library StirOpenings {
     /// extension elements. Both are passed because the leaf needs the flat form
     /// and the fold needs the packed one; a caller that derived one from the
     /// other inconsistently is caught by the width checks below.
+    ///
+    /// Two row shapes are legal. An EXTENSION row contributes four limbs per
+    /// element (WHIR's later rounds open extension-valued rows). A BASE row -
+    /// round 0, where the queried matrix is the trace itself - contributes one
+    /// limb per element, and the caller has already lifted each limb into the
+    /// extension for the fold. The leaf bytes are the same construction in both
+    /// cases (Montgomery wire form, little-endian), so the authentication path
+    /// does not care which shape it is authenticating; only the width relation
+    /// between the two views differs.
     function openAndFold(
         bytes32 root,
         uint256 index,
@@ -208,7 +217,9 @@ library StirOpenings {
         bytes32[] memory siblings,
         uint256[] memory randomness
     ) internal pure returns (uint256) {
-        if (limbs.length != row.length * KoalaBearExt4.DEGREE) {
+        // Extension rows: four limbs per element. Base rows: one limb per
+        // element, pre-lifted by the caller into `row`.
+        if (limbs.length != row.length * KoalaBearExt4.DEGREE && limbs.length != row.length) {
             revert RowWidthMismatch(row.length * KoalaBearExt4.DEGREE, limbs.length);
         }
         bytes32 leaf = extLeaf(limbs);

@@ -3,6 +3,7 @@ pragma solidity ^0.8.28;
 
 import {KoalaBearExt4} from "../../lib/sol-whir-p3/field/KoalaBearExt4.sol";
 import {KeccakChallenger} from "../../lib/sol-whir-p3/transcript/KeccakChallenger.sol";
+import {StirOpenings} from "./StirOpenings.sol";
 import {SumcheckCore} from "./SumcheckCore.sol";
 
 /// The WHIR verifier core: the Fiat-Shamir replay of a WHIR opening proof.
@@ -262,6 +263,254 @@ library WhirVerifierCore {
 
         out.alpha = alpha;
         out.claimedEval = claimed;
+        out.foldedClaim = folded;
+        out.randomness = randomness;
+    }
+
+    // ---------------------------------------------------------------------
+    // Intermediate rounds
+    // ---------------------------------------------------------------------
+
+    /// One intermediate WHIR round's structural constants.
+    ///
+    /// Like the initial schedule these are config-fixed counts, never proof
+    /// data. The round's OOD point draws, query-index draws and batching draw
+    /// absorb no fixed bytes of their own: the WHIR transcript's step labels
+    /// steer the sampler's hierarchy, they are not appended to the byte
+    /// stream. That is an empirical fact of the traced prover (D-059), not an
+    /// assumption - the semantic blob shows no constant run between the round
+    /// commitment and the round sumcheck's separator.
+    struct RoundSchedule {
+        /// Which round this is, for error reporting only.
+        uint256 roundIndex;
+        /// The round's out-of-domain sample count from the config. The proof
+        /// must carry exactly this many answers.
+        uint256 oodSamples;
+        /// Words absorbed between the round batching draw and the round
+        /// sumcheck's first round (the sumcheck's domain separator).
+        uint256 sumcheckConstants;
+    }
+
+    /// Everything one intermediate round reads from the proof.
+    struct RoundInput {
+        /// This round's Merkle commitment (the new root the transcript binds).
+        bytes32 commitment;
+        /// The round's out-of-domain answers, in draw order.
+        uint256[] oodAnswers;
+        /// The post-commitment proof-of-work witness (canonical base field).
+        uint256 powWitness;
+        /// `round_params.pow_bits`. At zero difficulty the witness is pinned
+        /// to zero here - the grind itself absorbs nothing at zero bits, so
+        /// only this check stops a proof smuggling a nonzero witness through.
+        uint256 powBits;
+        /// `log_folded_domain_size`: the bit width of one query index AND the
+        /// depth of the tree the queries open in. Both are `log2(height)` of the
+        /// queried dimensions (`height = domain_size >> folding_factor`), so one
+        /// number serves both.
+        uint256 logFoldedDomainSize;
+        /// Number of STIR queries. The count comes from the schedule the
+        /// caller holds, never from the proof.
+        uint256 numQueries;
+        /// Opened rows, flattened canonical limbs: base-field limbs in round
+        /// 0, four limbs per extension element afterwards.
+        uint256[] rowsFlat;
+        /// Canonical limbs per row (row width for base rows, 4x that for
+        /// extension rows).
+        uint256 rowLimbs;
+        /// Packed extension elements per row: `1 << prevRandomness.length`.
+        uint256 rowElems;
+        /// True when the rows are base field (round 0 only).
+        bool rowsAreBase;
+        /// Per-query Merkle paths, leaf-to-root, against `prevCommitment`.
+        bytes32[][] paths;
+        /// The commitment the queries open against: the previous round's root,
+        /// or the batch commitment for round 0.
+        bytes32 prevCommitment;
+        /// The previous fold point, packed: the initial sumcheck's randomness
+        /// for round 0, the previous round sumcheck's randomness after that.
+        uint256[] prevRandomness;
+        /// The round sumcheck's round polynomials and witnesses.
+        uint256[] sumcheckCA;
+        uint256[] sumcheckCInf;
+        uint256[] sumcheckPowWitnesses;
+        /// `round_params.folding_pow_bits`.
+        uint256 sumcheckPowBits;
+    }
+
+    /// What one intermediate round produces.
+    struct RoundOutput {
+        /// The round batching challenge: weights this round's fresh claims.
+        uint256 gamma;
+        /// The combined claim entering the round sumcheck, after this round's
+        /// constraint folded onto the carried claim.
+        uint256 claimedEval;
+        /// The claim after the round sumcheck folds it.
+        uint256 foldedClaim;
+        /// The point this round's sumcheck reduces to: the next round's fold
+        /// point (or the terminal phase's, after the last round).
+        uint256[] randomness;
+        /// The out-of-domain points drawn this round, unexpanded.
+        uint256[] oodPoints;
+        /// Each query's folded row evaluation, in query order.
+        uint256[] folds;
+    }
+
+    /// A round carries the wrong number of OOD answers for its shape.
+    error RoundOodAnswerCountMismatch(uint256 round, uint256 expected, uint256 actual);
+    /// A round carries the wrong number of opened rows or paths for its query count.
+    error RoundRowCountMismatch(uint256 expected, uint256 actual);
+    /// A zero-difficulty site carried a nonzero proof-of-work witness.
+    /// Mirrors `NonCanonicalPowWitness`.
+    error NonCanonicalPowWitness(uint256 round);
+    /// The opened rows do not tile the flattened buffer, or a row's width
+    /// disagrees with the fold point that must fold it.
+    error RowBufferMismatch(uint256 expected, uint256 actual);
+
+    /// Replay one intermediate WHIR round.
+    ///
+    /// Mirrors `replay`'s per-round body, in order:
+    ///
+    /// 1. bind the round commitment (`ParsedCommitment::parse_with_round`);
+    /// 2. per OOD sample: draw the point, bind the answer;
+    /// 3. check the post-commitment proof of work (`verify_stir_challenges
+    ///    does this BEFORE drawing the query indices);
+    /// 4. draw the query indices as uniform bit strings;
+    /// 5. open every query against the PREVIOUS commitment and fold each row
+    ///    at the previous fold point (`verify_merkle_proof` + `eval_ext`);
+    /// 6. draw the round batching challenge;
+    /// 7. fold this round's claims onto the carried claim: the carried claim
+    ///    keeps gamma^0 (`new_with_existing_claim` sets `initial_power = 1`),
+    ///    the OOD group takes gamma^1.., the query group follows;
+    /// 8. run the round sumcheck on the combined claim.
+    ///
+    /// The step order is the transcript's, and steps 3-5 are interleaved the
+    /// way the Rust interleaves them: the PoW sits between the OOD answers and
+    /// the index draws, not next to the sumcheck.
+    function verifyRound(
+        Transcript memory t,
+        RoundSchedule memory s,
+        RoundInput memory input,
+        uint256 carriedClaim
+    ) internal pure returns (RoundOutput memory out) {
+        // --- shape checks before any sponge work --------------------------------
+        //
+        // Every rejection below happens before the first absorb so a malformed
+        // proof cannot desynchronise the transcript on its way out.
+        if (input.powBits == 0 && input.powWitness != 0) {
+            revert NonCanonicalPowWitness(s.roundIndex);
+        }
+        if (input.oodAnswers.length != s.oodSamples) {
+            revert RoundOodAnswerCountMismatch(s.roundIndex, s.oodSamples, input.oodAnswers.length);
+        }
+        if (input.rowElems != (uint256(1) << input.prevRandomness.length)) {
+            revert RowBufferMismatch(uint256(1) << input.prevRandomness.length, input.rowElems);
+        }
+        uint256 expectedLimbs = input.numQueries * input.rowLimbs;
+        if (input.rowsFlat.length != expectedLimbs) {
+            revert RowBufferMismatch(expectedLimbs, input.rowsFlat.length);
+        }
+        if (input.paths.length != input.numQueries) {
+            revert RoundRowCountMismatch(input.numQueries, input.paths.length);
+        }
+
+        // --- 1-2: commitment, then OOD point/answer pairs ----------------------
+        observeDigest(t, input.commitment);
+        out.oodPoints = new uint256[](input.oodAnswers.length);
+        for (uint256 i; i < input.oodAnswers.length; ++i) {
+            out.oodPoints[i] = drawExt(t);
+            observeExt(t, input.oodAnswers[i]);
+        }
+
+        // --- 3: proof of work ----------------------------------------------------
+        //
+        // At zero bits `checkWitness` returns true without absorbing, which is
+        // exactly why the witness was pinned to zero above.
+        if (!t.state.checkWitness(input.powBits, input.powWitness)) {
+            revert NonCanonicalPowWitness(s.roundIndex);
+        }
+
+        // --- 4: query indices ------------------------------------------------------
+        //
+        // Uniform bit strings, not reduced field elements: `sampleBits` draws exactly
+        // `logFoldedDomainSize` bits with no rejection band, matching `sample_uniform_bits
+        // on the serializing challenger.
+        uint256[] memory indices = new uint256[](input.numQueries);
+        for (uint256 q; q < input.numQueries; ++q) {
+            indices[q] = t.state.sampleBits(input.logFoldedDomainSize);
+        }
+
+        // --- 5: open and fold every query ------------------------------------------
+        out.folds = new uint256[](input.numQueries);
+        for (uint256 q; q < input.numQueries; ++q) {
+            uint256 base = q * input.rowLimbs;
+            uint256[] memory limbs = new uint256[](input.rowLimbs);
+            uint256[] memory elems = new uint256[](input.rowElems);
+            for (uint256 j; j < input.rowLimbs; ++j) {
+                limbs[j] = input.rowsFlat[base + j];
+            }
+            if (input.rowsAreBase) {
+                // One base element per wire limb: limb j is element j.
+                for (uint256 j; j < input.rowElems; ++j) {
+                    elems[j] = StirOpenings.liftBase(limbs[j]);
+                }
+            } else {
+                // Four canonical limbs per extension element, low limb first.
+                for (uint256 e; e < input.rowElems; ++e) {
+                    uint256[4] memory coeffs;
+                    coeffs[0] = limbs[e * 4];
+                    coeffs[1] = limbs[e * 4 + 1];
+                    coeffs[2] = limbs[e * 4 + 2];
+                    coeffs[3] = limbs[e * 4 + 3];
+                    elems[e] = KoalaBearExt4.pack(coeffs);
+                }
+            }
+            // The leaf authenticates the FLAT limbs (Montgomery wire form), the
+            // fold consumes the packed elements. Both views come from the same
+            // buffer, so they cannot disagree.
+            out.folds[q] = StirOpenings.openAndFold(
+                input.prevCommitment,
+                indices[q],
+                input.logFoldedDomainSize,
+                limbs,
+                elems,
+                input.paths[q],
+                input.prevRandomness
+            );
+        }
+
+        // --- 6: round batching challenge ----------------------------------------------
+        uint256 gamma = drawExt(t);
+        out.gamma = gamma;
+
+        // --- 7: fold this round's claims onto the carried claim ------------------------
+        //
+        // `Constraint::new_with_existing_claim(gamma, nv, [Eq(ood), Select(folds)])
+        // then `combine_evals`: the carried claim holds gamma^0, the equality group
+        // takes gamma^1..gamma^ood_samples, the selection group follows at the
+        // next powers up. The running exponent is exactly what `combine_evals`'s
+        // `shift` does.
+        uint256 claimed = carriedClaim;
+        uint256 power = gamma; // gamma^1: the carried claim owns gamma^0
+        for (uint256 i; i < input.oodAnswers.length; ++i) {
+            claimed = KoalaBearExt4.add(claimed, KoalaBearExt4.mul(input.oodAnswers[i], power));
+            power = KoalaBearExt4.mul(power, gamma);
+        }
+        for (uint256 q; q < input.numQueries; ++q) {
+            claimed = KoalaBearExt4.add(claimed, KoalaBearExt4.mul(out.folds[q], power));
+            power = KoalaBearExt4.mul(power, gamma);
+        }
+        out.claimedEval = claimed;
+
+        // --- 8: round sumcheck -----------------------------------------------------------
+        absorbConstants(t, s.sumcheckConstants);
+        (uint256 folded, uint256[] memory randomness) = SumcheckCore.verifyRounds(
+            t.state,
+            claimed,
+            input.sumcheckCA,
+            input.sumcheckCInf,
+            input.sumcheckPowWitnesses,
+            input.sumcheckPowBits
+        );
         out.foldedClaim = folded;
         out.randomness = randomness;
     }
