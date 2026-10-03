@@ -264,7 +264,7 @@ fn whir_semantic_program_artifact_has_the_pinned_shape() -> Result<(), Box<dyn E
         std::fs::read(&blob_path).map_err(|e| format!("missing {}: {e}", blob_path.display()))?;
     assert!(blob.len() > 28, "blob is shorter than its header");
     assert_eq!(&blob[..4], b"WSPR", "blob magic");
-    assert_eq!(u16::from_be_bytes([blob[4], blob[5]]), 1, "blob version");
+    assert_eq!(u16::from_be_bytes([blob[4], blob[5]]), 2, "blob version");
     let schedule_len = usize::from(u16::from_be_bytes([blob[6], blob[7]]));
     assert_eq!(schedule_len, 175, "blob schedule length");
     let be32 = |k: usize| {

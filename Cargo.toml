@@ -95,6 +95,10 @@ p3-poseidon2-circuit-air = { path = "vendor/p3-recursion/poseidon2-circuit-air" 
 p3-test-utils = { path = "vendor/p3-recursion/test-utils" }
 # crates.io-side companions the recursion stack expects at the v0.8.0 line.
 p3-lookup = "0.8.0"
+# The batch-STARK verifier: the settlement proof is a `BatchStarkProof`, so the vector
+# exporter replays `p3_batch_stark::verify_batch` directly. Dev-only: the lib proves through
+# `p3-circuit-prover`, which depends on the same crate at the same version.
+p3-batch-stark = "0.8.0"
 p3-sumcheck = "0.8.0"
 p3-whir = "0.8.0"
 p3-multilinear-util = "0.8.0"

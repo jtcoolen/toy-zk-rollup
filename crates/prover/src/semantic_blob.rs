@@ -13,6 +13,11 @@
 //!   | const_len u32 | var_len u32 | sample_len u32 | uniform_len u32 | witness_len u32
 //! ```
 //!
+//! Version history: v1 carried ops 0-5. v2 adds [`OP_CONST_COMMITMENT`] (6) and
+//! [`OP_UNIFORM_BITS_32`] (7), needed by the batch layer - a trusted-setup commitment and
+//! uniform draws wider than 16 bits. A v1 reader would misparse a v2 stream, so the
+//! version moved; nothing else about the format changed.
+//!
 //! then `schedule_len` entries of `[kind u8, arg u8, run u16]`, then the five
 //! payloads.
 //!
@@ -45,9 +50,27 @@ pub const OP_SAMPLE_BASE: u8 = 3;
 pub const OP_UNIFORM_BITS: u8 = 4;
 /// Check a proof-of-work witness at the given difficulty.
 pub const OP_CHECK_WITNESS: u8 = 5;
+/// Observe a commitment digest taken from the constant payload rather than the proof.
+///
+/// A commitment is normally proof data, but a trusted-setup commitment - the preprocessed
+/// trace commitment of a batch with preprocessed AIRs - commits the same matrices in every
+/// proof, so classification finds it fixed. It is not even present in the batch proof, so
+/// the contract must carry it as a literal; this op is how it reaches the constant payload.
+/// Additive: a stream that never uses it is unaffected.
+pub const OP_CONST_COMMITMENT: u8 = 6;
+/// Draw uniform bits into a 4-byte big-endian word.
+///
+/// The 2-byte form cannot hold a draw wider than 16 bits, and WHIR query indices are drawn
+/// at the full LDE domain width - 21 bits at `log_max_lde` 22 - so the wide draws get their
+/// own op rather than a widened payload that a v1 reader would misparse. Additive: a
+/// stream that never draws more than 16 uniform bits is byte-identical to before.
+pub const OP_UNIFORM_BITS_32: u8 = 7;
 
 /// Header size in bytes: magic, version, schedule length, five payload lengths.
 pub const HEADER_LEN: usize = 28;
+
+/// The blob format version this writer emits, asserted by every reader.
+pub const BLOB_VERSION: u16 = 2;
 
 /// Extend a run-length schedule by one operation, merging with the previous entry
 /// when the kind and argument match.
@@ -114,9 +137,7 @@ pub fn classify_observations(runs: &[SemProgram]) -> (Vec<Option<Vec<u32>>>, Vec
 /// # Errors
 ///
 /// When the program contains an event the format cannot carry (a raw
-/// `SampleBits`, a grinding record, an oversized run or bit count), or when a
-/// commitment digest was classified as config-fixed - which would mean the
-/// classification and the writer disagree about what a commitment is.
+/// `SampleBits`, a grinding record, an oversized run or bit count).
 pub fn replay_blob(
     program: &SemProgram,
     fixed: &[Option<Vec<u32>>],
@@ -139,17 +160,20 @@ pub fn replay_blob(
                     push_run(&mut schedule, OP_VAR_U32, 0);
                 }
             }
-            // A commitment is proof data by construction, so it never lands in the
-            // constant table even though classify_observations could in principle
-            // call one fixed. Erroring rather than guessing keeps the two honest.
+            // A commitment is proof data unless every run agreed on it, which happens
+            // exactly for trusted-setup commitments. classify_observations split the
+            // digest into little-endian words, so writing those words back little-endian
+            // reproduces the absorbed bytes exactly.
             SemEvent::ObserveBytes { bytes } => {
-                if fixed[i].is_some() {
-                    return Err(
-                        format!("event {i}: a commitment was classified as config-fixed").into(),
-                    );
+                if let Some(words) = &fixed[i] {
+                    for w in words {
+                        constants.extend_from_slice(&w.to_le_bytes());
+                    }
+                    push_run(&mut schedule, OP_CONST_COMMITMENT, 4);
+                } else {
+                    variables.extend_from_slice(bytes);
+                    push_run(&mut schedule, OP_COMMITMENT, 4);
                 }
-                variables.extend_from_slice(bytes);
-                push_run(&mut schedule, OP_COMMITMENT, 4);
             }
             // The recorder logs one event per BASIS COEFFICIENT, so a quartic
             // extension element arrives as four consecutive arity-1 events. The run
@@ -162,14 +186,16 @@ pub fn replay_blob(
                 push_run(&mut schedule, OP_SAMPLE_BASE, arg);
             }
             SemEvent::SampleUniformBits { bits, value } => {
-                if *bits > 16 {
-                    return Err(
-                        format!("event {i}: {bits} uniform bits exceed the u16 payload").into(),
-                    );
-                }
-                uniform.extend_from_slice(&u16::try_from(*value)?.to_be_bytes());
                 let arg = u8::try_from(*bits)?;
-                push_run(&mut schedule, OP_UNIFORM_BITS, arg);
+                if *bits > 16 {
+                    // u32, not usize: usize::to_be_bytes is 8 bytes on 64-bit targets and
+                    // would misalign every later read in the payload.
+                    uniform.extend_from_slice(&u32::try_from(*value)?.to_be_bytes());
+                    push_run(&mut schedule, OP_UNIFORM_BITS_32, arg);
+                } else {
+                    uniform.extend_from_slice(&u16::try_from(*value)?.to_be_bytes());
+                    push_run(&mut schedule, OP_UNIFORM_BITS, arg);
+                }
             }
             SemEvent::CheckWitness { bits, witness, ok } => {
                 if !ok {
@@ -194,7 +220,7 @@ pub fn replay_blob(
 
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(b"WSPR");
-    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&BLOB_VERSION.to_be_bytes());
     out.extend_from_slice(&u16::try_from(schedule.len())?.to_be_bytes());
     for len in [
         constants.len(),

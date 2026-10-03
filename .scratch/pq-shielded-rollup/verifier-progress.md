@@ -15,7 +15,8 @@ EIP-170 bytecode limits, and address them borrowing design from
 | M2 | Initial phase port (`verifyInitial`) pinned to the prover | done, committed `93fbec3` |
 | M3 | Per-round phase port (`verifyRound`) + prover-pinned test | done, committed `ea6ae3e` |
 | M4 | Final phase port (`verifyFinal`) + prover-pinned test | done (this commit) |
-| M5 | Batch STARK transcript layer (commitment/OOD/quotient/degree) | pending |
+| M5 | Batch STARK transcript layer: prover-pinned replay of `verify_batch`'s sequence | done (this commit) |
+| M5b | `BatchTranscript.sol` production contract, pinned by the M5 vectors | pending |
 | M6 | `ConstraintIdentity.sol` (generated AIR constraint identity) | pending |
 | M7 | `ChunkVerifier.sol` (multi-transaction sponge carry) | pending |
 | M8 | Gas benchmark + EIP-170 audit + size reductions | pending |
@@ -131,3 +132,134 @@ Blockers / open items:
   randomness, and (inside `verifyFinal`) the STIR check and terminal
   identity; a tampered public polynomial reverts. 85M gas for the whole
   WHIR core on this shape.
+
+
+## M5 — batch STARK transcript layer: PLAN (recorded before coding)
+
+### What M5 has to reproduce
+
+The settlement proof is a `BatchStarkProof<crate::whir::Config>`. Its WHIR proof is
+the batch proof's `opening_proof`, so the contract must replay
+`p3_batch_stark::verify_batch` with the WHIR core as its PCS layer. M5 is the layer
+BEFORE and AROUND the delegated WHIR opening argument:
+
+```
+new(BatchShape) -> instance_bindings(degree_bits) -> main_phase(main, public_values)
+  -> preprocessed_phase(Option<com>) -> lookup_phase(lookups, gadget, pow) -> alpha_lay_out
+  -> permutation_phase(Option<com>, terminals) -> alpha (constraint folding)
+  -> quotient_phase(quotient_com, Option<random_com>) -> ood_phase(pow) -> zeta
+  -> delegate( pcs.verify_with_preprocessing(coms_to_verify, opening_proof, ch, pre_idx) )
+  -> finish()
+```
+
+### Decisions
+
+- **D-061 Prove under a SEMANTIC settlement config, do not re-plumb the production path.**
+  The test builds the same settlement prover as `settle_recursion_circuit` but with
+  `SemStarkConfig = StarkConfig<SemPcs, Challenge, SemChallenger>`. The sem challenger
+  forwards every absorb/sample to the production Keccak challenger and only RECORDS,
+  so the proof is a real Keccak proof and `verify_batch(&sem_config, ...)` accepts it.
+  Alternative rejected: reconstructing `CircuitTableAir` over a second config from the
+  production `CircuitVerifier` - `table_airs` is generic over the config the prover was
+  built with, so a second config means a second prover anyway.
+- **D-062 The correctness criterion is PROGRAM EQUALITY, not value equality.**
+  The test runs `verify_batch` under the sem config (program P_native) and a hand-written
+  phase-by-phase replay (P_manual) and asserts `P_manual == P_native` event for event.
+  The Solidity side then replays P_manual's blob and pins alpha, zeta, the lookup layout,
+  and the terminal sum. If the two programs match, the contract's sequence is the
+  verifier's sequence by construction.
+- **D-063 Bus layout is trusted-setup metadata, not proof data.** `lay_out_lookup_challenges`
+  derives bus ids from lookup KINDS (global names shared, local fresh) and the widest
+  payload; `prefix[i] = alpha + (i+1)*beta^W`. The artifact exports per-instance bus ids,
+  `max_message_width`, and `next_bus` (AIR-derived), and the Solidity test RECOMPUTES
+  `prefix[i]` from alpha/beta and checks it against the exported per-instance layout.
+  Taking alpha/beta as inputs would let a prover choose its own lookup challenges.
+- **D-064 Opening points stay inputs (D-060 holds).** `commitments_with_opening_points`
+  is exported as a structure (round -> matrix -> domain size, points, opened values) and
+  the contract feeds it to the WHIR core's claim builder; no point bytes enter the blob.
+
+### Steps
+
+1. `p3-batch-stark = "0.8.0"` into `[workspace.dependencies]` and prover dev-deps.
+2. `crates/prover/tests/batch_stark_vectors.rs`: build inner proof -> recursion circuit ->
+   settlement prove under the SEM config; run native `verify_batch`; replay the phases
+   manually; assert program equality; export `contracts/test/vectors/batch_stark_vectors.json`
+   (+ `.bin` fixed-absorb blob) with shape, degree bits, commitments (hex), opened values,
+   terminals, alpha/beta/zeta, per-instance lookup layout, bus ids, opening-argument
+   structure, quotient chunk domains, and the fixed runs.
+3. `contracts/src/verifier/BatchTranscript.sol`: the phase sequence over
+   `KeccakChallenger.State` + the fixed blobs, returning alpha, zeta and the lookup layout.
+4. `contracts/test/BatchTranscript.t.sol`: pin alpha, zeta, the recomputed bus prefixes,
+   the terminal-sum check, and a tampered-commitment revert.
+5. Gate (fmt + clippy -p prover + targeted forge tests), commit M5.
+
+
+## M5 — DONE: the batch transcript sequence is pinned by the prover
+
+**What was proven.** `crates/prover/tests/batch_stark_vectors.rs` builds the real
+settlement batch (inner Fibonacci proof -> recursion circuit -> `BatchStarkProof` under
+the semantic config, D-061), runs the library's `p3_batch_stark::verify_batch` through the
+recording challenger, and separately drives every phase by hand. The two event streams are
+**identical: 29,902 events**. That is D-062 satisfied, and it means the phase order in the
+plan above is the library's order, not my reading of it.
+
+**What is pinned on-chain-side.** `contracts/test/BatchTranscript.t.sol` (5 tests) walks
+the recorded blob through the Solidity Keccak sponge and checks:
+- every sample, uniform draw and PoW witness in the batch layer agrees with the Rust
+  verifier, and all five payload cursors end exactly at their lengths (a short read would
+  desync a verifier at some later unnamed site);
+- the four extension draws sit at the structural pool offsets 0/4/8/12 =
+  `lookup_alpha`, `beta`, `constraint_alpha`, `zeta`;
+- the first five absorbed digests are main, preprocessed, permutation, quotient, random -
+  which is what proves the trusted-setup commitment is absorbed at the right site;
+- the bus prefixes recomputed on-chain from `alpha`, `beta` and the trusted-setup bus ids
+  equal the exported per-lookup pairs (D-063);
+- the LogUp terminals sum to zero;
+- flipping one bit of a proof commitment digest makes the walk revert (external harness
+  contract, same trick as M3).
+
+**Measured batch shape** (BASE_TRACE=1024 Fibonacci, pinned by
+`batch_stark_artifact_shape_is_pinned`): 6 instances, `degree_bits =
+[10,9,16,15,14,1]`, one global LogUp bus (`max_message_width = 5`, `next_bus = 1`),
+`ext_degree = 4`, is_zk, permutation + random + preprocessed commitments all present, both
+PoW witnesses zero. Blob: 122,738 bytes, 775 schedule entries, 716 samples.
+
+**Format change (D-065).** Two facts about the batch layer broke blob v1: the preprocessed
+commitment is byte-identical across proofs (trusted setup, and absent from `BatchProof`),
+and WHIR query indices are drawn at the full LDE width (21 bits). Added
+`OP_CONST_COMMITMENT = 6` and `OP_UNIFORM_BITS_32 = 7`, bumped the format to v2, and
+regenerated all three artifacts. Also fixed a real bug the new blob exposed:
+`SemanticBlob.countDigests` counted schedule entries instead of runs.
+
+**Gas data point.** Walking the whole batch blob with checking on costs ~55M gas;
+record-only ~51M. Affordable in one transaction, but the constraint layer (M6) is where
+the real cost sits, so M7 chunking stays on the plan.
+
+## Corrections found while doing M5 (kept because they are load-bearing)
+
+- **`sample_uniform_bits` is a masked little-endian u32**, not a big-endian byte-sourced
+  draw: `u32::from_le_bytes(sample_array()) & ((1 << bits) - 1)`. The Solidity side already
+  matched (`_sampleUint32` reads the block from its low end); the mismatch was in my
+  *payload*, which stored `usize::to_be_bytes()` - 8 bytes on a 64-bit target, misaligning
+  every later read. Symptom was a single confusing `bits 21 want 0 got 1134388`.
+- **KoalaBear's quartic extension reduces `x^4 = W` with `W = 3`**, not `x^4 = -1`. A
+  Node-side cross-check using `-1` disagreed with the Rust export and sent me chasing the
+  field library for a while. The on-chain `KoalaBearExt4._mul_packed` was right.
+- **The per-lookup challenge list is flat**: each lookup contributes two consecutive
+  4-coefficient entries `[prefix, beta]`, so pairs step by 2 while `bus_ids` steps by 1.
+- **forge-std has no `parseJsonArray`** in the vendored `Vm`; use `parseJsonUintArray` /
+  `parseJsonUint(json, path + "[i]")`. `parseJsonString` on an array fails with
+  "expected string, found array", and `.length` is not a valid path segment.
+- **Run-length merging means schedule entries != op counts.** Anything that sizes an array
+  from the schedule must sum the run field. This was a genuine bug, not a test artifact.
+
+## Next actions
+
+1. **M5b**: `contracts/src/verifier/BatchTranscript.sol` - the production phase sequence
+   over `KeccakChallenger.State` driven by proof bytes + trusted setup (not a blob walk),
+   returning `alpha`, `beta`, `zeta`, the constraint alpha and the lookup layout; pin it
+   against the same `batch_stark_vectors.json`.
+2. **M6**: `ConstraintIdentity.sol` generated from `SymbolicAirBuilder` /
+   `get_constraint_layout` (`p3-batch-stark/src/symbolic.rs:261`) for the Poseidon2 +
+   recompose + statement table AIRs. Largest remaining unknown.
+3. **M7** chunking, **M8** gas + EIP-170 audit, **M9** wallet/settlement/metrics.

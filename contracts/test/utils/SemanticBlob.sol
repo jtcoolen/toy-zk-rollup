@@ -33,9 +33,19 @@ library SemanticBlob {
     uint256 internal constant OP_SAMPLE_BASE = 3;
     uint256 internal constant OP_UNIFORM_BITS = 4;
     uint256 internal constant OP_CHECK_WITNESS = 5;
+    /// A commitment digest taken from the constant payload: a trusted-setup commitment
+    /// (the preprocessed trace commitment) is identical in every proof and is not part of
+    /// the batch proof at all, so the contract carries it as a literal.
+    uint256 internal constant OP_CONST_COMMITMENT = 6;
+    /// A uniform draw wider than 16 bits, as a 4-byte big-endian word. WHIR query indices
+    /// are drawn at the full LDE domain width (21 bits at log_max_lde 22).
+    uint256 internal constant OP_UNIFORM_BITS_32 = 7;
 
     uint256 internal constant HEADER_LEN = 28;
     uint256 internal constant MAGIC = 0x57535052; // "WSPR"
+    /// v2: adds OP_CONST_COMMITMENT and OP_UNIFORM_BITS_32. A v1 reader cannot parse a v2
+    /// stream, so the version is asserted, not assumed.
+    uint256 internal constant BLOB_VERSION = 2;
     uint256 internal constant DIGEST_LEN = 32;
 
     struct Blob {
@@ -98,7 +108,7 @@ library SemanticBlob {
         b.raw = VM.readFileBinary(path);
         require(b.raw.length > HEADER_LEN, "blob shorter than header");
         require(readU32Be(b.raw, 0) == MAGIC, "blob magic");
-        require(readU16Be(b.raw, 4) == 1, "blob version");
+        require(readU16Be(b.raw, 4) == BLOB_VERSION, "blob version");
         b.scheduleLen = readU16Be(b.raw, 6);
         b.constLen = readU32Be(b.raw, 8);
         b.varLen = readU32Be(b.raw, 12);
@@ -144,14 +154,8 @@ library SemanticBlob {
                 } else if (kind == OP_VAR_U32) {
                     w.state.observeBase(readU32Le(b.raw, b.varOff + w.cursor.variables));
                     w.cursor.variables += 4;
-                } else if (kind == OP_COMMITMENT) {
-                    bytes memory digest = sliceDigest(b.raw, b.varOff + w.cursor.variables);
-                    w.state.observeBytes(digest);
-                    if (record) {
-                        w.digests[nDigest] = bytes32(digest);
-                        ++nDigest;
-                    }
-                    w.cursor.variables += DIGEST_LEN;
+                } else if (kind == OP_COMMITMENT || kind == OP_CONST_COMMITMENT) {
+                    nDigest = absorbDigest(b, w, kind == OP_CONST_COMMITMENT, record, nDigest);
                 } else if (kind == OP_SAMPLE_BASE) {
                     uint256 got = w.state.sampleBase();
                     if (record) {
@@ -165,21 +169,26 @@ library SemanticBlob {
                         );
                     }
                     w.cursor.samples += 4;
-                } else if (kind == OP_UNIFORM_BITS) {
+                } else if (kind == OP_UNIFORM_BITS || kind == OP_UNIFORM_BITS_32) {
                     uint256 got = w.state.sampleBits(arg);
+                    bool wide = kind == OP_UNIFORM_BITS_32;
+                    uint256 want = wide
+                        ? readU32Be(b.raw, b.uniformOff + w.cursor.uniform)
+                        : readU16Be(b.raw, b.uniformOff + w.cursor.uniform);
                     if (check) {
-                        require(
-                            got == readU16Be(b.raw, b.uniformOff + w.cursor.uniform),
-                            string.concat(
-                                "uniform bits mismatch at site ",
-                                VM.toString(site),
-                                " bits ",
-                                VM.toString(arg)
-                            )
-                        );
+                        requireUniform(got, want, site, arg);
                     }
-                    w.cursor.uniform += 2;
+                    w.cursor.uniform += wide ? 4 : 2;
                 } else {
+                    require(
+                        kind == OP_CHECK_WITNESS,
+                        string.concat(
+                            "unknown schedule op ",
+                            VM.toString(kind),
+                            " at site ",
+                            VM.toString(site)
+                        )
+                    );
                     uint256 witness = readU32Le(b.raw, b.witnessOff + w.cursor.witnesses);
                     if (check) {
                         require(w.state.checkWitness(arg, witness), "proof-of-work witness rejected");
@@ -191,6 +200,56 @@ library SemanticBlob {
             }
         }
         require(scheduleAt == b.constOff, "schedule did not end at the payloads");
+    }
+
+    /// Compares one uniform draw against the recording, naming the site on failure.
+    ///
+    /// Extracted so the walk loop stays inside the Yul stack limit.
+    function requireUniform(uint256 got, uint256 want, uint256 site, uint256 bits)
+        private
+        pure
+    {
+        if (got != want) {
+            revert(
+                string.concat(
+                    "uniform mismatch site ",
+                    VM.toString(site),
+                    " bits ",
+                    VM.toString(bits),
+                    " want ",
+                    VM.toString(want),
+                    " got ",
+                    VM.toString(got)
+                )
+            );
+        }
+    }
+
+    /// Absorbs one commitment digest from the constant or variable payload, records it
+    /// when asked, advances the matching cursor, and returns the digest counter.
+    ///
+    /// Extracted because the walk loop otherwise overflows the Yul stack.
+    function absorbDigest(
+        Blob memory b,
+        Walk memory w,
+        bool fromConstants,
+        bool record,
+        uint256 nDigest
+    ) private pure returns (uint256) {
+        uint256 at =
+            fromConstants ? b.constOff + w.cursor.constants : b.varOff + w.cursor.variables;
+        bytes memory digest = sliceDigest(b.raw, at);
+        w.state.observeBytes(digest);
+        if (record) {
+            w.digests[nDigest] = bytes32(digest);
+            ++nDigest;
+        }
+        if (fromConstants) {
+            w.cursor.constants += DIGEST_LEN;
+        } else {
+            w.cursor.variables += DIGEST_LEN;
+        }
+        return nDigest;
     }
 
     /// Absorbs ONLY the constant runs, in order, and returns how many bytes they were.
@@ -207,12 +266,18 @@ library SemanticBlob {
             uint256 kind = uint256(uint8(b.raw[scheduleAt]));
             uint256 run = readU16Be(b.raw, scheduleAt + 2);
             scheduleAt += 4;
-            if (kind != OP_CONST_U32) {
+            if (kind == OP_CONST_COMMITMENT) {
+                for (uint256 k; k < run; ++k) {
+                    st.observeBytes(sliceDigest(b.raw, at));
+                    at += DIGEST_LEN;
+                }
+            } else if (kind != OP_CONST_U32) {
                 continue;
-            }
-            for (uint256 k; k < run; ++k) {
-                st.observeBase(readU32Le(b.raw, at));
-                at += 4;
+            } else {
+                for (uint256 k; k < run; ++k) {
+                    st.observeBase(readU32Le(b.raw, at));
+                    at += 4;
+                }
             }
         }
         absorbed = at - b.constOff;
@@ -222,8 +287,11 @@ library SemanticBlob {
     /// be sized before the walk.
     function countDigests(Blob memory b) internal pure returns (uint256 n) {
         for (uint256 e; e < b.scheduleLen; ++e) {
-            if (uint256(uint8(b.raw[HEADER_LEN + e * 4])) == OP_COMMITMENT) {
-                ++n;
+            uint256 at = HEADER_LEN + e * 4;
+            uint256 kind = uint256(uint8(b.raw[at]));
+            if (kind == OP_COMMITMENT || kind == OP_CONST_COMMITMENT) {
+                // One digest per absorbed site: the run length, not one per entry.
+                n += readU16Be(b.raw, at + 2);
             }
         }
     }

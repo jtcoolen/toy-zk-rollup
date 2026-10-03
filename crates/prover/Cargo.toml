@@ -59,6 +59,10 @@ postcard = "1.1"
 # to the Solidity side.
 p3-keccak = { workspace = true }
 p3-symmetric = { workspace = true }
+# Replayed directly by `tests/batch_stark_vectors.rs`: the settlement proof is a
+# `BatchStarkProof`, and the contract must reproduce this crate's transcript
+# sequence. Same version the vendored `p3-circuit-prover` resolves to.
+p3-batch-stark = { workspace = true }
 # The STIR vector generator (tests/stir_vectors.rs) needs `Poly::eval_ext` to
 # pin what the Solidity side calls `eval_multilinear` over a query row. That
 # lives in p3-multilinear-util, which the lib itself does not use - the prover

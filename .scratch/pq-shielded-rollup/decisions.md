@@ -1136,3 +1136,89 @@ different shape fails loudly instead of silently absorbing the wrong span.
   u32, and a 16-bit lane swap is not a 32-bit reversal. \`observeBase\`'s
   \`value < MODULUS\` check is what caught it - a good argument for keeping that
   require rather than trusting the caller.
+
+## D-061 - Prove the settlement batch under a semantic config, not a second config
+
+The contract must verify the outermost `BatchStarkProof`, which means the WHIR proof it
+carries must be a real Keccak proof - the transcript the contract replays has to be the
+transcript the prover actually ran. The tempting shortcut was to build a second
+`StarkConfig` over a purely-abstract challenger and prove twice; that produces a proof
+for a transcript nobody verifies.
+
+**Decision**: `SemConfig = StarkConfig<SemPcs, Challenge, SemChallenger>` where
+`SemChallenger` forwards every absorb, sample and witness check to the production
+`SerializingChallenger32<HashChallenger<u8, Keccak256Hash, 32>>` and only records. The
+proof is a genuine Keccak proof, so `verify_batch(&sem_config, ...)` accepts it and the
+recorded program is the verifier's real byte stream. The relation is unchanged: the
+settlement preprocessors depend only on the base field and the AIR builders and table
+provers are generic over `SC`, so `settle_sem` replicates `settle_recursion_circuit`
+line for line with only the config swapped.
+
+**Rejected**: rebuilding `CircuitTableAir` over a second config from the production
+`CircuitVerifier`. Rejected because the proof and the verifier would then disagree about
+which config's transcript they speak, which is exactly the class of bug that survives to
+mainnet.
+
+## D-062 - Program equality is the correctness criterion for the batch transcript
+
+Reading `verify_batch` and re-implementing its phase order is a transcription, and a
+transcription can silently reorder one absorb.
+
+**Decision**: the test runs the real `p3_batch_stark::verify_batch` under the semantic
+config (program `P_native`) and a hand-driven phase-by-phase replay (program
+`P_manual`), and asserts the two event streams are identical, event for event. A missing,
+extra or reordered absorb or draw diverges the streams, so the contract's phase sequence
+is the verifier's sequence by construction. Measured: 29,902 events, identical.
+
+**Consequence**: `manual_replay` in the test is the specification `BatchTranscript.sol`
+is written from, and it is checked against the library rather than against my reading of
+it.
+
+## D-063 - The bus layout is trusted-setup metadata, recomputed on-chain
+
+The per-lookup LogUp challenge pairs are not drawn from the transcript; they are
+computed as `prefix[bus] = alpha + (bus + 1) * beta^W` from two drawn challenges and a
+bus layout that comes from the AIRs. Shipping the pairs in the proof would let a prover
+hand the contract a layout that matches its own claim rather than the circuit's.
+
+**Decision**: the artifact exports per-instance bus ids, `max_message_width` and
+`next_bus` as trusted-setup metadata. The Solidity test recomputes `gamma = beta^W` and
+every prefix from `alpha`, `beta` and the bus ids and checks them against the exported
+pairs. The settlement shape has exactly one global bus (`next_bus = 1`, `W = 5`), so the
+recomputation is cheap: one iterated power and one addition per lookup.
+
+**Rejected**: exporting the pairs as proof data and trusting them.
+
+## D-064 - Opening points are inputs, never blob bytes
+
+Unchanged from D-060 and reconfirmed by the export: the opening argument's points (zeta,
+zeta_next, the quotient chunk domains) are derived from the public statement and the
+drawn challenges, so they are computed by the contract, never absorbed as constants.
+The artifact exports them for cross-checking only.
+
+## D-065 - Blob format v2: a constant-commitment op and a 4-byte uniform op
+
+Two facts about the batch layer broke the v1 format:
+
+1. The **preprocessed commitment is genuinely config-fixed**. A batch with preprocessed
+   AIRs commits the same matrices in every proof, so classification finds the digest
+   identical across runs - and it is not even present in `BatchProof`, so the contract
+   must carry it as a literal. v1 asserted commitments were always proof data and errored.
+2. **WHIR query indices are drawn at the full LDE domain width** - 21 bits at
+   `log_max_lde = 22` - and v1's uniform payload was 2 bytes.
+
+**Decision**: add `OP_CONST_COMMITMENT = 6` (digest read from the constant payload) and
+`OP_UNIFORM_BITS_32 = 7` (4-byte big-endian word), and bump the format version to 2.
+Additive ops would have left v1 streams byte-identical, but a v1 reader would misparse a
+v2 stream, so the version moved and all three artifacts were regenerated. The version
+field exists precisely so a reader can refuse a stream it cannot parse; using it is the
+point of having it.
+
+**Rejected**: widening the uniform payload in place (silently misaligns v1 readers), and
+encoding wide draws as several 2-byte words (splits one logical draw across schedule
+entries for no benefit).
+
+**Incidental fix**: `SemanticBlob.countDigests` counted schedule *entries* rather than
+*runs*, so any blob whose commitment runs merged under run-length encoding under-sized
+the recorded digest array and the walk panicked out of bounds. The batch blob (21 proof
+digests in 22 runs) exposed it.
