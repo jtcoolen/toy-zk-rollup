@@ -289,6 +289,11 @@ fn bus_layout(lookups: &[p3_lookup::Lookups<F>]) -> (Vec<Vec<usize>>, usize, usi
 /// What the hand-driven replay recovers: the scalars the contract must reproduce and the
 /// derived per-instance shape it recomputes from trusted setup.
 struct ReplayOut {
+    /// Event-stream length after each batch-transcript phase, keyed by phase name. The
+    /// production contract's absorb counts are pinned against these: run-length merging
+    /// hides phase boundaries in the blob schedule, so the marks are the only way the
+    /// Solidity side can check it consumed exactly the right prefix at each step.
+    phase_marks: Vec<(String, usize)>,
     /// The challenge that folds every instance's constraints (`permutation_phase`).
     constraint_alpha: Challenge,
     /// The `LogUp` base randomness, recovered as `prefix[0] - beta^W` (see [`beta`]).
@@ -317,7 +322,12 @@ fn manual_replay(
     verifier: &CircuitVerifier<SemConfig>,
     proof: &p3_circuit_prover::BatchStarkProof<SemConfig>,
     public_values: &[Vec<F>],
+    sink: &SemSink,
 ) -> Result<ReplayOut, Box<dyn Error>> {
+    let mut marks: Vec<(String, usize)> = Vec::new();
+    let mut mark = |name: &str, sink: &SemSink| {
+        marks.push((name.to_string(), sink.program().len()));
+    };
     let airs = verifier
         .table_airs::<EXT_DEG>()
         .map_err(|e| format!("{e:?}"))?;
@@ -397,12 +407,17 @@ fn manual_replay(
         shape,
     );
 
+    mark("new", sink);
     transcript.instance_bindings(&batch.degree_bits);
+    mark("instance_bindings", sink);
     transcript.main_phase(batch.commitments.main.clone(), public_values);
+    mark("main_phase", sink);
     transcript.preprocessed_phase(common.preprocessed.as_ref().map(|g| g.commitment.clone()));
+    mark("preprocessed_phase", sink);
     let laid_out = transcript
         .lookup_phase(all_lookups, &gadget, batch.lookup_pow_witness)
         .map_err(|e| format!("{e:?}"))?;
+    mark("lookup_phase", sink);
     let terminal_values: Vec<Challenge> = batch
         .lookup_terminals
         .iter()
@@ -411,13 +426,16 @@ fn manual_replay(
         .collect();
     let constraint_alpha =
         transcript.permutation_phase(batch.commitments.permutation.clone(), &terminal_values);
+    mark("permutation_phase", sink);
     transcript.quotient_phase(
         batch.commitments.quotient_chunks.clone(),
         batch.commitments.random.clone(),
     );
+    mark("quotient_phase", sink);
     let zeta = transcript
         .ood_phase(batch.ood_pow_witness)
         .map_err(|e| format!("{e:?}"))?;
+    mark("ood_phase", sink);
 
     let (coms_to_verify, quotient_domains, preprocessed_index) = commitments_with_opening_points(
         config,
@@ -450,10 +468,12 @@ fn manual_replay(
         })
         .collect();
 
+    mark("before_delegate", sink);
     let opening_result = transcript.delegate(|ch| {
         pcs.verify_with_preprocessing(coms_to_verify, &batch.opening_proof, ch, preprocessed_index)
     });
     transcript.finish();
+    mark("after_finish", sink);
     let opening_result: Result<(), String> = opening_result.map_err(|e| format!("{e:?}"));
     opening_result?;
 
@@ -479,6 +499,7 @@ fn manual_replay(
     let lookup_alpha = first_prefix - gamma;
 
     Ok(ReplayOut {
+        phase_marks: marks,
         constraint_alpha,
         lookup_alpha,
         beta,
@@ -524,8 +545,14 @@ fn one_run(
 
     let sink_manual = SemSink::new();
     let manual_config = sem_config(&sink_manual);
-    let out = manual_replay(&manual_config, &verifier, &proof, &public_values)
-        .expect("manual phase replay");
+    let out = manual_replay(
+        &manual_config,
+        &verifier,
+        &proof,
+        &public_values,
+        &sink_manual,
+    )
+    .expect("manual phase replay");
     let p_manual = sink_manual.program();
 
     assert_eq!(
@@ -646,6 +673,11 @@ fn export_batch_stark_vectors() {
             "random": batch.commitments.random.as_ref().map(com_json),
             "preprocessed": common.preprocessed.as_ref().map(|g| com_json(&g.commitment)),
         },
+                "phase_marks": out
+                    .phase_marks
+                    .iter()
+                    .map(|(name, at)| json!({"phase": name, "at": at}))
+                    .collect::<Vec<_>>(),
         "pow_witnesses": {
             "lookup": batch.lookup_pow_witness.map(base_json),
             "ood": base_json(batch.ood_pow_witness),
