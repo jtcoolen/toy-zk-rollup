@@ -129,8 +129,16 @@ library WhirVerifierCore {
     struct InitialSchedule {
         /// Words absorbed after the commitment and before the first claim.
         uint256 preClaimsConstants;
-        /// Words absorbed before each concrete opening claim's evaluations.
-        uint256 perClaimConstants;
+        /// Framing words absorbed before each concrete opening claim's
+        /// evaluations, one entry per claim.
+        ///
+        /// At the small shape every claim is framed identically, so this is a
+        /// uniform array. At the settlement shape the framing is ragged: a
+        /// claim whose table carries structurally-constrained (constant)
+        /// columns absorbs a longer framing prefix, and the constant columns
+        /// themselves arrive as ordinary evaluations from the proof. Only the
+        /// framing prefix differs per claim; the evaluation loop does not.
+        uint256[] perClaimConstants;
         /// Words absorbed after the last claim and before the batching draw.
         uint256 batchingConstants;
         /// Words absorbed between the batching draw and the initial sumcheck's
@@ -217,7 +225,7 @@ library WhirVerifierCore {
         // reach the wire.
         uint256 cursor = 0;
         for (uint256 c; c < input.claimWidths.length; ++c) {
-            absorbConstants(t, s.perClaimConstants);
+            absorbConstants(t, s.perClaimConstants[c]);
             uint256 width = input.claimWidths[c];
             if (cursor + width > input.openingEvals.length) {
                 revert OpeningEvalCountMismatch(c, width, input.openingEvals.length - cursor);

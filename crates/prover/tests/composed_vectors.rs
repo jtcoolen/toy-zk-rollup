@@ -419,6 +419,72 @@ fn reclassify_zero_runs(
 fn varying_positions(program: &SemProgram, fixed: &[Option<Vec<u32>>]) -> Vec<usize> {
     (0..program.len()).filter(|&i| fixed[i].is_none()).collect()
 }
+/// Per-claim run schedule for one composed round: for each opening claim,
+/// the alternating [is_constant, words] runs of its transcript region,
+/// derived from the sink phase offsets and the fixed classification. This is
+/// the contract's initial-phase walk plan: absorb `words` constant words from
+/// the trusted table, then observe `words/4` extension evals from the proof,
+/// alternating. Constant eval runs are structurally-constrained columns whose
+/// values are config-determined (nonzero, trusted); varying eval runs are the
+/// proof's claimed evaluations. The raggedness (trailing and mid-claim
+/// constant runs) is invisible to any scalar schedule and must ship as data.
+fn claim_run_schedule(
+    program: &SemProgram,
+    fixed: &[Option<Vec<u32>>],
+    phase_offsets: &[usize],
+) -> Vec<Vec<[usize; 2]>> {
+    // phase_offsets[0] is the claims start; offsets[1..=n] are the claim ends.
+    // Only the first `n` windows are claim regions; later windows cross into the
+    // batching draw and sumcheck, which carry samples and are not claim framing.
+    let mut out: Vec<Vec<[usize; 2]>> = Vec::new();
+    for w in phase_offsets.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if a >= b {
+            out.push(Vec::new());
+            continue;
+        }
+        let mut runs: Vec<[usize; 2]> = Vec::new();
+        let mut i = a;
+        while i < b {
+            // A claim region is all observe events; a non-observe event (a
+            // sample crossing a window boundary) is treated as one varying word
+            // so the cursor always advances and the walk cannot spin.
+            let is_observe = matches!(
+                program[i],
+                SemEvent::ObserveBase { .. } | SemEvent::ObserveBytes { .. }
+            );
+            let is_const = is_observe && fixed[i].is_some();
+            let kind = usize::from(is_const);
+            let mut words = 0usize;
+            while i < b {
+                let same = matches!(
+                    program[i],
+                    SemEvent::ObserveBase { .. } | SemEvent::ObserveBytes { .. }
+                ) && usize::from(fixed[i].is_some()) == kind;
+                if !same {
+                    break;
+                }
+                words += fixed[i].as_ref().map_or(1, |v| v.len());
+                i += 1;
+            }
+            if words == 0 {
+                // Non-observe boundary event: one varying word, advance once.
+                runs.push([0, 1]);
+                i += 1;
+                continue;
+            }
+            if let Some(last) = runs.last_mut() {
+                if last[0] == kind {
+                    last[1] += words;
+                    continue;
+                }
+            }
+            runs.push([kind, words]);
+        }
+        out.push(runs);
+    }
+    out
+}
 /// The full alternating run schedule of one round region: every maximal run
 /// of constant (fixed) or varying observations as `[is_constant, words]`
 /// pairs, in order. This is the contract's walk plan: absorb `words` constant
@@ -519,6 +585,22 @@ fn composed_program_equality_and_export() {
     doc["round_const_words"] = json!(const_words);
     doc["round_fixed_runs"] = json!(round_fixed_runs(&program_b, &fixed, &starts_b));
     doc["round_run_schedule"] = json!(round_run_schedule(&program_b, &fixed, &starts_b));
+    doc["claim_run_schedules"] = json!(doc["rounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .map(|(r, rd)| {
+            let po = rd["walk"]["phase_offsets"].as_array().unwrap();
+            let all: Vec<usize> = po.iter().map(|v| v.as_u64().unwrap() as usize).collect();
+            // Claim windows are offsets[0..=claims]; later windows cross into
+            // the batching draw and sumcheck, which are not claim framing.
+            let claims = rd["walk"]["claim_widths"].as_array().unwrap().len();
+            let n = (claims + 1).min(all.len());
+            let offsets = &all[..n];
+            json!(claim_run_schedule(&program_b, &fixed, offsets))
+        })
+        .collect::<Vec<_>>());
     doc["blob_len"] = json!(blob.len());
     doc["phase_marks_before_delegate"] = json!(out
         .phase_marks

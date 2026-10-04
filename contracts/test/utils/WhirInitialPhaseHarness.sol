@@ -75,12 +75,19 @@ library WhirInitialPhaseHarness {
         returns (WhirVerifierCore.InitialSchedule memory s, WhirVerifierCore.InitialInput memory input)
     {
         s.preClaimsConstants = runWords(j, 0);
-        s.perClaimConstants = runWords(j, 1);
         s.batchingConstants = runWords(j, 3);
         s.sumcheckConstants = runWords(j, 4);
 
         uint256 width = uintAt(j, ".shape.width");
         uint256 claims = uintAt(j, ".shape.num_opening_claims");
+
+        // Small shape: every claim is framed by the same run (run 1). The
+        // settlement shape replaces this uniform fill with a per-claim table
+        // derived from the composed run schedule.
+        s.perClaimConstants = new uint256[](claims);
+        for (uint256 c; c < claims; ++c) {
+            s.perClaimConstants[c] = runWords(j, 1);
+        }
         uint256 oodSamples = uintAt(j, ".shape.commitment_ood_samples");
 
         uint256[] memory evals = new uint256[](claims * width);

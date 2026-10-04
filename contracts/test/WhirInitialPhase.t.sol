@@ -77,12 +77,15 @@ contract WhirInitialPhaseTest is Test {
         // before the batching draw, and the first 37 words of run 4 belong to
         // the sumcheck's own separator.
         s.preClaimsConstants = _runWords(j, 0);
-        s.perClaimConstants = _runWords(j, 1);
         s.batchingConstants = _runWords(j, 3);
         s.sumcheckConstants = 37;
 
         uint256 width = vm.parseJsonUint(j, ".shape.width");
         uint256 claims = vm.parseJsonUint(j, ".shape.num_opening_claims");
+        s.perClaimConstants = new uint256[](claims);
+        for (uint256 c; c < claims; ++c) {
+            s.perClaimConstants[c] = _runWords(j, 1);
+        }
         uint256 oodSamples = vm.parseJsonUint(j, ".shape.commitment_ood_samples");
 
         uint256[] memory evals = new uint256[](claims * width);
