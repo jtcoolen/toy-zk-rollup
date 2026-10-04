@@ -485,6 +485,113 @@ fn claim_run_schedule(
     }
     out
 }
+/// The curated framing table for one composed round: the constant words the
+/// contract absorbs via `absorbConstants`, in the order its phases consume
+/// them, with the constant EVALUATIONS excluded (those are proof data the
+/// contract reads from calldata, not framing).
+///
+/// Walks the region's maximal runs. A fixed run before the claims is the
+/// pre-claims framing; inside a claim span the first fixed run is that claim's
+/// framing and any later fixed run is a constant evaluation (dropped); after
+/// the last claim every fixed run is framing (batching, then one sumcheck
+/// separator per sumcheck: initial, each intermediate round, terminal).
+///
+/// Returns the concatenated little-endian hex of the kept words and the
+/// per-run word counts, so the contract can slice them into its schedule
+/// structs by position.
+fn round_framing_table(
+    program: &SemProgram,
+    fixed: &[Option<Vec<u32>>],
+    start: usize,
+    end: usize,
+    phase_offsets: &[usize],
+) -> (String, Vec<usize>) {
+    // phase_offsets = [claims_start, claim_end_0, ..., claim_end_{n-1}].
+    // Classify each fixed EVENT as framing or constant-eval, then emit the
+    // framing events in program order as contiguous segments. A fixed event is
+    // framing iff it is before the claims, after the last claim, or within a
+    // claim's framing prefix (the leading fixed events of that claim, before its
+    // first varying event). A fixed event after a claim's varying evals is a
+    // constant evaluation - proof data the contract reads from calldata - even
+    // when it is physically adjacent to the next claim's framing (the two runs
+    // merge into one maximal fixed run, so a run-level boundary test would drop
+    // the next claim's framing; the event-level test splits them correctly).
+    let claims_start = *phase_offsets.first().unwrap_or(&start);
+    let last_claim_end = *phase_offsets.last().unwrap_or(&start);
+    // Per-claim framing prefix length in events: leading fixed events of the
+    // claim before its first varying event.
+    let is_fixed_ev = |i: usize| {
+        matches!(
+            program[i],
+            SemEvent::ObserveBase { .. } | SemEvent::ObserveBytes { .. }
+        ) && fixed[i].is_some()
+    };
+    let mut framing_prefix: Vec<usize> = Vec::new();
+    for w in phase_offsets.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let mut n = 0usize;
+        let mut i = a;
+        while i < b && is_fixed_ev(i) {
+            n += 1;
+            i += 1;
+        }
+        framing_prefix.push(n);
+    }
+    // Claim index for a position: the c with phase_offsets[c] <= i < offsets[c+1].
+    let claim_of = |i: usize| -> Option<usize> {
+        for c in 0..framing_prefix.len() {
+            if i >= phase_offsets[c] && i < phase_offsets[c + 1] {
+                return Some(c);
+            }
+        }
+        None
+    };
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut lens: Vec<usize> = Vec::new();
+    let mut seg = 0usize;
+    let mut i = start;
+    while i < end {
+        if !is_fixed_ev(i) {
+            if seg > 0 {
+                lens.push(seg);
+                seg = 0;
+            }
+            i += 1;
+            continue;
+        }
+        let words = fixed[i].as_ref().map_or(1, |v| v.len());
+        let keep = if i < claims_start || i >= last_claim_end {
+            true
+        } else if let Some(c) = claim_of(i) {
+            // Offset within the claim, in events.
+            let mut off = 0usize;
+            let mut k = phase_offsets[c];
+            while k < i {
+                off += 1;
+                k += 1;
+            }
+            off < framing_prefix[c]
+        } else {
+            false
+        };
+        if keep {
+            if let Some(ws) = &fixed[i] {
+                for w in ws {
+                    bytes.extend(w.to_le_bytes());
+                }
+            }
+            seg += words;
+        } else if seg > 0 {
+            lens.push(seg);
+            seg = 0;
+        }
+        i += 1;
+    }
+    if seg > 0 {
+        lens.push(seg);
+    }
+    (hex(&bytes), lens)
+}
 /// The full alternating run schedule of one round region: every maximal run
 /// of constant (fixed) or varying observations as `[is_constant, words]`
 /// pairs, in order. This is the contract's walk plan: absorb `words` constant
@@ -585,22 +692,27 @@ fn composed_program_equality_and_export() {
     doc["round_const_words"] = json!(const_words);
     doc["round_fixed_runs"] = json!(round_fixed_runs(&program_b, &fixed, &starts_b));
     doc["round_run_schedule"] = json!(round_run_schedule(&program_b, &fixed, &starts_b));
-    doc["claim_run_schedules"] = json!(doc["rounds"]
+    let claim_schedules: Vec<Vec<Vec<[usize; 2]>>> = doc["rounds"]
         .as_array()
         .unwrap()
         .iter()
-        .enumerate()
-        .map(|(r, rd)| {
+        .map(|rd| {
             let po = rd["walk"]["phase_offsets"].as_array().unwrap();
             let all: Vec<usize> = po.iter().map(|v| v.as_u64().unwrap() as usize).collect();
-            // Claim windows are offsets[0..=claims]; later windows cross into
-            // the batching draw and sumcheck, which are not claim framing.
             let claims = rd["walk"]["claim_widths"].as_array().unwrap().len();
             let n = (claims + 1).min(all.len());
             let offsets = &all[..n];
-            json!(claim_run_schedule(&program_b, &fixed, offsets))
+            claim_run_schedule(&program_b, &fixed, offsets)
         })
-        .collect::<Vec<_>>());
+        .collect();
+    doc["claim_run_schedules"] = json!(&claim_schedules);
+    doc["round_framing_tables"] = json!(round_framing_tables(
+        &doc,
+        &program_b,
+        &fixed,
+        &starts_b,
+        &claim_schedules,
+    ));
     doc["blob_len"] = json!(blob.len());
     doc["phase_marks_before_delegate"] = json!(out
         .phase_marks
@@ -624,6 +736,66 @@ fn composed_program_equality_and_export() {
         fixed.iter().filter(|f| f.is_some()).count(),
         const_words,
     );
+}
+
+/// Consumption-aligned framing schedules for every composed round.
+///
+/// Each entry is `{hex, pre_claims, claim_framings, batching, seps}`: the
+/// framing bytes of one round's region plus the word counts at the four points
+/// the contract consumes them - before the claims, once per claim, at the
+/// batching draw, and once per sumcheck separator. See `round_framing_table`
+/// for which fixed events count as framing.
+fn round_framing_tables(
+    doc: &serde_json::Value,
+    program: &SemProgram,
+    fixed: &[Option<Vec<u32>>],
+    starts: &[usize],
+    claim_schedules: &[Vec<Vec<[usize; 2]>>],
+) -> Vec<serde_json::Value> {
+    doc["rounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .map(|(r, rd)| {
+            let po = rd["walk"]["phase_offsets"].as_array().unwrap();
+            let all: Vec<usize> = po.iter().map(|v| v.as_u64().unwrap() as usize).collect();
+            let claims = rd["walk"]["claim_widths"].as_array().unwrap().len();
+            let claim_offsets = &all[..(claims + 1).min(all.len())];
+            let st = starts[r];
+            let en = starts.get(r + 1).copied().unwrap_or(program.len());
+            let (hexbytes, lens) = round_framing_table(program, fixed, st, en, claim_offsets);
+            // The per-claim framings are the claim run schedules' leading
+            // constant-run lengths; they appear contiguously in `lens`.
+            let claim_framing: Vec<usize> = claim_schedules[r]
+                .iter()
+                .map(|runs| {
+                    runs.first()
+                        .map_or(0, |run| if run[0] == 1 { run[1] } else { 0 })
+                })
+                .collect();
+            let mut p = 0usize;
+            'find: while p + claim_framing.len() <= lens.len() {
+                for k in 0..claim_framing.len() {
+                    if lens[p + k] != claim_framing[k] {
+                        p += 1;
+                        continue 'find;
+                    }
+                }
+                break;
+            }
+            let pre_claims: usize = lens[..p].iter().sum();
+            let batching = lens[p + claim_framing.len()];
+            let seps = lens[p + claim_framing.len() + 1..].to_vec();
+            json!({
+                "hex": hexbytes,
+                "pre_claims": pre_claims,
+                "claim_framings": claim_framing,
+                "batching": batching,
+                "seps": seps,
+            })
+        })
+        .collect()
 }
 
 /// Shape pin: the committed artifact must describe the settlement batch's five opening

@@ -579,3 +579,35 @@ each semantic boundary (sumcheck round, stir opening, terminal sum, constraint
 identity) invoke the already-pinned gadget. The scalar InitialSchedule /
 FinalSchedule fit the small shape only; at settlement shape they are replaced
 by the schedule walk. This is the composed-verifier architecture.
+
+
+## D-070: consumption-aligned framing schedule (composed claim region)
+
+The composed claim region is now exported as a schedule the contract slices at
+its four consumption points, not at raw fixed-run boundaries.
+
+`round_framing_table` classifies each fixed EVENT (not run) as framing iff it
+is before the claims, after the last claim, or within a claim's framing prefix
+(leading fixed events before that claim's first varying event). This splits the
+merged runs correctly: a claim's trailing constant EVAL run and the next claim's
+framing run are physically adjacent (one maximal fixed run) but the event-level
+test separates them - the earlier run-level boundary test dropped the next
+claim's framing (round 3 showed 6 framings, not 8).
+
+`round_framing_tables` then aligns the framing runs to the contract's
+consumption points and exports per round:
+  {hex, pre_claims, claim_framings[], batching, seps[]}
+where seps has exactly 1 (initial sumcheck) + n_intermediate + 1 (terminal)
+entries - verified for all 5 rounds:
+  r0 pre=94  b=233 seps=5 | r1 pre=188 b=245 seps=6 | r2 pre=604 b=441 seps=5
+  r3 pre=188 b=245 seps=6 | r4 pre=188 b=233 seps=5
+(pre_claims is a SUM because the pre-claim region is 1-2 runs; the contract
+absorbs it as one block.)
+
+Ground truth from the blob: round 0 region = Cx94 (preClaims) Sx4 (alpha) Vx4
+(OOD answer) [Cx126 Vx16]x6 (claims) ... The commitment digest is absorbed at
+event 155 by the BATCH layer, before delegate at 161, so the WHIR core transcript
+starts at 161 with the digest already in the sponge - matching the small-shape
+tests' observeDigest(commitment) then verifyInitial.
+
+Next: WhirComposed.t.sol driving all 5 rounds from composed_vectors.json.
