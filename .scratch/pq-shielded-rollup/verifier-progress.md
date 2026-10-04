@@ -763,3 +763,113 @@ one small proof + assembly hot paths), not correctness issues.
 
 Bundle v3 deltas: PRF gains final_sumcheck_ca/cinf/pow_witnesses per round,
 drops domain_points; CFG batch prefix gains the two grind difficulty bits.
+
+
+## D-074 — Real shielded block verifies on-chain and applies to ShieldedPool (DONE)
+
+`block_program_equality_and_export` proves a real 1-transfer shielded block
+(funded_note -> prove_client_transfer -> build_multi_transfer_circuit ->
+settle_block_circuit at BLOCK_LOG_MAX_LDE=25) and exports the composed vectors,
+bundle, and a small `block_genesis.json` sidecar (statement limbs, genesis
+leaves, expected root after). `BlockE2E.t.sol` deploys the real ShieldedPool
+with the real verifier and real genesis leaves and:
+- applies the real block: proof verifies, currentRoot == expectedRootAfter,
+  leafCount 2 (1,600,405,878 gas);
+- rejects a tampered proof byte (510M), a wrong statement (184M), and a
+  tampered LogUp terminal with the exact TerminalSumNonZero (184M).
+MemoryOOG/OutOfGas lessons: never parse the 12 MB vectors JSON in setUp
+(sidecar instead); never store the 2.7 MB proof in storage (read from disk
+per test).
+
+## D-075 — verify_batch's post-opening checks (part 1 DONE, part 2 = D-076)
+
+verify_batch ends with two checks after the opening argument:
+1. `lookup_gadget.verify_terminal_sum(lookup_terminals)` — the batch's LogUp
+   terminals must sum to zero. SHIPPED (4049256): WhirVerifier fail-fast sum
+   over prf.terminals right after _checkStatement; pinned by BlockE2E tamper
+   test and constraint_identity_vectors.rs.
+2. Per-instance constraint identity (below) — NOT yet wired. This is the last
+   soundness gap: without it a prover could open a fake trace that passes the
+   WHIR argument but satisfies no AIR.
+
+## D-076 — Constraint identity on-chain: the plan (IN PROGRESS)
+
+The identity, per instance i (pinned natively by
+crates/prover/tests/constraint_identity_vectors.rs):
+
+    fold(constraintAlpha, constraints_i(zeta)) * inv_vanishing_i(zeta)
+        == recomposeQuotient(chunks_i, chunkDomains_i, invD_i, zeta)
+
+ConstraintIdentity.sol already implements every piece (DAG interpreter,
+selectors, chunk vanishings, quotient recompose) and test/ConstraintIdentity.t.sol
+pins it against the exported vectors; what remains is plumbing it into
+WhirVerifier.verify with inputs from the SAME proof run as the bundle.
+
+### Input inventory (fib shape, 6 instances)
+
+| input | source | status |
+|---|---|---|
+| zeta | oodPhase return | discard -> capture |
+| constraintAlpha | permutationPhase return | discard -> capture |
+| lookupAlpha, beta | lookupPhase returns | capture (for perm challenges) |
+| permChallenges[i] | [prefix(bus), beta] per lookup; bus ids + max_message_width are trusted setup | export layout, compute on-chain via BatchTranscript.lookupPair |
+| permValues[i] | prf.terminals partitioned by per-instance terminal counts (trusted setup, =1 each) | trivial |
+| trace_local/next[i] | main round (r=1) claims at zeta / zeta_next, widths [4,4,76,76,166,166,4,3] | from boundEvals * scale |
+| quotient chunks[i] | quotient round (r=2) claims, 4 ext per chunk = flattened base coeffs -> pack limbs | from boundEvals * scale |
+| pre local/next[i] | preprocessed round (r=3) claims, widths [6,2,59,59,24,24,10,4] | from boundEvals * scale |
+| perm local/next[i] | permutation round (r=4) claims, base-flattened widths [8,8,8,8,28,28,16,16,24,24,16,16] -> pack limbs per 4 | from boundEvals * scale |
+| public_values[i] | pv blob (already checked vs statement) | trusted |
+| periodic_values | all empty at this shape | empty |
+| trace_domain {log_size, shift, inv_shift, h_inv} | fixed by degree_bits | export (trusted) |
+| chunk_domains, invD, num_chunks | domain-only constants | export (trusted) |
+| constraint programs (nodes/base/ext consts/roots) | get_symbolic_constraints + flattener | export (trusted), ~88 KB fib |
+| eq scales per claim | univariate_eq_point(zeta, padded_arity(log_height, 4)).1 = prod_j (1 + zeta^(2^j)) | derive on-chain from zeta |
+
+Key realization: the opened values are EXACTLY the round-0 claims the contract
+already absorbs (boundEvals, proof order, claimPerm maps constraint->proof
+order), times the eq scale, which is a pure function of zeta and the trusted
+matrix shapes. No new proof bytes; the constraint section is pure CONFIG.
+
+Round -> batch-round mapping (fib, pinned by claim widths):
+r0 = ZK random round, r1 = main trace, r2 = quotient chunks, r3 = preprocessed,
+r4 = permutation. The block proof has the same five rounds (same batch shape).
+
+### Steps
+
+1. Factor the flattener + fold_constraints + ext helpers from
+   constraint_identity_vectors.rs into tests/constraint_ir/mod.rs (shared).
+2. composed_vectors.rs export: after the composed run, replay the batch
+   transcript (as constraint_identity_vectors does) and write a
+   `constraint_identity` object into the composed vectors JSON: zeta,
+   constraint_alpha, per-instance {program, trace_domain, chunk_domains,
+   inv_d, num_chunks, bus layout, terminal count, expected_fold,
+   expected_quotient, opened (for the pin test)}. Same run as the bundle, so
+   pins match the bundle's proof bytes.
+3. gen_composed_flat.mjs / gen_bundle.mjs: emit a CONSTRAINTS section; header
+   v4 gains cstWords u32 LE @16. CONFIG/PROOF layout unchanged.
+4. WhirVerifier.sol v4: capture the three challenges; during the round loop
+   retain per-round (claimWidths, claimPerm, boundEvals, matrix log_sizes) —
+   or better, compute each round's opened slices inline and stash them; after
+   the loop, per instance assemble ConstraintIdentity.Opened, derive scales
+   from zeta, selectors, foldConstraints, recomposeQuotient, require equality.
+   New errors: ConstraintIdentityMismatch(index).
+5. Regenerate fib vectors + bundle; WhirVerifier.t.sol gains per-instance
+   expected_fold/expected_quotient pins; full fib suite green.
+6. Regenerate block vectors + bundle (background job ~60 s); BlockE2E green
+   with the identity active (tamper tests must still hit their exact errors).
+7. Full gate: cargo fmt + clippy + semgrep crypto rules + full forge suite;
+   descriptive commits, each compiling + passing relevant tests.
+
+### Decisions inside D-076
+
+- Opened values from round-0 claims * scale (bound by the WHIR proof), NOT
+  from the STM audit section (unbound). Alternative rejected: re-deriving
+  openings from proof rows would duplicate the WHIR argument.
+- Scales derived on-chain from zeta (prod (1+zeta^(2^j))), not shipped:
+  shipping them would let a prover steer openings off the verified claims.
+- Constraint programs ride in the bundle CONFIG section (deploy-time, pin
+  keccak256(config||constraints)); alternative (Solidity source per circuit)
+  rejected: the AIRs are generated, and the block shape differs from fib.
+- perm challenges computed from (lookupAlpha, beta, bus layout) rather than
+  shipped: two extra ext muls per lookup, zero trust.
+

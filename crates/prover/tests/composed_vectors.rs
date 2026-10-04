@@ -53,11 +53,11 @@ use batch_fixture::{
     settlement_params_for, Challenge, Dft, OpeningClaims, OpeningProof, ReplayOut, SemPcs,
     CAP_HEIGHT,
 };
+use pq_hash::{Keccak256Commitment, Sha3_256Shielded};
 use prover::block::{build_multi_transfer_circuit, shape_header, ChildProof, TransferShape};
 use prover::client::{prove_client_transfer, ClientSpec};
 use prover::fixtures::{funded_note, seed, tree_with};
 use prover::whir_recursion::InnerWhirConfig;
-use pq_hash::{Keccak256Commitment, Sha3_256Shielded};
 use shielded::keys::derive_spend_pk;
 use shielded::{Note, NullifierMap};
 use whir_walk::{verify_whir_round, RoundWalk, TerminalWalk, WhirRoundWalk};
@@ -191,7 +191,6 @@ fn composed_run_with(
     rounds_json: &mut Vec<serde_json::Value>,
     round_starts: &mut Vec<usize>,
 ) -> Result<(serde_json::Value, ReplayOut, SemProgram), Box<dyn Error>> {
-
     {
         let mut replacer = |ch: &mut SemChallenger,
                             claims: &OpeningClaims,
@@ -712,8 +711,17 @@ fn composed_program_equality_and_export() {
     // isolated fixed zero as a bug (check_no_ambiguous_zeros).
     let fixed = reclassify_zero_runs(&program_b, fixed_raw);
     let _ = varying_raw;
-    export_and_write(doc, &out, &program_b, &fixed, &starts_b, "composed_vectors", None, vec![])
-        .expect("export");
+    export_and_write(
+        doc,
+        &out,
+        &program_b,
+        &fixed,
+        &starts_b,
+        "composed_vectors",
+        None,
+        vec![],
+    )
+    .expect("export");
 }
 
 /// Shared export tail: classification outputs + framing tables + blob written to
@@ -900,7 +908,6 @@ fn composed_artifact_shape_is_pinned() {
     assert!(<SemPcs as p3_commit::UnivariateStarkPcs<Challenge, SemChallenger>>::ZK);
 }
 
-
 /// The real shielded block circuit through the same composed machinery.
 ///
 /// One client transfer (a funded note spent through the transfer circuit with a
@@ -1001,7 +1008,10 @@ fn block_program_equality_and_export() -> Result<(), Box<dyn Error>> {
             "genesis_leaves",
             json!([hex(note.commit(&Keccak256Commitment).as_bytes())]),
         ),
-        ("pool_root_after_hex", json!(hex(pool_tree.root().as_bytes()))),
+        (
+            "pool_root_after_hex",
+            json!(hex(pool_tree.root().as_bytes())),
+        ),
     ];
     // Small sidecar for the Solidity test: the full export is tens of MB and
     // parsing it on-chain in setUp exhausts the EVM memory limit. The E2E test
