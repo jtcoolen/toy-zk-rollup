@@ -194,6 +194,53 @@ console.log("batch: seed", seed.length, "deg", degree.length, "pv", pvWords.leng
   "terminals", terminals.length, "lookupPow", lookupPow, "oodPow", oodPow,
   "digests", [mainDigest, preDigest, permDigest, quotDigest, randDigest].map((d) => (d ? d.slice(2, 10) : "MISSING")).join(","));
 
+// ---- CONSTRAINTS (trusted setup, appended to CONFIG in v4) -------------------
+// The constraint-identity programs + domain constants from the SAME proof run as
+// the bundle (D-076). Trusted setup: the deploy-time config hash covers them.
+// Per instance: the flattened DAG (nodes/base_consts/ext_consts/roots), the
+// claim-layout flags, trace/chunk domain parameters, and inv_d. The opened
+// values themselves are NOT here: the contract derives them from the rounds
+// (boundEvals x scale(k, zeta)), which is what makes the check sound.
+const ci = jj.constraint_identity;
+if (!ci) throw new Error("vectors JSON lacks constraint_identity (re-run export)");
+const cst = isolate(() => {
+  pushWord(ci.instances.length);
+  pushWord(ci.statement_instance ?? 0xffffffff);
+  for (const inst of ci.instances) {
+    pushWord(inst.width);
+    pushWord(inst.preprocessed_width);
+    pushWord(inst.aux_width);
+    pushWord(inst.has_main_next ? 1 : 0);
+    pushWord(inst.has_pre_next ? 1 : 0);
+    pushWord(inst.num_constraints);
+    pushArr(inst.nodes);
+    pushArr(inst.base_consts);
+    pushArr(inst.ext_consts);
+    pushArr(inst.roots);
+    pushWord(inst.trace_domain.log_size);
+    pushWord(inst.trace_domain.shift);
+    pushWord(inst.trace_domain.inv_shift);
+    pushWord(inst.trace_domain.h_inv);
+    pushWord(inst.num_chunks);
+    for (const d of inst.chunk_domains) { pushWord(d.log_size); pushWord(d.shift); pushWord(d.inv_shift); }
+    pushArr(inst.inv_d);
+  }
+  // Bus layout for the permutation challenges: the widest payload W, then per
+  // instance the bus id of each lookup (the contract derives the pair
+  // [lookupAlpha + (bus+1)*beta^W, beta] per lookup), then which instances
+  // carry a LogUp terminal (perm value = that terminal, else empty).
+  pushWord(ci.max_message_width);
+  for (let i = 0; i < ci.instances.length; i++) pushArr(ci.bus_ids[i]);
+  for (let i = 0; i < ci.instances.length; i++) pushWord(ci.terminal_counts[i] ? 1 : 0);
+  // Per-round claim-group arities: the contract computes each group
+  // scale = prod_{i<k}(1 + zeta^(2^i)) from the group arity k and its own zeta.
+  // Same source as the STATEMENT matrices section (audit), trusted-setup-positioned.
+  pushWord(j.num_rounds);
+  for (let r = 0; r < j.num_rounds; r++) {
+    const mats = jj.rounds[r].matrices;
+    pushArr(mats.map((m) => m.arity));
+  }
+});
 // ---- CONFIG ----------------------------------------------------------------
 const cfg = [];
 {
@@ -242,6 +289,8 @@ const cfg = [];
   }
   // Move the per-round words (pushed into the module sink) into cfg.
   while (words.length) cfg.push(words.shift());
+  // D-076: constraint-identity programs + domain constants (v4).
+  cfg.push(cst.length, ...cst);
 }
 
 // ---- PROOF -----------------------------------------------------------------
@@ -322,7 +371,7 @@ const stm = [];
 
 const header = new Uint8Array(16);
 header.set([0x57, 0x42, 0x4e, 0x44]); // WBND
-header[4] = 3; // version 3: + final sumcheck fields, + batch grind bits in CFG, - domain_points
+header[4] = 4; // version 4: + CONSTRAINTS section at the tail of CONFIG (D-076)
 const view = new DataView(header.buffer);
 view.setUint32(8, cfg.length, true);
 view.setUint32(12, prf.length, true);
@@ -335,3 +384,5 @@ for (const w of prf) { dv.setUint32(off, w >>> 0, true); off += 4; }
 for (const w of stmOut) { dv.setUint32(off, w >>> 0, true); off += 4; }
 fs.writeFileSync(`contracts/test/vectors/${OUT}.bin`, Buffer.concat([Buffer.from(header), Buffer.from(body)]));
 console.log(`wrote ${OUT}.bin`, header.length + body.length, "bytes; cfg words", cfg.length, "prf words", prf.length, "stm words", stmOut.length);
+
+console.log("constraints words", cst.length);

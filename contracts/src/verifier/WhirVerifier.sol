@@ -6,6 +6,7 @@ import {IWhirVerifier} from "../interfaces/IWhirVerifier.sol";
 import {BatchTranscript} from "./BatchTranscript.sol";
 import {WhirVerifierCore} from "./WhirVerifierCore.sol";
 import {WhirGadgets} from "./WhirGadgets.sol";
+import {ConstraintIdentity} from "./ConstraintIdentity.sol";
 
 /// The settlement verifier: replays `p3_batch_stark::verify_batch` at the
 /// settlement shape, end to end, from one proof blob.
@@ -52,6 +53,7 @@ import {WhirGadgets} from "./WhirGadgets.sol";
 /// cannot be replayed against this statement.
 contract WhirVerifier is IWhirVerifier {
     using WhirVerifierCore for WhirVerifierCore.Transcript;
+    using KoalaBearExt4 for uint256;
 
     /// The proof does not start with the WBND magic.
     error BadMagic();
@@ -77,6 +79,13 @@ contract WhirVerifier is IWhirVerifier {
     /// check (p3-lookup LogUpGadget::verify_terminal_sum); without it a prover
     /// could balance nothing and still pass the opening argument.
     error TerminalSumNonZero();
+
+    /// The constraint identity failed for instance i: fold(alpha, C(zeta)) *
+    /// inv_vanishing(zeta) != quotient(zeta) on the derived opened values.
+    error ConstraintIdentityMismatch(uint256 instance);
+
+    /// The CONSTRAINTS section is missing or misframed (wire v4).
+    error BadConstraints();
 
     // ---------------------------------------------------------------------
     // Two-adic generators (canonical base elements)
@@ -177,7 +186,7 @@ contract WhirVerifier is IWhirVerifier {
         // The u32 LE fields need a byte swap; the version byte does not.
         cfgWords = _swapBytes(cfgWords);
         prfWords = _swapBytes(prfWords);
-        if (version != 3) revert BadVersion(version);
+        if (version != 4) revert BadVersion(version);
         if (m.length < 16 + (cfgWords + prfWords) * 4) revert ProofTooShort();
 
         // Word offsets into the proof data: the 16-byte header is 4 words, so
@@ -197,7 +206,7 @@ contract WhirVerifier is IWhirVerifier {
         // 224/192/160/128, canonical) and must sum to zero in the extension field.
         // Independent of transcript state, so it runs fail-fast before the round
         // loop: one packed add per terminal, no inversions.
-        uint256 terminalSum;
+        uint256 terminalSum = 0;
         for (uint256 i; i < prf.terminals.length; ++i) {
             terminalSum = KoalaBearExt4.add(terminalSum, prf.terminals[i]);
         }
@@ -207,10 +216,12 @@ contract WhirVerifier is IWhirVerifier {
         BatchTranscript.State memory s = BatchTranscript.begin(cfg.seedBytes, cfg.degreeBytes);
         BatchTranscript.mainPhase(s, prf.mainDigest, prf.pvBytes);
         BatchTranscript.preprocessedPhase(s, cfg.preDigest);
-        BatchTranscript.lookupPhase(s, cfg.lookupPowBits, prf.lookupPow);
-        BatchTranscript.permutationPhase(s, prf.permDigest, prf.terminals);
+        (uint256 lookupAlpha, uint256 beta) =
+            BatchTranscript.lookupPhase(s, cfg.lookupPowBits, prf.lookupPow);
+        uint256 constraintAlpha =
+            BatchTranscript.permutationPhase(s, prf.permDigest, prf.terminals);
         BatchTranscript.quotientPhase(s, prf.quotDigest, prf.randDigest);
-        BatchTranscript.oodPhase(s, cfg.oodPowBits, prf.oodPow);
+        uint256 zeta = BatchTranscript.oodPhase(s, cfg.oodPowBits, prf.oodPow);
 
         // Hand the sponge to the WHIR core: the batch layer delegates to the PCS
         // layer on the SAME challenger, so no reseed happens here.
@@ -220,6 +231,9 @@ contract WhirVerifier is IWhirVerifier {
         // --- CONFIG: schedule ------------------------------------------------------
         uint256 numRounds;
         (numRounds, co) = _word(m, co);
+        // The constraint identity (D-076) needs each round's bound evaluations
+        // after the walk: keep them (rounds 1..4; round 0 is the random round).
+        uint256[][] memory boundEvalsOf = new uint256[][](numRounds);
         // round_starts is a test-harness artifact (per-round sponge seeding);
         // the on-chain walk is continuous, so it is skipped, not consumed.
         (, co) = _arr(m, co);
@@ -230,9 +244,18 @@ contract WhirVerifier is IWhirVerifier {
             (c, co) = _decodeRoundCfg(m, co);
             RoundPrf memory p;
             (p, po) = _decodeRoundPrf(m, po);
+            boundEvalsOf[r] = p.boundEvals;
             _runRound(t, c, p);
         }
 
+        // --- the constraint identity (D-076) ------------------------------------
+        // The last layer of verify_batch: per instance, recompute every opened
+        // value from the bound evaluations this walk just verified, then check
+        // fold(alpha, C(zeta)) * inv_vanishing(zeta) == quotient(zeta). The
+        // programs and domain constants are CONFIG (trusted setup, v4 tail).
+        ConstraintsCfg memory cc;
+        (cc, co) = _decodeConstraints(m, co);
+        _checkIdentity(cc, boundEvalsOf, zeta, constraintAlpha, lookupAlpha, beta, prf.terminals, statement);
 
         return true;
     }
@@ -881,6 +904,392 @@ contract WhirVerifier is IWhirVerifier {
         out = new uint256[](n);
         for (uint256 i; i < n; ++i) {
             out[i] = v;
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Constraint identity (D-076): CONFIG decode + opened-value derivation
+    // ---------------------------------------------------------------------
+
+    /// The CONSTRAINTS section (wire v4, tail of CONFIG): the trusted-setup
+    /// constraint programs and domain constants for every batch instance, the
+    /// bus layout for the permutation challenges, and each round's claim-group
+    /// arities. Everything the identity consumes that the proof does NOT pin.
+    struct ConstraintsCfg {
+        uint256 numInstances;
+        uint256 statementInstance;
+        uint256[] width;
+        uint256[] preWidth;
+        uint256[] auxWidth;
+        bool[] hasMainNext;
+        bool[] hasPreNext;
+        uint256[] numConstraints;
+        ConstraintIdentity.Program[] programs;
+        uint256[] traceLogSize;
+        uint256[] traceInvShift;
+        uint256[] traceHInv;
+        uint256[] numChunks;
+        ConstraintIdentity.ChunkDomain[][] chunkDomains;
+        uint256[][] invD;
+        uint256 maxMessageWidth;
+        uint256[][] busIds;
+        bool[] hasTerminal;
+        uint256[][] roundArities;
+    }
+
+    function _decodeConstraints(bytes memory m, uint256 off)
+        private
+        pure
+        returns (ConstraintsCfg memory c, uint256 no)
+    {
+        uint256 len;
+        (len, no) = _word(m, off);
+        uint256 end = no + len;
+        uint256 n;
+        (n, no) = _word(m, no);
+        c.numInstances = n;
+        (c.statementInstance, no) = _word(m, no);
+        c.programs = new ConstraintIdentity.Program[](n);
+        c.chunkDomains = new ConstraintIdentity.ChunkDomain[][](n);
+        c.invD = new uint256[][](n);
+        c.busIds = new uint256[][](n);
+        c.width = new uint256[](n);
+        c.preWidth = new uint256[](n);
+        c.auxWidth = new uint256[](n);
+        c.hasMainNext = new bool[](n);
+        c.hasPreNext = new bool[](n);
+        c.numConstraints = new uint256[](n);
+        c.traceLogSize = new uint256[](n);
+        c.traceInvShift = new uint256[](n);
+        c.traceHInv = new uint256[](n);
+        c.numChunks = new uint256[](n);
+        c.hasTerminal = new bool[](n);
+        for (uint256 i; i < n; ++i) {
+            (c.width[i], no) = _word(m, no);
+            (c.preWidth[i], no) = _word(m, no);
+            (c.auxWidth[i], no) = _word(m, no);
+            uint256 f;
+            (f, no) = _word(m, no);
+            c.hasMainNext[i] = f != 0;
+            (f, no) = _word(m, no);
+            c.hasPreNext[i] = f != 0;
+            (c.numConstraints[i], no) = _word(m, no);
+            ConstraintIdentity.Program memory prog;
+            (prog.nodes, no) = _arr(m, no);
+            (prog.baseConsts, no) = _arr(m, no);
+            uint256[] memory extFlat;
+            (extFlat, no) = _arr(m, no);
+            prog.extConsts = _packQuartics(extFlat);
+            (prog.roots, no) = _arr(m, no);
+            c.programs[i] = prog;
+            (c.traceLogSize[i], no) = _word(m, no);
+            (, no) = _word(m, no); // trace shift: unused (selectors work in u = zeta * invShift)
+            (c.traceInvShift[i], no) = _word(m, no);
+            (c.traceHInv[i], no) = _word(m, no);
+            (c.numChunks[i], no) = _word(m, no);
+            uint256 k = c.numChunks[i];
+            ConstraintIdentity.ChunkDomain[] memory cds =
+                new ConstraintIdentity.ChunkDomain[](k);
+            for (uint256 j; j < k; ++j) {
+                (cds[j].logSize, no) = _word(m, no);
+                (cds[j].shift, no) = _word(m, no);
+                (cds[j].invShift, no) = _word(m, no);
+            }
+            c.chunkDomains[i] = cds;
+            uint256[] memory invDFlat;
+            (invDFlat, no) = _arr(m, no);
+            c.invD[i] = _packQuartics(invDFlat);
+        }
+        (c.maxMessageWidth, no) = _word(m, no);
+        for (uint256 i; i < n; ++i) {
+            (c.busIds[i], no) = _arr(m, no);
+        }
+        for (uint256 i; i < n; ++i) {
+            uint256 f;
+            (f, no) = _word(m, no);
+            c.hasTerminal[i] = f != 0;
+        }
+        uint256 nr;
+        (nr, no) = _word(m, no);
+        c.roundArities = new uint256[][](nr);
+        for (uint256 r; r < nr; ++r) {
+            (c.roundArities[r], no) = _arr(m, no);
+        }
+        if (no != end) revert BadConstraints();
+    }
+
+    /// Pack flat u32 extension limbs (4 per value, canonical order) into the
+    /// packed representation (limbs at bits 224/192/160/128).
+    function _packQuartics(uint256[] memory flat)
+        private
+        pure
+        returns (uint256[] memory out)
+    {
+        out = new uint256[](flat.length / 4);
+        for (uint256 j; j < out.length; ++j) {
+            out[j] = (flat[4 * j] << 224) | (flat[4 * j + 1] << 192) | (flat[4 * j + 2] << 160)
+                | (flat[4 * j + 3] << 128);
+        }
+    }
+
+    /// Horner evaluation of a quartic at x (the EF4 class of the indeterminate):
+    /// c0 + c1*x + c2*x^2 + c3*x^3 from four consecutive claimed extension
+    /// values - the inverse of the prover's from_ext_basis claim packing.
+    function _fromExt4(uint256[] memory vals, uint256 off) private pure returns (uint256) {
+        uint256 x = uint256(1) << 192;
+        uint256 acc = vals[off + 3];
+        acc = acc.mul(x).add(vals[off + 2]);
+        acc = acc.mul(x).add(vals[off + 1]);
+        return acc.mul(x).add(vals[off]);
+    }
+
+    /// prod_{i<k}(1 + z^{2^i}): the univariate-eq scale of a claim group of
+    /// padded arity k at point z.
+    function _claimScale(uint256 z, uint256 k) private pure returns (uint256) {
+        uint256 sc = KoalaBearExt4.ONE;
+        uint256 y = z;
+        for (uint256 i; i < k; ++i) {
+            sc = sc.mul(KoalaBearExt4.ONE.add(y));
+            y = y.square();
+        }
+        return sc;
+    }
+
+    /// The claims of one opening round: widths, owning matrix, arity, point
+    /// index (0 = zeta, 1 = zeta_next of the matrix). Rounds are positional:
+    /// 0 random, 1 main, 2 quotient, 3 preprocessed, 4 permutation. Matrix-
+    /// major claim order, matching the walk's bound-evaluation order (pinned
+    /// against the export, D-076).
+    struct ClaimLayout {
+        uint256 count;
+        uint256[] widths;
+        uint256[] matrix;
+        uint256[] arities;
+        uint256[] point;
+    }
+
+    function _claimLayout(ConstraintsCfg memory c, uint256 round)
+        private
+        pure
+        returns (ClaimLayout memory L)
+    {
+        uint256 n = c.numInstances;
+        uint256[] memory ar = c.roundArities[round];
+        if (round == 1 || round == 3) {
+            uint256 cnt = 0;
+            for (uint256 i; i < n; ++i) {
+                cnt += (round == 1 ? c.hasMainNext[i] : c.hasPreNext[i]) ? 2 : 1;
+            }
+            L.count = cnt;
+            L.widths = new uint256[](cnt);
+            L.matrix = new uint256[](cnt);
+            L.arities = new uint256[](cnt);
+            L.point = new uint256[](cnt);
+            uint256 j = 0;
+            for (uint256 i; i < n; ++i) {
+                uint256 w = round == 1 ? c.width[i] : c.preWidth[i];
+                uint256 reps = (round == 1 ? c.hasMainNext[i] : c.hasPreNext[i]) ? 2 : 1;
+                for (uint256 q; q < reps; ++q) {
+                    L.widths[j] = w;
+                    L.matrix[j] = i;
+                    L.arities[j] = ar[i];
+                    L.point[j] = q;
+                    j++;
+                }
+            }
+        } else if (round == 2) {
+            // one claim per quotient chunk; matrices are the chunks themselves
+            uint256 cnt = 0;
+            for (uint256 i; i < n; ++i) {
+                cnt += c.numChunks[i];
+            }
+            L.count = cnt;
+            L.widths = new uint256[](cnt);
+            L.matrix = new uint256[](cnt);
+            L.arities = new uint256[](cnt);
+            L.point = new uint256[](cnt);
+            uint256 j = 0;
+            for (uint256 i; i < n; ++i) {
+                for (uint256 q; q < c.numChunks[i]; ++q) {
+                    L.widths[j] = 4;
+                    L.matrix[j] = i;
+                    L.arities[j] = ar[j];
+                    L.point[j] = 0;
+                    j++;
+                }
+            }
+        } else {
+            // round 4: two claims per instance (local at zeta, next at zeta_next)
+            uint256 cnt = 2 * n;
+            L.count = cnt;
+            L.widths = new uint256[](cnt);
+            L.matrix = new uint256[](cnt);
+            L.arities = new uint256[](cnt);
+            L.point = new uint256[](cnt);
+            uint256 j = 0;
+            for (uint256 i; i < n; ++i) {
+                for (uint256 q; q < 2; ++q) {
+                    L.widths[j] = 4 * c.auxWidth[i];
+                    L.matrix[j] = i;
+                    L.arities[j] = ar[i];
+                    L.point[j] = q;
+                    j++;
+                }
+            }
+        }
+    }
+
+    /// The constraint identity for every instance, from the derived opened
+    /// values. Mirrors the tail of verify_batch: fold the AIR constraints at
+    /// zeta, scale by the inverse vanishing, compare to the recomposed
+    /// quotient. A proof that passes the WHIR walk but not this check has
+    /// consistent openings of the wrong polynomials - this is the soundness
+    /// layer that binds the traces to the AIR.
+    function _checkIdentity(
+        ConstraintsCfg memory c,
+        uint256[][] memory boundEvalsOf,
+        uint256 zeta,
+        uint256 constraintAlpha,
+        uint256 lookupAlpha,
+        uint256 beta,
+        uint256[] memory terminals,
+        uint256[] calldata statement
+    ) private pure {
+        uint256 n = c.numInstances;
+        if (c.roundArities.length != 5) revert BadConstraints();
+        // zeta_next per instance: zeta * g, g the two-adic generator of the
+        // trace domain (shift-1 domains: next_point(zeta) = zeta * h).
+        uint256[] memory zetaNext = new uint256[](n);
+        for (uint256 i; i < n; ++i) {
+            zetaNext[i] = zeta.mulBase(twoAdicGenerator(c.traceLogSize[i]));
+        }
+        // Per-instance opened values, filled round by round.
+        ConstraintIdentity.Opened[] memory opened =
+            new ConstraintIdentity.Opened[](n);
+        for (uint256 i; i < n; ++i) {
+            opened[i].permValues = new uint256[](0);
+            opened[i].periodicValues = new uint256[](0);
+        }
+        // Quotient chunks accumulate per instance (filled in round 2).
+        uint256[][] memory quotBuf = new uint256[][](n);
+        for (uint256 i; i < n; ++i) {
+            quotBuf[i] = new uint256[](c.numChunks[i]);
+        }
+        // Perm values: the LogUp terminals, in order of instances that carry
+        // one (terminal_counts, same order as the proof's terminal list).
+        uint256 tIdx = 0;
+        for (uint256 i; i < n; ++i) {
+            if (c.hasTerminal[i]) {
+                opened[i].permValues = new uint256[](1);
+                opened[i].permValues[0] = terminals[tIdx];
+                tIdx++;
+            }
+        }
+        // Perm challenges: [prefix(bus), beta] per lookup; prefix =
+        // lookupAlpha + (bus + 1) * beta^W (transcript.rs bus_prefix, W =
+        // max message width).
+        uint256 betaW = beta;
+        for (uint256 w = 1; w < c.maxMessageWidth; ++w) {
+            betaW = betaW.mul(beta);
+        }
+        for (uint256 i; i < n; ++i) {
+            uint256 nb = c.busIds[i].length;
+            opened[i].permChallenges = new uint256[](2 * nb);
+            for (uint256 k = 0; k < nb; ++k) {
+                uint256 prefix = lookupAlpha.add(betaW.mulBase(c.busIds[i][k] + 1));
+                opened[i].permChallenges[2 * k] = prefix;
+                opened[i].permChallenges[2 * k + 1] = beta;
+            }
+        }
+        // Public values: only the statement instance carries them. The
+        // calldata statement is plain base-field values (the pv-bytes check
+        // monts them to compare), and the AIR reads them plain.
+        if (c.statementInstance < n) {
+            opened[c.statementInstance].publicValues = new uint256[](statement.length);
+            for (uint256 j; j < statement.length; ++j) {
+                opened[c.statementInstance].publicValues[j] = statement[j];
+            }
+        }
+
+        // Round 1 (main) and round 3 (preprocessed): opened == claimed
+        // element-wise, local at zeta / next at zeta_next of the matrix.
+        // Round 2 (quotient) and round 4 (permutation): opened = fromExt4 of
+        // each 4-value group of the claimed values.
+        for (uint256 round = 1; round <= 4; ++round) {
+            ClaimLayout memory L = _claimLayout(c, round);
+            uint256[] memory bound = boundEvalsOf[round];
+            uint256 boff = 0;
+            uint256[] memory qIdx = new uint256[](n);
+            for (uint256 j; j < L.count; ++j) {
+                uint256 mi = L.matrix[j];
+                uint256 z = L.point[j] == 0 ? zeta : zetaNext[mi];
+                uint256 sc = _claimScale(z, L.arities[j]);
+                uint256 w = L.widths[j];
+                if (round == 1) {
+                    if (L.point[j] == 0) {
+                        opened[mi].mainLocal = _claimed(bound, boff, w, sc);
+                    } else {
+                        opened[mi].mainNext = _claimed(bound, boff, w, sc);
+                    }
+                } else if (round == 3) {
+                    if (L.point[j] == 0) {
+                        opened[mi].preLocal = _claimed(bound, boff, w, sc);
+                    } else {
+                        opened[mi].preNext = _claimed(bound, boff, w, sc);
+                    }
+                } else if (round == 2) {
+                    quotBuf[mi][qIdx[mi]] = _fromExt4Group(bound, boff, w, sc)[0];
+                    qIdx[mi]++;
+                } else {
+                    if (L.point[j] == 0) {
+                        opened[mi].permLocal = _fromExt4Group(bound, boff, w, sc);
+                    } else {
+                        opened[mi].permNext = _fromExt4Group(bound, boff, w, sc);
+                    }
+                }
+                boff += w;
+            }
+        }
+
+        // The identity itself: fold(alpha, C(zeta)) * inv_zH(zeta) == Q(zeta).
+        for (uint256 i; i < n; ++i) {
+            ConstraintIdentity.Selectors memory sels = ConstraintIdentity.selectors(
+                zeta, c.traceInvShift[i], c.traceLogSize[i], c.traceHInv[i]);
+            uint256 fold =
+                ConstraintIdentity.foldConstraints(c.programs[i], opened[i], sels, constraintAlpha);
+            uint256 quotient = ConstraintIdentity.recomposeQuotient(
+                quotBuf[i], c.chunkDomains[i], c.invD[i], zeta);
+            if (fold.mul(sels.invVanishing) != quotient) {
+                revert ConstraintIdentityMismatch(i);
+            }
+        }
+    }
+
+    /// claimed = bound * scale, element-wise, w values from off.
+    function _claimed(uint256[] memory bound, uint256 off, uint256 w, uint256 sc)
+        private
+        pure
+        returns (uint256[] memory out)
+    {
+        out = new uint256[](w);
+        for (uint256 j; j < w; ++j) {
+            out[j] = bound[off + j].mul(sc);
+        }
+    }
+
+    /// fromExt4 over each 4-value group of the w claimed values.
+    function _fromExt4Group(uint256[] memory bound, uint256 off, uint256 w, uint256 sc)
+        private
+        pure
+        returns (uint256[] memory out)
+    {
+        out = new uint256[](w / 4);
+        for (uint256 j; j < w / 4; ++j) {
+            uint256[] memory vals = new uint256[](4);
+            for (uint256 q; q < 4; ++q) {
+                vals[q] = bound[off + 4 * j + q].mul(sc);
+            }
+            out[j] = _fromExt4(vals, 0);
         }
     }
 }

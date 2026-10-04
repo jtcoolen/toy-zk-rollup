@@ -1012,3 +1012,119 @@ step touched is clean apart from the same families.
    terminals (already on the wire); pv from blob; periodic empty.
 3. Regenerate fib vectors+bundle, pin + WhirVerifier green; then block
    vectors+bundle (background), BlockE2E green with identity.
+
+## D-076 wiring — pinned derivation rules (numerically verified this session)
+
+The last soundness gap: the contract must recompute the constraint identity
+`fold(alpha, C(zeta)) * inv_vanishing(zeta) == quotient(zeta)` per instance,
+from opened values it DERIVES (never proof-supplied). All rules below were
+verified numerically against `composed_vectors.json` (fib run, all 6
+instances, all rounds) with a standalone JS model:
+
+1. **Claimed openings**: `claimed = boundEval * scale(k, point)` element-wise,
+   where k = padded arity of the matrix, point = the claim's point, and
+   `scale(k, z) = prod_{i<k}(1 + z^{2^i})` in EF4. (This is the export's own
+   rescale assert, composed_vectors.rs:361.)
+2. **MAIN (round 1) / PREPROCESSED (round 3)**: opened == claimed element-wise
+   (ext values). local claims at zeta, next claims at zeta_next.
+3. **QUOTIENT (round 2) / PERMUTATION (round 4)**: opened = `fromExt` of each
+   group of 4 claimed ext values: Horner at x (the EF4 element [0,1,0,0],
+   packed 1<<192): `acc = ((c3*x + c2)*x + c1)*x + c0`. Verified for all 32
+   quotient claims and all 12 perm claims.
+4. **zeta_next** = zeta * twoAdicGenerator(trace_domain.log_size). Verified.
+5. **Claim order**: matrix-major then point (schedule order). Matrix
+   boundaries = eq_points_lens (points per matrix). Claim j spans
+   claim_widths[j] ext values of boundEvals.
+6. **Round→instance map**: rounds 1/3/4 matrix i == instance i; round 2
+   matrices grouped by instance, num_chunks[i] consecutive each.
+7. **Perm challenges**: per lookup k of instance i: `[prefix(bus_k), beta]`,
+   `prefix = lookupAlpha + (bus_k + 1) * beta^W`, W = max_message_width.
+   (transcript.rs lay_out_lookup_challenges; prefix formula verified for all
+   instances against the export.)
+8. **Perm values**: 1 terminal (t.0) per instance with terminal_counts[i];
+   terminals are proof-supplied and already sum-checked to zero.
+9. **Public values**: statement array for statement_instance only, else empty.
+   **Periodic values**: empty at this shape; contract fails closed if a
+   program references OP_PERIODIC with an empty array.
+
+## D-076 wiring plan (in progress)
+
+- [x] CONSTRAINTS section v4 in gen_bundle (programs, domains, inv_d, flags,
+      per-round arities). EXTENDING now: + bus_ids, max_message_width,
+      terminal_counts (needed for perm challenges / perm values).
+- [ ] WhirVerifier: accept version 4; decode CONSTRAINTS tail after the round
+      loop; capture (lookupAlpha, beta) from lookupPhase, constraintAlpha from
+      permutationPhase, zeta from oodPhase; save RoundPrf per round; after the
+      round loop derive opened values per instance (rules 1-9) and assert
+      fold*invVanishing == recomposeQuotient per instance via
+      ConstraintIdentity.
+- [ ] WhirVerifier.t.sol green (positive tests now enforce the identity).
+- [ ] Regenerate block vectors + bundle; BlockE2E green with identity.
+- [ ] Full gate.
+
+Decision: round roles are positional (0 random, 1 main, 2 quotient, 3 pre,
+4 perm) and pinned by numRounds == 5 check; alternatives considered: role tags
+on the wire (rejected: CONFIG is trusted setup anyway, tags add drift risk).
+Decision: fail closed on periodic columns (fib/block have none); shipping
+periodic column definitions is a later milestone if any AIR needs them.
+
+### Derivation pipeline — FINAL pinned form (brute-force verified, fib shape)
+
+- `RoundPrf.boundEvals` (packed ext) are in **matrix-major claim order** (NOT
+  the walk's arity-sorted claim order; `claim_perm` is walk-internal and not
+  needed here). Verified by brute-force offset search for all 4 rounds:
+  offsets are exactly the cumulative claim widths.
+- Claim j: width cw[j] ext values at offset sum(cw[..j]); matrix = instance
+  order (rounds 1/3/4: 1 claim per instance + 1 more if has_next; round 2:
+  num_chunks[i] claims of width 4 each); arity from CONSTRAINTS per-round
+  arities; point = zeta (first claim of the matrix) or zeta_next_i =
+  zeta * twoAdicGenerator(trace_log_size[i]) (second claim).
+- claimed = bound * scale(arity, point) element-wise.
+- MAIN/PRE opened = claimed element-wise.
+- QUOT/PERM opened = fromExt over each 4 consecutive claimed ext values
+  (Horner at x = 1<<192 packed).
+- Claim widths per round (fib): r1 [4,4,76,76,166,166,4,3] (= main widths,
+  next-claims repeated), r2 all 4s, r3 [6,2,59,59,24,24,10,4] (= pre widths),
+  r4 [8,8,8,8,28,28,16,16,24,24,16,16] (= 4 * aux_width per claim).
+- Perm challenges: per lookup k of instance i: [prefix, beta], prefix =
+  lookupAlpha + (bus_k + 1) * beta^W (verified for all instances).
+- Perm values: terminals in order of instances with terminal_counts[i].
+
+## D-076 CLOSED — constraint identity enforced on-chain
+
+Wire v4: CONSTRAINTS section (trusted setup) appended to CONFIG: per-instance
+flattened AIR program (nodes/base/ext consts/roots), claim-layout flags
+(width/pre/aux widths, has_main_next/has_pre_next), trace + chunk domains,
+inv_d, statement_instance, bus layout (max_message_width, per-instance bus
+ids, terminal flags), per-round claim-group arities.
+
+WhirVerifier.verify now:
+- accepts version 4 only;
+- captures (lookupAlpha, beta), constraintAlpha, zeta from the batch
+  transcript phases;
+- keeps each round's boundEvals;
+- decodes CONSTRAINTS after the round loop (cursor at CONFIG tail);
+- derives every opened value from bound_evals x scale(arity, point) —
+  matrix-major claim order (pinned: identity mapping, claim_perm is
+  walk-internal), per-instance zeta_next = zeta * twoAdicGenerator(log_i);
+  MAIN/PRE element-wise, QUOT/PERM via fromExt4 Horner at x over 4-groups;
+  perm challenges [lookupAlpha + (bus+1)*beta^W, beta]; perm values = the
+  LogUp terminals in terminal_counts order; public values = the plain
+  calldata statement on statement_instance (NOT montgomery — pinned);
+- asserts fold(alpha, C(zeta)) * inv_vanishing(zeta) == recomposeQuotient
+  per instance (ConstraintIdentity.sol), reverting
+  ConstraintIdentityMismatch(i).
+
+Pinned gotchas this session:
+- bound_evals are in matrix-major claim order, NOT the walk's arity-sorted
+  claim order (brute-force offset search over all 4 rounds: offsets are the
+  cumulative claim widths, all match).
+- public values are plain base values (foldConstraints lifts them); the
+  calldata statement is plain too (pv-bytes check monts it).
+- extConsts/inv_d on the wire are flat u32 limbs (pushArr), packed 4-to-1 in
+  Solidity (_packQuartics), NOT the raw32 packed form.
+- round 2 arities are per-claim (one matrix per quotient chunk).
+
+Tests: fib WhirVerifier 6/6 (accepts real proof, 1.064B gas); full forge
+suite 128/128 incl. BlockE2E with the regenerated v4 block bundle (2.83 MB,
+constraints 30,887 words). Real block apply gas ~1.6B (unchanged shape).
