@@ -8,6 +8,10 @@
 //! recorded program still equals the native verifier's, the composition is proven -
 //! not a re-derivation of the protocol, but the same code at a different shape.
 
+use crate::config::mmcs;
+use crate::semantic_trace::SemChallenger;
+use crate::whir::{Challenge, Dft};
+use crate::F;
 use p3_field::{BasedVectorSpace, PrimeCharacteristicRing, PrimeField32};
 use p3_matrix::Dimensions;
 use p3_multilinear_util::point::Point;
@@ -22,10 +26,6 @@ use p3_whir::domain::{WhirDomain, WhirQueryPoint};
 use p3_whir::parameters::WhirConfig;
 use p3_whir::pcs::proof::{QueryOpenings, WhirProof};
 use p3_whir::transcript::{WhirShape, WhirVerifierTranscript};
-use prover::config::mmcs;
-use prover::semantic_trace::SemChallenger;
-use prover::whir::{Challenge, Dft};
-use prover::F;
 use std::error::Error;
 
 /// The verifier-side WHIR transcript over the traced challenger.
@@ -54,54 +54,59 @@ pub fn challenge_of(constraint: &Constraint<F, Challenge>) -> Challenge {
 }
 
 /// The output of the intermediate-round phase of a transcript walk.
-pub(crate) struct RoundWalk {
+#[derive(Debug)]
+pub struct RoundWalk {
     /// The combined claim after each round's `combine_evals`, i.e. the sum that
     /// round's sumcheck must open with. Pins the round constraint's batching:
     /// ood answers at gamma^1.., then the folded query evaluations.
-    pub(crate) claimed_evals: Vec<Challenge>,
-    pub(crate) folded_claims: Vec<Challenge>,
+    pub claimed_evals: Vec<Challenge>,
+    /// The running folded claim after each round's folding, before the next
+    /// round's constraint batches onto it.
+    pub folded_claims: Vec<Challenge>,
     /// Each round's folded query evaluations, in query order: the opened row
     /// folded at the previous round's randomness. The contract computes these
     /// from the Merkle openings; pinning them here separates a fold bug from a
     /// batching bug.
-    pub(crate) folds: Vec<Vec<Challenge>>,
+    pub folds: Vec<Vec<Challenge>>,
     /// Out-of-domain points, in the order drawn.
-    pub(crate) ood_points: Vec<Challenge>,
+    pub ood_points: Vec<Challenge>,
     /// Per-round query domain points (univariate base scalars), in query
     /// order: the STIR selection points this round's constraint batches.
-    pub(crate) domain_points: Vec<Vec<u32>>,
+    pub domain_points: Vec<Vec<u32>>,
     /// Per-round batching challenges for the STIR selection statements.
-    pub(crate) round_batching: Vec<Challenge>,
+    pub round_batching: Vec<Challenge>,
     /// Query indices per WHIR round.
-    pub(crate) query_indices: Vec<Vec<usize>>,
+    pub query_indices: Vec<Vec<usize>>,
     /// The point each round's sumcheck reduces to.
-    pub(crate) round_randomness: Vec<Vec<Challenge>>,
+    pub round_randomness: Vec<Vec<Challenge>>,
     /// Per-round OOD answers, in draw order (proof data, not transcript state).
-    pub(crate) ood_answers: Vec<Vec<Challenge>>,
+    pub ood_answers: Vec<Vec<Challenge>>,
     /// Per-round `PoW` witnesses (base field).
-    pub(crate) pow_witnesses: Vec<F>,
+    pub pow_witnesses: Vec<F>,
     /// Per-round sumcheck {0,1}-pair evaluations, split like the initial one.
-    pub(crate) sumcheck_ca: Vec<Vec<Challenge>>,
-    pub(crate) sumcheck_cinf: Vec<Vec<Challenge>>,
+    pub sumcheck_ca: Vec<Vec<Challenge>>,
+    /// Per-round sumcheck constraint-infinity messages, in round order.
+    pub sumcheck_cinf: Vec<Vec<Challenge>>,
     /// Per-round sumcheck proof-of-work witnesses (canonical base u32s; empty
     /// at zero difficulty). The contract's SumcheckCore checks each grind.
-    pub(crate) sumcheck_pow_witnesses: Vec<Vec<u32>>,
+    pub sumcheck_pow_witnesses: Vec<Vec<u32>>,
     /// Per-round opened rows, flattened base-field limbs for round 0 and packed
     /// extension elements for later rounds. The contract authenticates these
     /// against the previous commitment and folds them; exporting them lets the
     /// test check the fold separately from the Merkle path.
-    pub(crate) rows_base: Vec<Vec<u32>>,
-    pub(crate) rows_ext: Vec<Vec<Challenge>>,
+    pub rows_base: Vec<Vec<u32>>,
+    /// Per-round opened extension rows (query order), flattened per row.
+    pub rows_ext: Vec<Vec<Challenge>>,
     /// Per-round round parameters the contract needs: `num_variables`,
     /// `log_folded_domain_size`, `ood_samples`, `folding_pow_bits`.
-    pub(crate) params: Vec<[u32; 4]>,
+    pub params: Vec<[u32; 4]>,
     /// Each round's Merkle commitment root: the contract binds it and later
     /// rounds open against the previous one.
-    pub(crate) commitments: Vec<[u8; 32]>,
+    pub commitments: Vec<[u8; 32]>,
     /// Per-round, per-query Merkle paths (leaf-to-root sibling digests, hex),
     /// rebuilt from each round's pruned multiproof with the verifier's own
     /// restore walk. Round 0 opens base rows, later rounds extension rows.
-    pub(crate) paths: Vec<Vec<Vec<String>>>,
+    pub paths: Vec<Vec<Vec<String>>>,
 }
 
 /// Walk the intermediate WHIR rounds of the verifier transcript.
@@ -111,9 +116,9 @@ pub(crate) struct RoundWalk {
 /// batching challenge, then fold with the round sumcheck. The contract performs the
 /// identical sequence per round, so this is the shape its loop must match.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn replay_rounds(
+pub fn replay_rounds(
     vt: &mut SemVerifierTranscript<'_>,
-    whir: &WhirProof<F, Challenge, prover::config::Mmcs>,
+    whir: &WhirProof<F, Challenge, crate::config::Mmcs>,
     config: &WhirConfig<Challenge, F, SemChallenger>,
     dft: &Dft,
     initial_claimed: Challenge,
@@ -260,7 +265,7 @@ pub(crate) fn replay_rounds(
                 QueryOpenings::Base(o) => &o.proof,
                 QueryOpenings::Extension(o) => &o.proof,
             };
-            let paths = prover::config::mmcs(cap_height)
+            let paths = crate::config::mmcs(cap_height)
                 .restore_and_recompute_paths(&dims, &indices, &row_limbs, proof)
                 .map_err(|e| format!("round {round_index} restore paths: {e:?}"))?;
             walk.paths.push(
@@ -361,40 +366,44 @@ pub(crate) fn replay_rounds(
 }
 
 /// The output of the terminal phase.
-pub(crate) struct TerminalWalk {
+#[derive(Debug)]
+pub struct TerminalWalk {
     /// Terminal query indices.
-    pub(crate) query_indices: Vec<usize>,
+    pub query_indices: Vec<usize>,
     /// The point the closing sumcheck reduces to, when there is one.
-    pub(crate) final_randomness: Option<Vec<Challenge>>,
+    pub final_randomness: Option<Vec<Challenge>>,
     /// The final polynomial, sent in the clear: `2^num_variables` coefficients.
-    pub(crate) final_poly: Vec<Challenge>,
+    pub final_poly: Vec<Challenge>,
     /// The terminal proof-of-work witness as a canonical base u32.
-    pub(crate) final_pow_witness: u32,
+    pub final_pow_witness: u32,
     /// Terminal opened rows as canonical limbs (four per extension element).
-    pub(crate) final_rows_ext: Vec<Vec<Challenge>>,
+    pub final_rows_ext: Vec<Vec<Challenge>>,
     /// Per-query Merkle paths for the terminal openings (against the last
     /// round's root), rebuilt with the same walk the verifier runs.
-    pub(crate) final_paths: Vec<Vec<String>>,
+    pub final_paths: Vec<Vec<String>>,
     /// Each terminal query's folded row at the last round's randomness.
-    pub(crate) final_folds: Vec<Challenge>,
+    pub final_folds: Vec<Challenge>,
     /// The terminal queries' domain points (univariate base scalars).
-    pub(crate) final_domain_points: Vec<u32>,
+    pub final_domain_points: Vec<u32>,
     /// Closing sumcheck round values: h(0) and h(infinity) per round.
-    pub(crate) final_sumcheck_ca: Vec<Challenge>,
-    pub(crate) final_sumcheck_cinf: Vec<Challenge>,
+    pub final_sumcheck_ca: Vec<Challenge>,
+    /// Closing sumcheck constraint-infinity messages.
+    pub final_sumcheck_cinf: Vec<Challenge>,
     /// Closing sumcheck `PoW` witnesses (canonical base u32s; empty at zero
     /// difficulty, one per round otherwise).
-    pub(crate) final_sumcheck_pow_witnesses: Vec<u32>,
+    pub final_sumcheck_pow_witnesses: Vec<u32>,
     /// The claim entering and leaving the closing sumcheck.
-    pub(crate) claimed_before_final: Challenge,
-    pub(crate) claimed_after_final: Challenge,
+    /// The claim entering the final fold.
+    pub claimed_before_final: Challenge,
+    /// The claim after the final fold: the constant the verifier checks.
+    pub claimed_after_final: Challenge,
 }
 
 /// Walk the terminal phase: bind the final polynomial, check the terminal query
 /// proof-of-work, draw the terminal query indices, then run the closing sumcheck.
-pub(crate) fn replay_terminal(
+pub fn replay_terminal(
     vt: &mut SemVerifierTranscript<'_>,
-    whir: &WhirProof<F, Challenge, prover::config::Mmcs>,
+    whir: &WhirProof<F, Challenge, crate::config::Mmcs>,
     config: &WhirConfig<Challenge, F, SemChallenger>,
     dft: &Dft,
     claimed_eval: Challenge,
@@ -519,61 +528,63 @@ pub(crate) fn replay_terminal(
 ///
 /// `PcsProof` bundles both; the driver takes the bundle so the eval list can never
 /// be zipped against a different proof than the transcript walk consumes.
-pub(crate) type PcsProof = p3_whir::pcs::proof::PcsProof<F, Challenge, prover::config::Mmcs>;
+pub type PcsProof = p3_whir::pcs::proof::PcsProof<F, Challenge, crate::config::Mmcs>;
 
 /// Everything one full WHIR run (initial fold, intermediate rounds, terminal phase)
 /// produces, as the walk sees it.
-pub(crate) struct WhirRoundWalk {
+#[derive(Debug)]
+pub struct WhirRoundWalk {
     /// Layout batching challenge `alpha`.
-    pub(crate) alpha: Challenge,
+    pub alpha: Challenge,
     /// Batching challenge `gamma` of the initial constraint.
-    pub(crate) gamma: Challenge,
+    pub gamma: Challenge,
     /// The combined claim before the initial sumcheck folds it.
-    pub(crate) initial_claimed_eval: Challenge,
+    pub initial_claimed_eval: Challenge,
     /// The claim after the initial sumcheck folds it - what round 0 carries.
-    pub(crate) claimed_eval: Challenge,
+    pub claimed_eval: Challenge,
     /// The point the initial sumcheck reduces to.
-    pub(crate) randomness: Vec<Challenge>,
+    pub randomness: Vec<Challenge>,
     /// Equality points of the initial constraint, in batching-power order.
-    pub(crate) eq_points: Vec<Point<Challenge>>,
+    pub eq_points: Vec<Point<Challenge>>,
     /// The claimed evaluation paired with each equality point.
-    pub(crate) eq_evals: Vec<Challenge>,
+    pub eq_evals: Vec<Challenge>,
     /// Number of constraints in each equality statement group.
-    pub(crate) eq_group_lens: Vec<usize>,
+    pub eq_group_lens: Vec<usize>,
     /// Arity the initial constraint lives in.
-    pub(crate) num_variables: usize,
+    pub num_variables: usize,
     /// Program offsets (into the shared sink) of the phase boundaries of this
     /// round's walk: [claims_start, claim_end_0, ..., claim_end_n,
     /// initial_fold_end, terminal_start, terminal_end]. Trusted-setup
     /// schedule data: the contract's walk plan is derived from these, not
     /// re-derived from shapes (the per-claim framing constant count varies
     /// with claim width and stacked arity).
-    pub(crate) phase_offsets: Vec<usize>,
+    pub phase_offsets: Vec<usize>,
     /// The virtual out-of-domain answers the initial phase binds, in order.
-    pub(crate) initial_ood_answers: Vec<Challenge>,
+    pub initial_ood_answers: Vec<Challenge>,
     /// The initial sumcheck's {0,1}-pair evaluations, split like the rounds'.
-    pub(crate) initial_sumcheck_ca: Vec<Challenge>,
-    pub(crate) initial_sumcheck_cinf: Vec<Challenge>,
+    pub initial_sumcheck_ca: Vec<Challenge>,
+    /// The initial sumcheck's constraint-infinity messages.
+    pub initial_sumcheck_cinf: Vec<Challenge>,
     /// Initial sumcheck proof-of-work witnesses (canonical base u32s; empty at
     /// zero difficulty).
-    pub(crate) initial_sumcheck_pow_witnesses: Vec<u32>,
+    pub initial_sumcheck_pow_witnesses: Vec<u32>,
     /// The root the terminal queries open against: the last round's commitment,
     /// or the batch commitment when there were no rounds.
-    pub(crate) last_root: [u8; 32],
+    pub last_root: [u8; 32],
     /// The claimed evaluations the schedule opens, one batch per opening, matrix-major
     /// order matching `points`. These are the UNSCALED bounds the contract's initial
     /// phase absorbs; the rescale check multiplies them by the eq-scales.
-    pub(crate) bound_evals: Vec<Vec<Challenge>>,
+    pub bound_evals: Vec<Vec<Challenge>>,
     /// Number of evaluations per opening batch.
-    pub(crate) claim_widths: Vec<usize>,
+    pub claim_widths: Vec<usize>,
     /// The intermediate-round walk.
-    pub(crate) rounds: RoundWalk,
+    pub rounds: RoundWalk,
     /// Per-query Merkle paths for the round-0 openings, expanded one path per query.
-    pub(crate) round0_paths: Vec<Vec<String>>,
+    pub round0_paths: Vec<Vec<String>>,
     /// The terminal-phase walk.
-    pub(crate) terminal: TerminalWalk,
+    pub terminal: TerminalWalk,
     /// Per-round query indices, terminal set last.
-    pub(crate) query_indices: Vec<Vec<usize>>,
+    pub query_indices: Vec<Vec<usize>>,
 }
 
 /// Drive one complete WHIR opening-argument verification through the traced
@@ -590,7 +601,7 @@ pub(crate) struct WhirRoundWalk {
 ///
 /// Any transcript, sumcheck or shape error the native walk surfaces, with the phase.
 #[allow(clippy::too_many_lines)] // one linear replay of WhirVerifier::replay; splitting scatters the spec
-pub(crate) fn verify_whir_round(
+pub fn verify_whir_round(
     ch: &mut SemChallenger,
     pcs_proof: &PcsProof,
     config: &WhirConfig<Challenge, F, SemChallenger>,

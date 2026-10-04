@@ -52,6 +52,7 @@ pub mod transcript_trace;
 pub mod transfer;
 pub mod whir;
 pub mod whir_recursion;
+pub mod whir_walk;
 // The spike is the executable statement of a property we depend on, not shipped API.
 #[cfg(test)]
 mod spike;

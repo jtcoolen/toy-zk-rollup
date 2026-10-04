@@ -130,9 +130,7 @@ type Commitment = <prover::config::Mmcs as p3_commit::Mmcs<F>>::Commitment;
 /// The proof type, as the PCS declares it.
 type UniProof = <SemPcs as p3_commit::Pcs<Challenge, SemChallenger>>::Proof;
 
-mod whir_walk;
-
-use whir_walk::verify_whir_round;
+use prover::whir_walk::verify_whir_round;
 
 const fn params() -> ProtocolParameters {
     ProtocolParameters {

@@ -32,6 +32,10 @@ p3-keccak = { workspace = true }
 p3-recursion = { workspace = true }
 p3-whir = { workspace = true }
 p3-sumcheck = { workspace = true }
+# The verifier walk (prover::whir_walk) evaluates multilinear polys at opening
+# points (Poly::eval_ext) and reads Point/Dimensions types; the STIR vector
+# generator pins query-row evaluations with the same crate.
+p3-multilinear-util = { workspace = true }
 # The recursion engine's own support crates. The in-circuit verifier circuit is a
 # `p3_circuit::Circuit` proven through `p3_circuit_prover::BatchStarkProver`; its
 # Poseidon2 non-primitive tables come from `p3_poseidon2_circuit_air`. Same git rev
@@ -63,11 +67,6 @@ p3-symmetric = { workspace = true }
 # `BatchStarkProof`, and the contract must reproduce this crate's transcript
 # sequence. Same version the vendored `p3-circuit-prover` resolves to.
 p3-batch-stark = { workspace = true }
-# The STIR vector generator (tests/stir_vectors.rs) needs `Poly::eval_ext` to
-# pin what the Solidity side calls `eval_multilinear` over a query row. That
-# lives in p3-multilinear-util, which the lib itself does not use - the prover
-# folds through p3-whir's own kernels - so this is a dev-only dependency.
-p3-multilinear-util = { workspace = true }
 # Self-dependency with `testkit` on. An integration test links against the lib
 # compiled *without* `cfg(test)`, so the fixtures gated on it are otherwise
 # invisible to `tests/`. Depending on ourselves with the feature enabled is the

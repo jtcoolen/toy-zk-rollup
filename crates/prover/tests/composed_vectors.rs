@@ -47,7 +47,6 @@ use prover::whir_recursion::{RecursionCircuit, LOG_MAX_LDE};
 use prover::F;
 
 mod batch_fixture;
-mod whir_walk;
 use batch_fixture::{
     base_json, bus_layout, com_json, dom_json, ext_json, fib_recursion, hex, one_run_for,
     settlement_params, settlement_params_for, Challenge, Dft, OpeningClaims, OpeningProof,
@@ -65,9 +64,9 @@ use prover::block::{build_multi_transfer_circuit, shape_header, ChildProof, Tran
 use prover::client::{prove_client_transfer, ClientSpec};
 use prover::fixtures::{funded_note, seed, tree_with};
 use prover::whir_recursion::InnerWhirConfig;
+use prover::whir_walk::{verify_whir_round, RoundWalk, TerminalWalk, WhirRoundWalk};
 use shielded::keys::derive_spend_pk;
 use shielded::{Note, NullifierMap};
-use whir_walk::{verify_whir_round, RoundWalk, TerminalWalk, WhirRoundWalk};
 
 /// A point as the contract reads it: one extension element per coordinate.
 fn point_json(p: &Point<Challenge>) -> Vec<Vec<u32>> {
