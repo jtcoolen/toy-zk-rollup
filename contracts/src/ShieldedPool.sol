@@ -88,22 +88,39 @@ contract ShieldedPool is MerkleAccumulator {
     error NullifierRootMismatch(bytes32 expected, bytes32 got);
     error NotFeeRecipient();
 
-    constructor(IWhirVerifier verifier_, address feeRecipient_) {
+    /// Deploy at an explicit genesis state.
+    ///
+    /// The commitment tree is seeded by appending `genesisLeaves_` here, so the
+    /// starting root is *derived*, not claimed - the pool cannot be deployed at
+    /// a root its own accumulator disagrees with. Pass an empty array for a pool
+    /// that starts from nothing (its first block then extends the empty tree).
+    ///
+    /// `genesisNullifierRoot_` is the nullifier-map root the genesis state has.
+    /// Pass `bytes32(0)` to mean "an empty nullifier map": the contract then
+    /// computes the prover's empty-map root itself (depth 256, empty leaf zero,
+    /// empty[h] = keccak(empty[h-1] || empty[h-1]) - a constant of that scheme,
+    /// ~256 keccak at deploy) rather than trusting a first block to name it.
+    ///
+    /// The genesis roots are not trusted blindly either way: the first applied
+    /// block must prove a transition *from* them, so a wrong genesis simply
+    /// makes every real block revert with RootMismatch / NullifierRootMismatch.
+    constructor(
+        IWhirVerifier verifier_,
+        address feeRecipient_,
+        bytes32[] memory genesisLeaves_,
+        bytes32 genesisNullifierRoot_
+    ) {
         require(address(verifier_) != address(0), "verifier required");
         require(feeRecipient_ != address(0), "fee recipient required");
         verifier = verifier_;
         feeRecipient = feeRecipient_;
-        // Both trees start empty; the first block's `before` roots must equal
-        // these. The commitment root is this contract's own empty tree. The
-        // nullifier map's empty root is the PROVER's scheme - depth 256, empty
-        // leaf zero, empty[h] = keccak(empty[h-1] || empty[h-1]) - and it is a
-        // constant of that scheme, so we compute it once at deploy (~256
-        // keccak) rather than trusting a first block to name it. A block whose
-        // nullifierBefore is anything else does not extend an empty map.
+        for (uint256 i; i < genesisLeaves_.length; ++i) {
+            _append(genesisLeaves_[i]);
+        }
         currentRoot = root();
-        currentNullifierRoot = _emptyNullifierRoot();
+        currentNullifierRoot =
+            genesisNullifierRoot_ == bytes32(0) ? _emptyNullifierRoot() : genesisNullifierRoot_;
     }
-
     /// Apply a verified block.
     ///
     /// The order of checks is deliberate. Verification comes first because it is
@@ -165,7 +182,7 @@ contract ShieldedPool is MerkleAccumulator {
         }
     }
 
-        /// Withdraw collected fees. Only the fee recipient.
+    /// Withdraw collected fees. Only the fee recipient.
     function withdrawFees() external {
         if (msg.sender != feeRecipient) revert NotFeeRecipient();
         uint256 amount = address(this).balance;

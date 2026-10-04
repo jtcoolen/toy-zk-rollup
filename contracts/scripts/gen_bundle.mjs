@@ -22,8 +22,13 @@
 // Run from the repo root: node contracts/scripts/gen_bundle.mjs
 import fs from "node:fs";
 
-const j = JSON.parse(fs.readFileSync("contracts/test/vectors/composed_flat.json", "utf8"));
-const jj = JSON.parse(fs.readFileSync("contracts/test/vectors/composed_vectors.json", "utf8"));
+// argv: flat name (default composed_flat), vectors name (default composed_vectors),
+// output bundle name (default composed_bundle). See gen_composed_flat.mjs.
+const FLAT = process.argv[2] ?? "composed_flat";
+const VEC = process.argv[3] ?? "composed_vectors";
+const OUT = process.argv[4] ?? "composed_bundle";
+const j = JSON.parse(fs.readFileSync(`contracts/test/vectors/${FLAT}.json`, "utf8"));
+const jj = JSON.parse(fs.readFileSync(`contracts/test/vectors/${VEC}.json`, "utf8"));
 
 // The active word sink: pushWord/pushArr/pushExtArr/pushBlob append here.
 let words = [];
@@ -85,7 +90,7 @@ function isolate(fn) {
 // PROOF pieces (varying): main digest, public-value words, lookup grind
 // witness, permutation digest, LogUp terminals (ext), quotient digest,
 // randomization digest, ood grind witness.
-const bin = fs.readFileSync("contracts/test/vectors/composed_vectors.bin");
+const bin = fs.readFileSync(`contracts/test/vectors/${VEC}.bin`);
 const schedLen = bin.readUInt16BE(6);
 const payloadLens = [8, 12, 16, 20, 24].map((o) => bin.readUInt32BE(o));
 const constStart = 28 + schedLen * 4;
@@ -328,5 +333,5 @@ let off = 0;
 for (const w of cfg) { dv.setUint32(off, w >>> 0, true); off += 4; }
 for (const w of prf) { dv.setUint32(off, w >>> 0, true); off += 4; }
 for (const w of stmOut) { dv.setUint32(off, w >>> 0, true); off += 4; }
-fs.writeFileSync("contracts/test/vectors/composed_bundle.bin", Buffer.concat([Buffer.from(header), Buffer.from(body)]));
-console.log("wrote composed_bundle.bin", header.length + body.length, "bytes; cfg words", cfg.length, "prf words", prf.length, "stm words", stmOut.length);
+fs.writeFileSync(`contracts/test/vectors/${OUT}.bin`, Buffer.concat([Buffer.from(header), Buffer.from(body)]));
+console.log(`wrote ${OUT}.bin`, header.length + body.length, "bytes; cfg words", cfg.length, "prf words", prf.length, "stm words", stmOut.length);

@@ -8,6 +8,14 @@ optimizer = true
 optimizer_runs = 200
 evm_version = "cancun"
 
+# The WHIR settlement proof replay is the heaviest computation in the
+# system (the fib proof alone used 960M gas; the block proof is larger). The
+# default test block gas limit (2^30-1) is below what a full verification
+# needs, so tests run with the EVM maximum. This is a test-profile knob only;
+# on a real chain the proof would not fit one block yet - that is the open
+# gas-reduction work (D-068), deliberately deferred behind the E2E milestone.
+gas_limit = 10000000000
+
 # Generated vectors are read by tests via `vm.readFile`. Read-only, scoped to
 # the vectors directory: the tests consume prover-emitted data and must not
 # be able to read anything else.

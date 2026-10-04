@@ -96,7 +96,9 @@ contract ShieldedPoolTest is Test {
         fee = uint64(vm.parseJsonUint(j, ".total_fee"));
 
         verifier = new StubVerifier();
-        pool = new ShieldedPool(verifier, address(0xB0B));
+        // Empty genesis: no leaves, empty nullifier map (bytes32(0) sentinel).
+        bytes32[] memory noLeaves = new bytes32[](0);
+        pool = new ShieldedPool(verifier, address(0xB0B), noLeaves, bytes32(0));
         decoder = new DecodeHarness();
     }
 

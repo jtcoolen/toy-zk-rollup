@@ -92,7 +92,14 @@ pub(crate) fn sem_challenger_with(sink: &SemSink) -> SemChallenger {
 /// grinding budget is derived from `log_max_lde + ZK_ARITY_SLACK`, and the verifier
 /// recomputes the WHIR schedule from these parameters, so a mismatch fails the opening.
 pub(crate) fn settlement_params() -> p3_whir::parameters::ProtocolParameters {
-    let pow_bits = prover::whir::required_pow_bits(LOG_MAX_LDE + prover::whir::ZK_ARITY_SLACK)
+    settlement_params_for(LOG_MAX_LDE)
+}
+
+/// The same budget derived for an arbitrary log_max_lde. The block circuit
+/// settles at a larger LDE (25) than the recursion circuit (22), and the grind
+/// budget is read off the config's own arity, so the fixture must build either.
+pub(crate) fn settlement_params_for(log_max_lde: usize) -> p3_whir::parameters::ProtocolParameters {
+    let pow_bits = prover::whir::required_pow_bits(log_max_lde + prover::whir::ZK_ARITY_SLACK)
         .expect("settlement shape reaches the security target");
     p3_whir::parameters::ProtocolParameters {
         pow_bits,
@@ -102,12 +109,17 @@ pub(crate) fn settlement_params() -> p3_whir::parameters::ProtocolParameters {
 
 /// A semantic settlement config whose challenger records into sink.
 pub(crate) fn sem_config(sink: &SemSink) -> SemConfig {
+    sem_config_for(sink, LOG_MAX_LDE)
+}
+
+/// sem_config at an explicit log_max_lde.
+pub(crate) fn sem_config_for(sink: &SemSink, log_max_lde: usize) -> SemConfig {
     let pcs = SemPcs::new(
-        settlement_params(),
+        settlement_params_for(log_max_lde),
         Dft::default(),
         prover::config::mmcs(CAP_HEIGHT),
         sem_challenger_with(sink),
-        LOG_MAX_LDE,
+        log_max_lde,
     );
     StarkConfig::new(pcs, sem_challenger_with(sink))
 }
@@ -143,7 +155,19 @@ pub(crate) fn settle_sem(
     CircuitVerifier<SemConfig>,
     p3_circuit_prover::BatchStarkProof<SemConfig>,
 ) {
-    let settlement = sem_config(sink);
+    settle_sem_for(rc, sink, LOG_MAX_LDE)
+}
+
+/// settle_sem at an explicit log_max_lde (the block circuit settles at 25).
+pub(crate) fn settle_sem_for(
+    rc: &RecursionCircuit,
+    sink: &SemSink,
+    log_max_lde: usize,
+) -> (
+    CircuitVerifier<SemConfig>,
+    p3_circuit_prover::BatchStarkProof<SemConfig>,
+) {
+    let settlement = sem_config_for(sink, log_max_lde);
     let shared = Poseidon2Config::KOALA_BEAR_D4_W16.for_shared_challenger_table();
     let preprocessors: Vec<Box<dyn NpoPreprocessor<F>>> = vec![
         Box::new(Poseidon2SharedPreprocessor::new(vec![shared])),
@@ -528,8 +552,23 @@ pub(crate) fn one_run(
     CircuitVerifier<SemConfig>,
     p3_circuit_prover::BatchStarkProof<SemConfig>,
 ) {
+    one_run_for(pis, rc, opening, LOG_MAX_LDE)
+}
+
+/// one_run at an explicit log_max_lde.
+pub(crate) fn one_run_for(
+    pis: &[F],
+    rc: &RecursionCircuit,
+    mut opening: Option<&mut OpeningReplacer<'_>>,
+    log_max_lde: usize,
+) -> (
+    SemProgram,
+    ReplayOut,
+    CircuitVerifier<SemConfig>,
+    p3_circuit_prover::BatchStarkProof<SemConfig>,
+) {
     let sink = SemSink::new();
-    let (verifier, proof) = settle_sem(rc, &sink);
+    let (verifier, proof) = settle_sem_for(rc, &sink, log_max_lde);
 
     // The prover shares the sink; mark where the verifier's program begins.
     let mark = sink.program().len();
@@ -546,7 +585,7 @@ pub(crate) fn one_run(
         .expect("table public values");
 
     let sink_manual = SemSink::new();
-    let manual_config = sem_config(&sink_manual);
+    let manual_config = sem_config_for(&sink_manual, log_max_lde);
     let out = manual_replay(
         &manual_config,
         &verifier,

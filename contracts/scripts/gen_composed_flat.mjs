@@ -1,4 +1,4 @@
-// Generates contracts/test/vectors/composed_flat.json from composed_vectors.json.
+// Generates contracts/test/vectors/<OUT>.json from <SRC>.json (argv names).
 //
 // The flat sidecar pre-digests the composed artifact into exactly the shapes the
 // Solidity verifier consumes: extension elements packed as
@@ -30,7 +30,12 @@ const flatExt = (arr) => arr.map((e) => hexOf(pack(e)));
 const flatExt2 = (arr) => arr.flat().map((e) => hexOf(pack(e)));
 const montList = (arr) => arr.map((x) => mont(x));
 
-const j = JSON.parse(fs.readFileSync("contracts/test/vectors/composed_vectors.json", "utf8"));
+// Vector base name (argv 2) and output name (argv 3) default to the Fibonacci
+// settlement artifact; pass "block_composed_vectors" / "block_composed_flat" for
+// the real shielded block circuit.
+const SRC = process.argv[2] ?? "composed_vectors";
+const OUT = process.argv[3] ?? "composed_flat";
+const j = JSON.parse(fs.readFileSync(`contracts/test/vectors/${SRC}.json`, "utf8"));
 const out = {
   round_starts: j.round_starts,
   description:
@@ -173,5 +178,5 @@ for (let r = 0; r < j.num_rounds; r++) {
   });
 }
 
-fs.writeFileSync("contracts/test/vectors/composed_flat.json", JSON.stringify(out));
-console.log("wrote contracts/test/vectors/composed_flat.json");
+fs.writeFileSync(`contracts/test/vectors/${OUT}.json`, JSON.stringify(out));
+console.log(`wrote contracts/test/vectors/${OUT}.json`);
