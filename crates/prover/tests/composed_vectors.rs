@@ -247,6 +247,7 @@ fn constraint_identity_block(
         "description": "constraint identity: programs + opened values + pins, from the same proof run as the bundle",
         "zeta": ext_json(&out.zeta),
         "constraint_alpha": ext_json(&out.constraint_alpha),
+        "statement_instance": json!(verifier.statement_layout().table_instance()),
         "bus_ids": json!(bus_ids),
         "max_message_width": json!(max_message_width),
         "terminal_counts": json!(proof.proof.lookup_terminals.iter().map(Option::is_some).collect::<Vec<_>>()),
