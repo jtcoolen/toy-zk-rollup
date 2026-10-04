@@ -263,3 +263,71 @@ rules:
       - metavariable-regex:
           metavariable: $K
           regex: (?i).*(secret|private|seed|key|mnemonic|entropy).*
+
+  # -------------------------------------------------------------------------
+  # Solidity: the settlement boundary.
+  #
+  # The verifier is pure field arithmetic and keccak256 - it must never gain a
+  # signature check, a delegatecall, or a second source of truth. These rules
+  # cover contracts/ the same way the Rust rules cover crates/. Vendored code
+  # under contracts/lib is excluded: it is upstream (sol-whir-p3, forge-std).
+  # -------------------------------------------------------------------------
+  - id: sol-no-legacy-signature
+    languages: [solidity]
+    severity: ERROR
+    message: >
+      ecrecover is a classical signature primitive and is forbidden. Spend
+      authorization is SPHINCS+, verified inside the proof; the settlement
+      contract must not authenticate anything itself.
+    paths:
+      include:
+        - /contracts/**/*.sol
+      exclude:
+        - /contracts/lib/**
+    pattern: ecrecover(...)
+
+  - id: sol-no-legacy-hash
+    languages: [solidity]
+    severity: ERROR
+    message: >
+      The settlement boundary commits with keccak256 (the native opcode the
+      prover mirrors); the shielded layer uses SHA3-256 in Rust. The sha256 and
+      ripemd160 precompiles must not appear in this codebase.
+    paths:
+      include:
+        - /contracts/**/*.sol
+      exclude:
+        - /contracts/lib/**
+    pattern-either:
+      - pattern: sha256(...)
+      - pattern: ripemd160(...)
+
+  - id: sol-no-tx-origin
+    languages: [solidity]
+    severity: ERROR
+    message: >
+      tx.origin must not be used for authorization (phishing-prone); the wallet
+      extension signs transactions, msg.sender is the caller's contract.
+    paths:
+      include:
+        - /contracts/**/*.sol
+      exclude:
+        - /contracts/lib/**
+    pattern: tx.origin
+
+  - id: sol-no-unbounded-delegate
+    languages: [solidity]
+    severity: ERROR
+    message: >
+      delegatecall and selfdestruct are forbidden: the verifier and the pool are
+      immutable logic. An upgrade path would silently invalidate every pinned
+      vector test, which is the whole security argument.
+    paths:
+      include:
+        - /contracts/**/*.sol
+      exclude:
+        - /contracts/lib/**
+    pattern-either:
+      - pattern: $X.delegatecall(...)
+      - pattern: selfdestruct(...)
+      - pattern: $X.selfdestruct(...)

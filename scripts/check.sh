@@ -109,7 +109,7 @@ if command -v semgrep >/dev/null 2>&1; then
   HOME="$SEMGREP_HOME" semgrep scan \
     --config "$ROOT/semgrep/pq-crypto.yml" \
     --error \
-    crates/ || fail "semgrep found a policy violation"
+    crates/ contracts/ || fail "semgrep found a policy violation"
 else
   echo "semgrep not installed; skipping"
 fi
