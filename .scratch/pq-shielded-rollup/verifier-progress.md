@@ -1128,3 +1128,32 @@ Pinned gotchas this session:
 Tests: fib WhirVerifier 6/6 (accepts real proof, 1.064B gas); full forge
 suite 128/128 incl. BlockE2E with the regenerated v4 block bundle (2.83 MB,
 constraints 30,887 words). Real block apply gas ~1.6B (unchanged shape).
+
+## Local-chain settlement E2E (deploy + settle scripts)
+
+Deployed the stack to anvil and applied the REAL shielded block on-chain:
+
+- contracts/script/Deploy.s.sol: deploys WhirVerifier + ShieldedPool with the
+  genesis leaves from block_genesis.json (same proof run as the bundle),
+  writes contracts/deployments/local.json {verifier,pool,deployer,chainId}.
+  foundry.toml grants read-write on ./deployments.
+- contracts/scripts/settle_block.mjs: ABI-encodes applyBlock(uint256[],bytes)
+  and sends it over JSON-RPC from the unlocked anvil account (the node holds
+  no keys; a prod relayer signs externally). Selector 0x0cb000b5 pinned by
+  test/SelectorPins.t.sol against the native keccak256 opcode (the same one
+  the contract dispatches on), so the off-chain constant cannot drift.
+- contracts/scripts/pool_state.mjs: reads blockNumber/currentRoot/
+  currentNullifierRoot + settlement receipt.
+
+Result on anvil (chain 31337, --block-gas-limit 2e10 --no-request-size-limit):
+  status 0x1, gas 1,642,329,455, blockNumber 0->1, currentRoot ==
+  block_genesis.pool_root_after_hex (91d47b99...), nullifier root advanced,
+  BlockApplied emitted. The 2.8 MB calldata needs --no-request-size-limit
+  (anvil default body cap is 2 MB).
+
+Anvil flags that matter: --block-gas-limit (NOT --gas-block-limit),
+--no-request-size-limit for the 2.8 MB proof.
+
+Note: a hand-rolled JS keccak was tried and rejected (self-test caught bit
+errors); the settle script uses the pinned selector instead - the contract
+does all real keccak on-chain, so the script needs none.

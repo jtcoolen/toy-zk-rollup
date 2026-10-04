@@ -19,7 +19,7 @@ gas_limit = 10000000000
 # Generated vectors are read by tests via `vm.readFile`. Read-only, scoped to
 # the vectors directory: the tests consume prover-emitted data and must not
 # be able to read anything else.
-fs_permissions = [{ access = "read", path = "./test/vectors" }]
+fs_permissions = [{ access = "read", path = "./test/vectors" }, { access = "read-write", path = "./deployments" }]
 
 # Strict: treat every compiler warning as an error so the build stays clean.
 deny = "warnings"

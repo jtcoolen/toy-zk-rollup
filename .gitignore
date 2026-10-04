@@ -23,6 +23,8 @@ wallet/dist/
 
 contracts/out/
 contracts/cache/
+contracts/broadcast/
+contracts/deployments/
 
 # Reference clones for study only (sol-whir-p3, plutus-plonky3-exploration,
 # bitcoin-stark-verifier). The committed source of truth for the Solidity
