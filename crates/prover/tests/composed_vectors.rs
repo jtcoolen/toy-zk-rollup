@@ -40,14 +40,15 @@ use p3_sumcheck::{OpeningBatch, OpeningProtocol, OpeningRequest, TableShape, Tab
 use p3_whir::parameters::WhirConfig;
 use serde_json::json;
 
-use prover::semantic_trace::SemChallenger;
+use prover::semantic_blob::{classify_observations, replay_blob};
+use prover::semantic_trace::{SemChallenger, SemProgram};
 use prover::whir::FOLDING_FACTOR;
 
 mod batch_fixture;
 mod whir_walk;
 use batch_fixture::{
-    base_json, com_json, dom_json, ext_json, fib_recursion, one_run, settlement_params, Challenge,
-    Dft, OpeningClaims, OpeningProof, ReplayOut, SemPcs, CAP_HEIGHT,
+    base_json, com_json, dom_json, ext_json, fib_recursion, hex, one_run, settlement_params,
+    Challenge, Dft, OpeningClaims, OpeningProof, ReplayOut, SemPcs, CAP_HEIGHT,
 };
 use whir_walk::{verify_whir_round, RoundWalk, TerminalWalk, WhirRoundWalk};
 
@@ -105,6 +106,14 @@ fn walk_json(walk: &WhirRoundWalk) -> serde_json::Value {
         "eq_points": walk.eq_points.iter().map(point_json).collect::<Vec<_>>(),
         "eq_evals": exts(&walk.eq_evals),
         "eq_group_lens": walk.eq_group_lens,
+        "initial_ood_answers": exts(&walk.initial_ood_answers),
+        "initial_sumcheck_ca": exts(&walk.initial_sumcheck_ca),
+        "initial_sumcheck_cinf": exts(&walk.initial_sumcheck_cinf),
+        "last_root": hex(&walk.last_root),
+        "bound_evals": exts2(&walk.bound_evals),
+        "claim_widths": walk.claim_widths,
+        "round_commitments": r.commitments.iter().map(|c| hex(c)).collect::<Vec<_>>(),
+        "round_paths": r.paths.clone(),
         "rounds": {
             "claimed_evals": exts(&r.claimed_evals),
             "folded_claims": exts(&r.folded_claims),
@@ -147,18 +156,26 @@ fn walk_json(walk: &WhirRoundWalk) -> serde_json::Value {
 /// ingredients, drives the shared walk on the batch challenger, and re-checks the
 /// claimed openings against the walk's bound evaluations - the rescale step
 /// verify_rounds performs after verify_at.
-fn composed_run() -> Result<(serde_json::Value, ReplayOut), Box<dyn Error>> {
+fn composed_run(
+    rounds_json: &mut Vec<serde_json::Value>,
+    round_starts: &mut Vec<usize>,
+) -> Result<(serde_json::Value, ReplayOut, SemProgram), Box<dyn Error>> {
     let (pis, rc) = fib_recursion();
     let params = settlement_params();
-    let mut rounds_json: Vec<serde_json::Value> = Vec::new();
 
     {
         let mut replacer = |ch: &mut SemChallenger,
                             claims: &OpeningClaims,
                             proof: &OpeningProof,
-                            _preprocessed_index: Option<usize>|
+                            _preprocessed_index: Option<usize>,
+                            sink: &prover::semantic_trace::SemSink|
          -> Result<(), String> {
             for (round, (claim, round_proof)) in claims.iter().zip(&proof.rounds).enumerate() {
+                // Record where this round's events begin in the combined program: the
+                // delegate region splits per round, and the contract needs each round's
+                // fixed-constant slice to generate (not read) its absorbs.
+                let _ = sink;
+                round_starts.push(sink.program().len());
                 // The statement: shapes and per-matrix opening points, read off the
                 // batch proof exactly as verify_rounds reads them.
                 let mut shapes: Vec<(usize, usize)> = Vec::new();
@@ -277,23 +294,78 @@ fn composed_run() -> Result<(serde_json::Value, ReplayOut), Box<dyn Error>> {
             "rounds": rounds_json,
             "zeta": ext_json(&out.zeta),
             "program_len": program.len(),
+            "round_starts": round_starts.clone(),
             "phase_marks": out
                 .phase_marks
                 .iter()
                 .map(|(name, at)| json!({"phase": name, "at": at}))
                 .collect::<Vec<_>>(),
         });
-        Ok((doc, out))
+        Ok((doc, out, program))
     }
+}
+
+/// Fixed-constant word count per round region: how many constant words the contract's
+/// constant payload must supply to each round, derived from the classification. The
+/// Solidity side asserts it consumed exactly this many, so a schedule drift fails loud.
+fn round_const_words(
+    program: &SemProgram,
+    fixed: &[Option<Vec<u32>>],
+    starts: &[usize],
+) -> Vec<usize> {
+    let end_of = |r: usize| starts.get(r + 1).copied().unwrap_or(program.len());
+    starts
+        .iter()
+        .enumerate()
+        .map(|(r, &start)| {
+            (start..end_of(r))
+                .filter_map(|i| fixed[i].as_ref().map(|v| v.len()))
+                .sum()
+        })
+        .collect()
 }
 
 /// The linchpin: prove, verify natively, replay the batch phases with the shared WHIR
 /// walk in the delegate, and require the combined programs to agree (asserted inside
-/// one_run). Then export the per-round statements for the Solidity side.
+/// one_run). Then export the per-round statements and the composed blob for Solidity.
+///
+/// Two runs, same circuit and config, each re-masking: classifying them splits the
+/// settlement event stream into config-fixed absorbs (the contract regenerates them
+/// from the schedule) and proof-dependent absorbs (read from calldata). Both runs are
+/// verified against the native run, so the blob and every exported value describe one
+/// proof - the same-run discipline of D-059.
 #[test]
-#[ignore = "proves the settlement batch (~6s); regenerates composed_vectors.json"]
+#[ignore = "proves the settlement batch twice (~12s); regenerates composed_vectors.{json,bin}"]
 fn composed_program_equality_and_export() {
-    let (doc, _out) = composed_run().expect("composed run");
+    let mut rounds_a = Vec::new();
+    let mut starts_a = Vec::new();
+    let (_doc_a, _out_a, program_a) =
+        composed_run(&mut rounds_a, &mut starts_a).expect("composed run A");
+
+    let mut rounds_b = Vec::new();
+    let mut starts_b = Vec::new();
+    let (doc, out, program_b) = composed_run(&mut rounds_b, &mut starts_b).expect("composed run B");
+    assert_eq!(
+        program_a.len(),
+        program_b.len(),
+        "runs disagree on program length"
+    );
+    assert_eq!(starts_a, starts_b, "runs disagree on round boundaries");
+
+    let (fixed, varying) = classify_observations(&[program_a.clone(), program_b.clone()]);
+    let blob = replay_blob(&program_b, &fixed).expect("composed blob");
+    let const_words = round_const_words(&program_b, &fixed, &starts_b);
+
+    let mut doc = doc;
+    doc["varying_positions"] = json!(varying);
+    doc["round_const_words"] = json!(const_words);
+    doc["blob_len"] = json!(blob.len());
+    doc["phase_marks_before_delegate"] = json!(out
+        .phase_marks
+        .iter()
+        .find(|(n, _)| n == "before_delegate")
+        .map(|(_, at)| *at));
+
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../contracts/test/vectors");
     std::fs::create_dir_all(&dir).expect("vectors dir");
     std::fs::write(
@@ -301,10 +373,14 @@ fn composed_program_equality_and_export() {
         serde_json::to_string_pretty(&doc).expect("serialize"),
     )
     .expect("write json");
+    std::fs::write(dir.join("composed_vectors.bin"), &blob).expect("write bin");
     println!(
-        "wrote composed_vectors.json: {} rounds, program {} events",
+        "wrote composed_vectors.json: {} rounds, program {} events, blob {} bytes, {} fixed runs, const words {:?}",
         doc["num_rounds"].as_u64().unwrap(),
-        doc["program_len"].as_u64().unwrap()
+        doc["program_len"].as_u64().unwrap(),
+        blob.len(),
+        fixed.iter().filter(|f| f.is_some()).count(),
+        const_words,
     );
 }
 

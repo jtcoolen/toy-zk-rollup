@@ -47,7 +47,13 @@ pub(crate) type OpeningProof = <SemPcs as Pcs<Challenge, SemChallenger>>::Proof;
 
 /// A replacement for the native PCS inside the batch delegate: same challenger, same
 /// claims, same proof, same error surface (Ok only when every check passed).
-pub(crate) type OpeningReplacer<'a> = dyn FnMut(&mut SemChallenger, &OpeningClaims, &OpeningProof, Option<usize>) -> Result<(), String>
+pub(crate) type OpeningReplacer<'a> = dyn FnMut(
+        &mut SemChallenger,
+        &OpeningClaims,
+        &OpeningProof,
+        Option<usize>,
+        &SemSink,
+    ) -> Result<(), String>
     + 'a;
 
 /// Base field.
@@ -464,6 +470,7 @@ pub(crate) fn manual_replay(
             &coms_to_verify,
             &batch.opening_proof,
             preprocessed_index,
+            sink,
         ),
     });
     transcript.finish();

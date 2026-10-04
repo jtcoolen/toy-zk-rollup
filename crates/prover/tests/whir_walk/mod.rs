@@ -92,6 +92,13 @@ pub(crate) struct RoundWalk {
     /// Per-round round parameters the contract needs: `num_variables`,
     /// `log_folded_domain_size`, `ood_samples`, `folding_pow_bits`.
     pub(crate) params: Vec<[u32; 4]>,
+    /// Each round's Merkle commitment root: the contract binds it and later
+    /// rounds open against the previous one.
+    pub(crate) commitments: Vec<[u8; 32]>,
+    /// Per-round, per-query Merkle paths (leaf-to-root sibling digests, hex),
+    /// rebuilt from each round's pruned multiproof with the verifier's own
+    /// restore walk. Round 0 opens base rows, later rounds extension rows.
+    pub(crate) paths: Vec<Vec<Vec<String>>>,
 }
 
 /// Walk the intermediate WHIR rounds of the verifier transcript.
@@ -108,6 +115,7 @@ pub(crate) fn replay_rounds(
     dft: &Dft,
     initial_claimed: Challenge,
     initial_randomness: &Point<Challenge>,
+    cap_height: usize,
 ) -> Result<RoundWalk, Box<dyn Error>> {
     let mut walk = RoundWalk {
         folded_claims: Vec::new(),
@@ -125,6 +133,8 @@ pub(crate) fn replay_rounds(
         rows_base: Vec::new(),
         rows_ext: Vec::new(),
         params: Vec::new(),
+        commitments: Vec::new(),
+        paths: Vec::new(),
     };
     // The claim the round sumchecks fold, threaded from the initial phase
     // exactly as the native verifier threads it: each round's constraint adds
@@ -170,6 +180,17 @@ pub(crate) fn replay_rounds(
             u32::try_from(rp.ood_samples).expect("ood_samples fits u32"),
             u32::try_from(rp.folding_pow_bits).expect("folding_pow_bits fits u32"),
         ]);
+        walk.commitments.push(
+            <[u8; 32]>::try_from(
+                rproof
+                    .commitment
+                    .as_ref()
+                    .expect("every intermediate round commits")
+                    .roots()[0]
+                    .as_ref(),
+            )
+            .expect("32-byte root"),
+        );
         vt.query_pow(round_index, rproof.pow_witness)
             .map_err(|e| format!("round {round_index} query pow: {e:?}"))?;
         let indices = vt.query_indices(round_index);
@@ -200,6 +221,50 @@ pub(crate) fn replay_rounds(
             walk.rows_ext.extend(rows.clone());
         } else {
             walk.rows_base.extend(base_limbs);
+        }
+        // Per-round query paths, rebuilt from the pruned multiproof with the
+        // verifier's own restore walk: round 0 opens base rows (width 1 <<
+        // folding), later rounds extension rows (the ext tree is the base tree
+        // with four times the row width). The contract verifies one
+        // self-sufficient path per query, so the artifact carries the expanded form.
+        {
+            let (dims, row_limbs): (Vec<Dimensions>, Vec<Vec<Vec<F>>>) = match &rproof.openings {
+                QueryOpenings::Base(o) => (
+                    vec![Dimensions {
+                        height: rp.domain_size >> rp.folding_factor,
+                        width: 1 << rp.folding_factor,
+                    }],
+                    o.rows.iter().map(|row| vec![row.clone()]).collect(),
+                ),
+                QueryOpenings::Extension(o) => (
+                    vec![Dimensions {
+                        height: rp.domain_size >> rp.folding_factor,
+                        width: (1 << rp.folding_factor) * 4,
+                    }],
+                    o.rows
+                        .iter()
+                        .map(|row| {
+                            vec![row
+                                .iter()
+                                .flat_map(|x| x.as_basis_coefficients_slice().to_vec())
+                                .collect::<Vec<_>>()]
+                        })
+                        .collect(),
+                ),
+            };
+            let proof = match &rproof.openings {
+                QueryOpenings::Base(o) => &o.proof,
+                QueryOpenings::Extension(o) => &o.proof,
+            };
+            let paths = prover::config::mmcs(cap_height)
+                .restore_and_recompute_paths(&dims, &indices, &row_limbs, proof)
+                .map_err(|e| format!("round {round_index} restore paths: {e:?}"))?;
+            walk.paths.push(
+                paths
+                    .iter()
+                    .map(|p| p.siblings.iter().map(|d| hex(d)).collect())
+                    .collect(),
+            );
         }
         if rows.len() != indices.len() {
             return Err(format!(
@@ -465,6 +530,20 @@ pub(crate) struct WhirRoundWalk {
     pub(crate) eq_group_lens: Vec<usize>,
     /// Arity the initial constraint lives in.
     pub(crate) num_variables: usize,
+    /// The virtual out-of-domain answers the initial phase binds, in order.
+    pub(crate) initial_ood_answers: Vec<Challenge>,
+    /// The initial sumcheck's {0,1}-pair evaluations, split like the rounds'.
+    pub(crate) initial_sumcheck_ca: Vec<Challenge>,
+    pub(crate) initial_sumcheck_cinf: Vec<Challenge>,
+    /// The root the terminal queries open against: the last round's commitment,
+    /// or the batch commitment when there were no rounds.
+    pub(crate) last_root: [u8; 32],
+    /// The claimed evaluations the schedule opens, one batch per opening, matrix-major
+    /// order matching `points`. These are the UNSCALED bounds the contract's initial
+    /// phase absorbs; the rescale check multiplies them by the eq-scales.
+    pub(crate) bound_evals: Vec<Vec<Challenge>>,
+    /// Number of evaluations per opening batch.
+    pub(crate) claim_widths: Vec<usize>,
     /// The intermediate-round walk.
     pub(crate) rounds: RoundWalk,
     /// Per-query Merkle paths for the round-0 openings, expanded one path per query.
@@ -546,6 +625,19 @@ pub(crate) fn verify_whir_round(
         "the initial sumcheck must fold exactly the first round's arity"
     );
 
+    let initial_sumcheck_ca: Vec<Challenge> = whir
+        .initial_sumcheck
+        .polynomial_evaluations
+        .iter()
+        .map(|p| p[0])
+        .collect();
+    let initial_sumcheck_cinf: Vec<Challenge> = whir
+        .initial_sumcheck
+        .polynomial_evaluations
+        .iter()
+        .map(|p| p[1])
+        .collect();
+
     let rounds = replay_rounds(
         &mut vt,
         whir,
@@ -559,6 +651,7 @@ pub(crate) fn verify_whir_round(
         // forward without validating the sum - only the terminal identity does.
         claimed_eval,
         &initial_randomness,
+        cap_height,
     )?;
 
     // Per-query Merkle authentication paths for the round-0 openings, rebuilt
@@ -657,6 +750,16 @@ pub(crate) fn verify_whir_round(
         eq_evals,
         eq_group_lens,
         num_variables: constraint.num_variables(),
+        initial_ood_answers: whir.initial_ood_answers.clone(),
+        initial_sumcheck_ca,
+        initial_sumcheck_cinf,
+        last_root,
+        bound_evals: pcs_proof
+            .evals
+            .iter()
+            .map(|b| b.current().to_vec())
+            .collect(),
+        claim_widths: pcs_proof.evals.iter().map(|b| b.current().len()).collect(),
         rounds,
         round0_paths,
         terminal,
