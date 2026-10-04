@@ -56,8 +56,9 @@ use prover::whir_recursion::{
     build_recursion_circuit, settle_recursion_circuit, RecursionCircuit, CAP_HEIGHT, LOG_MAX_LDE,
 };
 
-mod constraint_ir;
-use constraint_ir::{ext_json, instance_identity_json, EF, F};
+use prover::constraint_ir::{instance_identity_json, EF};
+use prover::settlement_replay::ext_json;
+use prover::F;
 
 type WhirPcs = prover::whir::Pcs;
 type Config = prover::whir::Config;

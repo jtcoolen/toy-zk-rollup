@@ -41,7 +41,9 @@
 
 pub mod block;
 pub mod client;
+pub mod composed_export;
 pub mod config;
+pub mod constraint_ir;
 pub mod export;
 pub mod fixed_config;
 pub mod nullifier_gadget;

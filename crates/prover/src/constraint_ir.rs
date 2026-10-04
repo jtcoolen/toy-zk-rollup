@@ -23,32 +23,51 @@ use p3_field::{BasedVectorSpace, PrimeCharacteristicRing, PrimeField32};
 use p3_koala_bear::KoalaBear;
 
 /// Base field of the settlement batch.
-pub(crate) type F = KoalaBear;
+pub type F = KoalaBear;
 /// Quartic extension the settlement constraints fold into.
-pub(crate) type EF = BinomialExtensionField<F, 4>;
+pub type EF = BinomialExtensionField<F, 4>;
 
 /// Post-order IR node. Arithmetic nodes reference child node indices, so shared
 /// subtrees are emitted once and the program is a DAG, not a tree.
 #[derive(Clone, Debug)]
-pub(crate) enum Node {
+pub enum Node {
+    /// Index into the base-field constant pool.
     ConstBase(usize),
+    /// Index into the extension-field constant pool.
     ConstExt(usize),
+    /// Main-trace column at the current row.
     MainLocal(usize),
+    /// Main-trace column at the next row.
     MainNext(usize),
+    /// Preprocessed column at the current row.
     PreLocal(usize),
+    /// Preprocessed column at the next row.
     PreNext(usize),
+    /// Permutation (LogUp) column at the current row.
     PermLocal(usize),
+    /// Permutation column at the next row.
     PermNext(usize),
+    /// Index into the per-instance permutation challenges.
     PermChallenge(usize),
+    /// Index into the LogUp terminal values.
     PermValue(usize),
+    /// Index into the instance's public values.
     Public(usize),
+    /// Index into the periodic columns evaluated at zeta.
     Periodic(usize),
+    /// Selector: first row of the trace domain.
     IsFirst,
+    /// Selector: last row of the trace domain.
     IsLast,
+    /// Selector: not the last row (transition constraints).
     IsTransition,
+    /// Sum of two nodes.
     Add(usize, usize),
+    /// Difference of two nodes.
     Sub(usize, usize),
+    /// Product of two nodes.
     Mul(usize, usize),
+    /// Additive inverse of a node.
     Neg(usize),
 }
 
@@ -56,8 +75,9 @@ impl Node {
     // Node indices and constant pool slots are far below 2^32 by construction (the
     // largest settlement DAG is a few thousand nodes), so the narrowing casts below
     // cannot truncate.
+    /// Encode as the wire triple [tag, x, y] the Solidity decoder reads.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    pub(crate) const fn encode(&self) -> [u32; 3] {
+    pub const fn encode(&self) -> [u32; 3] {
         let (tag, x, y) = match *self {
             Self::ConstBase(i) => (0, i, 0),
             Self::ConstExt(i) => (1, i, 0),
@@ -84,25 +104,32 @@ impl Node {
 }
 
 /// One instance's flattened constraint program plus the constant pools it indexes.
-pub(crate) struct InstanceIr {
-    pub(crate) nodes: Vec<Node>,
-    pub(crate) base_consts: Vec<u32>,
-    pub(crate) ext_consts: Vec<[u32; 4]>,
+#[derive(Debug)]
+pub struct InstanceIr {
+    /// The DAG in post-order: every node's children precede it.
+    pub nodes: Vec<Node>,
+    /// Base-field constants, canonical u32, indexed by ConstBase.
+    pub base_consts: Vec<u32>,
+    /// Extension constants as canonical basis coefficients, indexed by ConstExt.
+    pub ext_consts: Vec<[u32; 4]>,
     /// Constraint roots in GLOBAL emission order (base and ext interleaved by the
     /// layout): the fold `acc = acc*alpha + C_g` walks this list front to back.
-    pub(crate) roots: Vec<usize>,
+    pub roots: Vec<usize>,
 }
 
 /// DAG flattener with pointer-identity memoization. `SymbolicExpr` shares subtrees
 /// through `Arc`, so emitting each distinct node once keeps the program linear in
 /// distinct nodes rather than exponential in shared subtrees.
-pub(crate) struct Flattener {
-    pub(crate) ir: InstanceIr,
+#[derive(Debug)]
+pub struct Flattener {
+    /// The program under construction.
+    pub ir: InstanceIr,
     seen: HashMap<usize, usize>,
 }
 
 impl Flattener {
-    pub(crate) fn new() -> Self {
+    /// An empty program.
+    pub fn new() -> Self {
         Self {
             ir: InstanceIr {
                 nodes: Vec::new(),
@@ -143,7 +170,7 @@ impl Flattener {
     ///
     /// The root of a constraint is a plain enum value, so it is not memoized; the
     /// shared subtrees below it are `Arc`s and are keyed by pointer identity.
-    pub(crate) fn expr(&mut self, e: &SymbolicExpression<F>) -> usize {
+    pub fn expr(&mut self, e: &SymbolicExpression<F>) -> usize {
         self.expr_ref(e, None)
     }
 
@@ -196,7 +223,7 @@ impl Flattener {
 
     /// Intern an extension-field sub-expression. A lifted base subtree shares the
     /// same memo table: base nodes evaluate to EF values (a base value is an EF value).
-    pub(crate) fn expr_ext(&mut self, e: &SymbolicExpressionExt<F, EF>) -> usize {
+    pub fn expr_ext(&mut self, e: &SymbolicExpressionExt<F, EF>) -> usize {
         self.expr_ext_ref(e, None)
     }
 
@@ -249,7 +276,7 @@ impl Flattener {
 }
 
 /// Basis coefficients of an extension element, canonical u32.
-pub(crate) fn ext_coeffs(v: EF) -> [u32; 4] {
+pub fn ext_coeffs(v: EF) -> [u32; 4] {
     let s = <EF as BasedVectorSpace<F>>::as_basis_coefficients_slice(&v);
     [
         s[0].as_canonical_u32(),
@@ -259,31 +286,46 @@ pub(crate) fn ext_coeffs(v: EF) -> [u32; 4] {
     ]
 }
 
-pub(crate) fn ext_json(v: &EF) -> Vec<u32> {
+/// An extension element as canonical basis coefficients.
+pub fn ext_json(v: &EF) -> Vec<u32> {
     ext_coeffs(*v).to_vec()
 }
 
 /// Flat concatenation of basis coefficients: four u32s per element.
-pub(crate) fn exts_flat(vs: &[EF]) -> Vec<u32> {
+pub fn exts_flat(vs: &[EF]) -> Vec<u32> {
     vs.iter().flat_map(|v| ext_coeffs(*v)).collect()
 }
 
 /// The opened values one instance's constraint program consumes, as the contract sees
 /// them: everything the opening argument returns plus the transcript challenges.
-pub(crate) struct EvalInputs<'a> {
-    pub(crate) main_local: &'a [EF],
-    pub(crate) main_next: &'a [EF],
-    pub(crate) pre_local: &'a [EF],
-    pub(crate) pre_next: &'a [EF],
-    pub(crate) perm_local: &'a [EF],
-    pub(crate) perm_next: &'a [EF],
-    pub(crate) perm_challenges: &'a [EF],
-    pub(crate) perm_values: &'a [EF],
-    pub(crate) public_values: &'a [F],
-    pub(crate) periodic_values: &'a [EF],
-    pub(crate) is_first: EF,
-    pub(crate) is_last: EF,
-    pub(crate) is_transition: EF,
+#[derive(Debug)]
+pub struct EvalInputs<'a> {
+    /// Main-trace columns opened at zeta.
+    pub main_local: &'a [EF],
+    /// Main-trace columns opened at zeta*shift.
+    pub main_next: &'a [EF],
+    /// Preprocessed columns opened at zeta.
+    pub pre_local: &'a [EF],
+    /// Preprocessed columns opened at zeta*shift.
+    pub pre_next: &'a [EF],
+    /// Permutation columns opened at zeta.
+    pub perm_local: &'a [EF],
+    /// Permutation columns opened at zeta*shift.
+    pub perm_next: &'a [EF],
+    /// The instance's LogUp challenges ([prefix, beta] per lookup).
+    pub perm_challenges: &'a [EF],
+    /// LogUp terminal values (empty when the instance has none).
+    pub perm_values: &'a [EF],
+    /// The instance's public values (base field, canonical).
+    pub public_values: &'a [F],
+    /// Periodic columns evaluated at zeta.
+    pub periodic_values: &'a [EF],
+    /// First-row selector at zeta.
+    pub is_first: EF,
+    /// Last-row selector at zeta.
+    pub is_last: EF,
+    /// Transition selector at zeta (1 - is_last).
+    pub is_transition: EF,
 }
 
 /// Evaluate the constraint DAG and fold it with `alpha` by Horner, exactly as the
@@ -292,7 +334,7 @@ pub(crate) struct EvalInputs<'a> {
 /// The selector leaves carry denominators, but they are per-instance constants
 /// (`s1`, `s2`, `zh` depend only on `zeta` and the domain), so the contract pays
 /// three extension inversions per instance rather than reformulating the fold.
-pub(crate) fn fold_constraints(ir: &InstanceIr, inp: &EvalInputs<'_>, alpha: EF) -> EF {
+pub fn fold_constraints(ir: &InstanceIr, inp: &EvalInputs<'_>, alpha: EF) -> EF {
     let mut stack: Vec<EF> = Vec::with_capacity(ir.nodes.len());
     for node in &ir.nodes {
         let v = match *node {
@@ -347,13 +389,13 @@ pub(crate) fn fold_constraints(ir: &InstanceIr, inp: &EvalInputs<'_>, alpha: EF)
 }
 
 /// Lift a base element into the extension field.
-pub(crate) fn lift(x: F) -> EF {
+pub fn lift(x: F) -> EF {
     <EF as BasedVectorSpace<F>>::from_basis_coefficients_slice(&[x, F::ZERO, F::ZERO, F::ZERO])
         .expect("4 coefficients")
 }
 
 /// log2 of a power-of-two size.
-pub(crate) const fn log2_size(n: usize) -> usize {
+pub const fn log2_size(n: usize) -> usize {
     n.trailing_zeros() as usize
 }
 
@@ -394,7 +436,7 @@ use serde_json::json;
 /// carries. If either fails, the export is broken (or the proof is), and no
 /// downstream Solidity pin can rescue it.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub(crate) fn instance_identity_json<SC, A>(
+pub fn instance_identity_json<SC, A>(
     idx: usize,
     air: &A,
     layout: AirLayout,
