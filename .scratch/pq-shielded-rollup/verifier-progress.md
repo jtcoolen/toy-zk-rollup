@@ -873,3 +873,142 @@ r4 = permutation. The block proof has the same five rounds (same batch shape).
 - perm challenges computed from (lookupAlpha, beta, bus layout) rather than
   shipped: two extra ext muls per lookup, zero trust.
 
+
+
+## D-077 — Merkle-compressed block statement (QUEUED, next after D-076)
+
+User request: replace the block proof's flat per-transfer public inputs with a
+Merkle hash over them: statement = (n, input_root) where the tree leaves are
+per-transfer public inputs (nullifiers..., outputs..., root, fee).
+
+Design (decided):
+- Tree: complete binary Poseidon2 (KoalaBear, width 3) over the n transfer
+  leaves, padded to 2^ceil(log2 n) with a dedicated EMPTY constant;
+  leaf_i = P2(tag_leaf, H(nullifiers || outputs || root_i || fee_i)) absorbed
+  in fixed order; internal = P2(tag_node, L, R); input_root = P2(tag_root,
+  subtree_root, n) so the count is bound and leaf-shifting/padding is
+  impossible. Domain tags separate this tree from the pool tree (D-05).
+- In-circuit: the block circuit already holds every transfer's public inputs
+  as witnesses (it verifies each client proof against them); add Poseidon2
+  tree-build constraints and expose [n, input_root] as the block statement
+  instead of the O(n) flat limbs. Poseidon2 is the in-recursion hash (D-05),
+  so the tree is native there; keccak256 in-circuit was rejected (bit
+  decomposition cost).
+- On-chain: ShieldedPool.applyBlock already receives the leaves as calldata
+  (it must append outputs and mark nullifiers), so it recomputes the tree
+  root from calldata and compares against the proof statement - O(n) Poseidon2
+  hashes, no per-leaf inclusion proofs needed. Requires a Poseidon2-KoalaBear
+  implementation in Solidity (~width-3 perm: 16x3 external + 45 internal
+  x^7 sboxes + MDS + round constants; est. 5-8k gas/perm, ~100k gas for an
+  8-leaf tree - noise next to proof verification).
+- Statement stays O(1): [n, input_root, root_before, root_after, total_fee].
+  root_before/after/total_fee stay explicit (O(1), cheap continuity check);
+  the Merkle tree compresses only the O(n) per-transfer list.
+- Benefits: settlement proof's public-value section constant-size; future
+  block aggregation composes (n, root) pairs; per-transfer inclusion proofs
+  available for light clients (the tree structure buys that for free vs a flat
+  Poseidon2 digest - flat digest was the simpler alternative, rejected for
+  light-client openness).
+- Sequencing: AFTER D-076 part 2 (constraint identity is the soundness gap and
+  is mid-flight; its export is shape-agnostic so it re-runs unchanged after
+  the circuit change). Block vectors/bundle regenerate once, after D-077.
+
+
+
+### D-077 amendment (user): hash choice for the transfer-input tree
+
+User first asked for SHA2-256, then allowed Poseidon2 if SHA2 is too expensive.
+It is: the tree is BUILT in-circuit (the circuit holds the transfer public
+inputs and must bind the root to the proof), and SHA2-256 over KoalaBear needs
+32-bit add-carry emulation for every modular addition (field is mod 2^31-2^24,
+SHA2 adds mod 2^32) - roughly 100k constraints per compression. Poseidon2 over
+KoalaBear is native in the recursion already (D-05): ~65 constraints per
+permutation. The on-chain side must recompute whatever the circuit built, so
+the family is Poseidon2 end-to-end (Solidity impl ~5-8k gas/perm, noise next
+to proof verification). SHA2's on-chain precompile advantage is moot once the
+circuit side is the constraint.
+
+Structure per user notation: a sequential fold, not a padded balanced tree:
+root_0 = P2(tag, n); root_i = P2(root_{i-1}, leaf_i);
+leaf_i = P2(tag_leaf, H(nullifiers || outputs || root_i || fee_i)) with H the
+existing shielded SHA3-256 compressed to field limbs; input_root = root_n.
+n is bound into the seed so an empty/short chain cannot collide with a longer
+one. Statement stays [n, input_root, root_before, root_after, total_fee].
+Balanced-tree inclusion proofs (light clients) are a later option, not v1.
+
+
+
+### D-077 finalization: fold, not padded balanced tree
+
+Decided: sequential fold (user's H(H(..H(t1_PI), t2_PI)..) notation).
+Rationale (recorded so the tree is not relitigated):
+- applyBlock holds every leaf in calldata and recomputes the root from the
+  full list; no consumer needs O(log n) inclusion proofs today.
+- Fold circuit cost is n perms vs 2^ceil(log2 n)-1 for the padded tree: equal
+  or cheaper, no EMPTY padding constant to domain-separate, no depth/index
+  logic in circuit or Solidity.
+- n bound in the seed (root_0 = P2(tag, n)); leaf_i self-describing (absorbs
+  its own num_nullifiers/num_outputs since the shape header leaves the
+  statement when the list is compressed).
+- Fold chains incrementally: block builders maintain a running root, and
+  future block aggregation folds block B from block A's root.
+- Migration path kept open: the statement shape [n, input_root, root_before,
+  root_after, total_fee] is identical under both constructions, so if
+  light-client inclusion proofs become a requirement the swap is a
+  circuit+contract change with no statement-format migration.
+
+
+---
+
+## D-076 part 2 state record (shared builder landed, 2025-10-04)
+
+### Done this step
+- `constraint_ir/mod.rs` (642 L) now holds the shared export builder
+  `instance_identity_json::<SC, A>`: layout + symbolic constraints -> flattened
+  DAG (memoized Flattener) -> opened values -> fold -> both pins
+  (`fold * inv_vanishing == quotient`, inversion-free quotient reformulation)
+  -> the full JSON block. Bounds: `SC: StarkGenericConfig<Challenge = EF>`,
+  `Domain<SC>: PolynomialSpace<Val = F>` (Domain is the p3_uni_stark alias, not
+  an assoc type; both settlement configs resolve to the same concrete
+  TwoAdicMultiplicativeCoset so emitted JSON is config-independent).
+- `constraint_identity_vectors.rs` refactored to call it: the 240-line inline
+  loop collapsed to a 30-line per-instance call; regenerated vectors are
+  byte-identical in shape (7361 nodes, all pins pass).
+- `composed_vectors.rs` gained `constraint_identity_block(verifier, proof, out,
+  pis)` computed INSIDE `composed_run_with` - the same proof run whose transcript
+  events the bundle ships (a second run would mask fresh randomness and
+  desynchronize pins from bundle bytes). Emitted as doc key
+  `constraint_identity` for BOTH fib and block exports. Batch-level extras:
+  zeta, constraint_alpha, bus_ids + max_message_width (from
+  `batch_fixture::bus_layout`), terminal_counts.
+  `BatchStarkProof` wraps the inner `BatchProof`: access via
+  `proof.proof.opened_values` / `proof.proof.lookup_terminals`.
+- `batch_fixture::ReplayOut` gained `trace_domains` (natural domain per
+  instance, computed before `commitments_with_opening_points`).
+- Verification: composed identity block vs independent pin vectors - ALL
+  deterministic parts (nodes/roots/consts/domains/inv_d) match exactly; opened
+  shapes match per instance. ConstraintIdentity.t.sol passes on regenerated
+  JSON (fold pin 40.2M gas, selectors pin 4.6M). Fib bundle regenerated from
+  the fresh run (1,875,624 B); WhirVerifier.t.sol 6/6 green.
+
+### Gate status (pre-existing, NOT introduced here)
+`cargo clippy --workspace --all-targets -- -D warnings` fails with 136 errors
+concentrated in prover TEST targets (batch_stark_vectors 49, composed_vectors
+124 incl. overlap, whir_proof_vectors 17, constraint_identity_vectors 17):
+missing backticks in docs, pub(crate)-in-private-module (private_module),
+dead code in batch_fixture when a consumer target doesn't use every helper,
+pedantic style lints. These predate this step (whir_walk/batch_stark_vectors
+untouched here). Decision: fix them as a dedicated lint-hygiene commit before
+the final full gate; do not suppress. The per-target clippy on the files this
+step touched is clean apart from the same families.
+
+### Next (D-076 part 3)
+1. Bundle v4: CONSTRAINTS section (header version 4, `cst_words` u32 LE @16)
+   in gen_composed_flat.mjs / gen_bundle.mjs + WhirVerifier decode.
+2. Wire ConstraintIdentity into WhirVerifier.verify: capture constraintAlpha
+   from permutationPhase + zeta from oodPhase (currently discarded); derive
+   opened values from round-0 claim evals (boundEvals x exported scales);
+   perm challenges via BatchTranscript.lookupPair + bus layout; perm values =
+   terminals (already on the wire); pv from blob; periodic empty.
+3. Regenerate fib vectors+bundle, pin + WhirVerifier green; then block
+   vectors+bundle (background), BlockE2E green with identity.

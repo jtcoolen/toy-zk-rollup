@@ -317,6 +317,9 @@ pub(crate) struct ReplayOut {
     pub(crate) log_num_quotient_chunks: Vec<usize>,
     pub(crate) num_quotient_chunks: Vec<usize>,
     pub(crate) quotient_domains: Vec<Vec<Dom>>,
+    /// Per instance, the natural trace domain the constraint selectors and the
+    /// periodic-column evaluation are taken on (`natural_domain_for_degree`).
+    pub(crate) trace_domains: Vec<Dom>,
     pub(crate) opening_rounds: Vec<serde_json::Value>,
 }
 
@@ -445,6 +448,11 @@ pub(crate) fn manual_replay(
         .map_err(|e| format!("{e:?}"))?;
     mark("ood_phase", sink);
 
+    let trace_domains: Vec<Dom> = ext_domain_sizes
+        .iter()
+        .map(|&sz| pcs.natural_domain_for_degree(sz >> is_zk_usize))
+        .collect();
+
     let (coms_to_verify, quotient_domains, preprocessed_index) = commitments_with_opening_points(
         config,
         &airs,
@@ -536,6 +544,7 @@ pub(crate) fn manual_replay(
         log_num_quotient_chunks,
         num_quotient_chunks,
         quotient_domains,
+        trace_domains,
         opening_rounds,
     })
 }

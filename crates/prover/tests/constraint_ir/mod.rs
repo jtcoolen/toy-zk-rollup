@@ -356,3 +356,285 @@ pub(crate) fn lift(x: F) -> EF {
 pub(crate) const fn log2_size(n: usize) -> usize {
     n.trailing_zeros() as usize
 }
+
+// ---------------------------------------------------------------------------
+// Shared constraint-identity export builder
+// ---------------------------------------------------------------------------
+//
+// Both vector exporters (constraint_identity_vectors, composed_vectors) prove a
+// settlement batch and must emit, per instance: the flattened constraint
+// program, the trusted domain parameters, every opened value the fold consumes,
+// and the two pins (fold * inv_vanishing == quotient, and the inversion-free
+// quotient reformulation). The composed export needs the SAME data from the
+// SAME proof run the bundle ships: a second proof run would mask fresh
+// randomness and desynchronize the pins from the bundle bytes. This builder is
+// the single implementation both call.
+
+use p3_air::symbolic::AirLayout;
+use p3_air::Air;
+use p3_air::BaseAir;
+use p3_batch_stark::proof::OpenedValuesWithLookups;
+use p3_batch_stark::symbolic::{get_constraint_layout, get_symbolic_constraints};
+use p3_commit::{PeriodicColumns, PolynomialSpace};
+use p3_field::{ExtensionField, Field};
+use p3_lookup::{InteractionSymbolicBuilder, LogUpGadget, Lookup};
+use p3_uni_stark::{recompose_quotient_from_chunks, Domain, StarkGenericConfig};
+use serde_json::json;
+
+/// Flatten, evaluate, and pin the constraint identity for one instance, and
+/// return the JSON block the Solidity pin test reads.
+///
+/// SC is only used for the domain type and the library recompose; both
+/// settlement configs (production and semantic fixture) share the same
+/// Challenge = EF and the same concrete domain, so the emitted JSON is
+/// identical whichever the caller proves under.
+///
+/// The two assertions inside are the export's self-check: they are the exact
+/// equalities verify_batch enforces, evaluated on the opened values the proof
+/// carries. If either fails, the export is broken (or the proof is), and no
+/// downstream Solidity pin can rescue it.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) fn instance_identity_json<SC, A>(
+    idx: usize,
+    air: &A,
+    layout: AirLayout,
+    lookups_i: &[Lookup<F>],
+    ov: &OpenedValuesWithLookups<EF>,
+    public_values: &[F],
+    trace_domain: Domain<SC>,
+    chunk_domains: &[Domain<SC>],
+    perm_challenges: &[EF],
+    perm_values: &[EF],
+    zeta: EF,
+    constraint_alpha: EF,
+    gadget: &LogUpGadget,
+) -> serde_json::Value
+where
+    SC: StarkGenericConfig<Challenge = EF>,
+    Domain<SC>: PolynomialSpace<Val = F>,
+    A: Air<InteractionSymbolicBuilder<F, EF>> + BaseAir<F>,
+{
+    // The global emission order (base and ext interleaved) drives the Horner fold,
+    // so the layout and the constraint vectors come from one build.
+    let clayout = get_constraint_layout(air, layout, lookups_i, gadget);
+    let (base_constraints, ext_constraints) =
+        get_symbolic_constraints(air, layout, lookups_i, gadget);
+
+    let mut flat = Flattener::new();
+    let mut roots = Vec::with_capacity(clayout.total_constraints());
+    for g in 0..clayout.total_constraints() {
+        if let Some(p) = clayout.base_indices.iter().position(|&x| x == g) {
+            roots.push(flat.expr(&base_constraints[p]));
+        } else {
+            let q = clayout
+                .ext_indices
+                .iter()
+                .position(|&x| x == g)
+                .expect("global index lives in one of the two streams");
+            roots.push(flat.expr_ext(&ext_constraints[q]));
+        }
+    }
+    assert_eq!(
+        roots.len(),
+        base_constraints.len() + ext_constraints.len(),
+        "every constraint is a root exactly once"
+    );
+    let ir = InstanceIr { roots, ..flat.ir };
+
+    // Opened values, exactly as verify_batch hands them to the folder.
+    let aux_width = if lookups_i.is_empty() {
+        0
+    } else {
+        lookups_i.len() + 1
+    };
+    let recompose_perm = |flat_vals: &[EF]| -> Vec<EF> {
+        if aux_width == 0 {
+            return vec![];
+        }
+        flat_vals
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| {
+                <EF as ExtensionField<F>>::from_ext_basis_coefficients(chunk)
+                    .expect("chunk length matches DIMENSION")
+            })
+            .collect()
+    };
+    let perm_local = recompose_perm(&ov.permutation_local);
+    let perm_next = recompose_perm(&ov.permutation_next);
+    let width = BaseAir::<F>::width(air);
+    let trace_next_owned = ov
+        .base_opened_values
+        .trace_next
+        .clone()
+        .unwrap_or_else(|| vec![EF::ZERO; width]);
+    let pre_local = ov
+        .base_opened_values
+        .preprocessed_local()
+        .map(<[EF]>::to_vec)
+        .unwrap_or_default();
+    let pre_next = ov
+        .base_opened_values
+        .preprocessed_next()
+        .map_or_else(|| vec![EF::ZERO; layout.preprocessed_width], <[EF]>::to_vec);
+
+    let declared = air.periodic_columns();
+    let periodic_columns =
+        PeriodicColumns::new(&declared, trace_domain.size()).expect("periodic columns");
+    let periodic_values = trace_domain.evaluate_periodic_columns_at(periodic_columns, zeta);
+
+    let sels = trace_domain.selectors_at_point(zeta);
+    let inputs = EvalInputs {
+        main_local: &ov.base_opened_values.trace_local,
+        main_next: &trace_next_owned,
+        pre_local: &pre_local,
+        pre_next: &pre_next,
+        perm_local: &perm_local,
+        perm_next: &perm_next,
+        perm_challenges,
+        perm_values,
+        public_values,
+        periodic_values: &periodic_values,
+        is_first: sels.is_first_row,
+        is_last: sels.is_last_row,
+        is_transition: sels.is_transition,
+    };
+    let fold = fold_constraints(&ir, &inputs, constraint_alpha);
+
+    // The library quotient, and the inversion-free reformulation the contract
+    // uses: Z_j(zeta) = (zeta * inv_shift_j)^(2^Lj) - 1 with inv_shift_j a
+    // trusted domain constant, and invD_i = (prod_{j!=i} Z_j(first_i))^-1.
+    let quotient = recompose_quotient_from_chunks::<SC>(
+        chunk_domains,
+        &ov.base_opened_values.quotient_chunks,
+        zeta,
+    );
+    let zstars: Vec<EF> = chunk_domains
+        .iter()
+        .map(|d| d.vanishing_poly_at_point(zeta))
+        .collect();
+    // The cross-domain denominators of the recompose depend on no proof data,
+    // so their inverse is a trusted constant the export ships with the domains.
+    let inv_d: Vec<EF> = chunk_domains
+        .iter()
+        .enumerate()
+        .map(|(i2, di)| {
+            let prod: EF = chunk_domains
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i2)
+                .map(|(_j, dj)| lift(dj.vanishing_poly_at_point(di.first_point())))
+                .product();
+            prod.try_inverse().expect("chunk domains are disjoint")
+        })
+        .collect();
+    let qstar: EF = ov
+        .base_opened_values
+        .quotient_chunks
+        .iter()
+        .enumerate()
+        .map(|(i2, chunk)| {
+            let q = <EF as ExtensionField<F>>::from_ext_basis_coefficients(chunk)
+                .expect("chunk length matches DIMENSION");
+            let prod: EF = zstars
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i2)
+                .map(|(_, z)| *z)
+                .product();
+            q * prod * inv_d[i2]
+        })
+        .sum();
+    assert_eq!(
+        qstar, quotient,
+        "inversion-free quotient reformulation, instance {idx}"
+    );
+    assert_eq!(
+        fold * sels.inv_vanishing,
+        quotient,
+        "constraint identity mismatch, instance {idx}"
+    );
+
+    // Trusted domain parameters: the contract recomputes the selectors and the
+    // chunk vanishing polynomials from these plus zeta, and the pins below
+    // check its answers against the exported ones.
+    let trace_log_size = log2_size(trace_domain.size());
+    let trace_shift = trace_domain.first_point();
+    // next_point(x) = x * h, so h_inv = first_point / next_point(first_point).
+    let h = trace_domain
+        .next_point(trace_shift)
+        .expect("coset domains step by a generator")
+        / trace_shift;
+    let h_inv = h.try_inverse().expect("generator is nonzero");
+    let trace_inv_shift = trace_shift.try_inverse().expect("domain shift is nonzero");
+    // Flat arrays throughout: the Solidity pin parses each field with
+    // parseJsonUintArray, which cannot express nested arrays.
+    let nodes_flat: Vec<u32> = ir.nodes.iter().flat_map(Node::encode).collect();
+    let ext_consts_flat: Vec<u32> = ir.ext_consts.iter().flatten().copied().collect();
+    let chunk_domains_json: Vec<_> = chunk_domains
+        .iter()
+        .map(|d| {
+            let first = d.first_point();
+            json!({
+                "log_size": log2_size(d.size()),
+                "shift": first.as_canonical_u32(),
+                "inv_shift": first.try_inverse().expect("nonzero shift").as_canonical_u32(),
+            })
+        })
+        .collect();
+    let quotient_chunks_flat: Vec<u32> = ov
+        .base_opened_values
+        .quotient_chunks
+        .iter()
+        .flat_map(|c| {
+            ext_coeffs(
+                <EF as ExtensionField<F>>::from_ext_basis_coefficients(c)
+                    .expect("chunk length matches DIMENSION"),
+            )
+        })
+        .collect();
+    json!({
+        "index": idx,
+        "width": width,
+        "num_constraints": ir.roots.len(),
+        "nodes": nodes_flat,
+        "base_consts": ir.base_consts,
+        "ext_consts": ext_consts_flat,
+        "roots": ir.roots,
+        "trace_domain": {
+            "log_size": trace_log_size,
+            "shift": trace_shift.as_canonical_u32(),
+            "inv_shift": trace_inv_shift.as_canonical_u32(),
+            "h_inv": h_inv.as_canonical_u32(),
+        },
+        "num_chunks": chunk_domains.len(),
+        "chunk_domains": chunk_domains_json,
+        "inv_d": exts_flat(&inv_d),
+        "zstars_expected": exts_flat(&zstars),
+        "quotient_chunks": quotient_chunks_flat,
+        "opened": {
+            "main_local": exts_flat(&ov.base_opened_values.trace_local),
+            "main_next": exts_flat(&trace_next_owned),
+            "pre_local": exts_flat(&pre_local),
+            "pre_next": exts_flat(&pre_next),
+            "perm_local": exts_flat(&perm_local),
+            "perm_next": exts_flat(&perm_next),
+            "perm_challenges": exts_flat(perm_challenges),
+            "perm_values": exts_flat(perm_values),
+            "public_values": public_values
+                .iter()
+                .map(PrimeField32::as_canonical_u32)
+                .collect::<Vec<_>>(),
+            "periodic_values": exts_flat(&periodic_values),
+        },
+        "selectors_expected": {
+            "is_first": ext_json(&sels.is_first_row),
+            "is_last": ext_json(&sels.is_last_row),
+            "is_transition": ext_json(&sels.is_transition),
+            "inv_vanishing": ext_json(&sels.inv_vanishing),
+        },
+        "expected_fold": ext_json(&fold),
+        "expected_quotient": ext_json(&quotient),
+    })
+}

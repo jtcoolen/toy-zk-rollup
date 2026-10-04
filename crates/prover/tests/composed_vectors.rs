@@ -49,10 +49,17 @@ use prover::F;
 mod batch_fixture;
 mod whir_walk;
 use batch_fixture::{
-    base_json, com_json, dom_json, ext_json, fib_recursion, hex, one_run_for, settlement_params,
-    settlement_params_for, Challenge, Dft, OpeningClaims, OpeningProof, ReplayOut, SemPcs,
-    CAP_HEIGHT,
+    base_json, bus_layout, com_json, dom_json, ext_json, fib_recursion, hex, one_run_for,
+    settlement_params, settlement_params_for, Challenge, Dft, OpeningClaims, OpeningProof,
+    ReplayOut, SemConfig, SemPcs, CAP_HEIGHT,
 };
+mod constraint_ir;
+use constraint_ir::{instance_identity_json, EF};
+use p3_air::symbolic::AirLayout;
+use p3_air::BaseAir;
+use p3_circuit_prover::CircuitVerifier;
+use p3_lookup::LogUpGadget;
+
 use pq_hash::{Keccak256Commitment, Sha3_256Shielded};
 use prover::block::{build_multi_transfer_circuit, shape_header, ChildProof, TransferShape};
 use prover::client::{prove_client_transfer, ClientSpec};
@@ -179,6 +186,73 @@ fn composed_run(
     composed_run_with(&pis, &rc, params, LOG_MAX_LDE, rounds_json, round_starts)
 }
 
+/// The constraint-identity block for one settlement batch, built from the SAME
+/// proof run whose transcript events the bundle ships (a second run would mask
+/// fresh randomness and desynchronize the pins from the bundle bytes).
+///
+/// Per instance this carries the flattened constraint program, the trusted
+/// domain parameters, every opened value the fold consumes, and the two pins
+/// (fold * inv_vanishing == quotient, inversion-free quotient reformulation)
+/// - see constraint_ir::instance_identity_json. The Solidity verifier evaluates
+/// the program on opened values it derives from the WHIR rounds themselves,
+/// and the pin test replays this JSON against the same program.
+fn constraint_identity_block(
+    verifier: &CircuitVerifier<SemConfig>,
+    proof: &p3_circuit_prover::BatchStarkProof<SemConfig>,
+    out: &ReplayOut,
+    pis: &[F],
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let common = verifier.common_data();
+    let airs = verifier
+        .table_airs::<4>()
+        .map_err(|e| Box::<dyn Error>::from(format!("table_airs: {e:?}")))?;
+    let public_values = verifier
+        .table_public_values(pis)
+        .map_err(|e| Box::<dyn Error>::from(format!("table_public_values: {e:?}")))?;
+    let gadget = LogUpGadget::new();
+    let (bus_ids, max_message_width, _) = bus_layout(&common.lookups);
+    let mut instances = Vec::new();
+    for (i, air) in airs.iter().enumerate() {
+        let layout = AirLayout {
+            preprocessed_width: out.preprocessed_widths[i],
+            main_width: BaseAir::<F>::width(air),
+            num_public_values: BaseAir::<F>::num_public_values(air),
+            num_periodic_columns: BaseAir::<F>::num_periodic_columns(air),
+            ..Default::default()
+        };
+        let perm_values: Vec<EF> = proof
+            .proof
+            .lookup_terminals
+            .get(i)
+            .and_then(Option::as_ref)
+            .map(|t| vec![t.0])
+            .unwrap_or_default();
+        instances.push(instance_identity_json::<SemConfig, _>(
+            i,
+            air,
+            layout,
+            common.lookups[i].as_ref(),
+            &proof.proof.opened_values.instances[i],
+            &public_values[i],
+            out.trace_domains[i],
+            &out.quotient_domains[i],
+            &out.challenges[i],
+            &perm_values,
+            out.zeta,
+            out.constraint_alpha,
+            &gadget,
+        ));
+    }
+    Ok(json!({
+        "description": "constraint identity: programs + opened values + pins, from the same proof run as the bundle",
+        "zeta": ext_json(&out.zeta),
+        "constraint_alpha": ext_json(&out.constraint_alpha),
+        "bus_ids": json!(bus_ids),
+        "max_message_width": json!(max_message_width),
+        "terminal_counts": json!(proof.proof.lookup_terminals.iter().map(Option::is_some).collect::<Vec<_>>()),
+        "instances": json!(instances),
+    }))
+}
 /// The composed run at an explicit circuit + settlement shape. The Fibonacci
 /// recursion circuit and the real shielded block circuit differ in both, but the
 /// composition claim is the same: the shared WHIR walk inside the batch delegate
@@ -311,8 +385,9 @@ fn composed_run_with(
             }
             Ok(())
         };
-        let (program, out, _verifier, _proof) =
+        let (program, out, verifier, proof) =
             one_run_for(pis, rc, Some(&mut replacer), log_max_lde);
+        let constraint_identity = constraint_identity_block(&verifier, &proof, &out, pis)?;
         let doc = json!({
             "description": "composed settlement-shape WHIR walk: the shared walk driven
                 inside the batch delegate at the real opening shapes; program equality
@@ -329,6 +404,7 @@ fn composed_run_with(
                 .iter()
                 .map(|(name, at)| json!({"phase": name, "at": at}))
                 .collect::<Vec<_>>(),
+            "constraint_identity": constraint_identity,
         });
         Ok((doc, out, program))
     }
