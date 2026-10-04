@@ -70,6 +70,11 @@ library SemanticBlob {
         uint256 samples;
         uint256 uniform;
         uint256 witnesses;
+        /// Record-position counters for the recorded arrays in Walk. They live
+        /// here (not as walk locals) to keep the walk loop inside the Yul stack
+        /// limit now that it also carries a stop site.
+        uint256 recordedSamples;
+        uint256 recordedDigests;
     }
 
     /// The result of a walk: the final sponge state, the payload cursors, and -
@@ -133,20 +138,42 @@ library SemanticBlob {
     /// sponge produced, and every commitment digest it absorbed, so a caller can
     /// compare them against independently exported values.
     function walk(Blob memory b, bool check, bool record) internal pure returns (Walk memory w) {
+        w = _walk(b, type(uint256).max, check, record);
+        require(w.cursor.constants + w.cursor.variables <= b.constLen + b.varLen, "walk cursors");
+    }
+
+    /// Walks the schedule up to (but not including) event site `stopSite`, parking the
+    /// sponge mid-stream. This is the batch -> WHIR handover: the batch layer's events
+    /// end at the delegate point with the WHIR commitment already absorbed, and the
+    /// WHIR core continues on the returned sponge.
+    function walkTo(Blob memory b, uint256 stopSite, bool check, bool record)
+        internal
+        pure
+        returns (Walk memory w)
+    {
+        w = _walk(b, stopSite, check, record);
+    }
+
+    /// The shared walk body, stopping after `stopSite` events.
+    function _walk(Blob memory b, uint256 stopSite, bool check, bool record)
+        private
+        pure
+        returns (Walk memory w)
+    {
         if (record) {
             w.samples = new uint256[](b.sampleLen / 4);
             w.digests = new bytes32[](countDigests(b));
         }
-        uint256 scheduleAt = HEADER_LEN;
         uint256 site;
-        uint256 nSample;
-        uint256 nDigest;
         for (uint256 e; e < b.scheduleLen; ++e) {
+            uint256 scheduleAt = HEADER_LEN + e * 4;
             uint256 kind = uint256(uint8(b.raw[scheduleAt]));
             uint256 arg = uint256(uint8(b.raw[scheduleAt + 1]));
             uint256 run = readU16Be(b.raw, scheduleAt + 2);
-            scheduleAt += 4;
             for (uint256 k; k < run; ++k) {
+                if (site >= stopSite) {
+                    return w;
+                }
                 ++site;
                 if (kind == OP_CONST_U32) {
                     w.state.observeBase(readU32Le(b.raw, b.constOff + w.cursor.constants));
@@ -155,12 +182,13 @@ library SemanticBlob {
                     w.state.observeBase(readU32Le(b.raw, b.varOff + w.cursor.variables));
                     w.cursor.variables += 4;
                 } else if (kind == OP_COMMITMENT || kind == OP_CONST_COMMITMENT) {
-                    nDigest = absorbDigest(b, w, kind == OP_CONST_COMMITMENT, record, nDigest);
+                    w.cursor.recordedDigests =
+                        absorbDigest(b, w, kind == OP_CONST_COMMITMENT, record, w.cursor.recordedDigests);
                 } else if (kind == OP_SAMPLE_BASE) {
                     uint256 got = w.state.sampleBase();
                     if (record) {
-                        w.samples[nSample] = got;
-                        ++nSample;
+                        w.samples[w.cursor.recordedSamples] = got;
+                        ++w.cursor.recordedSamples;
                     }
                     if (check) {
                         require(
@@ -199,7 +227,6 @@ library SemanticBlob {
                 }
             }
         }
-        require(scheduleAt == b.constOff, "schedule did not end at the payloads");
     }
 
     /// Compares one uniform draw against the recording, naming the site on failure.

@@ -163,6 +163,13 @@ library WhirVerifierCore {
         uint256[] openingEvals;
         /// Number of evaluations per opening claim.
         uint256[] claimWidths;
+        /// Claim indices in CONSTRAINT order (placement order: tables by
+        /// descending arity, ties by descending table index, claims within a
+        /// table in insertion order). The transcript absorbs evaluations in
+        /// PROOF order; the batched claim weights them in placement order,
+        /// because plan_layout assigns stacked slots largest-table-first.
+        /// Empty means identity (proof order == placement order).
+        uint256[] claimPerm;
         /// The initial sumcheck's round polynomials, `h(0)` and `h(infinity)`.
         uint256[] roundCA;
         uint256[] roundCInf;
@@ -189,6 +196,37 @@ library WhirVerifierCore {
         uint256[] randomness;
     }
 
+    /// Flat eval order for the batched claim: constraint position ->
+    /// proof-order eval index. claimPerm maps constraint position ->
+    /// proof-order claim index; evals inside a claim keep their order. An
+    /// empty perm is the identity.
+    function _claimEvalOrder(uint256[] memory widths, uint256[] memory claimPerm, uint256 total)
+        private
+        pure
+        returns (uint256[] memory order)
+    {
+        order = new uint256[](total);
+        if (claimPerm.length == 0) {
+            for (uint256 k; k < total; ++k) {
+                order[k] = k;
+            }
+            return order;
+        }
+        uint256[] memory starts = new uint256[](widths.length);
+        uint256 acc;
+        for (uint256 c; c < widths.length; ++c) {
+            starts[c] = acc;
+            acc += widths[c];
+        }
+        uint256 pos;
+        for (uint256 pIdx; pIdx < claimPerm.length; ++pIdx) {
+            uint256 ci = claimPerm[pIdx];
+            for (uint256 e; e < widths[ci]; ++e) {
+                order[pos++] = starts[ci] + e;
+            }
+        }
+    }
+
     /// Replay the WHIR initial phase.
     ///
     /// Mirrors, in order:
@@ -213,6 +251,12 @@ library WhirVerifierCore {
     ///   claimed evaluation weights concrete evals at gamma^0.. and virtual
     ///   answers after them. Getting these two orders confused is invisible
     ///   to the sponge and visible only in the final identity.
+    ///
+    /// - Within the concrete claims, constraint order is PLACEMENT order, not
+    ///   proof order: `plan_layout` stacks the largest table first, so the
+    ///   constraint walks tables by descending arity (ties: descending table
+    ///   index), claims within a table in insertion order. `claimPerm` carries
+    ///   that permutation; the transcript still absorbs in proof order.
     function verifyInitial(
         Transcript memory t,
         InitialSchedule memory s,
@@ -256,8 +300,11 @@ library WhirVerifierCore {
         // `whir_proof_vectors.json` (`initial_claimed_eval`).
         uint256 claimed = 0;
         uint256 power = KoalaBearExt4.ONE;
-        for (uint256 i; i < input.openingEvals.length; ++i) {
-            claimed = KoalaBearExt4.add(claimed, KoalaBearExt4.mul(input.openingEvals[i], power));
+        // Walk concrete claims in placement order: claimPerm maps constraint
+        // position -> proof-order claim index. An empty perm is the identity.
+        uint256[] memory order = _claimEvalOrder(input.claimWidths, input.claimPerm, input.openingEvals.length);
+        for (uint256 k; k < input.openingEvals.length; ++k) {
+            claimed = KoalaBearExt4.add(claimed, KoalaBearExt4.mul(input.openingEvals[order[k]], power));
             power = KoalaBearExt4.mul(power, alpha);
         }
         for (uint256 i; i < input.oodAnswers.length; ++i) {
