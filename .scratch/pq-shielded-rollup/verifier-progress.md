@@ -16,8 +16,8 @@ EIP-170 bytecode limits, and address them borrowing design from
 | M3 | Per-round phase port (`verifyRound`) + prover-pinned test | done, committed `ea6ae3e` |
 | M4 | Final phase port (`verifyFinal`) + prover-pinned test | done (this commit) |
 | M5 | Batch STARK transcript layer: prover-pinned replay of `verify_batch`'s sequence | done (this commit) |
-| M5b | `BatchTranscript.sol` production contract, pinned by the M5 vectors | pending |
-| M6 | `ConstraintIdentity.sol` (generated AIR constraint identity) | pending |
+| M5b | `BatchTranscript.sol` production contract, pinned by the M5 vectors | done (this commit) |
+| M6 | `ConstraintIdentity.sol` (generated AIR constraint identity) | done (this commit) |
 | M7 | `ChunkVerifier.sol` (multi-transaction sponge carry) | pending |
 | M8 | Gas benchmark + EIP-170 audit + size reductions | pending |
 | M9 | Wallet extension, local-chain settlement E2E, metrics/dashboards | pending |
@@ -263,3 +263,85 @@ the real cost sits, so M7 chunking stays on the plan.
    `get_constraint_layout` (`p3-batch-stark/src/symbolic.rs:261`) for the Poseidon2 +
    recompose + statement table AIRs. Largest remaining unknown.
 3. **M7** chunking, **M8** gas + EIP-170 audit, **M9** wallet/settlement/metrics.
+
+## M5b — DONE: `BatchTranscript.sol` (production batch layer)
+
+- The phase sequence is now a real contract library, driven natively by
+  `BatchTranscriptNativeTest` with blob payload slices, landing on all four exported
+  challenges plus the bus-0 pair. The walk test pins the sponge; this pins the sequence.
+- `phase_marks` (event offset after each batch phase) are exported by the generator:
+  new=87, instance_bindings=111, main=115, preprocessed=116, lookup=125, permutation=154,
+  quotient=156, ood=161, delegate starts at 161 of 29,902.
+- Corrections (kept): a zero-difficulty grind absorbs NOTHING (my first port absorbed a
+  zero word and desynced at the lookup draw - the pin caught it); terminals need
+  `SumcheckCore.observeExt4Canonical` (Montgomery), not the raw packed absorber.
+
+## M6 - ConstraintIdentity: PLAN
+
+The last transcript-free layer: after the delegate, `verify_batch` checks per-instance
+that the folded constraint identity holds at zeta using the opened values. The AIRs are
+generated (Poseidon2/recompose/statement table AIRs), so the constraints must be
+GENERATED too: export each instance's symbolic constraint DAG from Rust (trusted setup),
+evaluate it in Solidity over the opened values. Steps:
+1. Read `p3-batch-stark/src/check_constraints.rs` + the folder: exact identity, alpha
+   powers, quotient chunk combination, public-value/periodic handling.
+2. Export the constraint IR (op DAG over: main local/next, preprocessed local/next,
+   public values, periodic, alpha, zeta, constants, +,-,*,neg,exp) per instance.
+3. `ConstraintIdentity.sol`: DAG evaluator in extension-field arithmetic.
+4. Pin: folded identity == quotient combination at zeta, per instance, vs the prover.
+
+## M6 - DONE: the constraint identity layer is pinned by the prover
+
+`verify_batch`'s last layer, after the delegated opening argument. Per instance:
+
+    fold(alpha, constraints(zeta)) * inv_vanishing(zeta) == quotient(zeta)
+
+**What exists now**
+
+- `crates/prover/tests/constraint_identity_vectors.rs` (`#[ignore]` generator + Rust pin).
+  Proves the settlement batch, replays the batch transcript to recover `zeta` and the
+  fold challenge, then per instance calls `get_constraint_layout` +
+  `get_symbolic_constraints` (the 4-arg p3-batch-stark versions - `CircuitTableAir`
+  implements `Air<InteractionSymbolicBuilder>`, not `SymbolicAirBuilder`), flattens each
+  constraint to a post-order op list, evaluates it, and asserts the identity against the
+  library's own `recompose_quotient_from_chunks`. Writes
+  `contracts/test/vectors/constraint_identity_vectors.json`.
+- `contracts/src/verifier/ConstraintIdentity.sol`: `selectors()`, `foldConstraints()`
+  (DAG interpreter), `chunkVanishings()`, `recomposeQuotient()`.
+- `contracts/test/ConstraintIdentity.t.sol`: reruns selectors, fold, chunk vanishings
+  and the recompose in Solidity for all six instances and requires each to match the
+  exported value, then checks the identity. 2 tests, 100 forge tests green.
+
+**Measured shape** (BASE_TRACE=1024, pinned): 7,361 flattened nodes over six instances -
+inst 0: 52, inst 1: 40, inst 2: 1,963, inst 3: 5,085, inst 4: 116, inst 5: 105.
+Constraint counts (K): 8, 4, 105, 196, 8, 12. Gas for the whole constraint layer over
+all six instances: **40.2M** (selectors alone: 4.6M). That is on top of the ~55M batch
+transcript walk, so the full verifier lands near 100M - under the 130M block gas limit
+but large. M8 has real work to do.
+
+**Design correction (do not relitigate)**: the plan's "inversion-free star fold" -
+substituting `is_first -> zh*s2`, `is_last -> zh*s1`, `is_transition -> s2` and claiming
+`acc_star == acc * s1 * s2` - is **unsound**. Constraints with no selector have
+denominator 1, so no single factor can be pulled out of the alpha fold. The sound version
+evaluates the **real selectors** and pays three extension inversions per instance
+(`s1`, `s2`, `zh`), which depend only on `zeta` and the domain, plus one for
+`inv_vanishing`. If those four inversions per instance are too expensive, the fix is
+Montgomery's trick (batch the inversions), not a reformulation of the fold.
+
+The quotient recompose genuinely is inversion-free at runtime: its denominators
+`Z_j(first_i)` are domain-only constants, so the export ships
+`invD_i = (prod_{j!=i} Z_j(first_i))^-1` and each chunk domain's `inv_shift`. The test
+asserts that reformulation equals the library's recompose before pinning anything.
+
+**API notes (p3 0.8.0, cost real time)**
+- `EF::from_base` does not exist. Lift with
+  `<EF as BasedVectorSpace<F>>::from_basis_coefficients_slice(&[x, ZERO, ZERO, ZERO])`.
+- `F::from_canonical_u32` does not exist either; `PrimeCharacteristicRing::from_u32` does.
+- `Arc::as_ptr` takes `&Arc<T>`; matching on a `&SymbolicExpression` binds the inner enum,
+  so memoize on the child `Arc`s (`Arc::as_ptr(x)` where `x: &Arc<_>`), not the root.
+- `PolynomialSpace::next_point` returns `Option<Ext>`.
+- `BatchVerifierTranscript` panics on drop unless finalized: `transcript.delegate(...)`
+  then `transcript.finish()`, i.e. the opening argument must actually be replayed.
+- The symbolic builder **clones** `Arc`s rather than sharing them, so pointer-identity
+  memoization dedupes leaves but not shared subtrees: 7,361 nodes instead of the 22,083
+  a naive expansion produces. Good enough; a real hash-consing pass is an M8 option.
