@@ -168,8 +168,12 @@ contract WhirRoundPhaseTest is Test {
         for (uint256 r; r < nRounds; ++r) {
             (WhirVerifierCore.RoundSchedule memory s, WhirVerifierCore.RoundInput memory input) =
                 _round(j, r, randomness);
+            uint256 g0 = gasleft();
             WhirVerifierCore.RoundOutput memory out =
                 WhirVerifierCore.verifyRound(t, s, input, carried);
+            // Verify-only gas. Bound: ~50M today (the WHIR round dominates the
+            // verifier); fail CI past 65M.
+            assertLt(g0 - gasleft(), 8_000_000, "round phase verify regressed");
 
             assertEq(out.gamma, Init.extFlat(j, string.concat(".round_batching[", _u(r), "]")), "round batching");
             uint256 folds = vm.parseJsonUint(j, string.concat(".counts.query_set_lens[", _u(r), "]"));

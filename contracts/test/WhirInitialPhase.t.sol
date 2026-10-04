@@ -125,7 +125,11 @@ contract WhirInitialPhaseTest is Test {
         // The STARK layer observes the batch commitment before handing over to
         // WHIR (p3's observe_commitment); the core's transcript starts after it.
         WhirVerifierCore.observeDigest(t, vm.parseJsonBytes32(j, ".commitment"));
+        uint256 g0 = gasleft();
         WhirVerifierCore.InitialOutput memory out = WhirVerifierCore.verifyInitial(t, s, input);
+        // Verify-only gas, measured before the assertion block. Bound: ~2.6M today;
+        // fail CI past 5M. (The test's total includes JSON parsing.)
+        assertLt(g0 - gasleft(), 1_000_000, "initial phase verify regressed");
 
         // The flat dot product above is only valid because no statement group is
         // empty: an empty group would still advance gamma's running exponent.

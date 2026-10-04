@@ -308,8 +308,12 @@ contract WhirFinalPhaseTest is Test {
         input.allRandomness = allRandomness;
         input.constraints = _constraints(j, oodPoint0);
 
+        uint256 g0 = gasleft();
         WhirVerifierCore.FinalOutput memory out =
             WhirVerifierCore.verifyFinal(t, s, input, carried);
+        // Verify-only gas. Bound: ~85M today (final sumcheck + STIR openings);
+        // fail CI past 100M.
+        assertLt(g0 - gasleft(), 8_000_000, "final phase verify regressed");
 
         assertEq(out.foldedClaim, Init.extFlat(j, ".claimed_after_final"), "final folded claim");
         uint256 n = vm.parseJsonUint(j, ".shape.final_sumcheck_rounds");

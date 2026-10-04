@@ -19,7 +19,7 @@ EIP-170 bytecode limits, and address them borrowing design from
 | M5b | `BatchTranscript.sol` production contract, pinned by the M5 vectors | done (this commit) |
 | M6 | `ConstraintIdentity.sol` (generated AIR constraint identity) | done (this commit) |
 | M7 | `ChunkVerifier.sol` (multi-transaction sponge carry) | done (this commit) |
-| M8 | Gas benchmark + EIP-170 audit + size reductions (see D-068 reference list) | pending |
+| M8 | Gas benchmark + EIP-170 audit + size reductions (see D-068 reference list) | audit done; reductions deferred |
 | M9 | Wallet extension, local-chain settlement E2E, metrics/dashboards | pending |
 
 ## M3 — DONE
@@ -380,3 +380,49 @@ have caught it (the draws would diverge), but fixing it before running is better
 **Gas note for M8**: the chunked walk costs 17.6M vs the native single-shot 18.2M -
 the encode/decode boundary is essentially free next to the keccak the phases do. So
 splitting across transactions buys gas headroom at no throughput cost.
+
+## M8 - AUDIT: honest gas + EIP-170 (reductions deferred to D-068)
+
+**The headline correction: the gas numbers I had been carrying were wrong.** The pin
+tests report 55M (batch walk) and 40M (constraint layer), but those totals are
+dominated by forge-std JSON parsing of the 797 KB / 368 KB vector files, not by the
+verifier. Measuring with inputs pre-parsed (`VerifierGas.t.sol`, and `gasleft()`
+brackets around the verify calls in the WHIR phase pins) gives the honest verify-only
+cost:
+
+| layer | verify-only gas | note |
+|---|---|---|
+| batch transcript walk (settlement shape) | **16.5M** | 7 phases, ~30 keccak flushes |
+| WHIR core initial | 0.28M | |
+| WHIR core round (x1) | 3.47M | |
+| WHIR core final | 3.17M | final sumcheck + STIR openings |
+| constraint layer, 6 instances | **8.7M** | selectors 0.28M, fold 8.0M, quotient 0.4M |
+
+The WHIR-core numbers come from `whir_proof_vectors` (the standalone WHIR proof),
+the walk and constraint numbers from the settlement batch - different artifacts, so
+they bound rather than sum to one settlement total. Order of magnitude: the whole
+verifier is **~30M verify-only**, not the ~100M the pin totals implied. It fits a
+single transaction with room to spare; M7's chunking is available for headroom but is
+not forced by gas.
+
+**Constraint layer breakdown** (per-instance fold, the dominant term): inst3 5.42M,
+inst2 2.18M, inst4 0.13M, inst5 0.13M, inst0 0.06M, inst1 0.05M. The fold tracks the
+DAG node count exactly (inst3 = 5,085 nodes = 5.4M gas, ~1,065 gas/node). Selectors
+are flat ~46K/instance (the four inversions dominate, independent of constraint
+count) - so Montgomery-batching them across instances would save at most ~0.2M total.
+Not worth it at this scale; recorded so nobody spends M8 time there.
+
+**EIP-170**: `VerifierSizeProbe` (test/utils) references every verifier entry point so
+the linker pulls all their code into one artifact. Runtime **15,216 bytes**, margin
+**9,360** under the 24,576 limit. A monolithic verifier deploys today. The probe is
+the regression tripwire: adding a layer that pushes it past 24,576 fails `--sizes`.
+
+**Gas regression bounds** are now asserted in the pins (initial <1M, round <8M, final
+<8M, walk <25M, constraint layer <55M) so a doubling fails CI, not just a benchmark
+run.
+
+**Deferred to D-068** (after the recursive proof verifies end to end): the assembly
+rewrites (packed-ext4 lane arithmetic, the DAG dispatch, Merkle compression) and the
+bytecode-size work, borrowing from bitcoin-stark-verifier / plutus-plonky3-exploration
+/ midfall quotient-hybrid. The audit says these are OPTIMIZATIONS now, not blockers -
+the verifier fits both limits as written.
