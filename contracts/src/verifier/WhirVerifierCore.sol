@@ -213,12 +213,12 @@ library WhirVerifierCore {
             return order;
         }
         uint256[] memory starts = new uint256[](widths.length);
-        uint256 acc;
+        uint256 acc = 0;
         for (uint256 c; c < widths.length; ++c) {
             starts[c] = acc;
             acc += widths[c];
         }
-        uint256 pos;
+        uint256 pos = 0;
         for (uint256 pIdx; pIdx < claimPerm.length; ++pIdx) {
             uint256 ci = claimPerm[pIdx];
             for (uint256 e; e < widths[ci]; ++e) {
@@ -414,6 +414,10 @@ library WhirVerifierCore {
         uint256[] oodPoints;
         /// Each query's folded row evaluation, in query order.
         uint256[] folds;
+        /// The query indices the transcript sampled, in query order. The caller
+        /// needs them to rebuild each query's domain point (g^index) for the
+        /// constraint weights without trusting proof bytes for it (D-072).
+        uint256[] queryIndices;
     }
 
     /// A round carries the wrong number of OOD answers for its shape.
@@ -499,6 +503,7 @@ library WhirVerifierCore {
         for (uint256 q; q < input.numQueries; ++q) {
             indices[q] = t.state.sampleBits(input.logFoldedDomainSize);
         }
+        out.queryIndices = indices;
 
         // --- 5: open and fold every query ------------------------------------------
         out.folds = new uint256[](input.numQueries);
@@ -622,7 +627,15 @@ library WhirVerifierCore {
         /// The terminal queries' domain points, lifted base scalars, in query
         /// order: `g^index` on the folded domain. The STIR check evaluates the
         /// public polynomial here.
+        ///
+        /// When `domainGenerator` is nonzero this field is IGNORED and
+        /// recomputed in-circuit from the sampled indices (D-072): the proof
+        /// does not get to pick its own domain points.
         uint256[] domainPoints;
+        /// When nonzero, the folded-domain generator (canonical base element)
+        /// used to compute each query's domain point as `generator^index` from
+        /// the indices the transcript itself sampled.
+        uint256 domainGenerator;
         /// Closing sumcheck round values and witnesses.
         uint256[] sumcheckCA;
         uint256[] sumcheckCInf;
@@ -646,6 +659,9 @@ library WhirVerifierCore {
         uint256 weight;
         /// The final polynomial evaluated at the closing randomness.
         uint256 finalValue;
+        /// The terminal query indices the transcript sampled, in query order:
+        /// the caller's source for each query's domain point (D-072).
+        uint256[] queryIndices;
     }
 
     /// A terminal query's folded row disagrees with the public polynomial.
@@ -686,8 +702,11 @@ library WhirVerifierCore {
         if (input.rowsFlat.length != input.numQueries * input.rowLimbs) {
             revert RowBufferMismatch(input.numQueries * input.rowLimbs, input.rowsFlat.length);
         }
-        if (input.paths.length != input.numQueries || input.domainPoints.length != input.numQueries) {
+        if (input.paths.length != input.numQueries) {
             revert RoundRowCountMismatch(input.numQueries, input.paths.length);
+        }
+        if (input.domainGenerator == 0 && input.domainPoints.length != input.numQueries) {
+            revert RoundRowCountMismatch(input.numQueries, input.domainPoints.length);
         }
 
         // --- bind the public polynomial ------------------------------------------
@@ -703,6 +722,17 @@ library WhirVerifierCore {
         uint256[] memory indices = new uint256[](input.numQueries);
         for (uint256 q; q < input.numQueries; ++q) {
             indices[q] = t.state.sampleBits(input.logFoldedDomainSize);
+        }
+        out.queryIndices = indices;
+
+        // Domain points: computed in-circuit from the sampled indices when a
+        // generator was supplied, so the STIR check cannot be steered by
+        // proof-chosen points (D-072).
+        if (input.domainGenerator != 0) {
+            input.domainPoints = new uint256[](input.numQueries);
+            for (uint256 q; q < input.numQueries; ++q) {
+                input.domainPoints[q] = WhirGadgets.powConstBase(input.domainGenerator, indices[q]);
+            }
         }
 
         // --- open, fold, and check each query against the public polynomial ----------

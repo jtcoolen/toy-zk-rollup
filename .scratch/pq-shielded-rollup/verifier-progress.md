@@ -611,3 +611,155 @@ starts at 161 with the digest already in the sponge - matching the small-shape
 tests' observeDigest(commitment) then verifyInitial.
 
 Next: WhirComposed.t.sol driving all 5 rounds from composed_vectors.json.
+
+
+## M7 COMPOSED ROUNDS GREEN (commit 61debf3) - 2025 goal round 5
+
+WhirComposedTest: all 5 composed opening rounds replay end to end in
+WhirVerifierCore.sol - initial phase (alpha, batched claim, initial sumcheck,
+randomness), every intermediate WHIR round (grinds, OOD answers, Merkle
+openings, folds, round batching, folded claim threading), the final phase
+(public poly bind, terminal PoW, terminal queries, STIR check, closing
+sumcheck) and the terminal identity
+claimed == eval_constraints_poly(all_r) * final_poly(final_r).
+
+Three root causes fixed (all pinned in code comments):
+1. CLAIM PLACEMENT ORDER. The batched dot product weights concrete claims in
+   constraint order (plan_layout: tables by descending arity, ties by
+   descending table index, claims within a table in insertion order), NOT
+   proof order. Transcript absorbs in proof order; only the dot product is
+   permuted. InitialInput.claimPerm (empty = identity).
+2. GRIND WITNESSES ARE MONTGOMERY. Blob stores base words in Montgomery;
+   checkWitness absorbs raw. JSON export is canonical; the generator converts
+   the five pow-witness fields (mont = x*2^32 mod p).
+3. PER-ROUND SEEDING. Each opening round seeds the sponge at its own
+   round_starts[r] site (r0 at the batch delegate event 161; later rounds
+   where the previous walk ended). SemanticBlob.walkTo(stopSite) parks the
+   sponge mid-stream for the batch->WHIR handover.
+
+Sidecar gotchas solved: rows_flat/final_rows_ext are RAW canonical limbs
+(extLeaf does Montgomery conversion itself, 4 limbs/ext element low-first);
+paths + round commitments ship as hex blobs (forge parseJsonBytes32Array
+chokes on big arrays; repo pattern is hex + Solidity slicing via assembly
+_node); n_inter exported explicitly (forge JSON paths have no .length).
+
+Test threading gotcha: memory reassignment inside a private function is
+invisible to the caller - the intermediate loop must RETURN its carried
+claim + randomness (Threading struct), not mutate params.
+
+REGRESSION: WhirInitialPhase/RoundPhase/FinalPhase/BatchTranscriptNative/
+WhirSemanticProgram/ProofCodec/StarkMerkle all green (36 tests).
+
+NEXT: top-level WhirVerifier.sol implementing IWhirVerifier.verify(statement,
+proof). The composed test is the verifier logic fed from a sidecar; the real
+entry point must derive the same inputs from the semantic blob (schedule-
+driven interpreter, D-070): walk the WSPR schedule, read proof payloads at
+the varying cursors, derive framing constants from the fixed payload at the
+exported offsets, drive WhirVerifierCore. Then wire into ShieldedPool with
+real proof bytes, then gas benchmark + EIP-170 size check (D-068 reductions
+if needed).
+
+
+## D-071: WhirVerifier wire format (settlement bundle)
+
+IWhirVerifier.verify(statement, proof) needs the composed inputs as BYTES, not
+JSON. The composed_flat sidecar mixes three trust classes; the bundle splits
+them explicitly:
+
+- PROOF (untrusted, from the prover): per-round commitments, bound_evals
+  (opening evaluations), OOD answers, sumcheck round values (ca/cinf), grind
+  witnesses (Montgomery), opened rows (raw canonical limbs), Merkle paths,
+  final poly + final rows + final paths, terminal pow witness.
+- STATEMENT (public): per-round matrix shapes (log_size, width) + opening
+  points, public values, degree bits.
+- CONFIG (trusted setup, D-066 posture): framing tables (keccak-derived
+  labels), schedule params (pow_bits, log_folded, ood_samples, num_queries),
+  claim_perm, eq_points (univariate_eq_point of the statement points -
+  in-circuit derivation needs inversions per point, deferred), per-round
+  domain base constants, num_variables, claim widths.
+
+TRANSCRIPT-DERIVED values (alpha, gamma, betas, query indices, folds,
+claimed/folded evals, round randomness, batching) are NEVER in the bundle -
+the verifier computes them; the test asserts they match the ground truth.
+A prover-supplied challenge would be a soundness hole.
+
+Wire format: fixed-order sections, versioned header, u32 LE words, 32-byte
+BE packed ext elements, raw byte runs for framing/paths blobs. ProofCodec
+cursor primitives do the decoding. Same run as composed_vectors.bin; emitted
+by contracts/scripts/gen_bundle.mjs from composed_flat.json + composed_vectors.json.
+
+WhirVerifier.sol = decode -> BatchTranscript walk (batch layer, sites 0..161)
+-> per opening round: WHIR core initial/intermediate/final on the delegated
+sponge -> terminal identity -> true. WhirComposed.t.sol logic moves into the
+contract; the test keeps only decode + expected-value assertions.
+
+
+## D-072: eq_points are statement-derived, not trusted config (soundness)
+
+The initial constraint's equality points are a function of zeta (drawn in
+ood_phase, per-proof) and the trusted shapes/layout: each claim's stacked
+point = univariate_eq_point(zeta, log_size_m) placed at the claim's block
+offset in the stacked variable space, zeros elsewhere; the virtual OOD claim
+gets the sampled point. They CANNOT be static trusted config (zeta changes
+per proof) and MUST NOT be prover-supplied unchecked: a prover choosing eq
+points proves openings at points of their choice, breaking the link to the
+batch statement.
+
+Plan: phase 1 (this round) ships eq_points in the bundle PROOF section and the
+contract uses them - correct but with a tracked soundness gap. Phase 2
+(next round) implements deriveEqPoints(zeta, shapes) in Solidity mirroring
+p3-sumcheck's stacking, validates derived == shipped in the test (proving the
+rule), then the contract derives instead of trusting. The composed test already
+proves the terminal identity with exactly these points; what remains is proving
+they are the ONLY points consistent with zeta.
+
+## Bundle layout shipped (composed_bundle.bin, WBND v1)
+header: magic WBND, version u8, cfg_words u32 LE, prf_words u32 LE
+cfg: [batchCfgLen, batchCfg..., per-round config..., per-round proof...]
+  batchCfg = fixed blob words before delegate (seed, degree bits, public
+  values, preprocessed digest)
+prf: [batchPrfLen, batchPrf..., per-round proof...]
+  batchPrf = varying blob words before delegate (main digest, lookup grind,
+  perm digest + terminals, quotient digests, ood grind)
+stm: [stmLen, per-round matrix shapes + opening points]
+
+
+## D-073 — Top-level WhirVerifier: the settlement proof verifies on-chain (DONE)
+
+`contracts/src/verifier/WhirVerifier.sol` is the entry point: WBND v3 bundle
+decode -> full batch transcript walk (begin/mainPhase/preprocessedPhase/
+lookupPhase/permutationPhase/quotientPhase/oodPhase) -> the SAME sponge handed
+to the WHIR core -> all five opening rounds (verifyInitial/verifyRound/
+verifyFinal) -> terminal identity. `WhirVerifierTest` drives it from the real
+composed bundle: accepts the real proof (960M gas), rejects wrong statement,
+wrong length, tampered bytes, truncation, bad magic. All 24 forge suites green.
+
+Wire findings this step pinned (each was a live bug):
+- **pv words on the wire are Montgomery** (p3 serializes the internal form);
+  the statement is canonical, so the statement check compares
+  `mulmod(statement[i], R, p)` against the blob word. The blob absorbs them raw
+  (correct); only the statement comparison converts.
+- **the blob's var payload is Montgomery too** (same serializer), so the
+  generator converts the LogUp terminals back to canonical before packing —
+  `observeExt4Canonical` expects canonical limbs. The native test used the
+  JSON's canonical values directly, which hid this until the bundle path ran.
+- **framingSeps indexing**: [0] frames the initial sumcheck, [1+i] round i, so
+  the closing sumcheck's separator is [1 + n_inter].
+- **round commitment wiring**: intermediate round i's new root is
+  `roundCommitments[i]` (n_inter entries); the batch commitment is only the
+  round-0 OPENING root (`prevCommitment`).
+- **section offsets are word offsets into the data** (header = 4 words): CONFIG
+  at word 4, PROOF at 4 + cfgWords; section length words count words.
+- D-072 phase 2 landed: domain points are computed in-circuit as
+  `g^(sampled index)` via `FinalInput.domainGenerator` /
+  `WhirGadgets.powConstBase`; the proof no longer carries domain_points (v3).
+  `round .gamma == verifyInitial alpha` threads constraints[0].gamma;
+  intermediate gammas come from `RoundOutput.gamma`.
+
+Sizes: WhirVerifier runtime 17,183 B — fits EIP-170 with 7,393 B margin.
+Gas: 960M for the full settlement proof (all 5 rounds) — above the 30M block
+target; calldata ~1.88 MB. Both are the D-068 reduction agenda (recursion to
+one small proof + assembly hot paths), not correctness issues.
+
+Bundle v3 deltas: PRF gains final_sumcheck_ca/cinf/pow_witnesses per round,
+drops domain_points; CFG batch prefix gains the two grind difficulty bits.
