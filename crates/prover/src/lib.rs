@@ -47,6 +47,7 @@ pub mod fixed_config;
 pub mod nullifier_gadget;
 pub mod semantic_blob;
 pub mod semantic_trace;
+pub mod settlement_replay;
 pub mod sha3_block;
 pub mod transcript_trace;
 pub mod transfer;

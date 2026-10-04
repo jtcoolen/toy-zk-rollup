@@ -42,6 +42,9 @@ p3-multilinear-util = { workspace = true }
 # as `p3-recursion` so the `ExprId`/`Target` types are the same ones.
 p3-circuit = { workspace = true }
 p3-circuit-prover = { workspace = true }
+# The batch transcript the settlement proof rides on: settlement_replay
+# drives BatchVerifierTranscript phase by phase (was a dev-only dep).
+p3-batch-stark = { workspace = true }
 p3-lookup = { workspace = true }
 p3-poseidon2-circuit-air = { workspace = true }
 
@@ -63,10 +66,6 @@ postcard = "1.1"
 # to the Solidity side.
 p3-keccak = { workspace = true }
 p3-symmetric = { workspace = true }
-# Replayed directly by `tests/batch_stark_vectors.rs`: the settlement proof is a
-# `BatchStarkProof`, and the contract must reproduce this crate's transcript
-# sequence. Same version the vendored `p3-circuit-prover` resolves to.
-p3-batch-stark = { workspace = true }
 # Self-dependency with `testkit` on. An integration test links against the lib
 # compiled *without* `cfg(test)`, so the fixtures gated on it are otherwise
 # invisible to `tests/`. Depending on ourselves with the feature enabled is the

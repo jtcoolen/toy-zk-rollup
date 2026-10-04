@@ -53,11 +53,36 @@ use prover::semantic_blob::{classify_observations, replay_blob};
 use prover::semantic_trace::SemChallenger;
 use prover::whir_recursion::LOG_MAX_LDE;
 
-mod batch_fixture;
-use batch_fixture::{
-    base_json, bus_layout, com_json, dom_json, ext_json, fib_recursion, hex, lookup_meta, one_run,
-    Challenge, ReplayOut, SemConfig, SemPcs, EXT_DEG, F, RUNS,
+use prover::settlement_replay::{
+    base_json, bus_layout, com_json, dom_json, ext_json, fib_recursion, hex, one_run, Challenge,
+    ReplayOut, SemConfig, SemPcs, EXT_DEG, F,
 };
+
+/// Independent proving runs; two is the minimum that separates fixed from varying.
+const RUNS: usize = 2;
+
+/// One instance's lookup metadata: trusted-setup data, never proof data (D-063).
+fn lookup_meta(lookups: &[p3_lookup::Lookup<F>]) -> Vec<serde_json::Value> {
+    lookups
+        .iter()
+        .map(|l| {
+            let widths: Vec<usize> = l.elements.iter().map(Vec::len).collect();
+            let first = widths.first().copied().unwrap_or(0);
+            assert!(
+                widths.iter().all(|w| *w == first),
+                "lookup tuples sharing a bus must share a width"
+            );
+            json!({
+                "kind": match &l.kind {
+                    p3_lookup::Kind::Global(name) => json!({"global": name}),
+                    p3_lookup::Kind::Local => json!("local"),
+                },
+                "num_tuples": l.elements.len(),
+                "tuple_width": first,
+            })
+        })
+        .collect()
+}
 
 /// Smoke: prove the settlement batch under the semantic config, verify natively, replay
 /// the phases by hand, and require the two transcript programs to agree.

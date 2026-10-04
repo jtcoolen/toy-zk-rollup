@@ -46,8 +46,7 @@ use prover::whir::FOLDING_FACTOR;
 use prover::whir_recursion::{RecursionCircuit, LOG_MAX_LDE};
 use prover::F;
 
-mod batch_fixture;
-use batch_fixture::{
+use prover::settlement_replay::{
     base_json, bus_layout, com_json, dom_json, ext_json, fib_recursion, hex, one_run_for,
     settlement_params, settlement_params_for, Challenge, Dft, OpeningClaims, OpeningProof,
     ReplayOut, SemConfig, SemPcs, CAP_HEIGHT,
@@ -370,7 +369,7 @@ fn composed_run_with(
                 rounds_json.push(json!({
                     "commitment": com_json(&claim.commitment),
                     "stacked_num_variables": stacked,
-                    "matrices": claim.matrices.iter().enumerate().map(|(mi, m)| json!({
+                    "matrices": claim.matrices.iter().enumerate().map(|(_mi, m)| json!({
                         "domain": dom_json(&m.domain),
                         "arity": padded_arity(m.domain.log_size(), FOLDING_FACTOR).get(),
                         "points": m.points.iter().map(|pt| json!({
