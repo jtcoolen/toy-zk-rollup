@@ -41,7 +41,7 @@ use p3_whir::parameters::WhirConfig;
 use serde_json::json;
 
 use prover::semantic_blob::{classify_observations, replay_blob};
-use prover::semantic_trace::{SemChallenger, SemProgram};
+use prover::semantic_trace::{SemChallenger, SemEvent, SemProgram};
 use prover::whir::FOLDING_FACTOR;
 
 mod batch_fixture;
@@ -325,6 +325,99 @@ fn round_const_words(
         .collect()
 }
 
+/// Segment each round region's config-fixed absorbs into runs, exactly as
+/// whir_proof_vectors::fixed_runs does for a whole program but scoped to one
+/// round's event range. Each run is the concatenation of consecutive fixed
+/// constant words as a little-endian hex string; run boundaries are the
+/// proof-dependent (varying) absorbs that interrupt them. The contract's
+/// constant payload is the concatenation of these runs in order, and the run
+/// lengths are the per-site absorb counts it must reproduce: verifyInitial's
+/// preClaims/perClaim/batching/sumcheck sites and each WHIR round's separator
+/// sites. At settlement shape the per-claim run is width-dependent (the eq
+/// point expansion grows with the claim's column count), so the small-shape
+/// scalar schedule does not generalize and the contract reads these lengths
+/// instead of deriving them.
+fn round_fixed_runs(
+    program: &SemProgram,
+    fixed: &[Option<Vec<u32>>],
+    starts: &[usize],
+) -> Vec<Vec<String>> {
+    let end_of = |r: usize| starts.get(r + 1).copied().unwrap_or(program.len());
+    starts
+        .iter()
+        .enumerate()
+        .map(|(r, &start)| {
+            let mut runs: Vec<String> = Vec::new();
+            let mut current: Vec<u8> = Vec::new();
+            for i in start..end_of(r) {
+                if matches!(
+                    program[i],
+                    SemEvent::ObserveBase { .. } | SemEvent::ObserveBytes { .. }
+                ) {
+                    if let Some(words) = &fixed[i] {
+                        current.extend(words.iter().flat_map(|w| w.to_le_bytes()));
+                        continue;
+                    }
+                }
+                if !current.is_empty() {
+                    runs.push(hex(&current));
+                    current.clear();
+                }
+            }
+            if !current.is_empty() {
+                runs.push(hex(&current));
+            }
+            runs
+        })
+        .collect()
+}
+/// Reclassify every all-zero fixed run as varying (proof data). See the call
+/// site for why: a run of zero words is a structurally-zero extension element,
+/// not a framing constant, and the contract must read it from calldata.
+fn reclassify_zero_runs(
+    program: &SemProgram,
+    fixed: Vec<Option<Vec<u32>>>,
+) -> Vec<Option<Vec<u32>>> {
+    let mut out = fixed;
+    let mut i = 0usize;
+    while i < program.len() {
+        let starts_run = matches!(
+            program[i],
+            SemEvent::ObserveBase { .. } | SemEvent::ObserveBytes { .. }
+        ) && out[i].is_some();
+        if !starts_run {
+            i += 1;
+            continue;
+        }
+        // Walk the maximal fixed run.
+        let begin = i;
+        let mut all_zero = true;
+        while i < program.len()
+            && matches!(
+                program[i],
+                SemEvent::ObserveBase { .. } | SemEvent::ObserveBytes { .. }
+            )
+            && out[i].is_some()
+        {
+            if out[i].as_ref().is_some_and(|w| w.iter().any(|&x| x != 0)) {
+                all_zero = false;
+            }
+            i += 1;
+        }
+        if all_zero {
+            for slot in &mut out[begin..i] {
+                *slot = None;
+            }
+        }
+    }
+    out
+}
+
+/// The positions the contract reads from calldata: every observation the
+/// corrected classification marks varying.
+fn varying_positions(program: &SemProgram, fixed: &[Option<Vec<u32>>]) -> Vec<usize> {
+    (0..program.len()).filter(|&i| fixed[i].is_none()).collect()
+}
 /// The linchpin: prove, verify natively, replay the batch phases with the shared WHIR
 /// walk in the delegate, and require the combined programs to agree (asserted inside
 /// one_run). Then export the per-round statements and the composed blob for Solidity.
@@ -352,13 +445,29 @@ fn composed_program_equality_and_export() {
     );
     assert_eq!(starts_a, starts_b, "runs disagree on round boundaries");
 
-    let (fixed, varying) = classify_observations(&[program_a.clone(), program_b.clone()]);
+    let (fixed_raw, varying_raw) = classify_observations(&[program_a.clone(), program_b.clone()]);
+    // Proof-data zeros: a config-fixed run whose every word is zero is not a
+    // framing constant but a structurally-zero extension element (a high
+    // final_poly coefficient, or a zero column of a claim's evaluations) that
+    // happens to be zero in both sampled runs. The contract reads proof data
+    // from calldata uniformly; leaving these in the trusted constant table
+    // would force the final-poly absorb to interleave constant and calldata
+    // words (Vx12 Cx4 Vx12 Cx4 ...), which no scalar schedule expresses.
+    // Reclassifying them as varying moves the zeros into the proof payload, so
+    // every framing run is a nonzero shape constant and final_poly is read
+    // whole from calldata. Framing constants are keccak-derived or fixed
+    // labels and are never all-zero; the small-shape guard already treats an
+    // isolated fixed zero as a bug (check_no_ambiguous_zeros).
+    let fixed = reclassify_zero_runs(&program_b, fixed_raw);
+    let varying = varying_positions(&program_b, &fixed);
+    let _ = varying_raw;
     let blob = replay_blob(&program_b, &fixed).expect("composed blob");
     let const_words = round_const_words(&program_b, &fixed, &starts_b);
 
     let mut doc = doc;
     doc["varying_positions"] = json!(varying);
     doc["round_const_words"] = json!(const_words);
+    doc["round_fixed_runs"] = json!(round_fixed_runs(&program_b, &fixed, &starts_b));
     doc["blob_len"] = json!(blob.len());
     doc["phase_marks_before_delegate"] = json!(out
         .phase_marks

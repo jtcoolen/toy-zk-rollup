@@ -426,3 +426,121 @@ rewrites (packed-ext4 lane arithmetic, the DAG dispatch, Merkle compression) and
 bytecode-size work, borrowing from bitcoin-stark-verifier / plutus-plonky3-exploration
 / midfall quotient-hybrid. The audit says these are OPTIMIZATIONS now, not blockers -
 the verifier fits both limits as written.
+
+
+## M10 - COMPOSED VERIFIER + POOL E2E
+
+### Done
+- ShieldedPool first tests (a7d96e9): 8 tests driven by real prover block data
+  (block_vectors.json). Caught a real bug - the pool left currentNullifierRoot=0
+  but the prover's genesis block names the empty nullifier-map root (depth-256
+  empty-subtree chain). Constructor now computes it at deploy. Stub verifier is
+  view (like the real seam) and accepts only keccak(abi.encode(statement,proof))
+  it was told, pinning verbatim passthrough.
+
+### The remaining gap to a TRUE e2e (real proof -> real verifier -> pool)
+Every layer is pinned against prover output IN ISOLATION:
+  - BatchTranscript.sol  <- batch_stark_vectors (settlement shape, program eq)
+  - ConstraintIdentity   <- constraint_identity_vectors (settlement shape)
+  - WhirVerifierCore     <- whir_proof_vectors (SMALL shape: 11 vars, 1 round)
+  - StarkMerkle/StirOpenings/SumcheckCore <- their own vectors
+But:
+  (a) No composed IWhirVerifier implementation stitches them.
+  (b) The WHIR core has NEVER been driven at the settlement shape
+      (25 vars, 4 rounds, 170 queries, pow 23) - only the small test shape.
+  (c) The batch->WHIR delegate handover (transcript.delegate(pcs.verify...)
+      -> WhirVerifierTranscript) has never been pinned.
+
+### Linchpin first (Rust-only, fast to iterate)
+Write crates/prover/tests/composed_vectors.rs: at the SETTLEMENT shape, take the
+real batch proof's opening_proof and drive WhirVerifierTranscript exactly as
+pcs.verify_with_preprocessing does, asserting program equality against the
+native run. If this passes, the WHIR core consumes exactly the batch transcript's
+delegated challenger at settlement shape -> the Solidity composition is then
+mechanical assembly of already-pinned pieces.
+
+### Then (Solidity)
+- WhirVerifier.sol: implements IWhirVerifier.verify(statement, proof):
+  ProofCodec decode -> BatchTranscript walk -> ConstraintIdentity per instance ->
+  delegate to WhirVerifierCore initial/round/final -> return true.
+- Wire into ShieldedPool ctor; a pool test feeds the REAL proof bytes (needs a
+  block_vectors.bin sidecar) and asserts the whole path.
+
+
+## M10 LINCHPIN PROVEN (commit 39ac1ca)
+
+The composition claim is now a tested fact, not a plan.
+
+- `tests/whir_walk`: the WHIR verifier-transcript walk (initial fold, round
+  loop, terminal phase) lifted out of `whir_proof_vectors.rs` into a shared
+  module, plus a new `verify_whir_round` driver taking a `PcsProof`, an
+  `OpeningProtocol` and its points, driving the whole run on a caller-owned
+  challenger. The small-shape pinned test drives this exact code and still
+  passes (program equality, negative controls, shape pin).
+- `tests/batch_fixture`: the settlement-batch scaffolding lifted out of
+  `batch_stark_vectors.rs`. `manual_replay`/`one_run` gained an optional
+  delegate hook: `None` runs the native PCS exactly as `verify_batch` does;
+  `Some` replaces the PCS inside `transcript.delegate` on the same challenger.
+- `tests/composed_vectors.rs`: the linchpin. Proves the settlement batch,
+  replays the batch phases, and inside the delegate rebuilds each of the five
+  opening rounds' WHIR config + opening schedule from public ingredients only
+  (`padded_arity`, `checked_stacked_num_variables`, `univariate_eq_point` - the
+  same construction `round_schedule` performs), drives `verify_whir_round` on
+  the batch challenger, and re-checks the claimed openings against the walk's
+  bound evaluations with the univariate-eq scales. `one_run` asserts the
+  combined event program equals the native run's: **29,902 events, identical.**
+
+Measured settlement shapes (composed_vectors.json, 6.5 MB):
+- 5 opening rounds; stacked arities 19/24/22/23/22.
+- 3 WHIR folding rounds in batch rounds 0/2/4, 4 in rounds 1/3.
+- round 2 opens 32 matrices (per-instance column split); others open 6.
+- rounds 1 and 4 open the two-row instances at 2 points.
+- phase_marks: delegate opens at event 161, closes at 29902.
+
+Consequence: the batch->WHIR handover is pinned. The Solidity composition is
+now mechanical assembly of pieces each already pinned: BatchTranscript.sol up
+to the delegate, then WhirVerifierCore per round with the statement exported
+here. No vendor patch was needed - every ingredient of round_schedule is public.
+
+## Next: composed Solidity verifier (WhirVerifier.sol)
+
+`IWhirVerifier.verify(statement, proof)` = ProofCodec decode -> BatchTranscript
+walk -> ConstraintIdentity per instance -> delegate to WhirVerifierCore
+initial/round/final per opening round -> return true. Feed real proof bytes.
+
+
+## D-069: proof-data zeros reclassified as varying; per-site constant schedules
+
+Measured: the composed blob's all-zero fixed runs are structurally-zero
+extension elements - high final_poly coefficients (round 1: 5/16, round 2:
+11/64, round 4: 21/64) and zero eval columns (round 3: 30 across four
+claims). They are constant across runs only because the circuit zeroes them
+structurally; they are proof data, not framing constants.
+
+Options considered:
+(a) Keep them fixed and give the final-poly absorb an interleaved
+    constant/calldata schedule (Vx12 Cx4 Vx12 Cx4 ...). Rejected: no scalar
+    schedule expresses it, the interleaving is proof-shaped, and a forged
+    nonzero in a "zero" slot would desync the sponge anyway.
+(b) RECLASSIFY every all-zero fixed run as varying (chosen). The contract
+    reads proof data from calldata uniformly; every framing run is then a
+    nonzero shape constant. Soundness: the transcript only sees the byte
+    stream - a prover putting a nonzero where the schedule says calldata
+    diverges the sponge from the honest prover's, exactly like any other
+    proof mismatch. Framing constants are keccak-derived labels, never zero.
+    The small-shape guard (check_no_ambiguous_zeros) already treated an
+    isolated fixed zero as a bug; this generalizes that stance.
+
+Consequence for WhirVerifierCore (measured run decomposition, exact):
+per composed opening round the framing runs are
+    [preClaims x oodSamples, perClaim x nClaims, batching,
+     sumcheck x (1 + nWhirRounds)]
+- preClaims absorbed ONCE PER virtual claim (oodSamples=2 in rounds 1-4).
+- perClaim varies per claim: width- AND arity-dependent (126 for width 4 at
+  arity 19; 414/774 at width 76/166; 334 for width-4 column-split matrices
+  at arity 22), so it must be a per-claim array from trusted setup, not a
+  scalar. Zero-split claims (round 3) split a perClaim run; the split
+  positions are trusted-setup schedule data.
+- finalPolyConstants = 0 after reclassification (final_poly read whole).
+Export: composed_vectors.json round_fixed_runs = per-round framing run
+values (hex); lengths are the schedule. Blob shrank 122738 -> 122322 B.
