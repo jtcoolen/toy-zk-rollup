@@ -83,6 +83,9 @@ pub(crate) struct RoundWalk {
     /// Per-round sumcheck {0,1}-pair evaluations, split like the initial one.
     pub(crate) sumcheck_ca: Vec<Vec<Challenge>>,
     pub(crate) sumcheck_cinf: Vec<Vec<Challenge>>,
+    /// Per-round sumcheck proof-of-work witnesses (canonical base u32s; empty
+    /// at zero difficulty). The contract's SumcheckCore checks each grind.
+    pub(crate) sumcheck_pow_witnesses: Vec<Vec<u32>>,
     /// Per-round opened rows, flattened base-field limbs for round 0 and packed
     /// extension elements for later rounds. The contract authenticates these
     /// against the previous commitment and folds them; exporting them lets the
@@ -130,6 +133,7 @@ pub(crate) fn replay_rounds(
         pow_witnesses: Vec::new(),
         sumcheck_ca: Vec::new(),
         sumcheck_cinf: Vec::new(),
+        sumcheck_pow_witnesses: Vec::new(),
         rows_base: Vec::new(),
         rows_ext: Vec::new(),
         params: Vec::new(),
@@ -328,6 +332,14 @@ pub(crate) fn replay_rounds(
                 .polynomial_evaluations
                 .iter()
                 .map(|pair| pair[1])
+                .collect(),
+        );
+        walk.sumcheck_pow_witnesses.push(
+            rproof
+                .sumcheck
+                .pow_witnesses
+                .iter()
+                .map(F::as_canonical_u32)
                 .collect(),
         );
         let r = vt
@@ -542,6 +554,9 @@ pub(crate) struct WhirRoundWalk {
     /// The initial sumcheck's {0,1}-pair evaluations, split like the rounds'.
     pub(crate) initial_sumcheck_ca: Vec<Challenge>,
     pub(crate) initial_sumcheck_cinf: Vec<Challenge>,
+    /// Initial sumcheck proof-of-work witnesses (canonical base u32s; empty at
+    /// zero difficulty).
+    pub(crate) initial_sumcheck_pow_witnesses: Vec<u32>,
     /// The root the terminal queries open against: the last round's commitment,
     /// or the batch commitment when there were no rounds.
     pub(crate) last_root: [u8; 32],
@@ -648,6 +663,12 @@ pub(crate) fn verify_whir_round(
         .polynomial_evaluations
         .iter()
         .map(|p| p[1])
+        .collect();
+    let initial_sumcheck_pow_witnesses: Vec<u32> = whir
+        .initial_sumcheck
+        .pow_witnesses
+        .iter()
+        .map(F::as_canonical_u32)
         .collect();
 
     let rounds = replay_rounds(
@@ -768,6 +789,7 @@ pub(crate) fn verify_whir_round(
         initial_ood_answers: whir.initial_ood_answers.clone(),
         initial_sumcheck_ca,
         initial_sumcheck_cinf,
+        initial_sumcheck_pow_witnesses,
         last_root,
         bound_evals: pcs_proof
             .evals

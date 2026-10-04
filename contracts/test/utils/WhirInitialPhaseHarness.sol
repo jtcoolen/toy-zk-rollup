@@ -74,7 +74,12 @@ library WhirInitialPhaseHarness {
         pure
         returns (WhirVerifierCore.InitialSchedule memory s, WhirVerifierCore.InitialInput memory input)
     {
-        s.preClaimsConstants = runWords(j, 0);
+        uint256 oodSamples = uintAt(j, ".shape.commitment_ood_samples");
+        // Small shape: one virtual claim, framed by run 0.
+        s.preClaimsConstants = new uint256[](oodSamples);
+        for (uint256 i; i < oodSamples; ++i) {
+            s.preClaimsConstants[i] = runWords(j, 0);
+        }
         s.batchingConstants = runWords(j, 3);
         s.sumcheckConstants = runWords(j, 4);
 
@@ -88,7 +93,6 @@ library WhirInitialPhaseHarness {
         for (uint256 c; c < claims; ++c) {
             s.perClaimConstants[c] = runWords(j, 1);
         }
-        uint256 oodSamples = uintAt(j, ".shape.commitment_ood_samples");
 
         uint256[] memory evals = new uint256[](claims * width);
         uint256[] memory widths = new uint256[](claims);

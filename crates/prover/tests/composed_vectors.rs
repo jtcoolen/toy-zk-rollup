@@ -80,6 +80,7 @@ fn schedule_json(config: &WhirConfig<Challenge, prover::F, SemChallenger>) -> se
         "rounds": config.round_parameters().iter().map(round).collect::<Vec<_>>(),
         "final_round": round(&config.final_round_config()),
         "commitment_ood_samples": config.commitment_ood_samples(),
+        "starting_folding_pow_bits": config.starting_folding_pow_bits(),
     })
 }
 
@@ -109,6 +110,7 @@ fn walk_json(walk: &WhirRoundWalk) -> serde_json::Value {
         "initial_ood_answers": exts(&walk.initial_ood_answers),
         "initial_sumcheck_ca": exts(&walk.initial_sumcheck_ca),
         "initial_sumcheck_cinf": exts(&walk.initial_sumcheck_cinf),
+        "initial_sumcheck_pow_witnesses": walk.initial_sumcheck_pow_witnesses.clone(),
         "last_root": hex(&walk.last_root),
         "bound_evals": exts2(&walk.bound_evals),
         "claim_widths": walk.claim_widths,
@@ -128,6 +130,7 @@ fn walk_json(walk: &WhirRoundWalk) -> serde_json::Value {
             "pow_witnesses": r.pow_witnesses.iter().map(|w| base_json(*w)).collect::<Vec<_>>(),
             "sumcheck_ca": exts2(&r.sumcheck_ca),
             "sumcheck_cinf": exts2(&r.sumcheck_cinf),
+            "sumcheck_pow_witnesses": r.sumcheck_pow_witnesses.clone(),
             "rows_base": r.rows_base,
             "rows_ext": exts2(&r.rows_ext),
             "params": r.params.iter().map(|p| p.to_vec()).collect::<Vec<_>>(),
@@ -784,7 +787,10 @@ fn round_framing_tables(
                 }
                 break;
             }
-            let pre_claims: usize = lens[..p].iter().sum();
+            // One framing block per virtual claim (OOD sample): the runs
+            // before the first concrete claim interleave with the virtual
+            // claims' point draws, so they must stay separate.
+            let pre_claims: Vec<usize> = lens[..p].to_vec();
             let batching = lens[p + claim_framing.len()];
             let seps = lens[p + claim_framing.len() + 1..].to_vec();
             json!({

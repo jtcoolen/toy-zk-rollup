@@ -127,8 +127,14 @@ library WhirVerifierCore {
     /// These come from the fixed configuration, never from the proof. They are
     /// the positions `absorbConstants` visits; the values are in the blob.
     struct InitialSchedule {
-        /// Words absorbed after the commitment and before the first claim.
-        uint256 preClaimsConstants;
+        /// Framing words absorbed before each virtual claim's point draw, one
+        /// entry per OOD sample.
+        ///
+        /// Each virtual claim is framed by its own run: the stream is
+        /// `framing, draw, answer` per virtual claim, so a settlement shape
+        /// with two OOD samples absorbs two framing blocks. At the small shape
+        /// there is one entry (possibly zero words).
+        uint256[] preClaimsConstants;
         /// Framing words absorbed before each concrete opening claim's
         /// evaluations, one entry per claim.
         ///
@@ -213,10 +219,9 @@ library WhirVerifierCore {
         InitialInput memory input
     ) internal pure returns (InitialOutput memory out) {
         // --- claim registration ------------------------------------------------
-        absorbConstants(t, s.preClaimsConstants);
-
-        // Virtual claims: draw the point, then bind the answer.
+        // Virtual claims: framing, then draw the point, then bind the answer.
         for (uint256 i; i < input.oodAnswers.length; ++i) {
+            absorbConstants(t, s.preClaimsConstants[i]);
             drawExt(t); // the virtual claim's univariate point; unused here
             observeExt(t, input.oodAnswers[i]);
         }

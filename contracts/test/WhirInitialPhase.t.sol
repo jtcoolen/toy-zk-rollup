@@ -76,7 +76,9 @@ contract WhirInitialPhaseTest is Test {
         // concrete claim's evaluations (both claims share the length), run 3
         // before the batching draw, and the first 37 words of run 4 belong to
         // the sumcheck's own separator.
-        s.preClaimsConstants = _runWords(j, 0);
+        // One virtual claim at this shape: one framing block (run 0).
+        s.preClaimsConstants = new uint256[](1);
+        s.preClaimsConstants[0] = _runWords(j, 0);
         s.batchingConstants = _runWords(j, 3);
         s.sumcheckConstants = 37;
 
