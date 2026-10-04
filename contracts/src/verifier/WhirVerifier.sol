@@ -71,6 +71,13 @@ contract WhirVerifier is IWhirVerifier {
     /// A digest blob that does not hold exactly 32 bytes.
     error BadDigestBlob();
 
+    /// The LogUp terminals must sum to zero across the batch: each AIR commits one
+    /// terminal (the sum of its per-row rational contributions), and the batch is
+    /// only satisfiable if they cancel. p3 verify_batch ends with exactly this
+    /// check (p3-lookup LogUpGadget::verify_terminal_sum); without it a prover
+    /// could balance nothing and still pass the opening argument.
+    error TerminalSumNonZero();
+
     // ---------------------------------------------------------------------
     // Two-adic generators (canonical base elements)
     //
@@ -184,6 +191,18 @@ contract WhirVerifier is IWhirVerifier {
         (prf, po) = _decodeBatchPrf(m, po);
         _checkStatement(prf.pvBytes, statement);
 
+        // --- post-opening check: the LogUp terminal sum ---------------------------
+        // Mirrors verify_batch's final lookup_gadget.verify_terminal_sum: the
+        // terminals are proof-supplied extension elements (packed limbs at bits
+        // 224/192/160/128, canonical) and must sum to zero in the extension field.
+        // Independent of transcript state, so it runs fail-fast before the round
+        // loop: one packed add per terminal, no inversions.
+        uint256 terminalSum;
+        for (uint256 i; i < prf.terminals.length; ++i) {
+            terminalSum = KoalaBearExt4.add(terminalSum, prf.terminals[i]);
+        }
+        if (terminalSum != 0) revert TerminalSumNonZero();
+
         // --- the batch transcript walk -------------------------------------------
         BatchTranscript.State memory s = BatchTranscript.begin(cfg.seedBytes, cfg.degreeBytes);
         BatchTranscript.mainPhase(s, prf.mainDigest, prf.pvBytes);
@@ -213,6 +232,8 @@ contract WhirVerifier is IWhirVerifier {
             (p, po) = _decodeRoundPrf(m, po);
             _runRound(t, c, p);
         }
+
+
         return true;
     }
 

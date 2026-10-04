@@ -74,6 +74,40 @@ contract BlockE2ETest is Test {
         pool.applyBlock(statement, proof);
     }
 
+    /// The LogUp terminal sum is checked fail-fast after the statement check: flip one limb of
+    /// terminal 0 and the verification must fail with exactly TerminalSumNonZero
+    /// (proving the check fires, not just that some byte matters).
+    ///
+    /// Terminal word offset inside the bundle: header(4w) + cfgWords + prf len(1w)
+    /// + mainDigest(8w) + pv blob(1 len + 87 words) + lookupPow(1w) +
+    /// permDigest(8w) + terminal count(1w). All fixed by the block shape.
+    function test_tampered_terminal_fails_the_sum_check() public {
+        bytes memory proof = _proof();
+        uint256 cfgWords;
+        assembly {
+            // u32 LE at byte 8 -> top byte of the word loaded at m+32+8.
+            cfgWords := shr(224, mload(add(add(proof, 32), 8)))
+        }
+        cfgWords = _swapBytes(cfgWords);
+        uint256 termWord = 4 + cfgWords + 1 + 8 + 1 + 87 + 1 + 8 + 1;
+        // Sanity: the 6 terminals' limb sums must be zero before tampering.
+        // (The honest proof passing test_real_block_applies already proves this.)
+        // Data word W sits at file byte 4W: the 16-byte header IS words 0-3.
+        uint256 byteOff = termWord * 4;
+        proof[byteOff] = proof[byteOff] ^ hex"01";
+        vm.expectRevert(WhirVerifier.TerminalSumNonZero.selector);
+        pool.applyBlock(statement, proof);
+    }
+
+    function _swapBytes(uint256 v) internal pure returns (uint256 o) {
+        assembly {
+            o := and(shr(24, v), 0xff)
+            o := or(o, and(shr(8, v), 0xff00))
+            o := or(o, and(shl(8, v), 0xff0000))
+            o := or(o, and(shl(24, v), 0xff000000))
+        }
+    }
+
     /// A wrong statement limb must not apply.
     function test_wrong_statement_does_not_apply() public {
         statement[statement.length - 1] = statement[statement.length - 1] ^ 1;
