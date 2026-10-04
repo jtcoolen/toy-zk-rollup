@@ -530,6 +530,13 @@ pub(crate) struct WhirRoundWalk {
     pub(crate) eq_group_lens: Vec<usize>,
     /// Arity the initial constraint lives in.
     pub(crate) num_variables: usize,
+    /// Program offsets (into the shared sink) of the phase boundaries of this
+    /// round's walk: [claims_start, claim_end_0, ..., claim_end_n,
+    /// initial_fold_end, terminal_start, terminal_end]. Trusted-setup
+    /// schedule data: the contract's walk plan is derived from these, not
+    /// re-derived from shapes (the per-claim framing constant count varies
+    /// with claim width and stacked arity).
+    pub(crate) phase_offsets: Vec<usize>,
     /// The virtual out-of-domain answers the initial phase binds, in order.
     pub(crate) initial_ood_answers: Vec<Challenge>,
     /// The initial sumcheck's {0,1}-pair evaluations, split like the rounds'.
@@ -589,15 +596,19 @@ pub(crate) fn verify_whir_round(
         &protocol.table_shapes(),
         PrefixProver::<F, Challenge>::strategy(),
     );
+    let sink = ch.sink();
+    let mut phase_offsets: Vec<usize> = Vec::new();
     for &eval in &whir.initial_ood_answers {
         layout.add_virtual_eval(eval, ch);
     }
+    phase_offsets.push(sink.len());
     for (((table_idx, batch), evals), point) in
         protocol.iter_openings().zip(&pcs_proof.evals).zip(points)
     {
         layout
             .add_claim_at(table_idx, batch, point, evals, ch)
             .map_err(|e| format!("add_claim_at: {e:?}"))?;
+        phase_offsets.push(sink.len());
     }
 
     let shape = WhirShape::new(config, protocol.num_openings());
@@ -619,6 +630,7 @@ pub(crate) fn verify_whir_round(
         (constraint, alpha, claimed, r)
     });
     let initial_randomness = randomness.map_err(|e| format!("initial sumcheck: {e:?}"))?;
+    phase_offsets.push(sink.len());
     assert_eq!(
         initial_randomness.num_variables(),
         config.round_folding_factor(0),
@@ -709,6 +721,7 @@ pub(crate) fn verify_whir_round(
         .expect("32-byte root")
     };
     let claimed_after_rounds = rounds.folded_claims.last().copied().unwrap_or(claimed_eval);
+    phase_offsets.push(sink.len());
     let terminal = replay_terminal(
         &mut vt,
         whir,
@@ -720,6 +733,7 @@ pub(crate) fn verify_whir_round(
         cap_height,
     )?;
     vt.finish();
+    phase_offsets.push(sink.len());
 
     // The initial constraint holds only equality statements - the selection group
     // is added per WHIR round - which is what makes the flattened point list line
@@ -750,6 +764,7 @@ pub(crate) fn verify_whir_round(
         eq_evals,
         eq_group_lens,
         num_variables: constraint.num_variables(),
+        phase_offsets,
         initial_ood_answers: whir.initial_ood_answers.clone(),
         initial_sumcheck_ca,
         initial_sumcheck_cinf,

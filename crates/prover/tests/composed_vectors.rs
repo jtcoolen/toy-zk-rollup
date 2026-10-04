@@ -112,6 +112,7 @@ fn walk_json(walk: &WhirRoundWalk) -> serde_json::Value {
         "last_root": hex(&walk.last_root),
         "bound_evals": exts2(&walk.bound_evals),
         "claim_widths": walk.claim_widths,
+        "phase_offsets": walk.phase_offsets,
         "round_commitments": r.commitments.iter().map(|c| hex(c)).collect::<Vec<_>>(),
         "round_paths": r.paths.clone(),
         "rounds": {
@@ -418,6 +419,55 @@ fn reclassify_zero_runs(
 fn varying_positions(program: &SemProgram, fixed: &[Option<Vec<u32>>]) -> Vec<usize> {
     (0..program.len()).filter(|&i| fixed[i].is_none()).collect()
 }
+/// The full alternating run schedule of one round region: every maximal run
+/// of constant (fixed) or varying observations as `[is_constant, words]`
+/// pairs, in order. This is the contract's walk plan: absorb `words` constant
+/// words from the trusted table, then read `words` words of proof data from
+/// calldata, alternating. The constant runs' VALUES are in round_fixed_runs;
+/// the varying runs' values are the proof payload in order. Deriving the
+/// schedule from shapes alone does not generalize at settlement shape (the
+/// per-claim constant count varies with claim width and stacked arity, and
+/// zero-column claims split runs at constraint-group granularity), so the
+/// schedule ships as trusted-setup data and the contract walks it.
+fn round_run_schedule(
+    program: &SemProgram,
+    fixed: &[Option<Vec<u32>>],
+    starts: &[usize],
+) -> Vec<Vec<[usize; 2]>> {
+    let end_of = |r: usize| starts.get(r + 1).copied().unwrap_or(program.len());
+    starts
+        .iter()
+        .enumerate()
+        .map(|(r, &start)| {
+            let mut runs: Vec<[usize; 2]> = Vec::new();
+            for i in start..end_of(r) {
+                let is_obs = matches!(
+                    program[i],
+                    SemEvent::ObserveBase { .. } | SemEvent::ObserveBytes { .. }
+                );
+                let words = if is_obs {
+                    fixed[i].as_ref().map_or(0, |w| w.len())
+                } else {
+                    0
+                };
+                // Constant run: fixed observation. Varying run: any other
+                // event (proof observation, sample, witness, uniform draw) -
+                // each contributes one transcript interaction; word counts
+                // for those are the payload sizes the codec defines.
+                let kind = if is_obs && fixed[i].is_some() { 1 } else { 0 };
+                let w = if kind == 1 { words } else { 1 };
+                if let Some(last) = runs.last_mut() {
+                    if last[0] == kind {
+                        last[1] += w;
+                        continue;
+                    }
+                }
+                runs.push([kind, w]);
+            }
+            runs
+        })
+        .collect()
+}
 /// The linchpin: prove, verify natively, replay the batch phases with the shared WHIR
 /// walk in the delegate, and require the combined programs to agree (asserted inside
 /// one_run). Then export the per-round statements and the composed blob for Solidity.
@@ -468,6 +518,7 @@ fn composed_program_equality_and_export() {
     doc["varying_positions"] = json!(varying);
     doc["round_const_words"] = json!(const_words);
     doc["round_fixed_runs"] = json!(round_fixed_runs(&program_b, &fixed, &starts_b));
+    doc["round_run_schedule"] = json!(round_run_schedule(&program_b, &fixed, &starts_b));
     doc["blob_len"] = json!(blob.len());
     doc["phase_marks_before_delegate"] = json!(out
         .phase_marks

@@ -156,6 +156,20 @@ impl SemSink {
         Self::default()
     }
 
+    /// Number of events recorded so far. Cheap: no clone, unlike
+    /// [`SemSink::program`]. Callers use it to mark phase boundaries in the
+    /// shared trace without copying the whole program.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).len()
+    }
+
+    /// True when nothing has been recorded yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// A snapshot of everything recorded so far.
     pub fn program(&self) -> SemProgram {
         self.0
@@ -216,6 +230,15 @@ impl CanObserve<&MerkleCap<F, [u8; 32]>> for SemChallenger {
     fn observe(&mut self, value: &MerkleCap<F, [u8; 32]>) {
         self.observe_cap(value);
         self.inner.observe(value);
+    }
+}
+
+impl SemChallenger {
+    /// The sink this challenger logs into. Cheap to clone (Arc-backed);
+    /// callers use [`SemSink::len`] to mark phase boundaries while walking.
+    #[must_use]
+    pub fn sink(&self) -> SemSink {
+        self.sink.clone()
     }
 }
 

@@ -544,3 +544,38 @@ per composed opening round the framing runs are
 - finalPolyConstants = 0 after reclassification (final_poly read whole).
 Export: composed_vectors.json round_fixed_runs = per-round framing run
 values (hex); lengths are the schedule. Blob shrank 122738 -> 122322 B.
+
+
+## Claim-region ground truth (phase_offsets instrumentation)
+
+verify_whir_round now records sink.len() at every claim boundary
+(WhirRoundWalk.phase_offsets). Exact per-claim decomposition at settlement
+shape (C=constant framing words, V=varying eval words, all ext = 4 words):
+
+  round 0 (6 claims w=4):  C126 V16 each
+  round 1 (8 claims):      C126 V16, C126 V16, C414 V304, C414 V304,
+                           C774 V664, C774 V664, C126 V16, C122 V12
+  round 2 (32 claims w=4): C334 V16 each
+  round 3 (8 claims):      C134 V24, C118 V8, C346 V208 C28, C346 V208 C28,
+                           C206 V60 C4 V32, C206 V60 C4 V32, C150 V40, C126 V16
+  round 4 (12 claims):     C142 V32 x4, C222 V112 x2, C174 V64 x2,
+                           C206 V96 x2, C174 V64 x2
+
+Facts:
+- Per-claim framing constant count = 110 + 4*(width - zero_eval_cols) for the
+  simple claims (round 0: 110+16=126; round 2: 334 at arity 22 differs ->
+  arity-dependent base, NOT a single formula).
+- Round 3 c2/c3 have a TRAILING constant run (C28): structurally-constrained
+  eval columns absorbed as constants AFTER the varying evals. c4/c5 have a
+  MID-claim constant run (C4) splitting the varying evals (V60 C4 V32).
+- The varying eval words are NOT the first-N bound_evals in wire order: the
+  constraint layout interleaves equality-statement structure, so eval order on
+  the wire is layout order, not matrix order.
+
+CONCLUSION: the claim region is ragged at constraint-group granularity and the
+only sound representation is the blob's own schedule. The contract must be a
+SCHEDULE-DRIVEN interpreter: walk the WSPR schedule (kind/arg/run), and at
+each semantic boundary (sumcheck round, stir opening, terminal sum, constraint
+identity) invoke the already-pinned gadget. The scalar InitialSchedule /
+FinalSchedule fit the small shape only; at settlement shape they are replaced
+by the schedule walk. This is the composed-verifier architecture.
