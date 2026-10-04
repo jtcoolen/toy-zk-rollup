@@ -34,8 +34,9 @@ use p3_uni_stark::{validate_degree_bits, StarkConfig, StarkGenericConfig};
 use serde_json::json;
 
 use prover::semantic_trace::{SemChallenger, SemProgram, SemSink};
+pub(crate) use prover::whir_recursion::CAP_HEIGHT;
 use prover::whir_recursion::{
-    build_recursion_circuit, InnerWhirConfig, RecursionCircuit, CAP_HEIGHT, LOG_MAX_LDE,
+    build_recursion_circuit, InnerWhirConfig, RecursionCircuit, LOG_MAX_LDE,
 };
 
 /// The batch proof's PCS opening argument: one claim per commitment round.
