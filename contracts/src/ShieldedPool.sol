@@ -94,10 +94,14 @@ contract ShieldedPool is MerkleAccumulator {
         verifier = verifier_;
         feeRecipient = feeRecipient_;
         // Both trees start empty; the first block's `before` roots must equal
-        // these. The nullifier map's empty root is the prover's, not ours: we
-        // never compute it, we just require the first block to name one and
-        // then chain from it.
+        // these. The commitment root is this contract's own empty tree. The
+        // nullifier map's empty root is the PROVER's scheme - depth 256, empty
+        // leaf zero, empty[h] = keccak(empty[h-1] || empty[h-1]) - and it is a
+        // constant of that scheme, so we compute it once at deploy (~256
+        // keccak) rather than trusting a first block to name it. A block whose
+        // nullifierBefore is anything else does not extend an empty map.
         currentRoot = root();
+        currentNullifierRoot = _emptyNullifierRoot();
     }
 
     /// Apply a verified block.
@@ -152,7 +156,16 @@ contract ShieldedPool is MerkleAccumulator {
         );
     }
 
-    /// Withdraw collected fees. Only the fee recipient.
+    /// The root of an empty nullifier map: the prover's depth-256 empty-subtree
+    /// chain (`NULLIFIER_TREE_DEPTH` in `crates/shielded/src/nullifier_tree.rs`).
+    /// Deploy-time only; the value is a constant of the scheme.
+    function _emptyNullifierRoot() private pure returns (bytes32 cur) {
+        for (uint256 h; h < 256; ++h) {
+            cur = keccak256(abi.encodePacked(cur, cur));
+        }
+    }
+
+        /// Withdraw collected fees. Only the fee recipient.
     function withdrawFees() external {
         if (msg.sender != feeRecipient) revert NotFeeRecipient();
         uint256 amount = address(this).balance;

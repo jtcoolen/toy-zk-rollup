@@ -434,6 +434,27 @@ fn block_vectors() -> Result<(), Box<dyn Error>> {
     let bundle = prover::export::bundle(&artifacts.statement, &artifacts.proof, 1, spec.fee)
         .expect("bundle builds");
 
+    // The pool-side view of the same block: the roots ShieldedPool chains and
+    // the digests it appends, as hex so the Solidity test can compare them
+    // against what it decodes from the statement limbs. These are the public
+    // values the circuit proved, read off the same run that made the proof.
+    let public = &artifacts.public;
+    let roots_hex = |r: &pq_hash::MerkleRoot| r.to_hex();
+    // The pool starts from the EMPTY commitment tree and appends this block's
+    // outputs; pin the root the Rust tree computes for exactly that sequence,
+    // so the on-chain accumulator is checked against the prover's own tree.
+    let mut pool_tree = CommitmentTree::new(Keccak256Commitment);
+    pool_tree.append(&output.commit(&Keccak256Commitment));
+
+    let digests_hex = |ds: &[pq_hash::Nullifier]| -> Vec<String> {
+        ds.iter().map(pq_hash::Nullifier::to_hex).collect()
+    };
+    let outputs_hex: Vec<String> = public
+        .outputs
+        .iter()
+        .map(pq_hash::NoteHash::to_hex)
+        .collect();
+
     // Computed outside the `json!` macro: the generic parameters contain
     // tokens the macro's matcher cannot parse.
     let proof_keccak = {
@@ -453,6 +474,12 @@ fn block_vectors() -> Result<(), Box<dyn Error>> {
             "transcript_bytes_hex_len": bundle.transcript_words.len() * 4,
             "proof_len": bundle.proof.len(),
             "proof_keccak_hex": proof_keccak,
+            "root_before_hex": roots_hex(&public.root),
+            "nullifier_before_hex": roots_hex(&public.nullifier_roots.before),
+            "nullifier_after_hex": roots_hex(&public.nullifier_roots.after),
+            "nullifiers_hex": digests_hex(&public.nullifiers),
+            "outputs_hex": outputs_hex,
+            "pool_root_after_hex": pool_tree.root().to_hex(),
         }),
     )?;
     println!(
@@ -537,6 +564,19 @@ impl BlockFixture {
             outputs: vec![self.output],
             fee: self.fee,
         }
+    }
+
+    /// The public values, derived WITHOUT proving.
+    ///
+    /// The same call `prove_client_transfer` makes internally; exposing it lets
+    /// the always-on check pin the root/nullifier/commitment hex fields without
+    /// a proving run.
+    fn public_values(&self) -> shielded::TransferPublic {
+        let map = shielded::NullifierMap::new(pq_hash::Keccak256Commitment);
+        let transfer = self.transfer();
+        let (public, _witnesses) =
+            prover::fixtures::public_and_witnesses_from(&transfer, self.root, map);
+        public
     }
 
     /// The statement limbs, derived WITHOUT proving.
@@ -733,6 +773,55 @@ fn check_block_vectors() -> Result<(), Box<dyn Error>> {
         now_words, words,
         "block_vectors.json transcript_words no longer match the Montgomery form of the statement"
     );
+    // The pool-side hex fields must describe the same public values the
+    // statement encodes. Decoding them from the statement limbs here would
+    // duplicate LimbCodec; comparing against the fixture's own public values
+    // pins the same fact from the other side.
+    let public = fixture.public_values();
+    let hex_field = |key: &str| -> Vec<String> {
+        v[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("{key} missing"))
+            .iter()
+            .map(|x| {
+                x.as_str()
+                    .unwrap_or_else(|| panic!("{key} entry not a string"))
+                    .to_string()
+            })
+            .collect()
+    };
+    let expect_hex = |key: &str, want: String| {
+        let got = v[key].as_str().unwrap_or_else(|| panic!("{key} missing"));
+        assert_eq!(got, want, "{key} drifted from the fixture's public values");
+    };
+    let mut pool_tree = shielded::CommitmentTree::new(pq_hash::Keccak256Commitment);
+    pool_tree.append(&fixture.output.commit(&pq_hash::Keccak256Commitment));
+    expect_hex("pool_root_after_hex", pool_tree.root().to_hex());
+
+    expect_hex("root_before_hex", public.root.to_hex());
+    expect_hex(
+        "nullifier_before_hex",
+        public.nullifier_roots.before.to_hex(),
+    );
+    expect_hex("nullifier_after_hex", public.nullifier_roots.after.to_hex());
+    let recorded_nullifiers = hex_field("nullifiers_hex");
+    let want_nullifiers: Vec<String> = public
+        .nullifiers
+        .iter()
+        .map(pq_hash::Nullifier::to_hex)
+        .collect();
+    assert_eq!(
+        recorded_nullifiers, want_nullifiers,
+        "nullifiers_hex drifted"
+    );
+    let recorded_outputs = hex_field("outputs_hex");
+    let want_outputs: Vec<String> = public
+        .outputs
+        .iter()
+        .map(pq_hash::NoteHash::to_hex)
+        .collect();
+    assert_eq!(recorded_outputs, want_outputs, "outputs_hex drifted");
+
     assert_eq!(v["num_transfers"].as_u64().expect("num_transfers"), 1);
     assert_eq!(
         v["total_fee"].as_u64().expect("total_fee"),

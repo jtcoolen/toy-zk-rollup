@@ -1,8 +1,18 @@
 {
   "note": "a real settled block; statement limbs are canonical, transcript_words are Montgomery",
+  "nullifier_after_hex": "3945e15314efe436108d0ec20ae820eec19a4fe902becb2db2c1564c12d0ca15",
+  "nullifier_before_hex": "a7ff9e28ffd3def443d324547688c2c4eb98edf7da757d6bfa22bff55b9ce24a",
+  "nullifiers_hex": [
+    "580854279c0d264eaeeedd9e51fe24d3878c7f6bc0d95af68521ea944946da68"
+  ],
   "num_transfers": 1,
-  "proof_keccak_hex": "1703c0a25310edb93f1b80ba9b46a5f098de7d223eed0ad049ca2738c7189550",
-  "proof_len": 853501,
+  "outputs_hex": [
+    "125a2f571bd69f7a577bb3acb7e9344a488a0c9d1ad6c259c341fe49c05c86ee"
+  ],
+  "pool_root_after_hex": "4fde7c524250ad075d0b8fe7a47b9bcc0b83fe9b5b1a9409e46a3bdb77116c17",
+  "proof_keccak_hex": "f20ca70afdf572f5fffbc24e5cad8d4c7965605a5230e29887c0754732efdb82",
+  "proof_len": 852285,
+  "root_before_hex": "e92dd75b719a5d74dce4e7e637f18ff1c5cc6d99c169d58ee1b7de8c16d7efa9",
   "statement": [
     2136,
     10068,
