@@ -1273,3 +1273,39 @@ The quotient recompose is genuinely inversion-free at runtime: its denominators
 `invD_i = (prod_{j!=i} Z_j(first_i))^-1` and each chunk domain's `inv_shift`. The
 Rust test asserts this reformulation equals `recompose_quotient_from_chunks` before
 pinning the identity, so the trusted constants cannot silently drift.
+
+## D-068 - M8 size-reduction references: borrow designs, do not adopt wholesale
+
+Recorded at the user's direction, to be picked up **after** the final recursive proof
+verifies end to end (M7 done). The constraint layer alone is 40.2M gas and the
+transcript walk ~55M, so M8 must cut both runtime and bytecode; EIP-170 (24,576
+bytes deployed) is a live risk for a single monolithic verifier.
+
+Reference repositories, with what each is for:
+
+- **https://github.com/GOATNetwork/bitson-stark-verifier** (aka
+  `GOATNetwork/bitcoin-stark-verifier`) - a production Solidity STARK verifier.
+  Study its layout discipline: how it splits verification across external library
+  functions and delegates, and how it keeps hot arithmetic in assembly. Design
+  source for the chunk/delegate structure our M7/M8 split needs.
+- **https://github.com/input-output-hk/plutus-plonky3-exploration** - the Plutus +
+  Plonky3 exploration. Its relevant ideas: generating the verifier from the circuit
+  description, and representing constraint/quotient work as data the evaluator
+  interprets rather than code the compiler emits - the same posture our
+  ConstraintIdentity op DAG already takes. Mine it for how they keep the generated
+  artifact small (shared subtrees, constant pooling, op fusion).
+- **https://github.com/ethereum/sol-whir-p3** - already vendored under
+  `contracts/lib/sol-whir-p3` (KoalaBear, KoalaBearExt4, KeccakChallenger). Keep
+  using it as the base layer; extensions go next to it, not inside it.
+- **https://github.com/EYBlockchain/midfall/tree/quotient-hybrid** - the
+  `quotient-hybrid` branch. The user's specific pointer: hand-written assembly for
+  hot sections as a complement to sol-whir-p3, to cut bytecode size (and gas).
+  Concretely the candidates in our verifier are the packed-ext4 add/sub/mul lane
+  arithmetic, the DAG interpreter dispatch in `ConstraintIdentity.foldConstraints`,
+  and the Merkle compression path in `StarkMerkle`.
+
+**Posture**: these are design sources and code-structure ideas, not dependencies to
+import (different fields, different transcripts, different proof shapes). Every
+borrowed section must stay pinned by the existing prover-vector tests - a rewrite
+to assembly is only accepted when the pins still pass byte-for-byte.
+

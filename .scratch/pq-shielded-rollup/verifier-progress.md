@@ -18,8 +18,8 @@ EIP-170 bytecode limits, and address them borrowing design from
 | M5 | Batch STARK transcript layer: prover-pinned replay of `verify_batch`'s sequence | done (this commit) |
 | M5b | `BatchTranscript.sol` production contract, pinned by the M5 vectors | done (this commit) |
 | M6 | `ConstraintIdentity.sol` (generated AIR constraint identity) | done (this commit) |
-| M7 | `ChunkVerifier.sol` (multi-transaction sponge carry) | pending |
-| M8 | Gas benchmark + EIP-170 audit + size reductions | pending |
+| M7 | `ChunkVerifier.sol` (multi-transaction sponge carry) | done (this commit) |
+| M8 | Gas benchmark + EIP-170 audit + size reductions (see D-068 reference list) | pending |
 | M9 | Wallet extension, local-chain settlement E2E, metrics/dashboards | pending |
 
 ## M3 — DONE
@@ -345,3 +345,38 @@ asserts that reformulation equals the library's recompose before pinning anythin
 - The symbolic builder **clones** `Arc`s rather than sharing them, so pointer-identity
   memoization dedupes leaves but not shared subtrees: 7,361 nodes instead of the 22,083
   a naive expansion produces. Good enough; a real hash-consing pass is an M8 option.
+
+## M7 - DONE: `ChunkVerifier.sol`, the cross-transaction sponge carry
+
+The verifier cannot run in one transaction: transcript walk ~55M + constraint layer
+~40M + the WHIR core leaves no headroom under the block gas limit. So the walk runs
+one phase per transaction and the Fiat-Shamir sponge crosses the boundary.
+
+**The carry is small and fully serializable.** `KeccakChallenger.State` is
+`{bytes inputBuffer; uint256 inputLen; bytes32 outputBlock; uint256 outputIndex}`.
+`_flush` hashes exactly `inputLen` bytes from the buffer start, so the buffer's
+allocated *capacity* is not state - only the first `inputLen` bytes are. The carry is
+those absorbed bytes + `outputBlock` + `outputIndex` + the phase counter + the four
+drawn challenges. A few hundred bytes, `abi.encode`d.
+
+`ChunkVerifier.sol`: `begin` then `stepMain / stepPreprocessed / stepLookup /
+stepPermutation / stepQuotient / stepOod`, each decoding the carry, demanding its
+predecessor phase (`PhaseOutOfOrder`), running exactly one `BatchTranscript` phase,
+writing the mutated sponge back, re-encoding. `challenge(carry, which)` refuses a
+challenge whose phase has not run. `phaseOf`, `absorbedBytes` for the WHIR handover.
+
+**Pin** (`ChunkVerifier.t.sol`, 3 tests): the chunked walk lands on the same
+`.lookup_alpha / .beta / .constraint_alpha / .zeta` as the single-shot native test -
+17.6M gas for the whole chunked walk. Two revert tests: cannot skip a phase, cannot
+read a challenge early. 103 forge tests green, semgrep clean.
+
+**Correction caught while writing it**: my first draft had a `_asState(c)` helper that
+copied `c.sponge` into a `BatchTranscript.State` and claimed the phase's in-place
+mutations were "visible to `encode`". They are not - memory struct assignment copies
+value fields, so the phase mutated the copy, not `c.sponge`. Every step now copies the
+sponge in, runs the phase, and copies `s.sponge` back out explicitly. The pin would
+have caught it (the draws would diverge), but fixing it before running is better.
+
+**Gas note for M8**: the chunked walk costs 17.6M vs the native single-shot 18.2M -
+the encode/decode boundary is essentially free next to the keccak the phases do. So
+splitting across transactions buys gas headroom at no throughput cost.
