@@ -529,13 +529,12 @@ library WhirVerifierCore {
                 }
             } else {
                 // Four canonical limbs per extension element, low limb first.
+                // pack() is four shifts and an or; going through a
+                // uint256[4] memory allocated a fresh array per element per
+                // query for nothing.
                 for (uint256 e; e < input.rowElems; ++e) {
-                    uint256[4] memory coeffs;
-                    coeffs[0] = limbs[e * 4];
-                    coeffs[1] = limbs[e * 4 + 1];
-                    coeffs[2] = limbs[e * 4 + 2];
-                    coeffs[3] = limbs[e * 4 + 3];
-                    elems[e] = KoalaBearExt4.pack(coeffs);
+                    elems[e] = (limbs[e * 4] << 224) | (limbs[e * 4 + 1] << 192)
+                        | (limbs[e * 4 + 2] << 160) | (limbs[e * 4 + 3] << 128);
                 }
             }
             // The leaf authenticates the FLAT limbs (Montgomery wire form), the
@@ -760,12 +759,8 @@ library WhirVerifierCore {
                 mcopy(add(limbsPtr, 0x20), add(add(flatPtr, 0x20), mul(base, 0x20)), rowBytes)
             }
             for (uint256 e; e < input.rowElems; ++e) {
-                uint256[4] memory coeffs;
-                coeffs[0] = limbs[e * 4];
-                coeffs[1] = limbs[e * 4 + 1];
-                coeffs[2] = limbs[e * 4 + 2];
-                coeffs[3] = limbs[e * 4 + 3];
-                elems[e] = KoalaBearExt4.pack(coeffs);
+                elems[e] = (limbs[e * 4] << 224) | (limbs[e * 4 + 1] << 192)
+                    | (limbs[e * 4 + 2] << 160) | (limbs[e * 4 + 3] << 128);
             }
             uint256 fold = StirOpenings.openAndFold(
                 input.lastCommitment,
