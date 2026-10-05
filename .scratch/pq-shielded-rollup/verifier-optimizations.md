@@ -475,3 +475,137 @@ Per round: domainPoints ~30k, final-openfold 0.84-1.9M, closing-sumcheck
 - round 1 worst (most constraints x longest allR). Suspect: per-constraint
 `localR` allocation + `eq_poly_eval` recomputed per constraint instead of
 once per point.
+
+
+## §15 Fresh full profile at b6d7566 + section-size census (probe regenerated)
+
+The probe (GasProfileProbe.t.sol + GasProbeCore.sol + GasProbeStir.sol) was
+REGENERATED from current production (old copies had drifted: stale decode,
+stale query loop). Regeneration recipe: copy production file, rename lib,
+insert emits at section boundaries, strip pure/view from anything touching
+gasleft()/emit (transitive closure), fix import paths. Stack-too-deep rules
+learned the hard way:
+- a timing local must NOT be live across the query loop (verifyRound is at the
+  stack edge) - reuse ONE local g between emits inside verifyRound; the
+  openfold pair was dropped (query-loop cost = inter-round minus the rest).
+- instrument PRIVATE callees (_loadRow, _paths, _slice) instead of the caller:
+  a private fn has its own stack; scoped gasleft blocks in _runOneIntermediate
+  still blow up.
+
+### verify() accounting at b6d7566 (probe emits, real bundle)
+
+| bucket | total | notes |
+|---|---|---|
+| round-run (5 rounds) | 139.9M | intermediates 73.4M + final 50.3M + initial 16.1M |
+| - inter-round (17) | 73.4M | verifyRound body incl. query loops |
+| - stir-leaf (1336 q) | 10.0M | 7,507/q: Montgomery wire encode 64 limbs + keccak |
+| - loadrow (1336 q) | 6.0M | 4,498/q: calldata u32 LE -> canonical words |
+| - stir-merkle (1336 q) | 5.8M | 4,365/q: depth ~18-20 keccak folds |
+| - stir-fold (1336 q) | 0.2M | 162/q - fused hypercube is FREE now |
+| - final-openfold (5) | 6.8M | terminal queries: no merkle, horner over 160 coeffs |
+| - terminal-weight (5) | 42.0M | evalConstraintsPoly - arithmetic floor (see §14) |
+| initial (5) | 16.1M | round-0 phase: base-row opens + init sumcheck |
+| identity (1) | 11.6M | constraint identity recompute (D-076) |
+| r-claimfold (17) | 1.9M | gamma-power claim fold |
+| r-sumcheck (17) | 1.0M | sumcheck verify |
+| r-transcript (17) | 1.0M | digest + OOD absorbs + PoW + indices |
+| prf-decode (5) | 1.8M | calldata-direct decode is cheap now |
+| cfg-decode (5) | 0.8M | |
+| constraints-decode | 0.5M | |
+| batch-decode + transcript-walk | 0.1M | |
+
+Residual inside intermediates not covered by emits: _paths copy + per-query
+array allocs + expandFromUnivariate/powConstBase loops + pack loop ~= 45M.
+_paths is the last big memory-copy site -> next target (calldata-direct).
+
+### WBND section census (words on the wire; probe sz-* emits, 5 rounds total)
+
+| section | words | bytes | status |
+|---|---|---|---|
+| eqPoints | 193,384 | 773 KB | calldata-direct (b6d7566) |
+| paths | 187,960 | 752 KB | **STILL COPIED via _paths** |
+| rows | 37,088 | 148 KB | calldata-direct (0d9ea16) |
+| finalPaths | 9,192 | 37 KB | copied per final phase |
+| finalRowsExt | 4,736 | 19 KB | copied |
+| boundEvals | 1,039 | 4 KB | copied (small) |
+| roots/baseConsts/invDFlat | 650 | 2.6 KB | cfg, copied once |
+| scA/scInf/scPow/powWitnesses | ~340 | 1.4 KB | copied |
+| everything else | < 500 | | negligible |
+
+Memory high-water at end: 2.07 MB (mfree-end emit). paths is ~750 KB of it.
+
+### Decisions
+
+- D-080 paths calldata-direct: RoundInput gains pathsCdBase/pathsOff;
+  StarkMerkle gets a calldata sibling reader; _paths/_repeat deleted if the
+  memory path has no test callers. All paths in a round share one depth
+  (schedLogFolded[i]) so the grid is regular: query q siblings at
+  pathsAbs + (pathOff + q*depth)*32. Expected 10-20M.
+- D-081 terminal-weight slice kill: evalConstraintsPoly allocates a localR
+  slice per constraint (501 x 24 words in round 1). eq_poly_eval only reads
+  p[0..q.length] - pass allR directly, bound by q.length. ~3M.
+- D-082 extLeaf single-mstore: replace 4x mstore8 per limb with one
+  mstore(shl(224,w)) into an over-allocated buffer (n*4 + 28 slack),
+  keccak over n*4. ~3M.
+- EIP-170 margin +220 B at b6d7566: offset new code by deleting dead
+  extrapolate_012_reference / mulReference (verify emission first).
+
+## §16 Paths calldata-direct + the EIP-170 collapse (commit `9593730`)
+
+D-080 landed. verify 207,507,093 -> **199,476,544** (-8.03M), applyBlock
+362,255,177 -> **352,907,822** (-9.35M). Cumulative 1,064.3M -> 199.5M
+(**-81.3%**). 145 forge tests green. EIP-170 margin +57 B (24,519 B runtime).
+
+### What shipped
+
+- `RoundInput`/`FinalInput` gained `pathsCdBase`: absolute calldata byte
+  offset of the FIRST query's sibling path. All queries in a round share
+  `schedLogFolded[i]`, so query q's path is at `pathsCdBase + q*depth*32`.
+  `WhirVerifier` sets it from `p.pathsAbs` (+ `cur.pathOff*32` folded in at
+  the call site, no separate field - see the stack lesson below).
+- `StarkMerkle.computeRootMix/verifyMix`: ONE fold loop, per level
+  `switch cdBase case 0 { mload } default { calldataload }`.
+- `StirOpenings.openAndFold` takes `(pathsFlat, memOff, siblingsCdBase, ...)`.
+  `pathsFlat` is a FLAT `bytes32[]` (query-major) for the JSON harnesses;
+  production passes an empty array + nonzero cdBase.
+- Deleted `_paths`, `_repeat` from WhirVerifier; harnesses (`WhirRoundPhase`,
+  `WhirFinalPhase`, `WhirComposed`) build flat arrays.
+
+### Lessons (cost the whole session)
+
+1. **Two-source = one loop with a switch, never two loops.** A separate
+   `openAndFoldCd` + duplicated fold loop cost +458 B and put the contract at
+   -238 B under EIP-170. The single mixed loop costs ~35 B.
+2. **`pathsCdBase == 0` must be re-zeroed per query.** `cdBase + q*depth*32` is
+   nonzero for q>0 even on the memory path, so the switch misread calldata and
+   every composed-phase test reverted `OpeningNotAuthenticated`. The call site
+   passes `pathsCdBase == 0 ? 0 : pathsCdBase + q*depth*32`. Pinned by tests
+   that keep the memory path.
+3. **Struct fields are stack slots.** Adding `pathsMemOff` to RoundInput pushed
+   `_runOneIntermediate` past the Yul stack edge (`var_j is 2 too deep`) - the
+   struct is a single stack item but its field accesses spill. Fold offsets at
+   the call site instead of storing them.
+4. **Shape guards on memory-only fields cost real bytes.** Dropping the two
+   `paths.length == numQueries` checks (unreachable in production, harnesses
+   build exact-size arrays) bought back 39 B. `forge test` cannot catch a
+   bad-array harness - it panics with an empty revert, not a shape error.
+5. **Dead-code deletion is not a size lever.** `extrapolate_012_reference`,
+   `mulReference`, `_mulCoeffsReference` were already stripped by the optimizer:
+   zero bytecode change. Only code that is *reachable* occupies the budget.
+
+### Updated WBND census (post-D-080)
+
+| section | words | bytes | status |
+|---|---|---|---|
+| eqPoints | 193,384 | 773 KB | calldata-direct |
+| paths | 187,960 | 752 KB | **calldata-direct (9593730)** |
+| rows | 37,088 | 148 KB | calldata-direct |
+| finalPaths | 9,192 | 37 KB | copied per final phase |
+| finalRowsExt | 4,736 | 19 KB | copied |
+| boundEvals | 1,039 | 4 KB | copied |
+| rest | < 1,500 | | negligible |
+
+Remaining memory copies are now < 60 KB total, so the calldata-direct wave is
+essentially finished: the ~490 gas/word copy tax is gone from 96% of the wire.
+Next levers are arithmetic, not I/O: D-081 (terminal-weight localR slice kill),
+D-082 (extLeaf single-mstore), and the terminal-weight floor itself (42M).
