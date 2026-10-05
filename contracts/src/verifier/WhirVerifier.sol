@@ -1047,7 +1047,20 @@ contract WhirVerifier is IWhirVerifier {
             c.hasPreNext[i] = f != 0;
             (c.numConstraints[i], no) = _word(m, no);
             ConstraintIdentity.Program memory prog;
-            (prog.nodes, no) = _arr(m, no);
+            {
+                // Node program stays in calldata: foldConstraints reads the
+                // (op, a, b) triples in place. Copying 88 KB to memory costs
+                // ~490 gas/word of expansion at the heap high-water.
+                uint256 nNodes;
+                (nNodes, no) = _word(m, no);
+                uint256 abs;
+                assembly ("memory-safe") {
+                    abs := add(m.offset, mul(no, 4))
+                }
+                prog.nodesCdBase = abs;
+                prog.nodesLen = nNodes;
+                no += nNodes;
+            }
             (prog.baseConsts, no) = _arr(m, no);
             uint256[] memory extFlat;
             (extFlat, no) = _arr(m, no);

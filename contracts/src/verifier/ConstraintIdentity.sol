@@ -79,7 +79,15 @@ library ConstraintIdentity {
     /// triples `[op, a, b]`; `roots[g]` is the node index of constraint `g` in
     /// emission order, the order the Horner fold walks.
     struct Program {
+        /// Decoded node words; EMPTY when `nodesCdBase` is set (the production
+        /// path keeps the node program in calldata - copying 88 KB into memory
+        /// costs ~490 gas/word in expansion alone at the heap high-water).
         uint256[] nodes;
+        /// Absolute calldata byte offset of the first node word, or 0 to read
+        /// `nodes` from memory (JSON-driven tests).
+        uint256 nodesCdBase;
+        /// Node word count (3 per op) when reading from calldata.
+        uint256 nodesLen;
         uint256[] baseConsts;
         uint256[] extConsts;
         uint256[] roots;
@@ -137,14 +145,33 @@ library ConstraintIdentity {
         uint256 isLast = sels.isLast;
         uint256 s2 = sels.isTransition;
 
-        uint256 n = prog.nodes.length / 3;
+        uint256 n = prog.nodesCdBase == 0 ? prog.nodes.length / 3 : prog.nodesLen / 3;
         uint256[] memory stack = new uint256[](n);
+        uint256 cdBase = prog.nodesCdBase;
         for (uint256 i = 0; i < n; ++i) {
-            uint256 base = 3 * i;
-            // forge-lint: disable-next-line(unsafe-typecast)
-            uint8 op = uint8(prog.nodes[base]);
-            uint256 a = prog.nodes[base + 1];
-            uint256 b = prog.nodes[base + 2];
+            uint256 op;
+            uint256 a;
+            uint256 b;
+            if (cdBase == 0) {
+                uint256 base = 3 * i;
+                op = prog.nodes[base];
+                a = prog.nodes[base + 1];
+                b = prog.nodes[base + 2];
+            } else {
+                // Three LE u32 words per node, one calldataload: the node is
+                // 12 bytes, fully inside one word. LE decode = byte-swap of
+                // the big-endian slice (same recipe as _arr).
+                assembly ("memory-safe") {
+                    let w := calldataload(add(cdBase, mul(i, 12)))
+                    op := shr(248, w)
+                    let x := and(shr(192, w), 0xffffffff)
+                    x := or(and(shr(8, x), 0x00ff00ff), and(shl(8, x), 0xff00ff00))
+                    a := or(and(shr(16, x), 0x0000ffff), and(shl(16, x), 0xffff0000))
+                    let y := and(shr(160, w), 0xffffffff)
+                    y := or(and(shr(8, y), 0x00ff00ff), and(shl(8, y), 0xff00ff00))
+                    b := or(and(shr(16, y), 0x0000ffff), and(shl(16, y), 0xffff0000))
+                }
+            }
             if (op == OP_ADD) {
                 stack[i] = stack[a].add(stack[b]);
             } else if (op == OP_SUB) {
