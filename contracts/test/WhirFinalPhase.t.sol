@@ -42,6 +42,21 @@ contract FinalHarness {
 contract WhirFinalPhaseTest is Test {
     string constant ARTIFACT = "test/vectors/whir_proof_vectors.json";
 
+    function _flatPaths(
+        string memory j,
+        string memory field,
+        uint256 numQueries,
+        uint256 depth
+    ) private pure returns (bytes32[] memory out) {
+        out = new bytes32[](numQueries * depth);
+        for (uint256 q; q < numQueries; ++q) {
+            for (uint256 h; h < depth; ++h) {
+                out[q * depth + h] =
+                    vm.parseJsonBytes32(j, string.concat(field, "[", _u(q), "][", _u(h), "]"));
+            }
+        }
+    }
+
     function _u(uint256 v) private pure returns (string memory) {
         return vm.toString(v);
     }
@@ -118,14 +133,7 @@ contract WhirFinalPhaseTest is Test {
                 }
             }
             uint256 depth = vm.parseJsonUint(j, ".counts.round0_path_depth");
-            input.paths = new bytes32[][](numQueries);
-            for (uint256 q; q < numQueries; ++q) {
-                input.paths[q] = new bytes32[](depth);
-                for (uint256 h; h < depth; ++h) {
-                    input.paths[q][h] = vm.parseJsonBytes32(
-                        j, string.concat(".round0_paths[", _u(q), "][", _u(h), "]"));
-                }
-            }
+            input.pathsFlat = _flatPaths(j, ".round0_paths", numQueries, depth);
             input.prevRandomness = lastRandomness;
 
             uint256 sumcheckRounds =
@@ -204,14 +212,7 @@ contract WhirFinalPhaseTest is Test {
         }
 
         uint256 depth = input.logFoldedDomainSize;
-        input.paths = new bytes32[][](numQueries);
-        for (uint256 q; q < numQueries; ++q) {
-            input.paths[q] = new bytes32[](depth);
-            for (uint256 h; h < depth; ++h) {
-                input.paths[q][h] =
-                    vm.parseJsonBytes32(j, string.concat(".final_paths[", _u(q), "][", _u(h), "]"));
-            }
-        }
+        input.pathsFlat = _flatPaths(j, ".final_paths", numQueries, depth);
         input.prevRandomness = lastRandomness;
 
         // The domain points are base scalars on the folded domain; the STIR

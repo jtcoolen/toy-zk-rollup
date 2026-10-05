@@ -221,15 +221,21 @@ library StirOpenings {
     /// limb per element, and the caller has already lifted each limb into the
     /// extension for the fold. The leaf bytes are the same construction in both
     /// cases (Montgomery wire form, little-endian), so the authentication path
-    /// does not care which shape it is authenticating; only the width relation
-    /// between the two views differs.
+    /// does not care which shape it authenticates.
+    ///
+    /// Siblings come from the flat calldata grid at `siblingsCdBase` (32 B per
+    /// level) when nonzero - production keeps 750 KB of paths in calldata,
+    /// read exactly once - else from the flat memory array `pathsFlat` at word
+    /// offset `memOff` (JSON-driven harnesses).
     function openAndFold(
         bytes32 root,
         uint256 index,
         uint256 depth,
         uint256[] memory limbs,
         uint256[] memory row,
-        bytes32[] memory siblings,
+        bytes32[] memory pathsFlat,
+        uint256 memOff,
+        uint256 siblingsCdBase,
         uint256[] memory randomness
     ) internal pure returns (uint256) {
         // Extension rows: four limbs per element. Base rows: one limb per
@@ -238,7 +244,7 @@ library StirOpenings {
             revert RowWidthMismatch(row.length * KoalaBearExt4.DEGREE, limbs.length);
         }
         bytes32 leaf = extLeaf(limbs);
-        if (!StarkMerkle.verify(root, index, leaf, siblings, depth)) {
+        if (!StarkMerkle.verifyMix(root, index, leaf, pathsFlat, memOff, siblingsCdBase, depth)) {
             revert OpeningNotAuthenticated(index);
         }
         return foldRow(row, randomness);

@@ -36,7 +36,7 @@ contract StirOpeningsHarness {
         bytes32[] calldata siblings,
         uint256[] calldata randomness
     ) external pure returns (uint256) {
-        return StirOpenings.openAndFold(root, index, depth, limbs, row, siblings, randomness);
+        return StirOpenings.openAndFold(root, index, depth, limbs, row, siblings, 0, 0, randomness);
     }
 }
 
@@ -298,6 +298,8 @@ contract StirOpeningsTest is Test {
             limbs,
             row,
             siblings,
+            0,
+            0,
             randomness
         );
         assertEq(combined, StirOpenings.foldRow(row, randomness), "combined differs");

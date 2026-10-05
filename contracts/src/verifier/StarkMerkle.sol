@@ -115,6 +115,57 @@ library StarkMerkle {
         }
     }
 
+    /// Root from siblings, read from CALLOADDATA at `cdBase` (absolute byte
+    /// offset) when nonzero, else from the flat memory array `pathsFlat` at
+    /// word offset `memOff`; `n` levels, leaf-to-root. One loop, one switch
+    /// per level: production keeps a proof's 750 KB of paths out of memory
+    /// (expansion + refill measured ~12M gas on the real bundle), while
+    /// JSON-driven test harnesses keep their flat array at the cost of one
+    /// switch per level.
+    function computeRootMix(
+        bytes32 leafDigest,
+        uint256 index,
+        bytes32[] memory pathsFlat,
+        uint256 memOff,
+        uint256 cdBase,
+        uint256 n
+    ) internal pure returns (bytes32 current) {
+        assembly ("memory-safe") {
+            let buf := mload(0x40)
+            current := leafDigest
+            let src := add(pathsFlat, 0x20)
+            for { let level := 0 } lt(level, n) { level := add(level, 1) } {
+                let sib
+                switch cdBase
+                case 0 { sib := mload(add(src, shl(5, add(level, memOff)))) }
+                default { sib := calldataload(add(cdBase, shl(5, level))) }
+                let left := current
+                let right := sib
+                if and(shr(level, index), 1) {
+                    left := sib
+                    right := current
+                }
+                mstore(buf, left)
+                mstore(add(buf, 0x20), right)
+                current := keccak256(buf, 0x40)
+            }
+        }
+    }
+
+    /// Mixed-source form of `verify`: `cdBase` nonzero selects the calldata
+    /// grid, else the flat memory array at word offset `memOff`.
+    function verifyMix(
+        bytes32 expectedRoot,
+        uint256 index,
+        bytes32 leafDigest,
+        bytes32[] memory pathsFlat,
+        uint256 memOff,
+        uint256 cdBase,
+        uint256 depth
+    ) internal pure returns (bool) {
+        return computeRootMix(leafDigest, index, pathsFlat, memOff, cdBase, depth) == expectedRoot;
+    }
+
     /// Check that a leaf digest opens at `index` to `expectedRoot`.
     ///
     /// `expectedDepth` is checked as well as the root: an attacker who can

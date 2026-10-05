@@ -392,8 +392,14 @@ library WhirVerifierCore {
         uint256 rowElems;
         /// True when the rows are base field (round 0 only).
         bool rowsAreBase;
-        /// Per-query Merkle paths, leaf-to-root, against `prevCommitment`.
-        bytes32[][] paths;
+        /// Per-query Merkle paths, leaf-to-root, FLAT in query order against
+        /// `prevCommitment` (memory path: JSON harnesses, always from word 0).
+        bytes32[] pathsFlat;
+        /// Absolute calldata byte offset of the first query's sibling path in
+        /// the flat grid (32 B per level, query-major), or 0 for the memory
+        /// source above. All queries share one depth, so query q's path starts
+        /// at `pathsCdBase + q*depth*32`.
+        uint256 pathsCdBase;
         /// The commitment the queries open against: the previous round's root,
         /// or the batch commitment for round 0.
         bytes32 prevCommitment;
@@ -515,9 +521,6 @@ library WhirVerifierCore {
         if (haveLimbs != expectedLimbs) {
             revert RowBufferMismatch(expectedLimbs, haveLimbs);
         }
-        if (input.paths.length != input.numQueries) {
-            revert RoundRowCountMismatch(input.numQueries, input.paths.length);
-        }
 
         // --- 1-2: commitment, then OOD point/answer pairs ----------------------
         observeDigest(t, input.commitment);
@@ -586,7 +589,9 @@ library WhirVerifierCore {
                 input.logFoldedDomainSize,
                 limbs,
                 elems,
-                input.paths[q],
+                input.pathsFlat,
+                q * input.logFoldedDomainSize,
+                input.pathsCdBase == 0 ? 0 : input.pathsCdBase + q * input.logFoldedDomainSize * 32,
                 input.prevRandomness
             );
         }
@@ -672,8 +677,12 @@ library WhirVerifierCore {
         uint256 rowsLen;
         uint256 rowLimbs;
         uint256 rowElems;
-        /// Per-query Merkle paths against `lastCommitment`.
-        bytes32[][] paths;
+        /// Per-query Merkle paths against `lastCommitment`, FLAT in query
+        /// order (memory path: JSON harnesses).
+        bytes32[] pathsFlat;
+        /// Absolute calldata byte offset of the flat sibling grid, or 0 for
+        /// the memory source above (see RoundInput.pathsCdBase).
+        uint256 pathsCdBase;
         /// The last round's folding randomness: the terminal fold point.
         uint256[] prevRandomness;
         /// The terminal queries' domain points, lifted base scalars, in query
@@ -755,9 +764,6 @@ library WhirVerifierCore {
         if (haveLimbsF != input.numQueries * input.rowLimbs) {
             revert RowBufferMismatch(input.numQueries * input.rowLimbs, haveLimbsF);
         }
-        if (input.paths.length != input.numQueries) {
-            revert RoundRowCountMismatch(input.numQueries, input.paths.length);
-        }
         if (input.domainGenerator == 0 && input.domainPoints.length != input.numQueries) {
             revert RoundRowCountMismatch(input.numQueries, input.domainPoints.length);
         }
@@ -812,7 +818,9 @@ library WhirVerifierCore {
                 input.logFoldedDomainSize,
                 limbs,
                 elems,
-                input.paths[q],
+                input.pathsFlat,
+                q * input.logFoldedDomainSize,
+                input.pathsCdBase == 0 ? 0 : input.pathsCdBase + q * input.logFoldedDomainSize * 32,
                 input.prevRandomness
             );
             // The STIR statement: the fold must equal the public polynomial at

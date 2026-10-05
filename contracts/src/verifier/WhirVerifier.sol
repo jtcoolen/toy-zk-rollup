@@ -482,9 +482,10 @@ contract WhirVerifier is IWhirVerifier {
         input.rowsLen = nq * input.rowLimbs;
         cur.rowOff += nq * input.rowLimbs;
 
-        // Every query in round i opens at depth sched_log_folded[i].
+        // Every query in round i opens at depth sched_log_folded[i]. The
+        // sibling grid stays in calldata: 750 KB read exactly once.
         uint256 depth = c.schedLogFolded[i];
-        input.paths = _paths(p.pathsAbs, cur.pathOff, _repeat(depth, nq));
+        input.pathsCdBase = p.pathsAbs + cur.pathOff * 32;
         cur.pathOff += nq * depth;
 
         input.prevRandomness = st.lastRandomness;
@@ -563,7 +564,7 @@ contract WhirVerifier is IWhirVerifier {
         fi.rowElems = rowElems;
         fi.rowLimbs = rowElems * 4;
         fi.rowsFlat = p.finalRowsExt;
-        fi.paths = _paths(p.finalPathsAbs, 0, _repeat(c.finalLogFolded, nqT));
+        fi.pathsCdBase = p.finalPathsAbs;
         fi.prevRandomness = th.lastRandomness;
         // D-072 phase 2: the domain points are computed in-circuit from the
         // indices this verifier samples, not read from the proof.
@@ -945,34 +946,6 @@ contract WhirVerifier is IWhirVerifier {
         }
     }
 
-    function _paths(uint256 blobBase, uint256 start, uint256[] memory lens)
-        private
-        pure
-        returns (bytes32[][] memory out)
-    {
-        out = new bytes32[][](lens.length);
-        uint256 off = start;
-        for (uint256 i; i < lens.length; ++i) {
-            uint256 n = lens[i];
-            bytes32[] memory row = new bytes32[](n);
-            assembly ("memory-safe") {
-                let src := add(blobBase, mul(off, 0x20))
-                let dst := add(row, 0x20)
-                for { let j := 0 } lt(j, n) { j := add(j, 1) } {
-                    mstore(add(dst, mul(j, 0x20)), calldataload(add(src, mul(j, 0x20))))
-                }
-            }
-            out[i] = row;
-            off += n;
-        }
-    }
-
-    function _repeat(uint256 v, uint256 n) private pure returns (uint256[] memory out) {
-        out = new uint256[](n);
-        for (uint256 i; i < n; ++i) {
-            out[i] = v;
-        }
-    }
 
     // ---------------------------------------------------------------------
     // Constraint identity (D-076): CONFIG decode + opened-value derivation

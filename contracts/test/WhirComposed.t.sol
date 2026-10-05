@@ -87,14 +87,18 @@ contract WhirComposedTest is Test {
     function _paths(bytes memory blob, uint256 start, uint256[] memory lens)
         private
         pure
-        returns (bytes32[][] memory out)
+        returns (bytes32[] memory out)
     {
-        out = new bytes32[][](lens.length);
-        uint256 off = start;
+        uint256 total;
         for (uint256 i; i < lens.length; ++i) {
-            out[i] = new bytes32[](lens[i]);
+            total += lens[i];
+        }
+        out = new bytes32[](total);
+        uint256 off = start;
+        uint256 w;
+        for (uint256 i; i < lens.length; ++i) {
             for (uint256 j; j < lens[i]; ++j) {
-                out[i][j] = _node(blob, off + j);
+                out[w++] = _node(blob, off + j);
             }
             off += lens[i];
         }
@@ -364,7 +368,7 @@ contract WhirComposedTest is Test {
 
             // Every query in round i opens at depth sched_log_folded[i].
             uint256 depth = ctx.schedLogFolded[i];
-            input.paths = _paths(ctx.pathsBlob, ctx.pathOff, _repeat(depth, nq));
+            input.pathsFlat = _paths(ctx.pathsBlob, ctx.pathOff, _repeat(depth, nq));
             ctx.pathOff += nq * depth;
 
             input.prevRandomness = lastRandomness;
@@ -435,7 +439,7 @@ contract WhirComposedTest is Test {
         fi.rowLimbs = rowElemsT * 4;
         fi.rowsFlat = vm.parseJsonUintArray(ctx.j, string.concat(R, ".final_rows_ext"));
         bytes memory fPaths = vm.parseJsonBytes(ctx.j, string.concat(R, ".final_paths_hex"));
-        fi.paths = _paths(fPaths, 0, fPathLens);
+        fi.pathsFlat = _paths(fPaths, 0, fPathLens);
         fi.prevRandomness = lastRandomness;
         uint256[] memory fDomBase = vm.parseJsonUintArray(ctx.j, string.concat(R, ".final_domain_points"));
         fi.domainPoints = new uint256[](nqT);

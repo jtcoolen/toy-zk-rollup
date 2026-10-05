@@ -54,7 +54,7 @@ contract StirOpeningsGasTest is Test {
         uint256 index = json.readUint(string.concat(base, ".index"));
 
         uint256 before = gasleft();
-        StirOpenings.openAndFold(root, index, 6, limbs, row, siblings, randomness);
+        StirOpenings.openAndFold(root, index, 6, limbs, row, siblings, 0, 0, randomness);
         uint256 used = before - gasleft();
         emit log_named_uint("gas per STIR opening (depth 6, 16 ext elements)", used);
         // A loose ceiling that only fires on an order-of-magnitude regression.

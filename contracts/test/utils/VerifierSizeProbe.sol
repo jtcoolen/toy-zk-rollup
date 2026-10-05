@@ -100,7 +100,7 @@ contract VerifierSizeProbe {
         bytes32[] memory siblings,
         uint256[] memory randomness
     ) external pure returns (uint256) {
-        return StirOpenings.openAndFold(root, index, depth, limbs, row, siblings, randomness);
+        return StirOpenings.openAndFold(root, index, depth, limbs, row, siblings, 0, 0, randomness);
     }
 
     function merkleVerify(

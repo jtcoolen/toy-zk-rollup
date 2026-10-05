@@ -131,11 +131,10 @@ contract WhirRoundPhaseTest is Test {
         }
 
         uint256 depth = vm.parseJsonUint(j, ".counts.round0_path_depth");
-        input.paths = new bytes32[][](numQueries);
+        input.pathsFlat = new bytes32[](numQueries * depth);
         for (uint256 q; q < numQueries; ++q) {
-            input.paths[q] = new bytes32[](depth);
             for (uint256 h; h < depth; ++h) {
-                input.paths[q][h] = vm.parseJsonBytes32(
+                input.pathsFlat[q * depth + h] = vm.parseJsonBytes32(
                     j, string.concat(".round0_paths[", _u(q), "][", _u(h), "]")
                 );
             }

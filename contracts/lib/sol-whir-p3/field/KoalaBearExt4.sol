@@ -120,17 +120,6 @@ library KoalaBearExt4 {
         return _extrapolate012Fast(e0, e1, e2, r);
     }
 
-    function extrapolate_012_reference(uint256 e0, uint256 e1, uint256 e2, uint256 r)
-        internal
-        pure
-        returns (uint256)
-    {
-        uint256 l0 = _scalar_mul(mul(sub(r, ONE), sub(r, TWO)), INV_TWO);
-        uint256 l1 = mul(r, sub(TWO, r));
-        uint256 l2 = _scalar_mul(mul(r, sub(r, ONE)), INV_TWO);
-        return add(add(mul(e0, l0), mul(e1, l1)), mul(e2, l2));
-    }
-
     /// `prod_i (1 + 2 p_i q_i - p_i - q_i)` with the accumulator held in
     /// REGISTERS, not packed between coordinates.
     ///
@@ -370,10 +359,6 @@ library KoalaBearExt4 {
         return KoalaBear.add(KoalaBear.mul(a[0], b[0]), KoalaBear.mul(KoalaBear.W, wCoeff));
     }
 
-    function mulReference(uint256 a, uint256 b) internal pure returns (uint256) {
-        return pack(_mulCoeffsReference(unpack(a), unpack(b)));
-    }
-
     function _mul_packed(uint256 a, uint256 b) internal pure returns (uint256 out) {
         uint256 a0 = a >> 224;
         uint256 a1 = (a >> 192) & COEFF_MASK;
@@ -431,26 +416,6 @@ library KoalaBearExt4 {
         }
     }
 
-    function _mulCoeffsReference(uint256[4] memory a, uint256[4] memory b)
-        internal
-        pure
-        returns (uint256[4] memory out)
-    {
-        unchecked {
-            for (uint256 i = 0; i < DEGREE; ++i) {
-                for (uint256 j = 0; j < DEGREE; ++j) {
-                    uint256 term = KoalaBear.mul(a[i], b[j]);
-                    uint256 idx = i + j;
-                    if (idx >= DEGREE) {
-                        out[idx - DEGREE] =
-                            KoalaBear.add(out[idx - DEGREE], KoalaBear.mul(term, KoalaBear.W));
-                    } else {
-                        out[idx] = KoalaBear.add(out[idx], term);
-                    }
-                }
-            }
-        }
-    }
 
     function _extrapolate012Fast(uint256 e0, uint256 e1, uint256 e2, uint256 r)
         internal
