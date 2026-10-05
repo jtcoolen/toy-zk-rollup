@@ -333,3 +333,81 @@ After the calldata refactor the decode-time padding-canonical check moved
 with it (calldataload version) - tampered proofs still revert at decode.
 The negative tests caught a real regression during the eq/select rewrite;
 they keep earning their keep.
+## 13. Calldata-direct decode wave: paths, rows (0d9ea16..1acb195)
+
+Continuation of §12. Same principle, bigger payoff: **the proof bytes are
+already in calldata; copying them into memory costs twice** (the copy loop
+plus quadratic memory expansion at the ~4 MB heap high-water). Every decode
+that a consumer touches once should read calldata directly.
+
+| commit | change | verify() gas | delta |
+|---|---|---|---|
+| (prev) | paths calldata-direct (7f1fc7d) | 301,758,583 | -19.7M |
+| 3f20708 | rowsFlat calldata-direct | 251,013,608 | **-50.7M** |
+| 1acb195 | bytecode_hash=none (EIP-170 fix) | (no gas change) | - |
+
+applyBlock: 517,040,179 -> 448,922,974. Cumulative from baseline
+1,064,286,857: **-813.3M (-76.4%)**.
+
+### rowsFlat: the single biggest decode win (-50.7M)
+
+The per-round rows decode materialized up to 36,640 canonical uint256 words
+(1.17 MB) per big round - measured f-rows 1.22/2.19/3.38/4.88/5.21M - only
+for the query loop to mcopy each row into a reused limbs buffer anyway.
+Now the decode records the absolute calldata byte offset of the flat u32
+LE limbs (same pattern as pathsAbs); \`_loadRow\` in the core expands one row
+at a time (u32 LE -> canonical uint256 with the _arr byte-swap) into that
+buffer. Dual source: \`rowsCdBase == 0\` selects the memory path so the
+JSON-driven internal-API harnesses (WhirComposed.t, WhirFinalPhase.t) keep
+working unchanged.
+
+Lessons:
+- **\`_arr\` prefix counts WORDS (4 B), not bytes** - first attempt treated it
+  as bytes and scaled row offsets by 32 instead of 4 -> LimbOutOfRange.
+- **Inlining both row-load branches blew the stack** (Yul "1 too deep");
+  extracting \`_loadRow(limbs, flatPtr, rowsCd, base, rowLimbs)\` fixed it.
+  The query loop body is at the stack-depth edge: new locals go into
+  helpers, not the loop.
+
+### EIP-170: 2 bytes OVER (found + fixed)
+
+After 3f20708 WhirVerifier runtime = 24,578 B > 24,576 B limit. forge test
+does NOT enforce EIP-170 - only \`forge build --sizes\` shows it (margin
+column). Fixed with \`bytecode_hash = "none"\` in foundry.toml: removes the
+~41 B solc metadata CBOR appended to the runtime (not code; nothing pins
+the code hash). WhirVerifier now 24,537 B, margin +39 B. **Check
+\`forge build --sizes\` after every verifier edit from now on - the margin is
+single-digit hundreds of bytes.**
+
+### Fresh phase profile (post-7f1fc7d, probe total 325M vs real 301.7M)
+
+| phase | gas |
+|---|---|
+| batch-decode + cfg-head | 0.08M |
+| round-decode total (5 rounds) | 32.4M (rows 16.9M of it) |
+| initial run | ~17M |
+| intermediates (all rounds) | ~85M |
+| final phase (all rounds) | ~50M |
+| constraints-decode | 20.9M |
+| identity | 18.6M |
+
+Query-level sub-profile (instrumented core copy, test/GasProbeCore.sol):
+- per-round openfold loops: 5.4/2.2/1.2/0.9M (round 0..3 intermediates) -
+  Merkle path verify + fold, scales with nq x depth.
+- final-openfold: ~1-1.9M per round; domainPoints ~30k; closing-sumcheck
+  ~25-50k.
+- **terminal-weight (evalConstraintsPoly over allR) is the final-phase
+  hog: 3.0/16.4/6.1M per round** - Horner over all folding randomness per
+  constraint; round 1's 16.4M stands out (most constraints x longest allR).
+- eq_points IS live in every round (each _runRound sets
+  constraints[0].eqPoints); a decode-skip for rounds 1+ reverts with
+  TerminalClaimMismatch - dead-skip attempt reverted. Wire-level dedupe
+  (WBND v5) remains the only way to shrink that 1.48 MB.
+
+Probe mechanics (throwaway GasProfileProbe.t.sol + GasProbeCore.sol,
+regenerated from source by python; DELETE before gate):
+- gasleft deltas must be \`g_before - gasleft()\` (checked arithmetic
+  underflows the other way).
+- emit in a pure chain: loosen ONLY the emitting chain or deny=warnings
+  bites both directions (8961 vs 2018).
+
