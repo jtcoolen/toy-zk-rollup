@@ -18,7 +18,13 @@ import {ShieldedPool} from "../src/ShieldedPool.sol";
 
 contract Deploy is Script {
     function run() external {
-        string memory genesis = vm.readFile("test/vectors/block_genesis.json");
+        // GENESIS_FILE overrides the genesis source: the node e2e deploys
+        // with the node's own demo genesis (node genesis --out ...), which
+        // differs from the prover-vector genesis. The pool enforces
+        // rootBefore == currentRoot, so the deployment must start at exactly
+        // the tree the block was witnessed against.
+        string memory genesis_path = vm.envOr("GENESIS_FILE", string("test/vectors/block_genesis.json"));
+        string memory genesis = vm.readFile(genesis_path);
         bytes32[] memory leaves = vm.parseJsonBytes32Array(genesis, ".genesis_leaves");
         require(leaves.length > 0, "genesis leaves required");
 

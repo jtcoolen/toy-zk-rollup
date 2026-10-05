@@ -687,8 +687,10 @@ fn build_router(st: AppState, cors_origins: &[String]) -> Router {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     node::metrics::init_tracing();
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("token") {
-        return issue_token_cli(&args);
+    match args.get(1).map(String::as_str) {
+        Some("token") => return issue_token_cli(&args),
+        Some("genesis") => return write_genesis_cli(&args),
+        _ => {}
     }
     let config = Config::from_env()?;
     let key = load_token_key()?;
@@ -795,4 +797,20 @@ fn arg_after(args: &[String], flag: &str) -> Option<String> {
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+/// `node genesis [--out PATH]`: emit the genesis leaves the node's demo
+/// notes commit to, in the shape `Deploy.s.sol` reads. The deployed pool
+/// must start at exactly the tree the node witnessed against - the pool
+/// enforces `rootBefore == currentRoot`, so any other genesis reverts.
+fn write_genesis_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let out = arg_after(args, "--out").unwrap_or_else(|| "contracts/deployments/genesis.json".into());
+    let leaves: Vec<String> = GENESIS
+        .iter()
+        .map(|(b, v)| funded_note(*b, *v).0.commit(&Keccak256Commitment).to_hex())
+        .collect();
+    let doc = serde_json::json!({ "genesis_leaves": leaves });
+    std::fs::write(&out, serde_json::to_string_pretty(&doc)?)?;
+    eprintln!("wrote {out} ({} leaves)", leaves.len());
+    Ok(())
 }
