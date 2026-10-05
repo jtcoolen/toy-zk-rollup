@@ -732,9 +732,20 @@ contract WhirVerifier is IWhirVerifier {
         uint256 n;
         (n, no) = _word(d, off);
         out = new uint256[](n);
-        for (uint256 i; i < n; ++i) {
-            (out[i], no) = _word(d, no);
+        // One assembly pass: per-element _word calls cost ~460 gas/word in ABI
+        // call overhead alone (measured on rowsFlat); this loop is ~80.
+        assembly ("memory-safe") {
+            let src := add(d.offset, mul(no, 4))
+            let dst := add(out, 32)
+            for { let i := 0 } lt(i, n) { i := add(i, 1) } {
+                let x := shr(224, calldataload(add(src, mul(i, 4))))
+                // byte-swap the low 32 bits: LE u32 on the wire, canonical here
+                let r := or(and(shr(8, x), 0x00ff00ff), and(shl(8, x), 0xff00ff00))
+                r := or(and(shr(16, r), 0x0000ffff), and(shl(16, r), 0xffff0000))
+                mstore(add(dst, mul(i, 32)), r)
+            }
         }
+        no += n;
     }
 
     /// A byte blob: word count, then raw bytes (padded to a word boundary).
