@@ -407,7 +407,8 @@ contract WhirVerifier is IWhirVerifier {
         constraints[0].numVariables = c.numVariables;
         constraints[0].gamma = init.alpha;
         constraints[0].initialPower = 0;
-        constraints[0].eqPoints = _ragged(p.eqPoints, c.eqPointsLens);
+        constraints[0].eqCdBase = p.eqPointsCdBase;
+        constraints[0].eqLens = c.eqPointsLens;
 
         Threading memory th = _runIntermediates(t, c, p, init, constraints);
         _runFinal(t, c, p, th, constraints);
@@ -643,7 +644,7 @@ contract WhirVerifier is IWhirVerifier {
         uint256[] finalScA;
         uint256[] finalScInf;
         uint256[] finalScPow;
-        uint256[] eqPoints;
+        uint256 eqPointsCdBase;
     }
 
     function _decodeRoundCfg(bytes calldata m, uint256 off)
@@ -739,7 +740,18 @@ contract WhirVerifier is IWhirVerifier {
         (p.finalScA, no) = _extArr(m, no);
         (p.finalScInf, no) = _extArr(m, no);
         (p.finalScPow, no) = _arr(m, no);
-        (p.eqPoints, no) = _extArr(m, no);
+        {
+            // eq points stay in calldata: each group is consumed exactly once
+            // (constraintWeight), so a 773 KB memory copy is pure overhead.
+            uint256 nBytes;
+            (nBytes, no) = _word(m, no);
+            uint256 abs;
+            assembly ("memory-safe") {
+                abs := add(m.offset, mul(no, 4))
+            }
+            p.eqPointsCdBase = abs;
+            no += nBytes / 4;
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -926,23 +938,6 @@ contract WhirVerifier is IWhirVerifier {
         }
     }
 
-    function _ragged(uint256[] memory flat, uint256[] memory lens)
-        private
-        pure
-        returns (uint256[][] memory out)
-    {
-        out = new uint256[][](lens.length);
-        uint256 off = 0;
-        for (uint256 i; i < lens.length; ++i) {
-            uint256 n = lens[i];
-            uint256[] memory row = new uint256[](n);
-            assembly ("memory-safe") {
-                mcopy(add(row, 0x20), add(add(flat, 0x20), mul(off, 0x20)), mul(n, 0x20))
-            }
-            out[i] = row;
-            off += n;
-        }
-    }
 
     function _node(bytes memory blob, uint256 idx) private pure returns (bytes32 out) {
         assembly ("memory-safe") {

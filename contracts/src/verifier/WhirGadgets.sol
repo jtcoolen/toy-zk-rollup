@@ -76,8 +76,14 @@ library WhirGadgets {
         /// Exponent of `gamma` weighting the first statement: 0 for the initial
         /// constraint, 1 for every round constraint.
         uint256 initialPower;
-        /// OOD points, each `numVariables` coordinates.
+        /// OOD points, each `numVariables` coordinates. EMPTY when
+        /// `eqCdBase` is set (production keeps the wire groups in calldata).
         uint256[][] eqPoints;
+        /// Absolute calldata byte offset of the flat eq-point words, or 0 to
+        /// read `eqPoints` from memory (derived groups, JSON-driven tests).
+        uint256 eqCdBase;
+        /// Group lengths over the flat calldata words when `eqCdBase` is set.
+        uint256[] eqLens;
         /// STIR domain scalars, one per query, each lifted into the extension.
         uint256[] selVars;
     }
@@ -273,10 +279,41 @@ library WhirGadgets {
                 KoalaBearExt4.mul(w, gamma), selectEval(localR, c.selVars[i - 1])
             );
         }
-        for (uint256 i = c.eqPoints.length; i > 0; --i) {
-            w = KoalaBearExt4.add(
-                KoalaBearExt4.mul(w, gamma), eqEval(localR, c.eqPoints[i - 1])
-            );
+        if (c.eqCdBase == 0) {
+            for (uint256 i = c.eqPoints.length; i > 0; --i) {
+                w = KoalaBearExt4.add(
+                    KoalaBearExt4.mul(w, gamma), eqEval(localR, c.eqPoints[i - 1])
+                );
+            }
+        } else {
+            // Wire groups stay in calldata: 773 KB decoded to memory and
+            // ragged-copied only to be read once each, per round. Copy one
+            // group into a reused scratch (padding-checked exactly as the old
+            // _extArr decode did) and evaluate. Every group has exactly
+            // localR.length coordinates - eqEval would revert otherwise.
+            uint256 cdBase = c.eqCdBase;
+            uint256[] memory lens = c.eqLens;
+            uint256 off = 0;
+            for (uint256 i; i < lens.length; ++i) { off += lens[i]; }
+            uint256[] memory scratch = new uint256[](localR.length);
+            for (uint256 i = lens.length; i > 0; --i) {
+                uint256 len = lens[i - 1];
+                off -= len;
+                if (len != localR.length) { revert("LEN"); }
+                assembly ("memory-safe") {
+                    let src := add(cdBase, mul(off, 32))
+                    let dst := add(scratch, 32)
+                    let PAD := sub(shl(128, 1), 1)
+                    for { let j := 0 } lt(j, len) { j := add(j, 1) } {
+                        let x := calldataload(add(src, shl(5, j)))
+                        if and(x, PAD) { mstore(0, 0) revert(0, 0) }
+                        mstore(add(dst, shl(5, j)), x)
+                    }
+                }
+                w = KoalaBearExt4.add(
+                    KoalaBearExt4.mul(w, gamma), KoalaBearExt4.eq_poly_eval(localR, scratch)
+                );
+            }
         }
         // initialPower is 0 or 1 in this protocol; the loop keeps it general and
         // costs nothing when it is zero.
