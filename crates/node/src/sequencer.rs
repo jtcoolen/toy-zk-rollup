@@ -98,6 +98,10 @@ pub struct BlockArtifact {
     pub proof: p3_circuit_prover::BatchStarkProof<prover::whir::Config>,
     /// The verifier that accepted it, for the native-check audit trail.
     pub verifier: p3_circuit_prover::CircuitVerifier<prover::whir::Config>,
+    /// The witnessed block circuit, retained so the settlement exporter can
+    /// re-run the composed walk against the same public data (the WBND
+    /// bundle must encode a proof run, and classification needs two runs).
+    pub rc: prover::whir_recursion::RecursionCircuit,
     /// Number of transfers in the block.
     pub num_transfers: usize,
     /// Total fees collected.
@@ -260,6 +264,28 @@ impl Sequencer {
         &self.state
     }
 
+    /// The inner WHIR config child proofs must be proven under.
+    ///
+    /// The demo's in-process client (D-079) proves through the node, and its
+    /// proofs are only admissible if they were made under this exact config -
+    /// the block circuit verifies children against it.
+    #[must_use]
+    pub const fn inner(&self) -> &prover::whir_recursion::InnerWhirConfig {
+        &self.inner
+    }
+
+    /// The nullifier-map projection a client must prove against: committed
+    /// state plus every nullifier already queued.
+    ///
+    /// A client proving against the committed root alone would produce a
+    /// transfer that collides with the queue once admitted; the sequencer's
+    /// own admission check (`check_admit_against`) demands this projection's
+    /// root, so it is the only honest input to `prove_client_transfer`.
+    #[must_use]
+    pub fn client_map(&self) -> shielded::NullifierMap<pq_hash::Keccak256Commitment> {
+        self.pending.clone()
+    }
+
     /// Transfers waiting in the mempool.
     #[must_use]
     pub fn pending(&self) -> usize {
@@ -388,6 +414,7 @@ impl Sequencer {
             statement,
             proof,
             verifier,
+            rc,
             num_transfers: batch.len(),
             total_fee,
         })

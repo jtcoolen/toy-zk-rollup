@@ -60,8 +60,10 @@ pub mod auth;
 pub mod keystore;
 pub mod metrics;
 pub mod sequencer;
+pub mod settlement;
 pub mod state;
 pub mod tx;
+pub mod wire;
 
 pub use auth::{Acl, AuthError, Role, TokenSigner};
 pub use keystore::{KeystoreError, SealedVault};

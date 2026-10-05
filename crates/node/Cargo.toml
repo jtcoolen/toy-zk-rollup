@@ -12,7 +12,7 @@ publish = false
 pq-hash = { workspace = true }
 pq-sign = { workspace = true }
 shielded = { workspace = true }
-prover = { workspace = true }
+prover = { workspace = true, features = ["testkit"] }
 # Direct deps on types that appear in the node's public API (`CircuitVerifier`,
 # `BatchStarkProof`) and on the field arithmetic at the statement boundary.
 # Same git rev as `prover`'s, pinned once in the workspace so the two crates
@@ -49,6 +49,11 @@ serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true }
 postcard = { version = "1.0", default-features = false, features = ["alloc"] }
 thiserror = { workspace = true }
+
+# --- L1 settlement: JSON-RPC client for eth_sendTransaction / receipts ---
+# Plain HTTP to a local (or self-hosted) execution-layer RPC; no TLS provider
+# is pulled in, matching the posture of contracts/scripts/settle_block.mjs.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
 [dev-dependencies]
 # Real notes and trees, so the sequencer is driven by the same fixtures the
