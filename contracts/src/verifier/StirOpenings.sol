@@ -111,10 +111,14 @@ library StirOpenings {
         // One pass over the limbs into scratch space ABOVE the free memory
         // pointer - the documented scratch region for memory-safe assembly -
         // so there is no allocation, no zeroing pass, and no free-pointer bump:
-        // the digest is taken before anything else can claim the region. The
-        // byte encoding stays four MSTORE8s per limb (mstore is big-endian, so
-        // packing eight 31-bit limbs per word would need a byte swap per group
-        // and measured no better).
+        // the digest is taken before anything else can claim the region.
+        //
+        // Each limb is stored as ONE mstore of w << 224 at dst + 4i: the word
+        // store spills 28 bytes past the limb, but the next limb's store (at
+        // +4) overwrites that spill, so after the loop bytes [0, 4n) hold
+        // exactly the little-endian limb encoding and the trailing 28 bytes of
+        // scratch are never read (keccak covers 4n only). Four mstore8s per
+        // limb cost ~36 gas each round-trip; one shl+mstore costs ~10.
         bytes4 selTag = LimbOutOfRange.selector;
         assembly ("memory-safe") {
             let n := mload(limbs)
@@ -132,11 +136,16 @@ library StirOpenings {
                 // Wire form. v < 2^31 and r < 2^25 so the product cannot
                 // overflow a word; mod reduces it in place.
                 let w := mod(mul(v, r), p)
-                let d := add(dst, shl(2, i))
-                mstore8(d, and(w, 0xff))
-                mstore8(add(d, 1), and(shr(8, w), 0xff))
-                mstore8(add(d, 2), and(shr(16, w), 0xff))
-                mstore8(add(d, 3), shr(24, w))
+                // Little-endian 4-byte store via one mstore: byte-swap w, then
+                // place it in the word's top 4 bytes (mstore is big-endian).
+                // w < 2^31 so the top byte's spill reaches byte 6 of the word;
+                // the next limb's store at +4 overwrites the spill, and the
+                // final limb's spill sits in the unread scratch tail.
+                let sw := or(
+                    or(and(shl(24, w), 0xff000000), and(shl(8, w), 0xff0000)),
+                    or(and(shr(8, w), 0xff00), shr(24, w))
+                )
+                mstore(add(dst, shl(2, i)), shl(224, sw))
             }
             digest := keccak256(dst, mul(n, 4))
         }
