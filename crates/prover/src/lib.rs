@@ -36,6 +36,8 @@
 //! which are hash-and-field-arithmetic. That is checkable by a small, auditable
 //! Solidity contract with no trusted setup and no pairing curve.
 
+// wbnd builds one huge json! literal (60 keys per round).
+#![recursion_limit = "512"]
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
@@ -53,6 +55,7 @@ pub mod settlement_replay;
 pub mod sha3_block;
 pub mod transcript_trace;
 pub mod transfer;
+pub mod wbnd;
 pub mod whir;
 pub mod whir_recursion;
 pub mod whir_walk;

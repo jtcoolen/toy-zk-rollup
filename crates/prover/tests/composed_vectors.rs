@@ -217,7 +217,7 @@ fn block_program_equality_and_export() -> Result<(), Box<dyn Error>> {
     let (_doc_a, _out_a, program_a) = composed_run_with(
         &pis,
         &rc,
-        params.clone(),
+        &params,
         prover::block::BLOCK_LOG_MAX_LDE,
         &mut rounds_a,
         &mut starts_a,
@@ -228,7 +228,7 @@ fn block_program_equality_and_export() -> Result<(), Box<dyn Error>> {
     let (doc, out, program_b) = composed_run_with(
         &pis,
         &rc,
-        params,
+        &params,
         prover::block::BLOCK_LOG_MAX_LDE,
         &mut rounds_b,
         &mut starts_b,

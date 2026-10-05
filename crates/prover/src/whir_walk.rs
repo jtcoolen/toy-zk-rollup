@@ -8,6 +8,22 @@
 //! recorded program still equals the native verifier's, the composition is proven -
 //! not a re-derivation of the protocol, but the same code at a different shape.
 
+// Infallible-by-construction unwraps: every expect here parses JSON this
+// crate itself just produced (or fixed-shape blob bytes), so a failure is
+// a bug in the producer, not an input condition. Same precedent as fixtures.rs.
+// Doc-style lints (long doc paragraphs, # Errors/# Panics sections, arg/line
+// counts) are noise on this generated-artifact machinery: the functions are
+// internal encoders whose contracts are pinned by byte-identity tests.
+#![allow(
+    clippy::too_long_first_doc_paragraph,
+    clippy::doc_overindented_list_items,
+    clippy::missing_errors_doc,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation
+)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::missing_panics_doc)]
+
 use crate::config::mmcs;
 use crate::semantic_trace::SemChallenger;
 use crate::whir::{Challenge, Dft};
@@ -32,6 +48,7 @@ use std::error::Error;
 pub type SemVerifierTranscript<'a> = WhirVerifierTranscript<'a, SemChallenger, F, Challenge>;
 
 /// Hex for the Solidity side, which reads `hex"..."` literals.
+#[must_use]
 pub fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     bytes
@@ -88,7 +105,7 @@ pub struct RoundWalk {
     /// Per-round sumcheck constraint-infinity messages, in round order.
     pub sumcheck_cinf: Vec<Vec<Challenge>>,
     /// Per-round sumcheck proof-of-work witnesses (canonical base u32s; empty
-    /// at zero difficulty). The contract's SumcheckCore checks each grind.
+    /// at zero difficulty). The contract's `SumcheckCore` checks each grind.
     pub sumcheck_pow_witnesses: Vec<Vec<u32>>,
     /// Per-round opened rows, flattened base-field limbs for round 0 and packed
     /// extension elements for later rounds. The contract authenticates these
@@ -553,8 +570,8 @@ pub struct WhirRoundWalk {
     /// Arity the initial constraint lives in.
     pub num_variables: usize,
     /// Program offsets (into the shared sink) of the phase boundaries of this
-    /// round's walk: [claims_start, claim_end_0, ..., claim_end_n,
-    /// initial_fold_end, terminal_start, terminal_end]. Trusted-setup
+    /// round's walk: [`claims_start`, `claim_end_0`, ..., `claim_end_n`,
+    /// `initial_fold_end`, `terminal_start`, `terminal_end`]. Trusted-setup
     /// schedule data: the contract's walk plan is derived from these, not
     /// re-derived from shapes (the per-claim framing constant count varies
     /// with claim width and stacked arity).

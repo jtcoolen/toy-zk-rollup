@@ -1,12 +1,28 @@
 //! The semantic settlement driver: prove a recursion circuit under the
 //! recording (semantic) settlement config, verify it natively, and replay the
 //! batch transcript phase by phase - the specification BatchTranscript.sol is
-//! written from. Moved from tests/batch_fixture so the node can encode
+//! written from. Moved from `tests/batch_fixture` so the node can encode
 //! settlement bundles at runtime with the SAME code the pinned tests exercise.
 //!
 //! The correctness criterion is unchanged (D-062): the hand-driven replay's
-//! event program must equal the native CircuitVerifier::verify run's, event
+//! event program must equal the native `CircuitVerifier::verify` run's, event
 //! for event.
+
+// Infallible-by-construction unwraps: every expect here parses JSON this
+// crate itself just produced (or fixed-shape blob bytes), so a failure is
+// a bug in the producer, not an input condition. Same precedent as fixtures.rs.
+// Doc-style lints (long doc paragraphs, # Errors/# Panics sections, arg/line
+// counts) are noise on this generated-artifact machinery: the functions are
+// internal encoders whose contracts are pinned by byte-identity tests.
+#![allow(
+    clippy::too_long_first_doc_paragraph,
+    clippy::doc_overindented_list_items,
+    clippy::missing_errors_doc,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation
+)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::missing_panics_doc)]
 
 use std::error::Error;
 
@@ -43,7 +59,7 @@ use crate::whir_recursion::{
 /// The batch proof's PCS opening argument: one claim per commitment round.
 pub type OpeningClaims = Vec<CommitmentWithOpeningPoints<Challenge, Commitment, Dom>>;
 
-/// The WHIR proof behind the opening argument: one PcsProof per commitment round.
+/// The WHIR proof behind the opening argument: one `PcsProof` per commitment round.
 pub type OpeningProof = <SemPcs as Pcs<Challenge, SemChallenger>>::Proof;
 
 /// A replacement for the native PCS inside the batch delegate: same challenger, same
@@ -82,6 +98,7 @@ pub const BASE_TRACE: usize = 1024;
 pub const RUNS: usize = 2;
 
 /// A recording challenger bound to sink, wrapping the production Keccak challenger.
+#[must_use]
 pub fn sem_challenger_with(sink: &SemSink) -> SemChallenger {
     let inner =
         SerializingChallenger32::new(HashChallenger::new(Vec::new(), p3_keccak::Keccak256Hash {}));
@@ -91,13 +108,15 @@ pub fn sem_challenger_with(sink: &SemSink) -> SemChallenger {
 /// The WHIR protocol parameters the settlement config uses, replicated exactly: the
 /// grinding budget is derived from `log_max_lde + ZK_ARITY_SLACK`, and the verifier
 /// recomputes the WHIR schedule from these parameters, so a mismatch fails the opening.
+#[must_use]
 pub fn settlement_params() -> p3_whir::parameters::ProtocolParameters {
     settlement_params_for(LOG_MAX_LDE)
 }
 
-/// The same budget derived for an arbitrary log_max_lde. The block circuit
+/// The same budget derived for an arbitrary `log_max_lde`. The block circuit
 /// settles at a larger LDE (25) than the recursion circuit (22), and the grind
 /// budget is read off the config's own arity, so the fixture must build either.
+#[must_use]
 pub fn settlement_params_for(log_max_lde: usize) -> p3_whir::parameters::ProtocolParameters {
     let pow_bits = crate::whir::required_pow_bits(log_max_lde + crate::whir::ZK_ARITY_SLACK)
         .expect("settlement shape reaches the security target");
@@ -108,11 +127,13 @@ pub fn settlement_params_for(log_max_lde: usize) -> p3_whir::parameters::Protoco
 }
 
 /// A semantic settlement config whose challenger records into sink.
+#[must_use]
 pub fn sem_config(sink: &SemSink) -> SemConfig {
     sem_config_for(sink, LOG_MAX_LDE)
 }
 
-/// sem_config at an explicit log_max_lde.
+/// `sem_config` at an explicit `log_max_lde`.
+#[must_use]
 pub fn sem_config_for(sink: &SemSink, log_max_lde: usize) -> SemConfig {
     let pcs = SemPcs::new(
         settlement_params_for(log_max_lde),
@@ -125,6 +146,7 @@ pub fn sem_config_for(sink: &SemSink, log_max_lde: usize) -> SemConfig {
 }
 
 /// The witnessed recursion circuit for one Fibonacci proof, with its statement.
+#[must_use]
 pub fn fib_recursion() -> (Vec<F>, RecursionCircuit) {
     let inner = InnerWhirConfig::new(LOG_MAX_LDE, CAP_HEIGHT).expect("inner config");
     let air = FibonacciAir {};
@@ -148,6 +170,7 @@ pub fn fib_recursion() -> (Vec<F>, RecursionCircuit) {
 /// config. The preprocessors depend only on the base field and the AIR builders and table
 /// provers are generic over SC, so the relation is identical and only the transcript
 /// differs - which is the point.
+#[must_use]
 pub fn settle_sem(
     rc: &RecursionCircuit,
     sink: &SemSink,
@@ -158,7 +181,8 @@ pub fn settle_sem(
     settle_sem_for(rc, sink, LOG_MAX_LDE)
 }
 
-/// settle_sem at an explicit log_max_lde (the block circuit settles at 25).
+/// `settle_sem` at an explicit `log_max_lde` (the block circuit settles at 25).
+#[must_use]
 pub fn settle_sem_for(
     rc: &RecursionCircuit,
     sink: &SemSink,
@@ -207,11 +231,13 @@ pub fn ext_json(v: &Challenge) -> Vec<u32> {
 }
 
 /// A base-field element as the contract reads it: canonical u32.
+#[must_use]
 pub fn base_json(v: F) -> u32 {
     v.as_canonical_u32()
 }
 
 /// Lowercase hex, the encoding every pinned vector uses.
+#[must_use]
 pub fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -222,12 +248,14 @@ pub fn hex(bytes: &[u8]) -> String {
 }
 
 /// A commitment as the transcript absorbs it: concatenated cap roots.
+#[must_use]
 pub fn com_json(com: &Commitment) -> String {
     let bytes: Vec<u8> = com.roots().iter().flatten().copied().collect();
     hex(&bytes)
 }
 
 /// A domain as the contract needs it: log size and shift.
+#[must_use]
 pub fn dom_json(d: &Dom) -> serde_json::Value {
     json!({
         "log_size": d.size().trailing_zeros(),
@@ -239,6 +267,7 @@ pub fn dom_json(d: &Dom) -> serde_json::Value {
 /// index by name, local buses take a fresh one, and the widest payload fixes the
 /// bus-offset power. Exported as trusted-setup metadata; the on-chain side recomputes the
 /// prefixes from alpha, beta and W and checks them against the proof (D-063).
+#[must_use]
 pub fn bus_layout(lookups: &[p3_lookup::Lookups<F>]) -> (Vec<Vec<usize>>, usize, usize) {
     let mut global_index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     let mut next_bus = 0usize;
@@ -538,6 +567,7 @@ pub fn manual_replay(
 
 /// One full proving + verification cycle: prove under the semantic config, run the native
 /// verifier, replay the phases by hand, and assert program equality.
+#[must_use]
 pub fn one_run(
     pis: &[F],
     rc: &RecursionCircuit,
@@ -551,11 +581,12 @@ pub fn one_run(
     one_run_for(pis, rc, opening, LOG_MAX_LDE)
 }
 
-/// one_run at an explicit log_max_lde.
+/// `one_run` at an explicit `log_max_lde`.
+#[must_use]
 pub fn one_run_for(
     pis: &[F],
     rc: &RecursionCircuit,
-    mut opening: Option<&mut OpeningReplacer<'_>>,
+    opening: Option<&mut OpeningReplacer<'_>>,
     log_max_lde: usize,
 ) -> (
     SemProgram,
@@ -588,7 +619,7 @@ pub fn one_run_for(
         &proof,
         &public_values,
         &sink_manual,
-        opening.as_deref_mut(),
+        opening,
     )
     .expect("manual phase replay");
     let p_manual = sink_manual.program();

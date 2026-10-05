@@ -1,6 +1,6 @@
 //! Shared constraint-IR machinery: the symbolic-constraint flattener and the
-//! fold evaluator both vector exporters (constraint_identity_vectors,
-//! composed_vectors) drive on the SAME proof run the bundle ships.
+//! fold evaluator both vector exporters (`constraint_identity_vectors`,
+//! `composed_vectors`) drive on the SAME proof run the bundle ships.
 //!
 //! The settlement AIRs are generated (Poseidon2 / recompose / statement tables),
 //! so the constraints cannot be hand-written in Solidity. They are trusted-setup
@@ -8,9 +8,25 @@
 //! (shared subtrees emitted once, referenced by node index) and the Solidity
 //! side is a DAG interpreter (contracts/src/verifier/ConstraintIdentity.sol).
 //!
-//! Field types are the settlement pair (KoalaBear, quartic extension) both
+//! Field types are the settlement pair (`KoalaBear`, quartic extension) both
 //! consumers use: production `prover::whir::Config` challenges and the semantic
 //! fixture's `Challenge` are the same `BinomialExtensionField<KoalaBear, 4>`.
+
+// Infallible-by-construction unwraps: every expect here parses JSON this
+// crate itself just produced (or fixed-shape blob bytes), so a failure is
+// a bug in the producer, not an input condition. Same precedent as fixtures.rs.
+// Doc-style lints (long doc paragraphs, # Errors/# Panics sections, arg/line
+// counts) are noise on this generated-artifact machinery: the functions are
+// internal encoders whose contracts are pinned by byte-identity tests.
+#![allow(
+    clippy::too_long_first_doc_paragraph,
+    clippy::doc_overindented_list_items,
+    clippy::missing_errors_doc,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation
+)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::missing_panics_doc)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,13 +59,13 @@ pub enum Node {
     PreLocal(usize),
     /// Preprocessed column at the next row.
     PreNext(usize),
-    /// Permutation (LogUp) column at the current row.
+    /// Permutation (`LogUp`) column at the current row.
     PermLocal(usize),
     /// Permutation column at the next row.
     PermNext(usize),
     /// Index into the per-instance permutation challenges.
     PermChallenge(usize),
-    /// Index into the LogUp terminal values.
+    /// Index into the `LogUp` terminal values.
     PermValue(usize),
     /// Index into the instance's public values.
     Public(usize),
@@ -77,6 +93,7 @@ impl Node {
     // cannot truncate.
     /// Encode as the wire triple [tag, x, y] the Solidity decoder reads.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[must_use]
     pub const fn encode(&self) -> [u32; 3] {
         let (tag, x, y) = match *self {
             Self::ConstBase(i) => (0, i, 0),
@@ -104,13 +121,13 @@ impl Node {
 }
 
 /// One instance's flattened constraint program plus the constant pools it indexes.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct InstanceIr {
     /// The DAG in post-order: every node's children precede it.
     pub nodes: Vec<Node>,
-    /// Base-field constants, canonical u32, indexed by ConstBase.
+    /// Base-field constants, canonical u32, indexed by `ConstBase`.
     pub base_consts: Vec<u32>,
-    /// Extension constants as canonical basis coefficients, indexed by ConstExt.
+    /// Extension constants as canonical basis coefficients, indexed by `ConstExt`.
     pub ext_consts: Vec<[u32; 4]>,
     /// Constraint roots in GLOBAL emission order (base and ext interleaved by the
     /// layout): the fold `acc = acc*alpha + C_g` walks this list front to back.
@@ -120,7 +137,7 @@ pub struct InstanceIr {
 /// DAG flattener with pointer-identity memoization. `SymbolicExpr` shares subtrees
 /// through `Arc`, so emitting each distinct node once keeps the program linear in
 /// distinct nodes rather than exponential in shared subtrees.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Flattener {
     /// The program under construction.
     pub ir: InstanceIr,
@@ -129,6 +146,7 @@ pub struct Flattener {
 
 impl Flattener {
     /// An empty program.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             ir: InstanceIr {
@@ -276,6 +294,7 @@ impl Flattener {
 }
 
 /// Basis coefficients of an extension element, canonical u32.
+#[must_use]
 pub fn ext_coeffs(v: EF) -> [u32; 4] {
     let s = <EF as BasedVectorSpace<F>>::as_basis_coefficients_slice(&v);
     [
@@ -287,11 +306,13 @@ pub fn ext_coeffs(v: EF) -> [u32; 4] {
 }
 
 /// An extension element as canonical basis coefficients.
+#[must_use]
 pub fn ext_json(v: &EF) -> Vec<u32> {
     ext_coeffs(*v).to_vec()
 }
 
 /// Flat concatenation of basis coefficients: four u32s per element.
+#[must_use]
 pub fn exts_flat(vs: &[EF]) -> Vec<u32> {
     vs.iter().flat_map(|v| ext_coeffs(*v)).collect()
 }
@@ -312,9 +333,9 @@ pub struct EvalInputs<'a> {
     pub perm_local: &'a [EF],
     /// Permutation columns opened at zeta*shift.
     pub perm_next: &'a [EF],
-    /// The instance's LogUp challenges ([prefix, beta] per lookup).
+    /// The instance's `LogUp` challenges ([prefix, beta] per lookup).
     pub perm_challenges: &'a [EF],
-    /// LogUp terminal values (empty when the instance has none).
+    /// `LogUp` terminal values (empty when the instance has none).
     pub perm_values: &'a [EF],
     /// The instance's public values (base field, canonical).
     pub public_values: &'a [F],
@@ -324,7 +345,7 @@ pub struct EvalInputs<'a> {
     pub is_first: EF,
     /// Last-row selector at zeta.
     pub is_last: EF,
-    /// Transition selector at zeta (1 - is_last).
+    /// Transition selector at zeta (1 - `is_last`).
     pub is_transition: EF,
 }
 
@@ -395,6 +416,7 @@ pub fn lift(x: F) -> EF {
 }
 
 /// log2 of a power-of-two size.
+#[must_use]
 pub const fn log2_size(n: usize) -> usize {
     n.trailing_zeros() as usize
 }
@@ -432,7 +454,7 @@ use serde_json::json;
 /// identical whichever the caller proves under.
 ///
 /// The two assertions inside are the export's self-check: they are the exact
-/// equalities verify_batch enforces, evaluated on the opened values the proof
+/// equalities `verify_batch` enforces, evaluated on the opened values the proof
 /// carries. If either fails, the export is broken (or the proof is), and no
 /// downstream Solidity pin can rescue it.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]

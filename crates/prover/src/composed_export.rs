@@ -1,8 +1,24 @@
 //! The composed settlement export: prove a recursion circuit under the
 //! semantic config, drive the shared WHIR walk inside the batch delegate,
 //! and emit the composed artifact (JSON doc + semantic blob) the WBND
-//! encoder turns into calldata. Moved from tests/composed_vectors so the
+//! encoder turns into calldata. Moved from `tests/composed_vectors` so the
 //! node can produce the same artifact at runtime.
+
+// Infallible-by-construction unwraps: every expect here parses JSON this
+// crate itself just produced (or fixed-shape blob bytes), so a failure is
+// a bug in the producer, not an input condition. Same precedent as fixtures.rs.
+// Doc-style lints (long doc paragraphs, # Errors/# Panics sections, arg/line
+// counts) are noise on this generated-artifact machinery: the functions are
+// internal encoders whose contracts are pinned by byte-identity tests.
+#![allow(
+    clippy::too_long_first_doc_paragraph,
+    clippy::doc_overindented_list_items,
+    clippy::missing_errors_doc,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation
+)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::missing_panics_doc)]
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -41,6 +57,7 @@ pub fn point_json(p: &Point<Challenge>) -> Vec<Vec<u32>> {
 /// The per-round WHIR schedule as the contract sees it: one entry per WHIR round plus
 /// the terminal configuration, derived from the rebuilt config exactly as the small-shape
 /// artifact derives it.
+#[must_use]
 pub fn schedule_json(config: &WhirConfig<Challenge, crate::F, SemChallenger>) -> serde_json::Value {
     let round = |r: &p3_whir::parameters::RoundConfig| {
         json!({
@@ -71,6 +88,7 @@ pub fn exts(v: &[Challenge]) -> Vec<Vec<u32>> {
 }
 
 /// Nested extension elements (per-round lists) as canonical coefficients.
+#[must_use]
 pub fn exts2(v: &[Vec<Challenge>]) -> Vec<Vec<Vec<u32>>> {
     v.iter().map(|r| exts(r)).collect()
 }
@@ -142,14 +160,14 @@ pub fn walk_json(walk: &WhirRoundWalk) -> serde_json::Value {
 /// transcript.delegate: it rebuilds each round's WHIR statement from public
 /// ingredients, drives the shared walk on the batch challenger, and re-checks the
 /// claimed openings against the walk's bound evaluations - the rescale step
-/// verify_rounds performs after verify_at.
+/// `verify_rounds` performs after `verify_at`.
 pub fn composed_run(
     rounds_json: &mut Vec<serde_json::Value>,
     round_starts: &mut Vec<usize>,
 ) -> Result<(serde_json::Value, ReplayOut, SemProgram), Box<dyn Error>> {
     let (pis, rc) = fib_recursion();
     let params = settlement_params();
-    composed_run_with(&pis, &rc, params, LOG_MAX_LDE, rounds_json, round_starts)
+    composed_run_with(&pis, &rc, &params, LOG_MAX_LDE, rounds_json, round_starts)
 }
 
 /// The constraint-identity block for one settlement batch, built from the SAME
@@ -158,8 +176,8 @@ pub fn composed_run(
 ///
 /// Per instance this carries the flattened constraint program, the trusted
 /// domain parameters, every opened value the fold consumes, and the two pins
-/// (fold * inv_vanishing == quotient, inversion-free quotient reformulation)
-/// - see constraint_ir::instance_identity_json. The Solidity verifier evaluates
+/// (fold * `inv_vanishing` == quotient, inversion-free quotient reformulation),
+/// see `constraint_ir::instance_identity_json`. The Solidity verifier evaluates
 /// the program on opened values it derives from the WHIR rounds themselves,
 /// and the pin test replays this JSON against the same program.
 pub fn constraint_identity_block(
@@ -228,7 +246,7 @@ pub fn constraint_identity_block(
 pub fn composed_run_with(
     pis: &[F],
     rc: &RecursionCircuit,
-    params: p3_whir::parameters::ProtocolParameters,
+    params: &p3_whir::parameters::ProtocolParameters,
     log_max_lde: usize,
     rounds_json: &mut Vec<serde_json::Value>,
     round_starts: &mut Vec<usize>,
@@ -338,7 +356,7 @@ pub fn composed_run_with(
                 rounds_json.push(json!({
                     "commitment": com_json(&claim.commitment),
                     "stacked_num_variables": stacked,
-                    "matrices": claim.matrices.iter().enumerate().map(|(_mi, m)| json!({
+                    "matrices": claim.matrices.iter().map(|m| json!({
                         "domain": dom_json(&m.domain),
                         "arity": padded_arity(m.domain.log_size(), FOLDING_FACTOR).get(),
                         "points": m.points.iter().map(|pt| json!({
@@ -393,14 +411,14 @@ fn round_const_words(
         .enumerate()
         .map(|(r, &start)| {
             (start..end_of(r))
-                .filter_map(|i| fixed[i].as_ref().map(|v| v.len()))
+                .filter_map(|i| fixed[i].as_ref().map(std::vec::Vec::len))
                 .sum()
         })
         .collect()
 }
 
 /// Segment each round region's config-fixed absorbs into runs, exactly as
-/// whir_proof_vectors::fixed_runs does for a whole program but scoped to one
+/// `whir_proof_vectors::fixed_runs` does for a whole program but scoped to one
 /// round's event range. Each run is the concatenation of consecutive fixed
 /// constant words as a little-endian hex string; run boundaries are the
 /// proof-dependent (varying) absorbs that interrupt them. The contract's
@@ -449,6 +467,7 @@ fn round_fixed_runs(
 /// Reclassify every all-zero fixed run as varying (proof data). See the call
 /// site for why: a run of zero words is a structurally-zero extension element,
 /// not a framing constant, and the contract must read it from calldata.
+#[must_use]
 pub fn reclassify_zero_runs(
     program: &SemProgram,
     fixed: Vec<Option<Vec<u32>>>,
@@ -495,7 +514,7 @@ fn varying_positions(program: &SemProgram, fixed: &[Option<Vec<u32>>]) -> Vec<us
 }
 
 /// Per-claim run schedule for one composed round: for each opening claim,
-/// the alternating [is_constant, words] runs of its transcript region,
+/// the alternating [`is_constant`, words] runs of its transcript region,
 /// derived from the sink phase offsets and the fixed classification. This is
 /// the contract's initial-phase walk plan: absorb `words` constant words from
 /// the trusted table, then observe `words/4` extension evals from the proof,
@@ -539,7 +558,7 @@ fn claim_run_schedule(
                 if !same {
                     break;
                 }
-                words += fixed[i].as_ref().map_or(1, |v| v.len());
+                words += fixed[i].as_ref().map_or(1, std::vec::Vec::len);
                 i += 1;
             }
             if words == 0 {
@@ -615,12 +634,7 @@ fn round_framing_table(
     }
     // Claim index for a position: the c with phase_offsets[c] <= i < offsets[c+1].
     let claim_of = |i: usize| -> Option<usize> {
-        for c in 0..framing_prefix.len() {
-            if i >= phase_offsets[c] && i < phase_offsets[c + 1] {
-                return Some(c);
-            }
-        }
-        None
+        (0..framing_prefix.len()).find(|&c| i >= phase_offsets[c] && i < phase_offsets[c + 1])
     };
     let mut bytes: Vec<u8> = Vec::new();
     let mut lens: Vec<usize> = Vec::new();
@@ -635,7 +649,7 @@ fn round_framing_table(
             i += 1;
             continue;
         }
-        let words = fixed[i].as_ref().map_or(1, |v| v.len());
+        let words = fixed[i].as_ref().map_or(1, std::vec::Vec::len);
         let keep = if i < claims_start || i >= last_claim_end {
             true
         } else if let Some(c) = claim_of(i) {
@@ -673,7 +687,7 @@ fn round_framing_table(
 /// of constant (fixed) or varying observations as `[is_constant, words]`
 /// pairs, in order. This is the contract's walk plan: absorb `words` constant
 /// words from the trusted table, then read `words` words of proof data from
-/// calldata, alternating. The constant runs' VALUES are in round_fixed_runs;
+/// calldata, alternating. The constant runs' VALUES are in `round_fixed_runs`;
 /// the varying runs' values are the proof payload in order. Deriving the
 /// schedule from shapes alone does not generalize at settlement shape (the
 /// per-claim constant count varies with claim width and stacked arity, and
@@ -696,7 +710,7 @@ fn round_run_schedule(
                     SemEvent::ObserveBase { .. } | SemEvent::ObserveBytes { .. }
                 );
                 let words = if is_obs {
-                    fixed[i].as_ref().map_or(0, |w| w.len())
+                    fixed[i].as_ref().map_or(0, std::vec::Vec::len)
                 } else {
                     0
                 };
@@ -704,7 +718,7 @@ fn round_run_schedule(
                 // event (proof observation, sample, witness, uniform draw) -
                 // each contributes one transcript interaction; word counts
                 // for those are the payload sizes the codec defines.
-                let kind = if is_obs && fixed[i].is_some() { 1 } else { 0 };
+                let kind = usize::from(is_obs && fixed[i].is_some());
                 let w = if kind == 1 { words } else { 1 };
                 if let Some(last) = runs.last_mut() {
                     if last[0] == kind {
@@ -764,7 +778,10 @@ pub fn export_and_write(
     ));
     doc["blob_len"] = json!(blob.len());
     if let Some(pis) = statement {
-        doc["statement"] = json!(pis.iter().map(|v| v.as_canonical_u32()).collect::<Vec<_>>());
+        doc["statement"] = json!(pis
+            .iter()
+            .map(p3_field::PrimeField32::as_canonical_u32)
+            .collect::<Vec<_>>());
     }
     for (k, v) in extras {
         doc[k] = v;
