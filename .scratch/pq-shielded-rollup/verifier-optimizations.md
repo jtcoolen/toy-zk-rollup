@@ -747,3 +747,71 @@ finalPaths 37 KB, finalRowsExt 19 KB, rest small.
 4. eqPoints recompute (wire format v5): -773 KB calldata (-9.2M) + removes the
    decode/copy pass (~15M) - biggest single item, needs prover-side change.
 5. Everything else is call-boundary polish toward the ~150M floor.
+
+## §19 Can we beat 150M? Floor decomposition + deployment architecture (post-absorb-batch)
+
+State at 42d8cea: verify 179,928,504 (applyBlock 331,736,448), EIP-170 margin
++40 B. Fresh eqPoints census from the real block bundle: 1,889 groups
+(26+585+130+274+874), each a square-power expansion of ONE univariate the
+transcript already draws (p3-whir reader.rs: `expand_from_univariate(transcript.ood_point(), n)`).
+
+### Correction to §18
+
+§18 credited eqPoints derivation with "-9.2M calldata + ~15M compute". The
+compute half was wrong: the calldata->scratch copy measured negligible
+(15.60M vs 15.46M memory path), and DERIVING each group costs n=24 squares
+(~7.5K) that eq_poly_eval does not pay - ~+14M compute across 1,889 groups.
+Derivation is a SIZE lever (-773 KB, -9.2M calldata gas, net ~+5M gas), not a
+gas lever. §18's "total floor ~132M" becomes ~140M.
+
+### The honest floor decomposition (current protocol shape)
+
+    calldata floor (this bundle)      23.5M   EIP-2028, irreducible per byte
+    ext-field arithmetic floor        ~90M    ~250 gas/ext-mul-equivalent in
+                                              full assembly; protocol fixes the
+                                              op count (folds, eq evals,
+                                              sumchecks, constraint weights)
+    keccak floor                      ~2M     sponge flushes + 1,336x10 Merkle
+    decode/parse floor                ~5M     fused loader already near it
+    call-boundary + glue overhead     ~25M    the ONLY big soft target left
+    ------------------------------------------------
+    hard floor                        ~140M   realistic landing ~150-155M
+
+So: **yes, below 150M is possible, but only by ~10M on gas** - the floor is
+protocol-bound, not implementation-bound. Every remaining gas lever is
+call-boundary surgery (assembly Merkle -4.5M, sumcheck/fold inlining -8M,
+localR kill -1.6M). The bundle-size levers (derivation, path folding,
+deploy-once constants) move the 1.97 MB to ~0.3 MB - which is what satisfies
+TX-SIZE limits (geth 64 KiB default tx gate, RPC body caps, mainnet block
+gas), not the gas number.
+
+### Deployment architecture (the combination answer)
+
+Bytecode limit (EIP-170) - midfall pattern, applied at COARSE phase
+boundaries only (per-call overhead is noise per-phase, fatal per-op):
+
+    ShieldedPool (3.8 KB)
+      -> WhirVerifier (core loop, 24.5 KB, margin +40 B)
+           staticcall -> TerminalWeight satellite  [42M-gas constraint identity;
+                        codehash+length pinned at construction; raw memory frame
+                        as calldata, no ABI codec - midfall ExternalPinned]
+           extcodecopy <- WhirConstants data contract [deploy-once cfg constants,
+                        midfall Halo2VerifyingKey pattern; also removes ~180 KB
+                        from every proof's calldata]
+
+    Trigger: when the next compute optimization needs >40 B of code, extract
+    the terminal-weight phase first (frees ~6-8 KB, costs ~2K gas per verify).
+
+Calldata/tx-size limit - GOAT philosophy (derive, don't ship), WBND v5:
+    eqPoints section dropped (derived from transcript draws)      -773 KB
+    cfg constants dropped (deploy-once contract)                  -180 KB
+    Merkle paths folded (D-072 ph.2: one folded check, not 1,336) -700 KB
+    => 1.97 MB -> ~0.32 MB; calldata floor 23.5M -> ~5.4M; fits any chain.
+
+IOHK discipline (already in force): hard specialisation to one circuit shape,
+byte-exact mirroring of the Rust verifier as source of truth, benchmark-driven
+iteration (this file IS their docs/benchmark.md equivalent).
+
+Mainnet-L1 note: even at 0.32 MB the ~140M compute floor exceeds a 30M block;
+the design targets the high-limit settlement chain the goal specifies. If L1
+ever matters: EIP-4844 blob for the proof + a cheap blob-hash check on-chain.
