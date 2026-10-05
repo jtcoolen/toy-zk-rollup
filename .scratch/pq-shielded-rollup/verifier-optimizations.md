@@ -609,3 +609,141 @@ Remaining memory copies are now < 60 KB total, so the calldata-direct wave is
 essentially finished: the ~490 gas/word copy tax is gone from 96% of the wire.
 Next levers are arithmetic, not I/O: D-081 (terminal-weight localR slice kill),
 D-082 (extLeaf single-mstore), and the terminal-weight floor itself (42M).
+
+## §17 Fused row loader, deferred fold mods, _packElems (commits 6b31a72, 35abbfa, e6a15e6)
+
+Three landed levers since §16:
+
+1. **Deferred convolution-lane reductions in `_fold_once`** (`6b31a72`). The four
+   convolution lanes t_i accumulated products then each took a `mod` before the
+   final add; `mod` distributes over the additions that build the lane, so the
+   intermediates only need congruence + non-wrapping. Worst lane t3 < 4*2^62 <
+   2^65, x3+t3 < 2^66, never wraps; every caller feeds reduced values so the
+   bound holds at every fold-tree level. 8 mods -> 4 per fold. Bit-identical.
+   verify 199.48M -> 197.96M.
+
+2. **`_packElems` unchecked assembly pack** (`35abbfa`). The Solidity loop that
+   packed 4 canonical limbs into one word per element paid a bounds check per
+   limb read (~500 gas/element); one assembly pass over the freshly loaded limbs
+   cut r-elems 10.07M -> ~6M. verify 197.96M -> 193.15M.
+
+3. **Fused row loader `_loadRowFused`** (`e6a15e6`). The query loop walked each
+   opened row three times: `_loadRow` decoded wire limbs into memory, `extLeaf`
+   re-read the buffer for the Montgomery-LE leaf encoding, `_packElems` re-read
+   it again for the fold elements. One pass straight from calldata now produces
+   both the leaf scratch bytes and the packed elements; `openAndFold` splits so
+   `openAndFoldLeaf` takes the pre-built digest. The per-query RowWidthMismatch
+   check moves to a once-per-round rowLimbs-vs-rowElems check (soundness: the
+   loader folds leaf and elements from one decode, so the width relation must
+   hold before the first query). verify 193.15M -> 188.75M, applyBlock 346.53M
+   -> 342.45M.
+
+**Size discipline lesson**: the first fused version duplicated the decode for
+base/ext rows and blew EIP-170 (24,915 B, -313 margin). `forge test` stayed
+green the whole time - only `forge build --sizes` shows the margin. The unified
+single-loop version (per-limb `switch rowsAreBase`) is 24,373 B (+203) and
+within 0.2M gas of the duplicated version: code size beats branch hoisting at
+this margin. Also: forge-lint's `incorrect-shift` heuristic flags
+`shl(sh, 0xffffffff)` (literal value operand); hoisting the mask to a local
+variable silences it without losing the masked-write pattern (the lane
+accumulator alternative cost +2.5M gas).
+
+**Calldata-branch bench (recorded from the TerminalWeightBench harness)**:
+copying eq groups from calldata into a scratch costs ~140K gas over the memory
+path for 501x24 groups (15.60M vs 15.46M) - the copy overhead is negligible
+against the arithmetic, which is why the calldata-direct pattern is free to use
+wherever it saves a decode pass.
+
+**Probe pipeline state**: `python3 /tmp/probe_pipeline.py && forge build`
+regenerates GasProbeVerifier from HEAD sources; profile at 35abbfa in §16
+table; i-transcript split (12.69M/2.96M/0.29M) confirmed the sponge absorbs
+are the initial-phase cost, not the sumcheck math.
+
+## §18 The ceiling: minimal gas to verify this proof (user question, answered twice)
+
+Bundle: WBND v4, 1,967,592 B payload (cfg 46,523 words + prf 444,602 words),
+34.0% zero bytes (669,950), 61,491 words on the wire with header. Current
+verify(): 188,749,491 gas at e6a15e6.
+
+### Part 1 - the calldata floor (just passing the proof)
+
+EIP-2028 pricing: 16 gas/nonzero byte, 4 gas/zero byte, +21,000 intrinsic.
+
+    nonzero 1,297,642 B x 16 = 20,762,272
+    zero      669,950 B x  4 =  2,679,800
+    payload calldata gas      = 23,442,072
+    + selector/offset/length/padding = 23,442,168
+    + intrinsic 21,000        = 23,463,168  ~= 23.46M
+
+**23.46M gas is the absolute floor for ANY on-chain verification that takes this
+proof as calldata** - a contract that does nothing at all. That is 12.4% of the
+current 188.75M. No compute optimization touches it; only shrinking the bundle
+does (see Part 3).
+
+Is it too large for one transaction? On permissive local/devnet infra: no -
+anvil runs with --block-gas-limit 20000000000 --no-request-size-limit and the
+whole verify fits. On mainnet-like limits it is borderline-to-impossible:
+23.4M calldata gas alone is 78% of a 30M block, and default RPC/txpool size
+gates (geth 64 KiB tx, 5 MiB RPC body) reject 1.97 MB without flags. The
+execution gas (165M) exceeds any L1 block; this design targets an L2/high-limit
+settlement chain, which is what the goal specifies.
+
+### Part 2 - compute floor, bottom-up from measured primitives
+
+Fresh FieldMicroBench anchors at e6a15e6 (per-op, minus ~81 gas loop overhead):
+ext mul ~423, ext add/sub ~103, mulBase ~124, square ~313, eq_poly_eval 26-coord
+~25.2K, computeRoot depth-20 ~4.5K, foldRow(16) ~11.0K, keccak256(64B)=42 gas
+(30+6*2), keccak256(256B)=78.
+
+Protocol work inventory (from the §16 profile, 1,336 total query-folds across
+5 rounds + final):
+
+| block | current | floor | why |
+|---|---|---|---|
+| calldata+intrinsic | 23.46M | 23.46M | EIP-2028, irreducible |
+| round-run arithmetic (sumcheck folds, constraint folds, claim folds) | ~126M | ~105M | already deferred-mod + register-carried; ~15% Solidity-overhead slack remains in call boundaries |
+| terminal-weight (identity eq groups, 5x501x24) | 42.0M | ~39M | eq_poly_eval measured 22,899 vs arithmetic floor 22,549 per 24-coord group - AT floor; the 3M slack is the per-constraint localR allocation (D-081, queued) |
+| initial phase | 16.0M | ~6M | i-transcript 12.69M is per-element observeBase call overhead (~300 gas/elem vs ~40 assembly floor); batched absorbs are the single biggest remaining lever |
+| stir-fold (1,336) | 15.3M | ~12M | 11.5K/query vs ~9.5K register-fold floor |
+| stir-leaf + decode (1,336) | ~9M | ~5M | fused loader landed; remaining is the per-limb mod+swap chain (floor: one mulmod-free reduce per limb) |
+| stir-merkle (1,336) | 6.5M | ~2M | pure keccak floor is 420 gas/query (10x42); Solidity path verify costs 4.9K; full-assembly path verify ~1.5K |
+| inter-round glue + transcripts | ~60M | ~48M | sumcheck observe/draw call overhead |
+| final phase + identity glue | ~50M | ~40M | horner + claim folds, mostly at floor |
+| everything else | ~20M | ~15M | decode, PoW, domain points |
+
+Sum of floors: **~150M gas** (23.5M calldata + ~127M compute). Realistic
+landing zone after all identified work: **160-170M** (the last 10% is
+call-boundary surgery inside hot loops with stack-depth limits biting).
+
+Sanity cross-check: pure keccak work in the proof is ~2M gas total (sponge
+flushes + Merkle), pure ext-field arithmetic is ~90M at a ~250-gas assembly
+floor per ext-mul-equivalent, decode ~5M - 117M + calldata = ~140M, consistent
+with the table. The proof is arithmetic-dominated: hashing is only ~1.5% of
+the floor. This is why the keccak-f[1600] port idea was dead on arrival and
+why every real win so far has been field arithmetic or decode passes.
+
+### Part 3 - the size lever (calldata floor is NOT fixed)
+
+Section census: eqPoints ~773 KB (39%), paths ~752 KB (38%), rows 148 KB,
+finalPaths 37 KB, finalRowsExt 19 KB, rest small.
+
+- **eqPoints are transcript-deterministic** - the eq evaluation points are
+  functions of challenges the verifier already samples. Recomputing them
+  in-circuit (the recursion circuit already does exactly this) deletes ~773 KB:
+  calldata floor 23.46M -> ~14.2M. Cost: recompute arithmetic (~the terminal
+  weight already evaluates eq polys; the points themselves are cheap
+  products). This is the single biggest total-gas lever identified anywhere.
+- **paths**: batched/folded Merkle opening (one folded check instead of 1,336
+  explicit paths) deletes most of 752 KB -> another ~6M calldata gas, at the
+  cost of a folding challenge round (D-072 phase 2 territory).
+- Both together: bundle 1.97 MB -> ~0.45 MB, calldata floor ~5.4M, total floor
+  ~132M.
+
+### What this means for the optimization queue
+
+1. localR kill (D-081): -3M, trivial, queued now.
+2. Batched transcript absorbs: -8 to -10M, next biggest compute item.
+3. Assembly Merkle path verify: -4.5M.
+4. eqPoints recompute (wire format v5): -773 KB calldata (-9.2M) + removes the
+   decode/copy pass (~15M) - biggest single item, needs prover-side change.
+5. Everything else is call-boundary polish toward the ~150M floor.
