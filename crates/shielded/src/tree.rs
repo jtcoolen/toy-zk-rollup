@@ -23,8 +23,12 @@
 //!
 //! # Hash choice
 //!
-//! Keccak-256 via [`CommitmentHasher`]: the EVM verifies these paths, and
-//! `keccak256` is a native opcode there. See the layering in the map.
+//! Poseidon2 over `KoalaBear` via [`CommitmentHasher`] (D-088). The tree is
+//! no longer verified by the EVM at all: the proof attests each append and the
+//! contract only stores roots, so the hash only has to be cheap *in-circuit*,
+//! where one Poseidon2 permutation is one AIR row (a Keccak-f would be ~24).
+//! The nullifier tree keeps Keccak — its gadget is already proven in-circuit
+//! and the contract never touches it either. See the layering in the map.
 
 use pq_hash::{CommitmentHasher, Digest32, MerkleRoot, NoteHash};
 
@@ -278,7 +282,7 @@ impl<H: CommitmentHasher> CommitmentTree<H> {
 mod tests {
     use super::*;
     use crate::keys::SpendPublicKey;
-    use pq_hash::Keccak256Commitment;
+    use pq_hash::Poseidon2Commitment;
 
     fn leaf(seed: u8, value: u64) -> NoteHash {
         crate::note::Note::new(
@@ -287,12 +291,12 @@ mod tests {
             [seed.wrapping_add(1); 32],
             SpendPublicKey::from_bytes([seed.wrapping_add(2); 32]),
         )
-        .commit(&Keccak256Commitment)
+        .commit(&Poseidon2Commitment::default())
     }
 
     #[test]
     fn empty_tree_root_is_the_precomputed_empty_root() {
-        let t = CommitmentTree::new(Keccak256Commitment);
+        let t = CommitmentTree::new(Poseidon2Commitment::default());
         assert!(t.is_empty());
         assert_eq!(t.root(), t.empty_root());
     }
@@ -301,14 +305,14 @@ mod tests {
     fn empty_root_is_not_the_zero_digest() {
         // The empty root is a hash chain, not zeros. If this were zero, an
         // attacker could forge an "empty" tree state trivially.
-        let e = EmptySubtrees::new(Keccak256Commitment);
+        let e = EmptySubtrees::new(Poseidon2Commitment::default());
         assert_ne!(e.root(), MerkleRoot::default());
         assert_eq!(e.at(0), Digest32::default());
     }
 
     #[test]
     fn every_appended_leaf_has_a_path_that_recomputes_the_root() {
-        let mut t = CommitmentTree::new(Keccak256Commitment);
+        let mut t = CommitmentTree::new(Poseidon2Commitment::default());
         let leaves: Vec<NoteHash> = (1..=7u8).map(|s| leaf(s, u64::from(s) * 100)).collect();
         for l in &leaves {
             t.append(l);
@@ -318,7 +322,7 @@ mod tests {
             let p = t.path(i).expect("in range");
             assert_eq!(p.len(), DEPTH);
             assert_eq!(
-                p.compute_root(&Keccak256Commitment, l),
+                p.compute_root(&Poseidon2Commitment::default(), l),
                 Some(root),
                 "leaf {i} must authenticate to the root"
             );
@@ -330,7 +334,7 @@ mod tests {
         // The empty-branch substitution is the subtle part; cover boundaries
         // around powers of two. Counts are u8 so no truncating cast is needed.
         for n in [1u8, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33] {
-            let mut t = CommitmentTree::new(Keccak256Commitment);
+            let mut t = CommitmentTree::new(Poseidon2Commitment::default());
             let leaves: Vec<NoteHash> = (0..n).map(|s| leaf(s, 1)).collect();
             for l in &leaves {
                 t.append(l);
@@ -339,7 +343,7 @@ mod tests {
             for (i, l) in leaves.iter().enumerate() {
                 let p = t.path(i).expect("in range");
                 assert_eq!(
-                    p.compute_root(&Keccak256Commitment, l),
+                    p.compute_root(&Poseidon2Commitment::default(), l),
                     Some(root),
                     "n={n} i={i}"
                 );
@@ -349,28 +353,28 @@ mod tests {
 
     #[test]
     fn path_for_wrong_leaf_does_not_reach_the_root() {
-        let mut t = CommitmentTree::new(Keccak256Commitment);
+        let mut t = CommitmentTree::new(Poseidon2Commitment::default());
         let leaves: Vec<NoteHash> = (1..=4u8).map(|s| leaf(s, 100)).collect();
         for l in &leaves {
             t.append(l);
         }
         let p = t.path(0).unwrap();
         assert_ne!(
-            p.compute_root(&Keccak256Commitment, &leaves[1]),
+            p.compute_root(&Poseidon2Commitment::default(), &leaves[1]),
             Some(t.root())
         );
     }
 
     #[test]
     fn out_of_range_path_is_none() {
-        let mut t = CommitmentTree::new(Keccak256Commitment);
+        let mut t = CommitmentTree::new(Poseidon2Commitment::default());
         t.append(&leaf(1, 1));
         assert!(t.path(1).is_none());
     }
 
     #[test]
     fn root_changes_with_every_append() {
-        let mut t = CommitmentTree::new(Keccak256Commitment);
+        let mut t = CommitmentTree::new(Poseidon2Commitment::default());
         let mut seen = Vec::new();
         for s in 1..=5u8 {
             t.append(&leaf(s, 1));
@@ -382,8 +386,8 @@ mod tests {
 
     #[test]
     fn tree_is_append_only_and_order_matters() {
-        let mut a = CommitmentTree::new(Keccak256Commitment);
-        let mut b = CommitmentTree::new(Keccak256Commitment);
+        let mut a = CommitmentTree::new(Poseidon2Commitment::default());
+        let mut b = CommitmentTree::new(Poseidon2Commitment::default());
         a.append(&leaf(1, 10));
         a.append(&leaf(2, 20));
         b.append(&leaf(2, 20));
@@ -395,14 +399,17 @@ mod tests {
     fn a_stale_path_stops_verifying_after_the_tree_grows() {
         // Paths are snapshots: a path taken at one root must not verify against
         // a later root. This is why the root is a public input to every transfer.
-        let mut t = CommitmentTree::new(Keccak256Commitment);
+        let mut t = CommitmentTree::new(Poseidon2Commitment::default());
         let a = leaf(1, 10);
         t.append(&a);
         let old_root = t.root();
         let p = t.path(0).unwrap();
         t.append(&leaf(2, 20));
         assert_ne!(old_root, t.root());
-        assert_ne!(p.compute_root(&Keccak256Commitment, &a), Some(t.root()));
+        assert_ne!(
+            p.compute_root(&Poseidon2Commitment::default(), &a),
+            Some(t.root())
+        );
     }
 
     #[test]
@@ -411,6 +418,9 @@ mod tests {
             siblings: vec![Digest32::default(); DEPTH - 1],
             index: 0,
         };
-        assert_eq!(p.compute_root(&Keccak256Commitment, &leaf(1, 1)), None);
+        assert_eq!(
+            p.compute_root(&Poseidon2Commitment::default(), &leaf(1, 1)),
+            None
+        );
     }
 }

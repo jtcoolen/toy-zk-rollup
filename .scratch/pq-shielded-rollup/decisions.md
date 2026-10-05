@@ -1604,3 +1604,147 @@ path; goal's settlement chain has high limits); SNARK-wrap (forbidden).
 **Note on gas.** The redesign is about LIMITS, not the ~140M compute floor:
 net gas effect ~-4M (calldata minus derivation cost). The gas queue (assembly
 Merkle, sumcheck inlining) resumes after step A frees code space.
+
+
+## D-088 — Commitment tree moves to Poseidon2; the contract stores roots instead of rebuilding them
+
+**Decision.** The note commitment tree is re-hashed from Keccak-256 to
+Poseidon2 (KoalaBear, width 16 — the WHIR MMCS's own permutation), the
+append of a transfer's outputs is proven **in-circuit** (frontier fold,
+fixed shape), each transfer's statement gains a `root_after` field, and
+`ShieldedPool.applyBlock` deletes its on-chain append loop: it checks
+`rootBefore` matches and stores the proof-attested `rootAfter`, exactly
+the way `nullifierAfter` already works.
+
+**Why.** The contract currently rebuilds the tree: per output it runs a
+32-pair Keccak fold plus frontier storage writes — ~152M of the 331M
+applyBlock gas, and it grows with tree state (SSTORE per level). The user
+directive chain: "do not reform the hash in the contract" → "just store
+the roots" → "use poseidon2 not keccak". Storing roots is only *sound*
+once the proof attests the transition, and attesting a Keccak append
+in-circuit costs ~24 AIR rows per Keccak-f × 32 levels × outputs —
+prohibitive. Poseidon2 makes one compression one AIR row, so a full
+append is ~64 perms (32 merge + 32 fold) regardless of tree size.
+
+**Consensus encodings (pinned by KATs in pq-hash):**
+- digest = 8 KoalaBear elements, each serialized as one LE u32 (32 bytes);
+  canonical check `< 0x7F00_0001`, strict decoder rejects, never reduces;
+  the fold itself reduces (total function, agrees with the AIR where
+  elements are canonical by construction).
+- bytes → elements: LE 16-bit limbs over the concatenated preimage, one
+  limb per element (the circuit's `bytes_to_limbs` convention), absorbed
+  by `PaddingFreeSponge<Poseidon2KoalaBear<16>, 16, 8, 8>` (overwrite
+  mode; short tail leaves stale rate cells — mirrored in tests).
+- node = `TruncatedPermutation<_, 2, 8, 16>` = perm(left‖right)[0..8].
+- empty[0] = 0⁸, empty[h] = compress(empty[h−1], empty[h−1]); KAT
+  compress(0,0) = 44917757aa9a1104a1ad4b7cbe60fe659316d4334d2ca2295e2525771877632b.
+- note leaf preimage unchanged in shape: DOMAIN(11 limbs) ‖ amount(4) ‖
+  rho(16) ‖ psi(16) ‖ pk_d(16) = 63 limbs → 8 sponge rows.
+
+**In-circuit geometry.** `Poseidon2Config::KOALA_BEAR_D4_W16`
+(width_ext 4, rate_ext 2 = 8 base elements, arity 2), driven exactly like
+the vendored `add_mmcs_verify` binary fold: first row `new_start=true,
+merkle_path=true, inputs[0..2]=leaf ext, mmcs_bit=dir`; chain rows put
+the sibling digest in the capacity slots `inputs[rate_ext+j]`; final row
+`out_ctl=[true;2]`; outputs = root limbs. Frontier merge + fold per
+append: ≤32 merge perms (selected by bits of the leaf count) + 32 fold
+perms (selected by bits of count+1); fixed shape via `select` on both
+digests and the frontier slots, so the AIR shape never varies.
+
+**Statement change.** `TransferShape::statement_len` gains 16 limbs
+(root_after); `BlockStatement.sol` `ROOTS_PER_TRANSFER 3→4`. All golden
+vectors regenerate.
+
+**Alternatives rejected.**
+- *Keccak append in-circuit*: ~768 AIR rows per output fold; blows the
+  block circuit's LDE budget for a hash the contract then re-hashes
+  anyway. Rejected by cost and by the directive.
+- *Validium-style: contract stores only a statement-root commitment*:
+  still needs the tree root inside the statement fold; adds a second
+  trust layer (data availability) for no gas the pool doesn't already
+  capture. Roots-only is strictly simpler.
+- *Poseidon2 for the nullifier tree too*: the nullifier gadget is already
+  proven with the vendored Keccak-f gadget and green end-to-end; moving
+  it is churn with no gas or soundness benefit. Keccak stays for
+  nullifiers and the transcript.
+
+**Execution order (each step compiles + tests green + commit):**
+1. `pq-hash::Poseidon2Commitment` native hasher + KATs. ✅ `8ab3dea`
+2. `shielded::tree` call sites → Poseidon2 (tree is generic over
+   `CommitmentHasher`; golden tree vectors regenerate).
+3. `prover::commitment_gadget`: in-circuit P2 leaf sponge + frontier
+   append gadget + unit tests (native fold == circuit fold).
+4. `transfer.rs`: P2 leaf hash, append after outputs, export
+   `root_after`; `TransferShape` +16 limbs.
+5. `block.rs`: commitment roots chained like nullifiers (pin first
+   `root_before`, chain `root_after → root_before`).
+6. Regenerate all vectors (composed bundle, block bundle, genesis).
+7. Contracts: `BlockStatement` rootAfter, `ShieldedPool` roots-only
+   (drop `MerkleAccumulator`), tests + Deploy updates.
+8. Node/wallet plumbing (root is now attested, not derived), full gate.
+
+
+## D-089 — Fold client-proof public inputs to one statement root in the final proof (QUEUED: next after D-088)
+
+**Directive (user).** "Add the folded hash for the client proofs public inputs
+during the recursion, to expose one public input root for the client proof
+public inputs in the final recursive proof."
+
+**Design sketch.** Each child (transfer/fib) proof carries a statement of
+public inputs (nullifiers, output commitments, amounts, roots, fee). During
+block-circuit recursion, instead of re-exposing every child statement verbatim
+in the settlement statement, the block circuit folds each child's statement
+limbs through the Poseidon2 sponge (the D-088 hasher: 16-bit limbs, overwrite
+sponge, 8-element digest) into a running `statementRoot`, chained across
+children exactly like the nullifier-root thread:
+`root_0 = fold(child_0 stmt); root_i = fold(root_{i-1} || child_i stmt)`.
+The settlement proof exposes ONE digest (`statementRoot`, 16 limbs) plus the
+few values the pool must act on directly.
+
+**What the contract still needs explicit** (it cannot replay Poseidon2, so
+anything it acts on must stay a plain public input): with D-088 roots-only the
+pool's needs collapse to `rootBefore, rootAfter, nfBefore, nfAfter, fee` —
+outputs are inside the attested root, nullifier double-spend is caught by the
+in-circuit absence fold. Everything else (per-note limbs, per-amount limbs)
+lives inside the fold. Outer statement shrinks from ~87+ limbs to ~5 digests +
+fee: smaller calldata, smaller decode loop, fewer recursion binding
+constraints.
+
+**Why Poseidon2 and not Keccak for the fold:** the contract never opens it (it
+pins the digest as a public input, same as rootAfter), so it only needs to be
+cheap in-circuit — one perm per 8 limbs. Keccak-f would cost ~24 rows for no
+benefit.
+
+**Sequencing.** Lands AFTER D-088 (the fold reuses the P2 sponge gadget from
+D-088 step 3 and the statement shape from steps 4-5). The verifier's statement
+decode loop and BlockStatement.sol shrink accordingly; regenerate vectors once.
+
+**Open question to settle at implementation:** whether the block circuit keeps
+ANY flattened child fields (e.g. fee per transfer for the fee-accrual check)
+or derives them from witness + fold. Lean: keep fee flattened (pool credits
+it), fold the rest.
+
+
+## D-090 — Stronger end-to-end integration test through the wallet extension (QUEUED after D-089)
+
+**Directive (user).** After the folded-hash work, record and carry out an e2e
+testing task with a stronger integration test exercising the MetaMask-style
+wallet extension path.
+
+**Scope.** Full-loop test: MV3 extension (or its headless harness) builds a
+transfer via wallet-wasm → signs spend authorization (SPHINCS+) → submits to
+node RPC → sequencer includes in block → settlement proof → local EVM chain
+(Anvil) → ShieldedPool.applyBlock accepts → balance/root/nullifier state
+asserted from the wallet side. Failure paths too: double-spend rejected,
+stale root rejected, bad signature rejected. Headless-first (puppeteer/chrome
+--headless with the extension loaded) so it runs in the gate without a GUI.
+
+## D-091 — Repository README (QUEUED, same window)
+
+Top-level README: what this is (post-quantum shielded-pool zk-rollup on WHIR:
+KoalaBear STARKs, no SNARKs), architecture diagram of the proof layers
+(transfer/fib → block recursion → settlement → Solidity Keccak replay),
+crypto layering table (SHA3-256 shielded / Poseidon2 commitment / Keccak
+transcript), crate map, how to run the gate (scripts/check.sh), how to run
+the local e2e (Anvil + node + extension), and pointers to
+.scratch/pq-shielded-rollup/{map,decisions}.md.

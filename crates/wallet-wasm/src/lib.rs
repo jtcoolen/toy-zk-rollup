@@ -25,10 +25,10 @@
 //!   released with `free_out()`.
 //! * Every fallible export returns `0` (`OK`) or a small `ERR_*` code. On
 //!   failure the out buffer holds a short UTF-8 message for the UI.
-//! * `free(offset)` releases an input buffer and **zeroizes** it first, so
+//! * `buf_free(offset)` releases an input buffer and **zeroizes** it first, so
 //!   password and key bytes do not linger in linear memory.
 //!
-//! Internally, `alloc` hands out offsets of buffers it owns in a registry
+//! Internally, `buf_alloc` hands out offsets of buffers it owns in a registry
 //! (`Mutex<Vec<Vec<u8>>>`), so reading inputs back is a lookup, not a raw
 //! pointer dereference - no `unsafe` anywhere, at the cost of one copy per
 //! call. Wallet payloads are bytes-to-kilobytes; the copy is free next to a
@@ -37,7 +37,7 @@
 //! # Secrets lifetime
 //!
 //! Unlocked key bytes exist as `Zeroizing<Vec<u8>>` only inside the call that
-//! needs them and are wiped on return. Input buffers are zeroized on `free`.
+//! needs them and are wiped on return. Input buffers are zeroized on `buf_free`.
 //! The crate never persists anything: JS owns storage.
 //!
 //! # Testing split
@@ -63,7 +63,7 @@
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use pq_hash::{Digest32, Keccak256Commitment, MerkleRoot, NoteHash, Nullifier, Sha3_256Shielded};
+use pq_hash::{Digest32, MerkleRoot, NoteHash, Nullifier, Poseidon2Commitment, Sha3_256Shielded};
 use pq_sign::{Sha2_128f, SigningKey, SpendAuth, SphincsPlusAuth};
 use shielded::keys::derive_spend_pk;
 use shielded::transfer::NullifierRoots;
@@ -106,7 +106,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Input buffers handed out by `alloc`. The registry is what lets the exports
+/// Input buffers handed out by `buf_alloc`. The registry is what lets the exports
 /// read inputs back by offset without any `unsafe` pointer arithmetic.
 static ARENA: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// The single out buffer.
@@ -126,7 +126,7 @@ fn mem_off(ptr: *const u8) -> u32 {
 /// Allocate `len` bytes and return their offset. JS writes input bytes there,
 /// then passes `(offset, len)` to an export.
 #[unsafe(no_mangle)]
-pub extern "C" fn alloc(len: u32) -> u32 {
+pub extern "C" fn buf_alloc(len: u32) -> u32 {
     let buf = vec![0u8; len as usize];
     let off = mem_off(buf.as_ptr());
     lock(&ARENA).push(buf);
@@ -135,16 +135,22 @@ pub extern "C" fn alloc(len: u32) -> u32 {
 
 /// Release an input buffer, zeroizing it first so secret bytes do not linger.
 #[unsafe(no_mangle)]
-pub extern "C" fn free(off: u32) -> i32 {
-    lock(&ARENA)
-        .iter()
-        .position(|b| mem_off(b.as_ptr()) == off)
-        .map_or(ERR_BAD_INPUT, |pos| {
-            // Zeroizing wipes the buffer on drop, so password and key bytes
-            // never linger in linear memory.
-            drop(Zeroizing::new(lock(&ARENA).remove(pos)));
-            OK
-        })
+pub extern "C" fn buf_free(off: u32) -> i32 {
+    // Two separate lock acquisitions, never nested: wasm32-unknown-unknown's
+    // std mutex aborts on contention, and the guard from `.position()` would
+    // still be alive when the removal ran if this were one expression.
+    let pos = {
+        let arena = lock(&ARENA);
+        arena.iter().position(|b| mem_off(b.as_ptr()) == off)
+    };
+    let Some(pos) = pos else {
+        return ERR_BAD_INPUT;
+    };
+    let buf = lock(&ARENA).remove(pos);
+    // Zeroizing wipes the buffer on drop, so password and key bytes never
+    // linger in linear memory.
+    drop(Zeroizing::new(buf));
+    OK
 }
 
 /// Read `(off, len)` back out of the arena. Returns a copy so no lock is held
@@ -508,7 +514,9 @@ fn imp_note_commit(
         psi,
         shielded::keys::SpendPublicKey::from_bytes(pk_d_arr),
     );
-    Ok(hex::encode(note.commit(&Keccak256Commitment).as_bytes()))
+    Ok(hex::encode(
+        note.commit(&Poseidon2Commitment::new()).as_bytes(),
+    ))
 }
 
 /// The nullifier for a note owned by this vault: `Note::nullifier` under
@@ -854,7 +862,7 @@ mod tests {
         );
         assert_eq!(
             hexed,
-            hex::encode(note.commit(&Keccak256Commitment).as_bytes())
+            hex::encode(note.commit(&Poseidon2Commitment::new()).as_bytes())
         );
     }
 

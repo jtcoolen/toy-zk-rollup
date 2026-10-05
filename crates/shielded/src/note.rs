@@ -145,7 +145,7 @@ impl core::fmt::Debug for Note {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pq_hash::Keccak256Commitment;
+    use pq_hash::Poseidon2Commitment;
 
     fn note(value: u64, seed: u8) -> Note {
         Note::new(
@@ -158,13 +158,13 @@ mod tests {
 
     #[test]
     fn commitment_is_deterministic() {
-        let h = Keccak256Commitment;
+        let h = Poseidon2Commitment::default();
         assert_eq!(note(10, 1).commit(&h), note(10, 1).commit(&h));
     }
 
     #[test]
     fn value_changes_the_commitment() {
-        let h = Keccak256Commitment;
+        let h = Poseidon2Commitment::default();
         assert_ne!(note(10, 1).commit(&h), note(11, 1).commit(&h));
     }
 
@@ -172,7 +172,7 @@ mod tests {
     fn randomness_changes_the_commitment() {
         // Two notes with the same value and key but different psi must not collide,
         // otherwise the commitment is not hiding.
-        let h = Keccak256Commitment;
+        let h = Poseidon2Commitment::default();
         let a = note(10, 1);
         let mut b = note(10, 1);
         b.psi = [9; 32];
