@@ -183,21 +183,27 @@ library KoalaBearExt4 {
                     let b2 := and(shr(160, qv), M)
                     let b3 := and(shr(128, qv), M)
 
-                    // pq = a * b, one reduction per lane.
+                    // DEFERRED REDUCTION. `mod` distributes over the additions
+                    // and the extension multiply is a sum of products, so the
+                    // intermediate lanes only need to stay congruent mod P and
+                    // small enough not to wrap 2^256. Worst case here: t < 10 P^2
+                    // (~2^66), e < 21 P^2 (~2^67), u = c*e + 3*(3 terms) < 10 P*e
+                    // (~2^101) - four orders of magnitude below the word limit.
+                    // So the only reductions that survive are the four on the
+                    // accumulator: twelve mod ops per coordinate collapse to four,
+                    // bit-identical (parity-tested against the Rust Point::eval_eq
+                    // through the pinned vectors).
                     let t0 := add(mul(a0, b0), mul(W, add(add(mul(a1, b3), mul(a2, b2)), mul(a3, b1))))
                     let t1 := add(add(mul(a0, b1), mul(a1, b0)), mul(W, add(mul(a2, b3), mul(a3, b2))))
                     let t2 := add(add(add(mul(a0, b2), mul(a1, b1)), mul(a2, b0)), mul(W, mul(a3, b3)))
                     let t3 := add(add(add(mul(a0, b3), mul(a1, b2)), mul(a2, b1)), mul(a3, b0))
-                    t0 := mod(t0, P)
-                    t1 := mod(t1, P)
-                    t2 := mod(t2, P)
-                    t3 := mod(t3, P)
 
-                    // term = 2pq + 1 - a - b (the +1 in lane 0 only).
-                    let e0 := mod(add(add(add(t0, t0), mul(3, P)), add(1, sub(sub(P, a0), b0))), P)
-                    let e1 := mod(add(add(add(t1, t1), mul(3, P)), add(sub(P, a1), sub(P, b1))), P)
-                    let e2 := mod(add(add(add(t2, t2), mul(3, P)), add(sub(P, a2), sub(P, b2))), P)
-                    let e3 := mod(add(add(add(t3, t3), mul(3, P)), add(sub(P, a3), sub(P, b3))), P)
+                    // term = 2pq + 1 - a - b (the +1 in lane 0 only), unreduced;
+                    // the 3P bias keeps every lane non-negative before the mod.
+                    let e0 := add(add(add(t0, t0), mul(3, P)), add(1, sub(sub(P, a0), b0)))
+                    let e1 := add(add(add(t1, t1), mul(3, P)), add(sub(P, a1), sub(P, b1)))
+                    let e2 := add(add(add(t2, t2), mul(3, P)), add(sub(P, a2), sub(P, b2)))
+                    let e3 := add(add(add(t3, t3), mul(3, P)), add(sub(P, a3), sub(P, b3)))
 
                     // acc *= term.
                     let u0 := add(mul(c0, e0), mul(W, add(add(mul(c1, e3), mul(c2, e2)), mul(c3, e1))))

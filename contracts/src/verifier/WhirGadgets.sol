@@ -188,10 +188,13 @@ library WhirGadgets {
                     let w := sub(v, 1)
                     if iszero(v) { w := sub(P, 1) }
                     // term = point * w + ONE (scalar mul: +1 in lane 0 only).
-                    let e0 := mod(add(mul(a0, w), 1), P)
-                    let e1 := mod(mul(a1, w), P)
-                    let e2 := mod(mul(a2, w), P)
-                    let e3 := mod(mul(a3, w), P)
+                    // Unreduced: e < P^2 (~2^62) and the accumulator product
+                    // stays under 10 P e (~2^97), so the four accumulator mods
+                    // below are the only reductions this coordinate needs.
+                    let e0 := add(mul(a0, w), 1)
+                    let e1 := mul(a1, w)
+                    let e2 := mul(a2, w)
+                    let e3 := mul(a3, w)
                     // acc *= term.
                     let u0 := add(mul(c0, e0), mul(W, add(add(mul(c1, e3), mul(c2, e2)), mul(c3, e1))))
                     let u1 := add(add(mul(c0, e1), mul(c1, e0)), mul(W, add(mul(c2, e3), mul(c3, e2))))
