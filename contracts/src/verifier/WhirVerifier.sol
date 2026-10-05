@@ -171,31 +171,30 @@ contract WhirVerifier is IWhirVerifier {
         override
         returns (bool)
     {
-        bytes memory m = proof;
-        if (m.length < 16) revert ProofTooShort();
+        // The proof is read straight from CALLODATA: every reader below is a
+        // calldataload, so the 2.8 MB bundle is never copied into memory. The
+        // copy alone measured 92.4M gas (memory expansion + refill) on the real
+        // bundle - the single largest item after the open path.
+        if (proof.length < 16) revert ProofTooShort();
         bytes4 magic;
-        assembly ("memory-safe") {
-            // bytes memory: the length word sits at m, the data at m+32.
-            magic := mload(add(m, 32))
-        }
-        if (magic != MAGIC) revert BadMagic();
         uint256 version;
         uint256 cfgWords;
         uint256 prfWords;
         assembly ("memory-safe") {
-            // One version byte at offset 4, then two u32 LE section lengths at
-            // offsets 8 and 12. The data starts at m+32, and mload reads
-            // big-endian-aligned, so the field at proof offset X sits in the TOP
-            // bytes of the word loaded at m+32+X.
-            version := shr(248, mload(add(m, 36)))
-            cfgWords := shr(224, mload(add(m, 40)))
-            prfWords := shr(224, mload(add(m, 44)))
+            // calldataload is big-endian-aligned like mload: the field at proof
+            // byte offset X sits in the TOP bytes of the word loaded at
+            // proof.offset + X.
+            magic := calldataload(proof.offset)
+            version := shr(248, calldataload(add(proof.offset, 4)))
+            cfgWords := shr(224, calldataload(add(proof.offset, 8)))
+            prfWords := shr(224, calldataload(add(proof.offset, 12)))
         }
+        if (magic != MAGIC) revert BadMagic();
         // The u32 LE fields need a byte swap; the version byte does not.
         cfgWords = _swapBytes(cfgWords);
         prfWords = _swapBytes(prfWords);
         if (version != 4) revert BadVersion(version);
-        if (m.length < 16 + (cfgWords + prfWords) * 4) revert ProofTooShort();
+        if (proof.length < 16 + (cfgWords + prfWords) * 4) revert ProofTooShort();
 
         // Word offsets into the proof data: the 16-byte header is 4 words, so
         // CONFIG starts at word 4 and PROOF right after the CONFIG words.
@@ -203,9 +202,9 @@ contract WhirVerifier is IWhirVerifier {
         uint256 po = 4 + cfgWords;
 
         BatchCfg memory cfg;
-        (cfg, co) = _decodeBatchCfg(m, co);
+        (cfg, co) = _decodeBatchCfg(proof, co);
         BatchPrf memory prf;
-        (prf, po) = _decodeBatchPrf(m, po);
+        (prf, po) = _decodeBatchPrf(proof, po);
         _checkStatement(prf.pvBytes, statement);
 
         // --- post-opening check: the LogUp terminal sum ---------------------------
@@ -238,20 +237,20 @@ contract WhirVerifier is IWhirVerifier {
 
         // --- CONFIG: schedule ------------------------------------------------------
         uint256 numRounds;
-        (numRounds, co) = _word(m, co);
+        (numRounds, co) = _word(proof, co);
         // The constraint identity (D-076) needs each round's bound evaluations
         // after the walk: keep them (rounds 1..4; round 0 is the random round).
         uint256[][] memory boundEvalsOf = new uint256[][](numRounds);
         // round_starts is a test-harness artifact (per-round sponge seeding);
         // the on-chain walk is continuous, so it is skipped, not consumed.
-        (, co) = _arr(m, co);
+        (, co) = _arr(proof, co);
 
         // --- per opening round -------------------------------------------------------
         for (uint256 r; r < numRounds; ++r) {
             RoundCfg memory c;
-            (c, co) = _decodeRoundCfg(m, co);
+            (c, co) = _decodeRoundCfg(proof, co);
             RoundPrf memory p;
-            (p, po) = _decodeRoundPrf(m, po);
+            (p, po) = _decodeRoundPrf(proof, po);
             boundEvalsOf[r] = p.boundEvals;
             _runRound(t, c, p);
         }
@@ -262,7 +261,7 @@ contract WhirVerifier is IWhirVerifier {
         // fold(alpha, C(zeta)) * inv_vanishing(zeta) == quotient(zeta). The
         // programs and domain constants are CONFIG (trusted setup, v4 tail).
         ConstraintsCfg memory cc;
-        (cc, co) = _decodeConstraints(m, co);
+        (cc, co) = _decodeConstraints(proof, co);
         _checkIdentity(cc, boundEvalsOf, zeta, constraintAlpha, lookupAlpha, beta, prf.terminals, statement);
 
         return true;
@@ -293,7 +292,7 @@ contract WhirVerifier is IWhirVerifier {
         uint256 oodPow;
     }
 
-    function _decodeBatchCfg(bytes memory m, uint256 off)
+    function _decodeBatchCfg(bytes calldata m, uint256 off)
         private
         pure
         returns (BatchCfg memory c, uint256 no)
@@ -309,7 +308,7 @@ contract WhirVerifier is IWhirVerifier {
         if (no != end) revert ProofTooShort();
     }
 
-    function _decodeBatchPrf(bytes memory m, uint256 off)
+    function _decodeBatchPrf(bytes calldata m, uint256 off)
         private
         pure
         returns (BatchPrf memory p, uint256 no)
@@ -640,7 +639,7 @@ contract WhirVerifier is IWhirVerifier {
         uint256[] eqPoints;
     }
 
-    function _decodeRoundCfg(bytes memory m, uint256 off)
+    function _decodeRoundCfg(bytes calldata m, uint256 off)
         private
         pure
         returns (RoundCfg memory c, uint256 no)
@@ -674,7 +673,7 @@ contract WhirVerifier is IWhirVerifier {
         (c.rowsIsBase, no) = _arr(m, no);
     }
 
-    function _decodeRoundPrf(bytes memory m, uint256 off)
+    function _decodeRoundPrf(bytes calldata m, uint256 off)
         private
         pure
         returns (RoundPrf memory p, uint256 no)
@@ -717,15 +716,15 @@ contract WhirVerifier is IWhirVerifier {
     // stored big-endian and read straight through.
     // ---------------------------------------------------------------------
 
-    function _word(bytes memory d, uint256 off) private pure returns (uint256 v, uint256 no) {
+    function _word(bytes calldata d, uint256 off) private pure returns (uint256 v, uint256 no) {
         assembly {
-            v := shr(224, mload(add(add(d, 32), mul(off, 4))))
+            v := shr(224, calldataload(add(d.offset, mul(off, 4))))
         }
         v = _swapBytes(v);
         no = off + 1;
     }
 
-    function _arr(bytes memory d, uint256 off)
+    function _arr(bytes calldata d, uint256 off)
         private
         pure
         returns (uint256[] memory out, uint256 no)
@@ -739,7 +738,7 @@ contract WhirVerifier is IWhirVerifier {
     }
 
     /// A byte blob: word count, then raw bytes (padded to a word boundary).
-    function _blob(bytes memory d, uint256 off)
+    function _blob(bytes calldata d, uint256 off)
         private
         pure
         returns (bytes memory out, uint256 no)
@@ -751,19 +750,17 @@ contract WhirVerifier is IWhirVerifier {
         assembly {
             // The allocation has roundup32(nBytes) usable bytes after the length
             // word; copy exactly that many, no more, so the tail store stays
-            // inside this allocation.
+            // inside this allocation. calldatacopy sources straight from the
+            // calldata section - no intermediate copy of the proof.
             let usable := and(add(nBytes, 31), not(31))
-            let src := add(add(d, 32), mul(no, 4))
-            let dst := add(out, 32)
-            for { let i := 0 } lt(i, usable) { i := add(i, 32) } {
-                mstore(add(dst, i), mload(add(src, i)))
-            }
+            let src := add(d.offset, mul(no, 4))
+            calldatacopy(add(out, 32), src, usable)
         }
         no += words;
     }
 
     /// A blob holding exactly one 32-byte big-endian item (a digest).
-    function _blob32(bytes memory d, uint256 off)
+    function _blob32(bytes calldata d, uint256 off)
         private
         pure
         returns (bytes32 out, uint256 no)
@@ -772,14 +769,14 @@ contract WhirVerifier is IWhirVerifier {
         (nBytes, no) = _word(d, off);
         if (nBytes != 32) revert BadDigestBlob();
         assembly {
-            out := mload(add(add(d, 32), mul(no, 4)))
+            out := calldataload(add(d.offset, mul(no, 4)))
         }
         no += 8;
     }
 
     /// A blob holding a sequence of 32-byte big-endian items (Merkle paths,
     /// commitment lists): returned as a bytes blob the ragged readers index.
-    function _blobArr32(bytes memory d, uint256 off)
+    function _blobArr32(bytes calldata d, uint256 off)
         private
         pure
         returns (bytes32[] memory out, uint256 no)
@@ -790,28 +787,28 @@ contract WhirVerifier is IWhirVerifier {
         out = new bytes32[](n);
         assembly {
             let dst := add(out, 32)
-            let srcBase := add(add(d, 32), mul(no, 4))
+            let srcBase := add(d.offset, mul(no, 4))
             for { let i := 0 } lt(i, n) { i := add(i, 1) } {
-                mstore(add(dst, mul(i, 32)), mload(add(srcBase, mul(i, 32))))
+                mstore(add(dst, mul(i, 32)), calldataload(add(srcBase, mul(i, 32))))
             }
         }
         no += nBytes / 4;
     }
 
     /// Raw 32-byte items WITHOUT a length prefix (the batch prefix digests).
-    function _raw32(bytes memory d, uint256 off)
+    function _raw32(bytes calldata d, uint256 off)
         private
         pure
         returns (bytes32 out, uint256 no)
     {
         assembly {
-            out := mload(add(add(d, 32), mul(off, 4)))
+            out := calldataload(add(d.offset, mul(off, 4)))
         }
         no = off + 8;
     }
 
     /// A count word followed by that many raw 32-byte items (terminals).
-    function _raw32Arr(bytes memory d, uint256 off)
+    function _raw32Arr(bytes calldata d, uint256 off)
         private
         pure
         returns (uint256[] memory out, uint256 no)
@@ -821,10 +818,10 @@ contract WhirVerifier is IWhirVerifier {
         out = new uint256[](n);
         assembly {
             let dst := add(out, 32)
-            let srcBase := add(add(d, 32), mul(no, 4))
+            let srcBase := add(d.offset, mul(no, 4))
             let PAD_MASK := sub(shl(128, 1), 1)
             for { let i := 0 } lt(i, n) { i := add(i, 1) } {
-                let w := mload(add(srcBase, mul(i, 32)))
+                let w := calldataload(add(srcBase, mul(i, 32)))
                 if and(w, PAD_MASK) {
                     mstore(0, 0)
                     revert(0, 0)
@@ -836,7 +833,7 @@ contract WhirVerifier is IWhirVerifier {
     }
 
     /// A blob of 32-byte packed extension elements, returned as uint256 words.
-    function _extArr(bytes memory d, uint256 off)
+    function _extArr(bytes calldata d, uint256 off)
         private
         pure
         returns (uint256[] memory out, uint256 no)
@@ -847,10 +844,10 @@ contract WhirVerifier is IWhirVerifier {
         out = new uint256[](n);
         assembly {
             let dst := add(out, 32)
-            let srcBase := add(add(d, 32), mul(no, 4))
+            let srcBase := add(d.offset, mul(no, 4))
             let PAD_MASK := sub(shl(128, 1), 1)
             for { let i := 0 } lt(i, n) { i := add(i, 1) } {
-                let w := mload(add(srcBase, mul(i, 32)))
+                let w := calldataload(add(srcBase, mul(i, 32)))
                 if and(w, PAD_MASK) {
                     mstore(0, 0)
                     revert(0, 0)
@@ -961,7 +958,7 @@ contract WhirVerifier is IWhirVerifier {
         uint256[][] roundArities;
     }
 
-    function _decodeConstraints(bytes memory m, uint256 off)
+    function _decodeConstraints(bytes calldata m, uint256 off)
         private
         pure
         returns (ConstraintsCfg memory c, uint256 no)
