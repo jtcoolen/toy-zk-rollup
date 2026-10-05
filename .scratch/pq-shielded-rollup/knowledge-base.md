@@ -183,3 +183,18 @@ theirs.
   `unsafe_code` lint in edition 2024; a wasm cdylib cannot export without
   one of them, hence the scoped crate-level allow in wallet-wasm.
 
+
+### wasm ABI gotchas (found the hard way, wallet-wasm smoke test)
+
+- A `#[unsafe(no_mangle)] pub extern "C" fn free` export **collides with
+  dlmalloc's C `free`** in the linked module: JS's `exports.free` resolved
+  to dlmalloc's, and calling it with a Rust heap pointer aborted the module.
+  Export names must avoid the C allocator namespace (`buf_alloc`/
+  `buf_free` now).
+- wasm32-unknown-unknown's std `Mutex` **aborts on contention** (no
+  blocking). A function that locks the same mutex twice - even in one
+  expression like `.position()` + `.remove()` while the first guard lives -
+  panics with `unreachable`. Lock, scope-drop, re-lock.
+- The smoke test (extension/smoke.mjs) is what caught both: native unit
+  tests exercise the pure `imp` functions and never touch the ABI.
+

@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  :root { color-scheme: dark; }
+  body { font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0;
+         width: 380px; background: #10131a; color: #d7dce6; }
+  header { padding: 10px 12px; background: #171c26; border-bottom: 1px solid #232a38;
+           font-weight: 600; letter-spacing: .3px; }
+  main { padding: 10px 12px; display: grid; gap: 10px; }
+  section { border: 1px solid #232a38; border-radius: 6px; padding: 10px; display: grid; gap: 8px; }
+  h2 { margin: 0; font-size: 11px; text-transform: uppercase; color: #8fa0bf; letter-spacing: .8px; }
+  input, button, select { font: inherit; background: #0c0f15; color: #d7dce6;
+           border: 1px solid #2c3547; border-radius: 4px; padding: 5px 7px; }
+  input:focus { outline: 1px solid #4f7cff; }
+  button { cursor: pointer; background: #23408f; border-color: #33519f; }
+  button:disabled { opacity: .45; cursor: default; }
+  .row { display: grid; grid-template-columns: 92px 1fr; align-items: center; gap: 8px; }
+  .out { word-break: break-all; color: #9fd08f; white-space: pre-wrap; min-height: 1em; }
+  .err { color: #ff8f8f; word-break: break-word; }
+  .note { color: #8fa0bf; font-size: 11px; }
+  .hidden { display: none; }
+  .tabs { display: flex; gap: 6px; }
+  .tabs button { flex: 1; background: #171c26; }
+  .tabs button.active { background: #23408f; }
+</style>
+</head>
+<body>
+<header>PQ Shielded Wallet <span id="netBadge" class="note"></span></header>
+<main>
+  <div class="tabs">
+    <button id="tabVault" class="active">Vault</button>
+    <button id="tabSend">Send</button>
+    <button id="tabDemo">Demo</button>
+    <button id="tabSettings">Settings</button>
+  </div>
+
+  <section id="viewVault">
+    <h2>Vault</h2>
+    <div id="vaultLocked">
+      <div class="row"><label for="pw1">Password</label><input id="pw1" type="password" autocomplete="off"></div>
+      <div class="row"><label for="pw2">Repeat</label><input id="pw2" type="password" autocomplete="off"></div>
+      <div style="display:flex;gap:6px">
+        <button id="btnCreate">Create vault</button>
+        <button id="btnUnlock">Unlock existing</button>
+      </div>
+      <input id="unlockFile" type="file" accept=".json,.vault" class="hidden">
+    </div>
+    <div id="vaultOpen" class="hidden">
+      <div class="note">pk_d <span id="pkd" class="out"></span></div>
+      <div class="note">SPHINCS+ vk <span id="vk" class="out"></span></div>
+      <div style="display:flex;gap:6px">
+        <button id="btnExport">Export vault</button>
+        <button id="btnLock">Lock</button>
+      </div>
+    </div>
+    <div id="vaultMsg" class="err"></div>
+  </section>
+
+  <section id="viewSend" class="hidden">
+    <h2>Shielded transfer</h2>
+    <p class="note">Statement fields come from the node (<code>/v1/roots</code>) and your
+    note material. The wallet signs the canonical message; the node verifies the
+    SPHINCS+ envelope, then answers 501 until remote proof admission lands (D-083) —
+    a 501 means <em>your signature verified on-chain-grade code</em>.</p>
+    <div class="row"><label for="pwSend">Password</label><input id="pwSend" type="password" autocomplete="off"></div>
+    <div class="row"><label for="sValue">Out value</label><input id="sValue" type="number" value="1000"></div>
+    <div class="row"><label for="sRho">rho (hex32)</label><input id="sRho" placeholder="64 hex chars"></div>
+    <div class="row"><label for="sPsi">psi (hex32)</label><input id="sPsi" placeholder="64 hex chars"></div>
+    <div class="row"><label for="sFee">Fee</label><input id="sFee" type="number" value="1"></div>
+    <div class="row"><label for="sNf">Spend input idx</label><input id="sNf" type="number" value="0"></div>
+    <div style="display:flex;gap:6px">
+      <button id="btnFillRoots">Fetch roots</button>
+      <button id="btnSignSend">Sign + submit</button>
+    </div>
+    <div id="sendOut" class="out"></div>
+    <div id="sendMsg" class="err"></div>
+  </section>
+
+  <section id="viewDemo" class="hidden">
+    <h2>Demo prover (Admin)</h2>
+    <p class="note">The node holds the fixture genesis keys and proves end to end
+    (D-079c). Needs an Admin token. This is the path that settles on L1 today.</p>
+    <div class="row"><label for="dIn">Input idx</label><input id="dIn" type="number" value="0"></div>
+    <div class="row"><label for="dVal">Out value</label><input id="dVal" type="number" value="1000"></div>
+    <div class="row"><label for="dFee">Fee</label><input id="dFee" type="number" value="1"></div>
+    <button id="btnDemo">Run demo transfer</button>
+    <div id="demoOut" class="out"></div>
+    <div id="demoMsg" class="err"></div>
+  </section>
+
+  <section id="viewSettings" class="hidden">
+    <h2>Node connection</h2>
+    <div class="row"><label for="setUrl">Base URL</label><input id="setUrl" placeholder="http://127.0.0.1:3000"></div>
+    <div class="row"><label for="setTok">Token</label><input id="setTok" type="password" placeholder="node token --role submitter"></div>
+    <button id="btnSave">Save</button>
+    <div class="note">Tokens live only in chrome.storage.local on this device.
+    Issue one with <code>node token --role submitter --ttl 86400</code>.</div>
+    <div id="setMsg" class="err"></div>
+  </section>
+</main>
+<script src="popup.js" type="module"></script>
+</body>
+</html>
