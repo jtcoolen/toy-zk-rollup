@@ -73,6 +73,14 @@ contract WhirVerifier is IWhirVerifier {
     /// A digest blob that does not hold exactly 32 bytes.
     error BadDigestBlob();
 
+    /// A packed extension element on the wire carried a nonzero low-128-bit
+    /// padding region. The padding is not part of the field element and every
+    /// consumer reduces lanes mod P, so a nonzero padding is a second
+    /// representation of the same element - proof malleability. The honest
+    /// encoder always zeroes it; rejecting at decode closes it for every
+    /// consumer at once. (Lanes at or above P are tolerated: they reduce to
+    /// their canonical value in every consumer, exactly as before.)
+
     /// The LogUp terminals must sum to zero across the batch: each AIR commits one
     /// terminal (the sum of its per-row rational contributions), and the batch is
     /// only satisfiable if they cancel. p3 verify_batch ends with exactly this
@@ -814,8 +822,14 @@ contract WhirVerifier is IWhirVerifier {
         assembly {
             let dst := add(out, 32)
             let srcBase := add(add(d, 32), mul(no, 4))
+            let PAD_MASK := sub(shl(128, 1), 1)
             for { let i := 0 } lt(i, n) { i := add(i, 1) } {
-                mstore(add(dst, mul(i, 32)), mload(add(srcBase, mul(i, 32))))
+                let w := mload(add(srcBase, mul(i, 32)))
+                if and(w, PAD_MASK) {
+                    mstore(0, 0)
+                    revert(0, 0)
+                }
+                mstore(add(dst, mul(i, 32)), w)
             }
         }
         no += n << 3;
@@ -834,8 +848,14 @@ contract WhirVerifier is IWhirVerifier {
         assembly {
             let dst := add(out, 32)
             let srcBase := add(add(d, 32), mul(no, 4))
+            let PAD_MASK := sub(shl(128, 1), 1)
             for { let i := 0 } lt(i, n) { i := add(i, 1) } {
-                mstore(add(dst, mul(i, 32)), mload(add(srcBase, mul(i, 32))))
+                let w := mload(add(srcBase, mul(i, 32)))
+                if and(w, PAD_MASK) {
+                    mstore(0, 0)
+                    revert(0, 0)
+                }
+                mstore(add(dst, mul(i, 32)), w)
             }
         }
         no += nBytes / 4;

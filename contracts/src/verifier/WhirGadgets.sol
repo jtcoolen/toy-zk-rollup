@@ -56,6 +56,11 @@ library WhirGadgets {
     /// Raised when a constraint claims more variables than the run accumulated.
     error NotEnoughChallenges(uint256 numVariables, uint256 accumulated);
 
+    /// `selectEval` was handed a domain point that is not a lifted base element.
+    /// Every protocol caller uses `powConstBase`, which lifts; anything else
+    /// means the caller broke the invariant.
+    error NonBaseDomainPoint();
+
     /// One constraint's weight data: everything needed to evaluate its weight
     /// polynomial at a local folding point.
     ///
@@ -131,27 +136,77 @@ library WhirGadgets {
     /// homomorphism, so squaring in the extension agrees with squaring in the base
     /// and lifting afterwards.
     function selectEval(uint256[] memory point, uint256 z) internal pure returns (uint256) {
-        uint256 acc = ONE;
-        uint256 v = z;
+        // FAST PATH: z base-lifted. In the protocol z is always a two-adic
+        // domain point lifted with fromBase (powConstBase), and powers of a
+        // base-lifted element stay base-lifted - the canonical embedding is a
+        // ring homomorphism - so every (v - ONE) is a SCALAR and each factor
+        // costs four base multiplies instead of an ext sub, ext mul, ext add,
+        // ext square and ext mul. The accumulator is carried unpacked in
+        // registers (same pattern as KoalaBearExt4.eq_poly_eval): the packed
+        // formulation re-shuffled lanes on every op for nothing.
+        if (z & ((uint256(1) << 224) - 1) != 0) {
+            // Unreachable in the protocol: every z is powConstBase (a lifted
+            // two-adic domain point) and the pinned vectors agree. A non-base
+            // z here means the caller broke that invariant; reverting beats
+            // carrying a second implementation of the same product that no
+            // vector exercises.
+            revert NonBaseDomainPoint();
+        }
+        return selectEvalBase(point, z >> 224);
+    }
+
+    /// `selectEval` with the base-lifted scalar `v0` (z = lift(v0)).
+    ///
+    /// Same product, same coordinate order (point[n-1] pairs with v^(2^0));
+    /// pinned by the same vectors - the generator's `var` is base-lifted in
+    /// every case, so this path is what the vectors actually exercise.
+    function selectEvalBase(uint256[] memory point, uint256 v0)
+        internal
+        pure
+        returns (uint256 acc)
+    {
+        uint256 len = point.length;
         unchecked {
-            for (uint256 i = point.length; i > 0; --i) {
-                // point[i-1] is coordinate n-1-k for k = point.length - i.
-                uint256 term = KoalaBearExt4.add(
-                    KoalaBearExt4.mul(point[i - 1], KoalaBearExt4.sub(v, ONE)),
-                    ONE
-                );
-                acc = KoalaBearExt4.mul(acc, term);
-                // The lowest coordinate consumes the last factor and needs no
-                // further power, so skip the square on the final pass. The
-                // reference squares unconditionally because a circuit gate is
-                // cheaper to keep uniform than to special-case; here a wasted
-                // extension-field square is real gas, paid once per STIR query.
-                if (i > 1) {
-                    v = KoalaBearExt4.square(v);
+            uint256 c0 = 1; // acc = ONE, unpacked
+            uint256 c1 = 0;
+            uint256 c2 = 0;
+            uint256 c3 = 0;
+            uint256 pp;
+            assembly ("memory-safe") {
+                pp := add(point, 0x20)
+                let P := 0x7f000001
+                let M := 0xffffffff
+                let W := 3
+                let v := v0
+                for { let i := len } gt(i, 0) { i := sub(i, 1) } {
+                    let pv := mload(add(pp, shl(5, sub(i, 1))))
+                    let a0 := shr(224, pv)
+                    let a1 := and(shr(192, pv), M)
+                    let a2 := and(shr(160, pv), M)
+                    let a3 := and(shr(128, pv), M)
+                    // w = v - 1 (base field).
+                    let w := sub(v, 1)
+                    if iszero(v) { w := sub(P, 1) }
+                    // term = point * w + ONE (scalar mul: +1 in lane 0 only).
+                    let e0 := mod(add(mul(a0, w), 1), P)
+                    let e1 := mod(mul(a1, w), P)
+                    let e2 := mod(mul(a2, w), P)
+                    let e3 := mod(mul(a3, w), P)
+                    // acc *= term.
+                    let u0 := add(mul(c0, e0), mul(W, add(add(mul(c1, e3), mul(c2, e2)), mul(c3, e1))))
+                    let u1 := add(add(mul(c0, e1), mul(c1, e0)), mul(W, add(mul(c2, e3), mul(c3, e2))))
+                    let u2 := add(add(add(mul(c0, e2), mul(c1, e1)), mul(c2, e0)), mul(W, mul(c3, e3)))
+                    let u3 := add(add(add(mul(c0, e3), mul(c1, e2)), mul(c2, e1)), mul(c3, e0))
+                    c0 := mod(u0, P)
+                    c1 := mod(u1, P)
+                    c2 := mod(u2, P)
+                    c3 := mod(u3, P)
+                    // v <- v^2 (base field), skipped on the last pass.
+                    if gt(i, 1) { v := mod(mul(v, v), P) }
                 }
             }
+            acc = (c0 << 224) | (c1 << 192) | (c2 << 160) | (c3 << 128);
         }
-        return acc;
     }
 
     /// `generator^index` lifted into the extension.

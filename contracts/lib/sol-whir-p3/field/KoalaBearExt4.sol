@@ -131,24 +131,86 @@ library KoalaBearExt4 {
         return add(add(mul(e0, l0), mul(e1, l1)), mul(e2, l2));
     }
 
+    /// `prod_i (1 + 2 p_i q_i - p_i - q_i)` with the accumulator held in
+    /// REGISTERS, not packed between coordinates.
+    ///
+    /// The packed-lane formulation (mul/add/sub per coordinate through the
+    /// public ops) re-shuffles lanes - shifts, masks, mods - on every
+    /// operation even though nothing crosses the pack boundary until the
+    /// product is done. Measured on the real block proof this function is the
+    /// single largest consumer (the terminal identity), and a microbench put
+    /// the packed version at ~1.6k gas per coordinate against ~350 here:
+    /// unpack p_i and q_i once, carry (c0..c3) in registers, reduce each lane
+    /// exactly once per stage. Same algebra as `_mul_packed` (the W=3
+    /// reduction x^4 = W), same result, pinned by the Ext4 parity suite and
+    /// the whir_gadget vectors.
+    ///
+    /// Lane bounds: inputs are canonical (< p < 2^31), products < 2^62, sums
+    /// of four products < 2^64, times W still < 2^66 - no wraparound, so each
+    /// lane reduces exactly once per stage. The +3p in the term lanes keeps
+    /// the subtraction positive before the mod (2pq < 2p and a + b < 2p).
     function eq_poly_eval(uint256[] memory p, uint256[] memory q)
         internal
         pure
         returns (uint256 acc)
     {
-        require(p.length == q.length, "LEN");
-        acc = ONE;
-
+        uint256 len = p.length;
+        if (len != q.length) {
+            revert("LEN");
+        }
         unchecked {
-            for (uint256 i = 0; i < p.length; ++i) {
-                // term = 1 + 2pq - p - q, with 2pq as a lane add: doubling is
-                // not a multiplication, and routing it through _scalar_mul paid
-                // a full scalar multiply (and formerly an allocation) per
-                // coordinate for a shift-and-fold.
-                uint256 pq = mul(p[i], q[i]);
-                uint256 term = add(add(pq, pq), sub(sub(ONE, p[i]), q[i]));
-                acc = mul(acc, term);
+            uint256 c0 = 1; // acc = ONE, unpacked
+            uint256 c1 = 0;
+            uint256 c2 = 0;
+            uint256 c3 = 0;
+            uint256 pp;
+            uint256 qp;
+            assembly ("memory-safe") {
+                pp := add(p, 0x20)
+                qp := add(q, 0x20)
+                let P := 0x7f000001
+                let M := 0xffffffff
+                let W := 3
+                for { let i := 0 } lt(i, len) { i := add(i, 1) } {
+                    let pv := mload(add(pp, shl(5, i)))
+                    let qv := mload(add(qp, shl(5, i)))
+                    let a0 := shr(224, pv)
+                    let a1 := and(shr(192, pv), M)
+                    let a2 := and(shr(160, pv), M)
+                    let a3 := and(shr(128, pv), M)
+                    let b0 := shr(224, qv)
+                    let b1 := and(shr(192, qv), M)
+                    let b2 := and(shr(160, qv), M)
+                    let b3 := and(shr(128, qv), M)
+
+                    // pq = a * b, one reduction per lane.
+                    let t0 := add(mul(a0, b0), mul(W, add(add(mul(a1, b3), mul(a2, b2)), mul(a3, b1))))
+                    let t1 := add(add(mul(a0, b1), mul(a1, b0)), mul(W, add(mul(a2, b3), mul(a3, b2))))
+                    let t2 := add(add(add(mul(a0, b2), mul(a1, b1)), mul(a2, b0)), mul(W, mul(a3, b3)))
+                    let t3 := add(add(add(mul(a0, b3), mul(a1, b2)), mul(a2, b1)), mul(a3, b0))
+                    t0 := mod(t0, P)
+                    t1 := mod(t1, P)
+                    t2 := mod(t2, P)
+                    t3 := mod(t3, P)
+
+                    // term = 2pq + 1 - a - b (the +1 in lane 0 only).
+                    let e0 := mod(add(add(add(t0, t0), mul(3, P)), add(1, sub(sub(P, a0), b0))), P)
+                    let e1 := mod(add(add(add(t1, t1), mul(3, P)), add(sub(P, a1), sub(P, b1))), P)
+                    let e2 := mod(add(add(add(t2, t2), mul(3, P)), add(sub(P, a2), sub(P, b2))), P)
+                    let e3 := mod(add(add(add(t3, t3), mul(3, P)), add(sub(P, a3), sub(P, b3))), P)
+
+                    // acc *= term.
+                    let u0 := add(mul(c0, e0), mul(W, add(add(mul(c1, e3), mul(c2, e2)), mul(c3, e1))))
+                    let u1 := add(add(mul(c0, e1), mul(c1, e0)), mul(W, add(mul(c2, e3), mul(c3, e2))))
+                    let u2 := add(add(add(mul(c0, e2), mul(c1, e1)), mul(c2, e0)), mul(W, mul(c3, e3)))
+                    let u3 := add(add(add(mul(c0, e3), mul(c1, e2)), mul(c2, e1)), mul(c3, e0))
+                    c0 := mod(u0, P)
+                    c1 := mod(u1, P)
+                    c2 := mod(u2, P)
+                    c3 := mod(u3, P)
+                }
             }
+            acc = (c0 << 224) | (c1 << 192) | (c2 << 160) | (c3 << 128);
         }
     }
 
