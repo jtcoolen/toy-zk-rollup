@@ -88,16 +88,31 @@ library StarkMerkle {
         bytes32 leafDigest,
         uint256 index,
         bytes32[] memory siblings
-    ) internal pure returns (bytes32) {
-        bytes32 current = leafDigest;
-        for (uint256 level; level < siblings.length; ++level) {
-            bytes32 sibling = siblings[level];
-            bool goRight = (index >> level) & 1 == 1;
-            current = goRight
-                ? keccak256(abi.encodePacked(sibling, current))
-                : keccak256(abi.encodePacked(current, sibling));
+    ) internal pure returns (bytes32 current) {
+        // Scratch pair at the top of memory (the region memory-safe assembly
+        // may use without bumping the free pointer): one 64-byte buffer reused
+        // per level, so a 20-level path costs zero allocations instead of 20
+        // 64-byte ones. The two orderings are the same store pair with the
+        // operands swapped - a select on the bit, not two code paths.
+        assembly ("memory-safe") {
+            let buf := mload(0x40)
+            current := leafDigest
+            let src := add(siblings, 0x20)
+            let n := mload(siblings)
+            for { let level := 0 } lt(level, n) { level := add(level, 1) } {
+                let sib := mload(add(src, shl(5, level)))
+                let left := current
+                let right := sib
+                if and(shr(level, index), 1) {
+                    // went right: sibling on the left
+                    left := sib
+                    right := current
+                }
+                mstore(buf, left)
+                mstore(add(buf, 0x20), right)
+                current := keccak256(buf, 0x40)
+            }
         }
-        return current;
     }
 
     /// Check that a leaf digest opens at `index` to `expectedRoot`.

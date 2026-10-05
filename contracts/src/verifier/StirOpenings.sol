@@ -107,26 +107,39 @@ library StirOpenings {
     /// 22.3k here, because it allocates and zeroes a 3.2 KB intermediate array and
     /// reads it back (`StirOpeningsGasTest` brackets both). One pass also means the
     /// range check and the conversion cannot be separated by a future edit.
-    function extLeaf(uint256[] memory limbs) internal pure returns (bytes32) {
-        bytes memory row = new bytes(limbs.length * 4);
-        for (uint256 i; i < limbs.length; ++i) {
-            uint256 v = limbs[i];
-            if (v >= P) {
-                revert LimbOutOfRange(v);
+    function extLeaf(uint256[] memory limbs) internal pure returns (bytes32 digest) {
+        // One pass over the limbs into scratch space ABOVE the free memory
+        // pointer - the documented scratch region for memory-safe assembly -
+        // so there is no allocation, no zeroing pass, and no free-pointer bump:
+        // the digest is taken before anything else can claim the region. The
+        // byte encoding stays four MSTORE8s per limb (mstore is big-endian, so
+        // packing eight 31-bit limbs per word would need a byte swap per group
+        // and measured no better).
+        bytes4 selTag = LimbOutOfRange.selector;
+        assembly ("memory-safe") {
+            let n := mload(limbs)
+            let dst := add(mload(0x40), 0x20)
+            let src := add(limbs, 0x20)
+            let p := 0x7f000001
+            let r := 0x01fffffe
+            for { let i := 0 } lt(i, n) { i := add(i, 1) } {
+                let v := mload(add(src, shl(5, i)))
+                if iszero(lt(v, p)) {
+                    mstore(0, selTag)
+                    mstore(4, v)
+                    revert(0, 36)
+                }
+                // Wire form. v < 2^31 and r < 2^25 so the product cannot
+                // overflow a word; mod reduces it in place.
+                let w := mod(mul(v, r), p)
+                let d := add(dst, shl(2, i))
+                mstore8(d, and(w, 0xff))
+                mstore8(add(d, 1), and(shr(8, w), 0xff))
+                mstore8(add(d, 2), and(shr(16, w), 0xff))
+                mstore8(add(d, 3), shr(24, w))
             }
-            // Wire form, then little-endian. `v` is below 2^31 and R below
-            // 2^25, so the product cannot overflow and the compiler reduces it
-            // without a wide-multiply path.
-            uint256 w = (v * MONTGOMERY_R) % P;
-            assembly ("memory-safe") {
-                let dst := add(add(row, 0x20), mul(i, 4))
-                mstore8(dst, and(w, 0xff))
-                mstore8(add(dst, 1), and(shr(8, w), 0xff))
-                mstore8(add(dst, 2), and(shr(16, w), 0xff))
-                mstore8(add(dst, 3), and(shr(24, w), 0xff))
-            }
+            digest := keccak256(dst, mul(n, 4))
         }
-        return StarkMerkle.leaf(row);
     }
 
     /// Pack four canonical base coefficients into the extension element they
@@ -148,9 +161,8 @@ library StirOpenings {
     /// in the order the transcript produced it: `randomness[0]` binds the most
     /// significant bit of the position within the row.
     ///
-    /// The row is copied because `evaluate_hypercube` contracts in place, and
-    /// the caller still needs the row to hash. At 16 elements that copy is cheap
-    /// and it removes a whole class of "the fold ate my input" bugs.
+    /// The row is copied only when the fold would contract in place (arity > 4);
+    /// see the body. The protocol's arity is 4, whose unrolled fold is pure.
     function foldRow(uint256[] memory row, uint256[] memory randomness)
         internal
         pure
@@ -159,6 +171,15 @@ library StirOpenings {
         uint256 expected = uint256(1) << randomness.length;
         if (row.length != expected) {
             revert RowWidthMismatch(expected, row.length);
+        }
+        // `evaluate_hypercube` contracts in place only on its general path
+        // (point.length > 4); the unrolled paths for dims 0-4 fold through
+        // registers and leave `evals` untouched. WHIR's folding factor is 4, so
+        // the protocol always takes a pure path and the copy is dead weight -
+        // a 16-word allocation + refill per query. Larger arities keep the
+        // defensive copy: the caller still needs the row to hash.
+        if (randomness.length <= 4) {
+            return KoalaBearExt4.evaluate_hypercube(row, randomness);
         }
         uint256[] memory scratch = new uint256[](row.length);
         for (uint256 i; i < row.length; ++i) {
