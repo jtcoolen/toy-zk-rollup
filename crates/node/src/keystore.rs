@@ -387,6 +387,76 @@ fn read_slice(bytes: &[u8], pos: &mut usize, len: usize) -> Result<Vec<u8>, Keys
     Ok(out)
 }
 
+/// Write secret bytes to a file with owner-only permissions, atomically.
+///
+/// The file is created with mode 0600 *at creation time* (not chmod after
+/// the fact, which leaves a window where another local user can open it),
+/// written fully, fsynced, then renamed into place so a crash cannot leave a
+/// half-written vault. An existing target is replaced only if it is a
+/// regular file - a symlink at the target path is refused rather than
+/// followed, because a vault path an attacker can point elsewhere is a write
+/// primitive they do not deserve.
+///
+/// # Errors
+///
+/// [`KeystoreError::Io`] if any step fails.
+pub fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<(), KeystoreError> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| KeystoreError::Io(e.to_string()))?;
+        f.write_all(bytes)
+            .map_err(|e| KeystoreError::Io(e.to_string()))?;
+        f.sync_all().map_err(|e| KeystoreError::Io(e.to_string()))?;
+    }
+    // Refuse to replace anything that is not a regular file (or absent).
+    if let Ok(md) = std::fs::symlink_metadata(path) {
+        if !md.file_type().is_file() {
+            return Err(KeystoreError::Io(
+                "vault target exists and is not a regular file".into(),
+            ));
+        }
+    }
+    std::fs::rename(&tmp, path).map_err(|e| KeystoreError::Io(e.to_string()))?;
+    // Belt and braces: some filesystems mask the creation mode.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| KeystoreError::Io(e.to_string()))?;
+    Ok(())
+}
+
+/// Read secret bytes from a file, refusing anything group- or world-readable.
+///
+/// A vault whose permissions were widened (by any means - a bug, a user, a
+/// tarball) may have been copied, so the password inside must be treated as
+/// exposed: this refuses to open it rather than silently trusting it. The
+/// file must also be a regular file, not a symlink or device.
+///
+/// # Errors
+///
+/// [`KeystoreError::Io`] if unreadable or not a regular file;
+/// [`KeystoreError::InsecurePermissions`] if the mode is wider than 0600.
+pub fn read_private(path: &std::path::Path) -> Result<Zeroizing<Vec<u8>>, KeystoreError> {
+    use std::os::unix::fs::PermissionsExt;
+    let md = std::fs::symlink_metadata(path).map_err(|e| KeystoreError::Io(e.to_string()))?;
+    if !md.file_type().is_file() {
+        return Err(KeystoreError::Io("not a regular file".into()));
+    }
+    if md.permissions().mode() & 0o077 != 0 {
+        return Err(KeystoreError::InsecurePermissions(
+            "secret file has group/other permissions (need 0600)".into(),
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|e| KeystoreError::Io(e.to_string()))?;
+    Ok(Zeroizing::new(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,74 +653,4 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).ok();
     }
-}
-
-/// Write secret bytes to a file with owner-only permissions, atomically.
-///
-/// The file is created with mode 0600 *at creation time* (not chmod after
-/// the fact, which leaves a window where another local user can open it),
-/// written fully, fsynced, then renamed into place so a crash cannot leave a
-/// half-written vault. An existing target is replaced only if it is a
-/// regular file - a symlink at the target path is refused rather than
-/// followed, because a vault path an attacker can point elsewhere is a write
-/// primitive they do not deserve.
-///
-/// # Errors
-///
-/// [`KeystoreError::Io`] if any step fails.
-pub fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<(), KeystoreError> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-            .map_err(|e| KeystoreError::Io(e.to_string()))?;
-        f.write_all(bytes)
-            .map_err(|e| KeystoreError::Io(e.to_string()))?;
-        f.sync_all().map_err(|e| KeystoreError::Io(e.to_string()))?;
-    }
-    // Refuse to replace anything that is not a regular file (or absent).
-    if let Ok(md) = std::fs::symlink_metadata(path) {
-        if !md.file_type().is_file() {
-            return Err(KeystoreError::Io(
-                "vault target exists and is not a regular file".into(),
-            ));
-        }
-    }
-    std::fs::rename(&tmp, path).map_err(|e| KeystoreError::Io(e.to_string()))?;
-    // Belt and braces: some filesystems mask the creation mode.
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| KeystoreError::Io(e.to_string()))?;
-    Ok(())
-}
-
-/// Read secret bytes from a file, refusing anything group- or world-readable.
-///
-/// A vault whose permissions were widened (by any means - a bug, a user, a
-/// tarball) may have been copied, so the password inside must be treated as
-/// exposed: this refuses to open it rather than silently trusting it. The
-/// file must also be a regular file, not a symlink or device.
-///
-/// # Errors
-///
-/// [`KeystoreError::Io`] if unreadable or not a regular file;
-/// [`KeystoreError::InsecurePermissions`] if the mode is wider than 0600.
-pub fn read_private(path: &std::path::Path) -> Result<Zeroizing<Vec<u8>>, KeystoreError> {
-    use std::os::unix::fs::PermissionsExt;
-    let md = std::fs::symlink_metadata(path).map_err(|e| KeystoreError::Io(e.to_string()))?;
-    if !md.file_type().is_file() {
-        return Err(KeystoreError::Io("not a regular file".into()));
-    }
-    if md.permissions().mode() & 0o077 != 0 {
-        return Err(KeystoreError::InsecurePermissions(
-            "secret file has group/other permissions (need 0600)".into(),
-        ));
-    }
-    let bytes = std::fs::read(path).map_err(|e| KeystoreError::Io(e.to_string()))?;
-    Ok(Zeroizing::new(bytes))
 }
