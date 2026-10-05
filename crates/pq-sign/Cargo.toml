@@ -15,7 +15,11 @@ insecure-stub = []
 
 [dependencies]
 slh-dsa = { workspace = true }
-rand = { workspace = true, features = ["thread_rng", "std"] }
+# std_rng (the chacha-based StdRng) not thread_rng: the trait bound is
+# CryptoRng and the tests seed a StdRng; thread_rng would pull getrandom,
+# which does not build for wasm32-unknown-unknown without JS glue, into the
+# wallet's wasm link.
+rand = { workspace = true, features = ["std_rng", "std"] }
 
 [lints]
 workspace = true
