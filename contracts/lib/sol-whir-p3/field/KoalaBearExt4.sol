@@ -141,7 +141,12 @@ library KoalaBearExt4 {
 
         unchecked {
             for (uint256 i = 0; i < p.length; ++i) {
-                uint256 term = add(ONE, sub(sub(_scalar_mul(mul(p[i], q[i]), 2), p[i]), q[i]));
+                // term = 1 + 2pq - p - q, with 2pq as a lane add: doubling is
+                // not a multiplication, and routing it through _scalar_mul paid
+                // a full scalar multiply (and formerly an allocation) per
+                // coordinate for a shift-and-fold.
+                uint256 pq = mul(p[i], q[i]);
+                uint256 term = add(add(pq, pq), sub(sub(ONE, p[i]), q[i]));
                 acc = mul(acc, term);
             }
         }
@@ -210,16 +215,24 @@ library KoalaBearExt4 {
         return add(a0, mul(r, sub(a1, a0)));
     }
 
-    function _scalar_mul(uint256 a, uint256 scalar) internal pure returns (uint256) {
-        uint256[4] memory coeffs = unpack(a);
-
+    /// Scalar multiplication lane-by-lane, WITHOUT a memory array.
+    ///
+    /// The obvious implementation unpacks into a `uint256[4] memory`, scales,
+    /// and repacks; the allocation alone measured ~1,465 gas per call
+    /// (`FieldMicroBench`), and `eq_poly_eval` calls this once per coordinate
+    /// of every eq point, so it sat on the identity's hot path. Shifting lanes
+    /// through registers instead keeps the same semantics (each lane is a
+    /// canonical base element, `KoalaBear.mul` reduces) at a fraction of the
+    /// cost.
+    function _scalar_mul(uint256 a, uint256 scalar) internal pure returns (uint256 out) {
         unchecked {
-            for (uint256 i = 0; i < DEGREE; ++i) {
-                coeffs[i] = KoalaBear.mul(coeffs[i], scalar);
-            }
+            uint256 m = COEFF_MASK;
+            uint256 c0 = KoalaBear.mul(a >> 224, scalar);
+            uint256 c1 = KoalaBear.mul((a >> 192) & m, scalar);
+            uint256 c2 = KoalaBear.mul((a >> 160) & m, scalar);
+            uint256 c3 = KoalaBear.mul((a >> 128) & m, scalar);
+            out = (c0 << 224) | (c1 << 192) | (c2 << 160) | (c3 << 128);
         }
-
-        return pack(coeffs);
     }
 
     function _frobenius(uint256 a) internal pure returns (uint256) {
