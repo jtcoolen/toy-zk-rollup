@@ -61,6 +61,14 @@ impl SpendAuth for StubSpendAuth {
             Err(SpendAuthError::Malformed)
         }
     }
+
+    fn signature_to_bytes(sig: &Self::Signature) -> Vec<u8> {
+        sig.0.clone()
+    }
+
+    fn signature_from_bytes(bytes: &[u8]) -> Result<Self::Signature, SpendAuthError> {
+        Ok(StubSignature(bytes.to_vec()))
+    }
 }
 
 #[cfg(test)]

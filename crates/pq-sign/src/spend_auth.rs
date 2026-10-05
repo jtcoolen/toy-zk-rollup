@@ -71,6 +71,19 @@ pub trait SpendAuth: Clone + Send + Sync + 'static {
     /// Returns [`SpendAuthError::Malformed`] if `bytes` is not a well-formed
     /// public key for this scheme.
     fn public_key_from_bytes(bytes: &[u8]) -> Result<Self::PublicKey, SpendAuthError>;
+
+    /// Serialize a signature to its canonical wire bytes.
+    fn signature_to_bytes(sig: &Self::Signature) -> Vec<u8>;
+
+    /// Parse a signature from [`Self::signature_to_bytes`] output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpendAuthError::Malformed`] if `bytes` is not a well-formed
+    /// signature for this scheme. Parsing is separate from verification: a
+    /// parsed signature still has to pass [`Self::verify`] before it means
+    /// anything.
+    fn signature_from_bytes(bytes: &[u8]) -> Result<Self::Signature, SpendAuthError>;
 }
 
 /// SPHINCS+ (FIPS-205) spend authorization using the `Sha2_128f` parameter set.
@@ -112,6 +125,14 @@ impl SpendAuth for SphincsPlusAuth {
     fn public_key_from_bytes(bytes: &[u8]) -> Result<Self::PublicKey, SpendAuthError> {
         VerifyingKey::<Sha2_128f>::try_from(bytes).map_err(|_| SpendAuthError::Malformed)
     }
+
+    fn signature_to_bytes(sig: &Self::Signature) -> Vec<u8> {
+        sig.to_vec()
+    }
+
+    fn signature_from_bytes(bytes: &[u8]) -> Result<Self::Signature, SpendAuthError> {
+        Signature::<Sha2_128f>::try_from(bytes).map_err(|_| SpendAuthError::Malformed)
+    }
 }
 
 #[cfg(test)]
@@ -150,6 +171,25 @@ mod tests {
         assert_eq!(
             SphincsPlusAuth::verify(&other_vk, b"hello", &sig),
             Err(SpendAuthError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn signature_roundtrips_through_bytes() {
+        let (sk, vk) = SphincsPlusAuth::generate_keypair(&mut rng(0x5eed));
+        let sig = SphincsPlusAuth::sign(&sk, b"roundtrip me");
+        let bytes = SphincsPlusAuth::signature_to_bytes(&sig);
+        let parsed = SphincsPlusAuth::signature_from_bytes(&bytes).expect("parses");
+        // The parsed signature must verify, not merely equal: equality is
+        // byte identity, verification is the property anything downstream uses.
+        assert!(SphincsPlusAuth::verify(&vk, b"roundtrip me", &parsed).is_ok());
+    }
+
+    #[test]
+    fn malformed_signature_is_an_error_not_a_panic() {
+        assert_eq!(
+            SphincsPlusAuth::signature_from_bytes(&[7; 16]),
+            Err(SpendAuthError::Malformed)
         );
     }
 
