@@ -4,6 +4,7 @@
 
 # Local toolchain homes (large, machine-specific)
 .cargo-home/
+.rustup-home/
 .home/
 
 # Node / wallet

@@ -534,6 +534,55 @@ mod tests {
         assert_eq!(&vault.open(b"").expect("open")[..], b"payload");
         assert_eq!(vault.open(b" ").err(), Some(KeystoreError::WrongPassword));
     }
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ks-{}-{}", tag, std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        dir
+    }
+
+    #[test]
+    fn private_roundtrip_keeps_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir("rt");
+        let path = dir.join("vault.bin");
+        write_private(&path, b"secret bytes").expect("write");
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "owner-only");
+        let got = read_private(&path).expect("read");
+        assert_eq!(&got[..], b"secret bytes");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn widened_permissions_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir("wide");
+        let path = dir.join("vault.bin");
+        write_private(&path, b"x").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert!(matches!(
+            read_private(&path),
+            Err(KeystoreError::InsecurePermissions(_))
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn symlink_target_is_refused() {
+        let dir = tmpdir("ln");
+        let path = dir.join("vault.bin");
+        std::os::unix::fs::symlink("/etc/passwd", &path).expect("symlink");
+        assert!(
+            write_private(&path, b"no").is_err(),
+            "must not follow symlink"
+        );
+        assert!(
+            read_private(&path).is_err(),
+            "must not read through symlink"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 /// Write secret bytes to a file with owner-only permissions, atomically.
@@ -604,58 +653,4 @@ pub fn read_private(path: &std::path::Path) -> Result<Zeroizing<Vec<u8>>, Keysto
     }
     let bytes = std::fs::read(path).map_err(|e| KeystoreError::Io(e.to_string()))?;
     Ok(Zeroizing::new(bytes))
-}
-
-#[cfg(test)]
-mod file_tests {
-    use super::*;
-
-    fn tmpdir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("ks-{}-{}", tag, std::process::id()));
-        std::fs::create_dir_all(&dir).expect("tmpdir");
-        dir
-    }
-
-    #[test]
-    fn private_roundtrip_keeps_mode_0600() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tmpdir("rt");
-        let path = dir.join("vault.bin");
-        write_private(&path, b"secret bytes").expect("write");
-        let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "owner-only");
-        let got = read_private(&path).expect("read");
-        assert_eq!(&got[..], b"secret bytes");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn widened_permissions_are_refused() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tmpdir("wide");
-        let path = dir.join("vault.bin");
-        write_private(&path, b"x").expect("write");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
-        assert!(matches!(
-            read_private(&path),
-            Err(KeystoreError::InsecurePermissions(_))
-        ));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn symlink_target_is_refused() {
-        let dir = tmpdir("ln");
-        let path = dir.join("vault.bin");
-        std::os::unix::fs::symlink("/etc/passwd", &path).expect("symlink");
-        assert!(
-            write_private(&path, b"no").is_err(),
-            "must not follow symlink"
-        );
-        assert!(
-            read_private(&path).is_err(),
-            "must not read through symlink"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
 }

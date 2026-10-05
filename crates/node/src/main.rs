@@ -305,7 +305,14 @@ impl Actor {
             ::metrics::gauge!(names::BLOCK_HEIGHT).set(snap.block_number as f64);
             ::metrics::gauge!(names::MEMPOOL_SIZE).set(snap.pending as f64);
         }
-        *self.snapshot.write().expect("snapshot lock not poisoned") = snap;
+        // Poison-tolerant on purpose: the snapshot is a derived status cache
+        // and the assignment below is a whole-value move, so a lock held during
+        // an unrelated panic still contains a valid (old or new) snapshot.
+        // Panicking here would take the node down over a stale metrics gauge.
+        *self
+            .snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = snap;
     }
 
     /// Prove one demo transfer end to end and admit it.
@@ -552,17 +559,19 @@ async fn guard(State(st): State<AppState>, req: Request, next: Next) -> Response
 }
 
 async fn health(State(st): State<AppState>) -> Json<serde_json::Value> {
-    Json(
-        st.snapshot
-            .read()
-            .expect("snapshot lock not poisoned")
-            .json(),
-    )
+    let guard = st
+        .snapshot
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Json(guard.json())
 }
 
 async fn roots(State(st): State<AppState>) -> Json<serde_json::Value> {
     let (root, nullifier_root) = {
-        let s = st.snapshot.read().expect("snapshot lock not poisoned");
+        let s = st
+            .snapshot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         (s.root_hex.clone(), s.nullifier_root_hex.clone())
     };
     Json(serde_json::json!({ "root": root, "nullifier_root": nullifier_root }))
@@ -731,12 +740,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            if driver_snap
+            let pending = driver_snap
                 .read()
-                .expect("snapshot lock not poisoned")
-                .pending
-                == 0
-            {
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending;
+            if pending == 0 {
                 continue;
             }
             let (rtx, rrx) = oneshot::channel();
@@ -804,7 +812,8 @@ fn arg_after(args: &[String], flag: &str) -> Option<String> {
 /// must start at exactly the tree the node witnessed against - the pool
 /// enforces `rootBefore == currentRoot`, so any other genesis reverts.
 fn write_genesis_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let out = arg_after(args, "--out").unwrap_or_else(|| "contracts/deployments/genesis.json".into());
+    let out =
+        arg_after(args, "--out").unwrap_or_else(|| "contracts/deployments/genesis.json".into());
     let leaves: Vec<String> = GENESIS
         .iter()
         .map(|(b, v)| funded_note(*b, *v).0.commit(&Keccak256Commitment).to_hex())
