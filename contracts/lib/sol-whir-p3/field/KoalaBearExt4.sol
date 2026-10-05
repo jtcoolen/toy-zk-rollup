@@ -269,6 +269,14 @@ library KoalaBearExt4 {
         // the extension multiply reduces every lane mod P anyway, and the
         // final add reduces again, so the result is bit-identical to the
         // three-call formulation (same formulas as eq_poly_eval).
+        //
+        // The four convolution-lane reductions are ALSO deferred into the
+        // final per-lane mod: mod distributes over the add, and with reduced
+        // inputs (lanes < P < 2^31) the worst lane t3 < 4 * 2^62 < 2^65, so
+        // x3 + t3 < 2^66 never wraps 2^256. Every caller feeds reduced
+        // values - the fold tree's intermediates come out of the final add
+        // reduced - so the bound holds at every level, at four fewer mod
+        // opcodes (~130 gas) per fold.
         assembly ("memory-safe") {
             let P := 0x7f000001
             let M := 0xffffffff
@@ -290,11 +298,6 @@ library KoalaBearExt4 {
             let t1 := add(add(mul(c0, d1), mul(c1, d0)), mul(W, add(mul(c2, d3), mul(c3, d2))))
             let t2 := add(add(add(mul(c0, d2), mul(c1, d1)), mul(c2, d0)), mul(W, mul(c3, d3)))
             let t3 := add(add(add(mul(c0, d3), mul(c1, d2)), mul(c2, d1)), mul(c3, d0))
-            t0 := mod(t0, P)
-            t1 := mod(t1, P)
-            t2 := mod(t2, P)
-            t3 := mod(t3, P)
-
             out :=
                 or(
                     or(shl(224, mod(add(x0, t0), P)), shl(192, mod(add(x1, t1), P))),
