@@ -1309,3 +1309,125 @@ import (different fields, different transcripts, different proof shapes). Every
 borrowed section must stay pinned by the existing prover-vector tests - a rewrite
 to assembly is only accepted when the pins still pass byte-for-byte.
 
+
+## D-079 - Node runtime: in-process demo client for child proofs; wire submit lands with the verifier-rebuild path
+
+The node must accept transfers over HTTP, but `ClientTransferProof` carries a
+`CircuitVerifier` (the child's relation, fixed at trusted preparation) and
+that type is not wire-serializable. Three options:
+
+- (a) `CircuitVerifier::from_independently_trusted_builtin_artifact` - the
+  vendor's own boundary for rebuilding a verifier from independently
+  provisioned artifact parts. Correct production path; needs an artifact
+  decoder plus a trust-anchor provisioning pipeline we have not built.
+- (b) Rebuild the transfer circuit from public data and `prepare_circuit`
+  without proving. Feasible - every baked constant in the transfer circuit
+  (published root, nullifier roots, membership siblings + index bits, output
+  `pk_d`) is public; only note secrets are witnesses - but it needs a new
+  verifier-only prover API and a wire format for the public witness material.
+- (c) In-process demo client: the E2E driver proves transfers with the real
+  prover (same fixtures as `crates/node/tests/sequencer.rs`) and hands the
+  full bundle to the sequencer.
+
+**Decision: (c) for the e2e milestone.** The proving path stays real - the
+sequencer still verifies every child proof natively and the block circuit
+re-verifies them in-circuit - and nothing is mocked. `POST /v1/transfer`
+admits the wire envelope (statement + SPHINCS+ signature) and runs envelope +
+state-admission checks; proof-carrying submit is deferred to (a) or (b).
+Alternatives rejected: (a) is the right end state but is a provisioning
+project, not a node feature; (b) duplicates the circuit builder's job behind a
+new API surface for no e2e gain. The seam is documented in
+`crates/node/src/sequencer.rs` rather than papered over.
+
+## D-080 - Settlement sender: raw JSON-RPC + hand-rolled ABI encoder; node holds no keys
+
+The settlement half of the node sends `ShieldedPool.applyBlock(uint256[],bytes)`
+(selector `0cb000b5`, pinned) to an EVM JSON-RPC endpoint.
+
+- No alloy/ethers: the offline registry does not carry them at the pinned revs,
+  and the surface we need is two calls (`eth_sendTransaction`,
+  `eth_getTransactionReceipt`) plus an ABI encoder for one signature. The
+  encoder is a port of `contracts/scripts/settle_block.mjs`, which is itself
+  pinned by the on-chain E2E (`0xf8b2540c...`).
+- Signing: `eth_sendTransaction` from a configured unlocked dev account
+  (anvil). The node holds no keys and no keystore for L1 - a production
+  relayer signs externally (same posture as the settle script's header).
+  Rejected: embedding a private key in the node process - strictly worse
+  blast radius for zero gain on a dev chain.
+- Receipt polling with a bounded deadline (2 s interval, 600 s cap) because the
+  calldata is ~2.8 MB and the dev chain needs the raised block gas/request
+  limits; failures increment `node_settle_tx_total{outcome="reverted"}` and
+  the artifact is retained for a manual retry - never blind-resent.
+
+## D-081 - In-memory export: extract `build_vectors_doc` from `export_and_write`
+
+The node's block cycle needs the composed vectors (doc + blob) without
+touching `contracts/test/vectors`. `export_and_write` already computes them
+in memory and then writes; the tail is extracted into
+`composed_export::build_vectors_doc(doc, out, program, fixed, starts,
+statement, extras) -> (Value, Vec<u8>)`, and `export_and_write` becomes that
+call plus two `fs::write`s. The export tests keep exercising the same code
+path; the node calls the pure half. Rejected: a parallel second implementation
+of the framing tables (drift risk - the whole point of D-076 was one source of
+truth).
+
+
+## D-082 - Security posture for the node binary (user directive)
+
+**Context.** User: "ensure you follow good practices: Zeroise secrets, password
+protected DB, salts, good crypto use recommended standards and algorithms,
+protected secrets, etc". Audited keystore.rs + auth.rs against it.
+
+**Findings (already compliant).** Argon2id m=64MiB/t=3/p=1 with per-vault
+16-B random salt stored in clear (salt is not secret); fresh 12-B GCM nonce
+per seal; AES-256-GCM gives AEAD integrity over the vault; Zeroizing on
+derived key and plaintext; version byte + bounded parse; token signer is
+HMAC-SHA256 with the zeroize feature, Debug hides the key, MAC checked
+constant-time before payload parse.
+
+**Gaps closed in Step E.**
+1. Vault/token-key files written 0600 via keystore::write_private /
+   read_private helpers, refusing symlinks and non-regular files.
+2. Token signing key provisioning: NODE_TOKEN_KEY_FILE (0600-checked on
+   read) or NODE_TOKEN_KEY env, loaded into Zeroizing<Vec<u8>>; never
+   logged, never in config structs that derive Debug.
+3. ACL is the source of truth: /health and /metrics require a ReadOnly token
+   (the stale "no token at all" comment in auth.rs corrected).
+4. Rate limiting wired: governor keyed per-role+endpoint on submit; body cap
+   via tower-http RequestBodyLimitLayer (envelope is ~8 KB sig + small JSON;
+   cap 1 MiB).
+5. Node holds no L1 keys: settlement via eth_sendTransaction from a
+   configured unlocked sender (D-080 unchanged).
+
+**Alternatives considered.** (a) OS keychain for the token key - rejected for
+the demo: cross-platform, and the file+0600+Zeroizing path is auditable and
+portable; (b) public /health - rejected: the ACL already says ReadOnly and
+unauthenticated health leaks block height/timing to unauthenticated hosts on
+a shared network; operators who want it public put a reverse proxy in front.
+
+
+## D-083 - Wallet-facing submit validates the envelope now; proof admission waits for D-079(b)
+
+With the node binary live, two submit paths exist and the difference must be
+explicit or the demo gets mistaken for the production API:
+
+- POST /v1/transfer (Submitter): the wallet's DTO - nullifiers, outputs,
+  roots, fee, SPHINCS+ vk and signature. The node parses vk/sig at the
+  exact scheme sizes and verifies the signature over the statement encoding
+  (the same code path the sequencer admission uses), then answers 501.
+  It cannot do more: admitting the proof needs the child verifier rebuilt
+  from public data (D-079 option b), and the node cannot even *reproduce*
+  the wallet's statement - the output note's rho/psi are wallet secrets,
+  and reproducing them from the spent note would break the hiding property.
+- POST /v1/demo/transfer (Admin): the scripted stand-in for the wallet. The
+  node holds the fixture genesis spend keys (D-079 option c), so it builds
+  the note, proves with the real prover, signs, and admits. Admin-only
+  because it holds keys - an operator tool, never a public endpoint.
+
+**Alternatives considered.** (a) Make /v1/transfer accept demo bundles -
+rejected: it would blur which guarantees are real; (b) implement D-079(b)
+now - rejected for scope: it needs a verifier-only prover API and a public-
+witness wire format; the e2e milestone does not need remote proving, and the
+501 keeps the seam honest. The envelope validation is not a stub: signature
+parse + verify run for real on every request, so the wallet integration can
+be built and tested against it today.
