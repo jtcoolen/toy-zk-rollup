@@ -1473,3 +1473,102 @@ security gain at this surface; (c) have the node sign for the wallet -
 rejected outright: the wallet exists precisely so keys never leave the
 browser.
 
+
+## D-085 - Deployment-size and calldata-size strategy (studied: IOHK, GOAT, midfall)
+
+User asked: split the verifier into multiple contracts? split traces? Studied
+the three reference repos for their size-limit strategies (first full study —
+recorded here so it is never re-litigated).
+
+### What each repo actually does
+
+**IOHK plutus-plonky3-exploration** — not Solidity: an Aiken/Plutus v3 verifier
+for Plonky3 uni-STARK + batch-STARK (Goldilocks). Strategy: hard-specialise to
+ONE configuration (every fixed param coordinated on both sides), mirror the
+Rust verifier byte-for-byte with the Rust side as source of truth, JSON proof
+pipeline (export_proof -> convert.py -> generated test literal embedding the
+whole proof), benchmark-driven (docs/benchmark.md tracks Plutus budget).
+Takeaways for us: (a) proof-embedding-as-generated-literal is their answer to
+input-size — not available on EVM; (b) their batch-STARK shape mirrors ours
+(we already mirror p3 batch_stark); (c) specialization over generality is the
+size strategy that works everywhere — we already do it (fixed schedule,
+generated WhirFixedConfig).
+
+**GOAT bitcoin-stark-verifier** — Bitcoin Script, no OP_CAT, far harsher limits
+(520 KB element, 10k sigops). Two directly transferable ideas:
+1. **"The constraints are derived, not supplied."** Each round buries its OOD
+   scalars, query domain points (domain_gen^index) and batching challenge
+   below the folding randomness; the closing check lifts them back out and
+   evaluates the weight polynomial from them. A round costs 1+n extension
+   elements to carry instead of n*(1+arity). This is the proof that our
+   eqPoints section (773 KB, 39% of the bundle) is DERIVABLE in-circuit —
+   the points are transcript-deterministic. GOAT ships them nowhere.
+2. **"The index IS the Merkle path"** — query indices squeezed from the
+   sponge (we already squeeze indices, but still ship 752 KB of explicit
+   paths). Their pruned.rs + proof_script::build (per-proof generated script)
+   show the specialization ceiling: emit only the code the proof needs.
+
+**EY midfall proofs/solidity-verifier** — the directly relevant EIP-170
+playbook (Halo2/KZG, but the size engineering is proof-system-agnostic):
+1. **Code generation** (Askama templates + Rust lowering): the verifier is
+   rendered per circuit/VK, so dead code never ships; constants render as
+   literals; hot paths are hand-written .yul partials (TranscriptProofParser
+   23 KB, AccumulatorHelpers 23 KB) included at generation time.
+2. **Three-contract split with codehash pinning**: Halo2Verifier (main) +
+   Halo2VerifyingKey (DATA-ONLY payload contract, RenderVk::Separate) +
+   Halo2QuotientEvaluator (the expensive split-out phase,
+   RenderQuotient::ExternalPinned — the main verifier pins the evaluator's
+   runtime LENGTH and CODEHASH and staticcalls it).
+3. **Frame-passing, no ABI codec**: the evaluator receives the verifier's
+   memory frame as raw calldata (calldata[0..N) == memory[BASE..BASE+N)),
+   copies it back to the same absolute memory addresses; output is a compact
+   fixed frame (word0 = magic/version guard, then results). Zero codec cost
+   across the contract boundary.
+4. Absolute Yul memory addresses, scratch from 0x80, terminal main assembly.
+
+### Decision
+
+Split contracts: **YES, at coarse phase boundaries only, midfall-style** —
+per-call overhead (~1-2K gas delegatecall + frame copy) is noise against
+multi-M phases and catastrophic inside 1,336-iteration loops. Our module
+files (WhirGadgets, StirOpenings, SumcheckCore...) are internal libraries that
+solc inlines into one 24,373 B contract; the split candidates are:
+- **Constants contract (data-only, midfall VK pattern)**: the WBND cfg
+  section's transcript/constraint constants (semantic blob) are circuit-fixed
+  — identical for every proof of this shape. Deploy once, pin codehash in the
+  verifier constructor, read via extcodecopy. Removes ~180 KB from EVERY
+  proof (~2.9M calldata gas + the decode pass).
+- **TerminalWeight satellite**: the 42M-gas constraint-identity phase
+  (WhirGadgets.constraintWeight + eq_poly_eval) behind a codehash-pinned
+  staticcall with a raw frame (allR, constraint IR, eq data, statement).
+  Frees ~6-8 KB of main-contract code (margin +203 -> +6-8K) and moves the
+  EIP-170 pressure to a contract with room. One call per verify: overhead
+  ~2K gas against 42M.
+- Later if needed: StirOpenings per-round satellite (5 calls/verify).
+NOT candidates: eq_poly_eval/fold internals as separate contracts (per-call
+overhead would eat the win — they move only as part of a phase-sized call).
+
+Split traces: **NO — it makes both limits worse.** Our bundle is dominated by
+sections that scale with QUERY COUNT and ROUNDS (eqPoints 39% + paths 38%),
+not trace width/height; queries are fixed by security/rate, so N sub-trace
+proofs each re-pay the per-proof fixed overhead (transcript constants, eq
+points, final openings) — total calldata grows ~N x fixed + 1 x variable.
+The correct direction is the opposite: amortize the fixed overhead over MORE
+blocks per proof (batch more transactions per settlement proof), plus the
+derivation levers below.
+
+Calldata-size ceiling path (ordered by size, from §18):
+1. eqPoints in-circuit derivation (GOAT idea 1): -773 KB, -9.2M calldata gas,
+   plus removes the copy/decode pass (~15M compute). Biggest single lever.
+2. Constants deploy-once (midfall VK pattern): -180 KB, -2.9M.
+3. Merkle path folding/batching (D-072 ph.2, GOAT idea 2): -~700 KB, -6M.
+   Together: bundle 1.97 MB -> ~0.3 MB, calldata floor 23.5M -> ~3.6M.
+4. Mainnet-L1 reality note: even at 0.3 MB the 150M compute floor needs an
+   L2/high-limit settlement chain (goal specifies local chain — fine);
+   EIP-4844 blob submission is the mainnet-L1 path if ever required.
+
+Alternatives rejected: (a) making every internal library external now —
+per-call overhead inside hot loops; (b) per-proof code generation (GOAT
+proof_script) — initcode/deploy cost per proof, wrong trade on EVM where
+calldata is cheap-ish and deploys are not; (c) splitting traces — above;
+(d) EIP-2539 Verkle/compressed state — out of scope, no SNARKs.
