@@ -857,8 +857,8 @@ contract WhirVerifier is IWhirVerifier {
         returns (uint256[] memory out)
     {
         out = new uint256[](len);
-        for (uint256 i; i < len; ++i) {
-            out[i] = src[start + i];
+        assembly ("memory-safe") {
+            mcopy(add(out, 0x20), add(add(src, 0x20), mul(start, 0x20)), mul(len, 0x20))
         }
     }
 
@@ -870,11 +870,13 @@ contract WhirVerifier is IWhirVerifier {
         out = new uint256[][](lens.length);
         uint256 off = 0;
         for (uint256 i; i < lens.length; ++i) {
-            out[i] = new uint256[](lens[i]);
-            for (uint256 j; j < lens[i]; ++j) {
-                out[i][j] = flat[off + j];
+            uint256 n = lens[i];
+            uint256[] memory row = new uint256[](n);
+            assembly ("memory-safe") {
+                mcopy(add(row, 0x20), add(add(flat, 0x20), mul(off, 0x20)), mul(n, 0x20))
             }
-            off += lens[i];
+            out[i] = row;
+            off += n;
         }
     }
 
@@ -892,11 +894,13 @@ contract WhirVerifier is IWhirVerifier {
         out = new bytes32[][](lens.length);
         uint256 off = start;
         for (uint256 i; i < lens.length; ++i) {
-            out[i] = new bytes32[](lens[i]);
-            for (uint256 j; j < lens[i]; ++j) {
-                out[i][j] = _node(blob, off + j);
+            uint256 n = lens[i];
+            bytes32[] memory row = new bytes32[](n);
+            assembly ("memory-safe") {
+                mcopy(add(row, 0x20), add(add(blob, 0x20), mul(off, 0x20)), mul(n, 0x20))
             }
-            off += lens[i];
+            out[i] = row;
+            off += n;
         }
     }
 
