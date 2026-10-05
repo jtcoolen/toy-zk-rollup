@@ -507,10 +507,10 @@ library WhirVerifierCore {
 
         // --- 5: open and fold every query ------------------------------------------
         out.folds = new uint256[](input.numQueries);
+        uint256[] memory limbs = new uint256[](input.rowLimbs);
+        uint256[] memory elems = new uint256[](input.rowElems);
         for (uint256 q; q < input.numQueries; ++q) {
             uint256 base = q * input.rowLimbs;
-            uint256[] memory limbs = new uint256[](input.rowLimbs);
-            uint256[] memory elems = new uint256[](input.rowElems);
             for (uint256 j; j < input.rowLimbs; ++j) {
                 limbs[j] = input.rowsFlat[base + j];
             }
