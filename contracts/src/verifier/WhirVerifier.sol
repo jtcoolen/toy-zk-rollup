@@ -482,7 +482,7 @@ contract WhirVerifier is IWhirVerifier {
 
         // Every query in round i opens at depth sched_log_folded[i].
         uint256 depth = c.schedLogFolded[i];
-        input.paths = _paths(p.pathsBlob, cur.pathOff, _repeat(depth, nq));
+        input.paths = _paths(p.pathsAbs, cur.pathOff, _repeat(depth, nq));
         cur.pathOff += nq * depth;
 
         input.prevRandomness = st.lastRandomness;
@@ -561,7 +561,7 @@ contract WhirVerifier is IWhirVerifier {
         fi.rowElems = rowElems;
         fi.rowLimbs = rowElems * 4;
         fi.rowsFlat = p.finalRowsExt;
-        fi.paths = _paths(p.finalPathsBlob, 0, _repeat(c.finalLogFolded, nqT));
+        fi.paths = _paths(p.finalPathsAbs, 0, _repeat(c.finalLogFolded, nqT));
         fi.prevRandomness = th.lastRandomness;
         // D-072 phase 2: the domain points are computed in-circuit from the
         // indices this verifier samples, not read from the proof.
@@ -619,7 +619,12 @@ contract WhirVerifier is IWhirVerifier {
         uint256[] initScInf;
         uint256[] initScPow;
         uint256[] rowsFlat;
-        bytes pathsBlob;
+        // Merkle-path blobs stay in calldata: absolute calldata BYTE offsets
+        // of the blob data (calldata refs cannot live in a memory struct, and
+        // threading the proof through would blow the stack in _runOneInter-
+        // mediate). _paths reads straight from these offsets.
+        uint256 pathsAbs;
+        uint256 finalPathsAbs;
         bytes32[] roundCommitments;
         uint256[] oodAnswers;
         uint256[] oodAnswerLens;
@@ -632,7 +637,6 @@ contract WhirVerifier is IWhirVerifier {
         uint256[] finalPoly;
         uint256 finalPowWitness;
         uint256[] finalRowsExt;
-        bytes finalPathsBlob;
         uint256[] finalScA;
         uint256[] finalScInf;
         uint256[] finalScPow;
@@ -686,7 +690,16 @@ contract WhirVerifier is IWhirVerifier {
         (p.initScInf, no) = _extArr(m, no);
         (p.initScPow, no) = _arr(m, no);
         (p.rowsFlat, no) = _arr(m, no);
-        (p.pathsBlob, no) = _blob(m, no);
+        {
+            uint256 nBytes;
+            (nBytes, no) = _word(m, no);
+            uint256 abs;
+            assembly ("memory-safe") {
+                abs := add(m.offset, mul(no, 4))
+            }
+            p.pathsAbs = abs;
+            no += nBytes / 4;
+        }
         (p.roundCommitments, no) = _blobArr32(m, no);
         (p.oodAnswers, no) = _extArr(m, no);
         (p.oodAnswerLens, no) = _arr(m, no);
@@ -699,7 +712,16 @@ contract WhirVerifier is IWhirVerifier {
         (p.finalPoly, no) = _extArr(m, no);
         (p.finalPowWitness, no) = _word(m, no);
         (p.finalRowsExt, no) = _arr(m, no);
-        (p.finalPathsBlob, no) = _blob(m, no);
+        {
+            uint256 nBytes;
+            (nBytes, no) = _word(m, no);
+            uint256 abs;
+            assembly ("memory-safe") {
+                abs := add(m.offset, mul(no, 4))
+            }
+            p.finalPathsAbs = abs;
+            no += nBytes / 4;
+        }
         (p.finalScA, no) = _extArr(m, no);
         (p.finalScInf, no) = _extArr(m, no);
         (p.finalScPow, no) = _arr(m, no);
@@ -914,7 +936,7 @@ contract WhirVerifier is IWhirVerifier {
         }
     }
 
-    function _paths(bytes memory blob, uint256 start, uint256[] memory lens)
+    function _paths(uint256 blobBase, uint256 start, uint256[] memory lens)
         private
         pure
         returns (bytes32[][] memory out)
@@ -925,7 +947,11 @@ contract WhirVerifier is IWhirVerifier {
             uint256 n = lens[i];
             bytes32[] memory row = new bytes32[](n);
             assembly ("memory-safe") {
-                mcopy(add(row, 0x20), add(add(blob, 0x20), mul(off, 0x20)), mul(n, 0x20))
+                let src := add(blobBase, mul(off, 0x20))
+                let dst := add(row, 0x20)
+                for { let j := 0 } lt(j, n) { j := add(j, 1) } {
+                    mstore(add(dst, mul(j, 0x20)), calldataload(add(src, mul(j, 0x20))))
+                }
             }
             out[i] = row;
             off += n;
