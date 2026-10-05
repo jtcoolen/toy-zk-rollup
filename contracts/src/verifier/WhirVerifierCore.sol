@@ -77,20 +77,11 @@ library WhirVerifierCore {
             revert ConstantsExhausted(4 * n, t.constants.length - t.constOff);
         }
         uint256 end = t.constOff + 4 * n;
-        bytes memory c = t.constants;
-        for (uint256 off = t.constOff; off < end; off += 4) {
-            uint256 word;
-            assembly {
-                // The payload stores each word little-endian. mload reads 32
-                // bytes big-endian-aligned, so the FOUR PAYLOAD BYTES sit in the
-                // TOP 32 bits of the loaded word - shift right by 224, do NOT
-                // truncate to uint32, which would keep the bytes 28..32.
-                word := shr(224, mload(add(add(c, 32), off)))
-            }
-            // safe: word is shr(224, mload(..)), so it is at most 2^32 - 1.
-            // forge-lint: disable-next-line(unsafe-typecast)
-            t.state.observeBase(swapBytes(uint32(word)));
-        }
+        // One bulk pass: the payload is already in the transcript's byte order
+        // (little-endian words), so the absorber appends it verbatim after a
+        // per-word range check. Byte-identical to the previous per-word
+        // observeBase(swapBytes(..)) loop - pinned by the transcript vectors.
+        t.state.observeBasesLE(t.constants, t.constOff, n);
         t.constOff = end;
     }
 
@@ -107,7 +98,7 @@ library WhirVerifierCore {
 
     /// Observe one extension element from the proof: four Montgomery limbs.
     function observeExt(Transcript memory t, uint256 packed) internal pure {
-        SumcheckCore.observeExt4Canonical(t.state, packed);
+        t.state.observeExt4Mont(packed);
     }
 
     /// Draw one extension element: four independent base samples, packed

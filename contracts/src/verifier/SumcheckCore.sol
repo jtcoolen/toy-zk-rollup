@@ -88,10 +88,7 @@ library SumcheckCore {
         // bits are ALWAYS zero, so reading `packed & mask` yields a valid-looking
         // zero instead of c3. Round 0 of the vectors has c3 == 0, which is
         // exactly why a hand-written spot check would not have caught this.
-        challenger.observeBase(toMontgomery((packed >> 224) & 0xffff_ffff));
-        challenger.observeBase(toMontgomery((packed >> 192) & 0xffff_ffff));
-        challenger.observeBase(toMontgomery((packed >> 160) & 0xffff_ffff));
-        challenger.observeBase(toMontgomery((packed >> 128) & 0xffff_ffff));
+        challenger.observeExt4Mont(packed);
     }
 
     /// Raised when a round's proof carries the wrong number of values.

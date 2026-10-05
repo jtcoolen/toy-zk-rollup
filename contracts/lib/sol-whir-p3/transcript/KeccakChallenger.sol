@@ -40,6 +40,102 @@ library KeccakChallenger {
         _appendBaseLE(self, uint32(value));
     }
 
+    /// Absorb `nWords` field words from `data` (starting at byte `off`, four
+    /// bytes per word, stored as the prover transcript wrote them) in one pass.
+    ///
+    /// Byte-identical to `nWords` sequential `observeBase` calls on the same
+    /// values: each word is range-checked against the KoalaBear modulus and
+    /// appended little-endian, and the output buffer is invalidated once up
+    /// front (every per-word append would do it anyway). The per-word Solidity
+    /// call, require, and capacity machinery collapse into one assembly loop -
+    /// the WHIR verifier absorbs framing constants in bulk through here, where
+    /// the per-element overhead dominated the initial phase transcript cost.
+    error BasesRange();
+
+    function observeBasesLE(
+        State memory self,
+        bytes memory data,
+        uint256 off,
+        uint256 nWords
+    ) internal pure {
+        if (off + nWords * 4 > data.length) {
+            revert BasesRange();
+        }
+        // An empty absorb must be a no-op, exactly like the per-word loop it
+        // replaces: zero appends never invalidated the buffered output block.
+        if (nWords == 0) {
+            return;
+        }
+        self.outputIndex = 0;
+        uint256 oldLen = self.inputLen;
+        uint256 newLen = oldLen + nWords * 4;
+        _ensureCapacity(self, newLen);
+        bytes memory buffer = self.inputBuffer;
+        uint256 p = KOALABEAR_MODULUS;
+        assembly ("memory-safe") {
+            let src := add(add(data, 0x20), off)
+            let dst := add(buffer, add(0x20, oldLen))
+            let end := add(src, shl(2, nWords))
+            for { } lt(src, end) { } {
+                // The blob stores each word little-endian; the top four bytes of
+                // the aligned load are the word in big-endian order.
+                let be := shr(224, mload(src))
+                // The range check is on the VALUE the old per-word path checked:
+                // the little-endian interpretation of the stored bytes (the old
+                // path byte-swapped the aligned load before observeBase).
+                let v := or(
+                    shr(24, be),
+                    or(
+                        and(shr(8, be), 0xff00),
+                        or(and(shl(8, be), 0xff0000), shl(24, and(be, 0xff)))
+                    )
+                )
+                if iszero(lt(v, p)) {
+                    mstore(0, 0x454e5200) // ENR0 - out-of-range base word
+                    revert(0, 4)
+                }
+                mstore(dst, shl(224, be))
+                src := add(src, 4)
+                dst := add(dst, 4)
+            }
+        }
+        self.inputLen = newLen;
+    }
+
+    /// Absorb one packed extension element - four canonical limbs at bits
+    /// 224/192/160/128 - as four Montgomery-converted base words in one pass.
+    ///
+    /// Byte-identical to four `observeBase(toMontgomery(limb))` calls: each
+    /// limb is reduced mod p (which also enforces the range check the per-word
+    /// path performed), converted with the Montgomery factor, and appended
+    /// little-endian. The low 128 bits of `packed` are padding and ignored.
+    function observeExt4Mont(State memory self, uint256 packed) internal pure {
+        self.outputIndex = 0;
+        uint256 oldLen = self.inputLen;
+        _ensureCapacity(self, oldLen + 16);
+        bytes memory buffer = self.inputBuffer;
+        uint256 p = KOALABEAR_MODULUS;
+        uint256 r = 0x01ff_fffe; // Montgomery R for KoalaBear
+        assembly ("memory-safe") {
+            let dst := add(buffer, add(0x20, oldLen))
+            for { let i := 0 } lt(i, 4) { i := add(i, 1) } {
+                let limb := and(shr(sub(224, shl(5, i)), packed), 0xffffffff)
+                // mod p, Montgomery, then the 4 bytes LITTLE-endian - the old
+                // path appended via _appendBaseLE, which byte-swaps.
+                let m := mulmod(mod(limb, p), r, p)
+                let be := or(
+                    shr(24, m),
+                    or(
+                        and(shr(8, m), 0xff00),
+                        or(and(shl(8, m), 0xff0000), shl(24, and(m, 0xff)))
+                    )
+                )
+                mstore(add(dst, shl(2, i)), shl(224, be))
+            }
+        }
+        self.inputLen = oldLen + 16;
+    }
+
     function observeHashU8Digest(State memory self, bytes32 digest) internal pure {
         _appendDigest32(self, digest);
     }
