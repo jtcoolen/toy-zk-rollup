@@ -1087,8 +1087,6 @@ dependencies = [
 name = "node"
 version = "0.1.0"
 dependencies = [
- "aes-gcm",
- "argon2",
  "axum",
  "governor",
  "hex",
@@ -1116,6 +1114,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
+ "vault",
  "zeroize",
 ]
 
@@ -2957,6 +2956,18 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "vault"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "argon2",
+ "rand 0.10.3",
+ "rand_core 0.10.1",
+ "thiserror",
+ "zeroize",
+]
 
 [[package]]
 name = "wait-timeout"

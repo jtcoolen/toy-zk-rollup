@@ -21,8 +21,9 @@ p3-circuit-prover = { workspace = true }
 p3-field = { workspace = true }
 
 # --- Security: password-protected keystore + signed bearer tokens ---
-argon2 = { workspace = true }
-aes-gcm = { workspace = true }
+# The vault crypto lives in its own wasm-safe crate (shared with the browser
+# wallet); the node keeps only file IO around it.
+vault = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 zeroize = { workspace = true }

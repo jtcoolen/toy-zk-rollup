@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/pq-hash",
     "crates/pq-sign",
+    "crates/vault",
     "crates/shielded",
     "crates/prover",
     "crates/node",
@@ -153,6 +154,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # --- Workspace crates ---
 pq-hash = { path = "crates/pq-hash" }
 pq-sign = { path = "crates/pq-sign" }
+vault = { path = "crates/vault" }
 shielded = { path = "crates/shielded" }
 prover = { path = "crates/prover" }
 

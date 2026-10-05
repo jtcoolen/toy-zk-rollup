@@ -138,6 +138,7 @@ rules:
         - /crates/pq-hash/**
         - /crates/pq-sign/**
         - /crates/shielded/**
+        - /crates/vault/**
     pattern-either:
       - pattern: unsafe { ... }
       - pattern: unsafe fn $F(...) { ... }
@@ -189,6 +190,7 @@ rules:
         - /crates/pq-hash/src/**
         - /crates/pq-sign/src/**
         - /crates/shielded/src/**
+        - /crates/vault/src/**
         - /crates/node/src/**
       exclude:
         - "**/tests/**"

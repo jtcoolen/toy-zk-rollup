@@ -1,0 +1,31 @@
+[package]
+name = "vault"
+description = "Password-protected vault keystore: Argon2id + AES-256-GCM, shared by the node and the browser wallet (wasm-safe)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Pure crypto + serialization: no filesystem, no std-only APIs beyond alloc,
+# so the SAME vault format seals and opens in the node process and in the
+# browser (wasm32-unknown-unknown). File I/O and permission checks stay with
+# the caller (the node's keystore module).
+[dependencies]
+argon2 = { workspace = true }
+aes-gcm = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+# rand_core (not rand): the trait we need is TryRng, and rand_core has no
+# getrandom dependency, so it builds clean for wasm32-unknown-unknown.
+rand_core = { workspace = true }
+
+# rand is TEST-ONLY: the production API is generic over TryRng and the caller
+# supplies entropy (SysRng in the node, a WebCrypto bridge in the wallet).
+# Keeping it out of [dependencies] also keeps `getrandom` - which does not
+# build for wasm32-unknown-unknown without JS glue - out of the wasm link.
+[dev-dependencies]
+rand = { workspace = true, features = ["std", "thread_rng"] }
+
+[lints]
+workspace = true
