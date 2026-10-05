@@ -49,7 +49,11 @@ pub type SpendVerifyingKey = <SphincsPlusAuth as SpendAuth>::PublicKey;
 pub type SpendSignature = <SphincsPlusAuth as SpendAuth>::Signature;
 
 /// Domain separation tag for the spend-authorization message.
-pub const DOMAIN_TX: &[u8] = b"pq-rollup/spend-auth/v1";
+///
+/// Re-exported from [`shielded::signing`], which owns the canonical encoding:
+/// prover, node and wallet all derive the signed bytes from that one
+/// implementation, so signer and verifier cannot drift.
+pub use shielded::signing::{encode_statement, DOMAIN_TX, MAX_COUNT_PER_FIELD};
 
 /// Errors from envelope admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +115,7 @@ impl ShieldedTransfer {
     /// true: a silently truncated length prefix would let two statements with
     /// counts differing by `2^32` collide.
     pub fn signing_message(&self) -> Result<Vec<u8>, TxError> {
-        encode_statement(&self.public)
+        encode_statement(&self.public).map_err(|_| TxError::TooLarge)
     }
 
     /// Check the envelope's signature against [`Self::signing_message`].
@@ -125,74 +129,6 @@ impl ShieldedTransfer {
         SphincsPlusAuth::verify(&self.verifying_key, &message, &self.signature)
             .map_err(|_| TxError::BadSignature)
     }
-}
-
-/// The most nullifiers or outputs one transfer may carry.
-///
-/// Bounded well below the wire format's `u32` prefix so the count is also
-/// representable in the block statement's `u16` shape limbs (see
-/// [`prover::block::shape_header`]). A wallet that exceeds this is not
-/// building a transfer this protocol supports.
-pub const MAX_COUNT_PER_FIELD: usize = 1_024;
-
-/// Encode a [`TransferPublic`] into the canonical signed-message bytes.
-///
-/// Layout (all counts little-endian `u32`, all digests raw 32 bytes):
-///
-/// ```text
-///   DOMAIN_TX
-///   ‖ n_nullifiers ‖ nullifier_0 ‖ … ‖ nullifier_{n-1}
-///   ‖ n_outputs    ‖ output_0    ‖ … ‖ output_{m-1}
-///   ‖ root ‖ nullifier_root_before ‖ nullifier_root_after
-///   ‖ fee (u64 LE)
-/// ```
-///
-/// The roots are included so the signature covers *which* state the transfer
-/// was witnessed against: a transfer re-broadcast against a different root is
-/// a different message, and the old signature does not cover it.
-///
-/// # Errors
-///
-/// Returns [`TxError::TooLarge`] if either count exceeds
-/// [`MAX_COUNT_PER_FIELD`].
-fn encode_statement(public: &TransferPublic) -> Result<Vec<u8>, TxError> {
-    if public.nullifiers.len() > MAX_COUNT_PER_FIELD || public.outputs.len() > MAX_COUNT_PER_FIELD {
-        return Err(TxError::TooLarge);
-    }
-    let mut out = Vec::with_capacity(
-        DOMAIN_TX.len() + 8 + public.nullifiers.len() * 32 + public.outputs.len() * 32 + 3 * 32 + 8,
-    );
-    out.extend_from_slice(DOMAIN_TX);
-    push_count(&mut out, public.nullifiers.len());
-    for nf in &public.nullifiers {
-        out.extend_from_slice(nf.as_bytes());
-    }
-    push_count(&mut out, public.outputs.len());
-    for out_hash in &public.outputs {
-        out.extend_from_slice(out_hash.as_bytes());
-    }
-    out.extend_from_slice(public.root.as_bytes());
-    out.extend_from_slice(public.nullifier_roots.before.as_bytes());
-    out.extend_from_slice(public.nullifier_roots.after.as_bytes());
-    out.extend_from_slice(&public.fee.to_le_bytes());
-    Ok(out)
-}
-
-/// Push a length prefix.
-///
-/// Callers have already bounds-checked against [`MAX_COUNT_PER_FIELD`], which
-/// is far below `u32::MAX`, so the truncating cast here is provably lossless.
-/// The lint is allowed rather than replaced with error handling because the
-/// check that makes this safe lives one frame up, in `encode_statement`, and
-/// duplicating it here would suggest it can still fail.
-///
-/// [`MAX_COUNT_PER_FIELD`]: crate::tx::MAX_COUNT_PER_FIELD
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "bounded by MAX_COUNT_PER_FIELD"
-)]
-fn push_count(out: &mut Vec<u8>, len: usize) {
-    out.extend_from_slice(&(len as u32).to_le_bytes());
 }
 
 /// A transfer's nullifiers, for the pool's replay index.

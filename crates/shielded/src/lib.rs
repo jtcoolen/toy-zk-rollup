@@ -31,6 +31,7 @@
 pub mod keys;
 pub mod note;
 pub mod nullifier_tree;
+pub mod signing;
 pub mod transfer;
 pub mod tree;
 
@@ -39,5 +40,6 @@ pub use note::Note;
 pub use nullifier_tree::{
     verify_non_inclusion, NonInclusionWitness, NullifierMap, NULLIFIER_TREE_DEPTH,
 };
+pub use signing::{encode_statement, EncodeError, DOMAIN_TX, MAX_COUNT_PER_FIELD};
 pub use transfer::{BalanceError, NullifierRoots, Transfer, TransferPublic, MAX_VALUE};
 pub use tree::{CommitmentTree, MembershipPath};
