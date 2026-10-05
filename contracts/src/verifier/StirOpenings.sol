@@ -253,6 +253,25 @@ library StirOpenings {
             revert RowWidthMismatch(row.length * KoalaBearExt4.DEGREE, limbs.length);
         }
         bytes32 leaf = extLeaf(limbs);
+        return openAndFoldLeaf(
+            root, index, depth, leaf, row, pathsFlat, memOff, siblingsCdBase, randomness
+        );
+    }
+
+    /// `openAndFold` with the leaf digest already computed by the row loader:
+    /// the production path fuses the wire-limb decode, the leaf encoding, and
+    /// the element packing into one pass, so the digest arrives pre-built.
+    function openAndFoldLeaf(
+        bytes32 root,
+        uint256 index,
+        uint256 depth,
+        bytes32 leaf,
+        uint256[] memory row,
+        bytes32[] memory pathsFlat,
+        uint256 memOff,
+        uint256 siblingsCdBase,
+        uint256[] memory randomness
+    ) internal pure returns (uint256) {
         if (!StarkMerkle.verifyMix(root, index, leaf, pathsFlat, memOff, siblingsCdBase, depth)) {
             revert OpeningNotAuthenticated(index);
         }

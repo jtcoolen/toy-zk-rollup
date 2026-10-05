@@ -472,53 +472,82 @@ library WhirVerifierCore {
     /// expanded to canonical uint256 (byte-swap as in the section decoder).
     /// rowsCd == 0 selects the memory source: rowLimbs words at flat + base.
     /// A separate function keeps the query loop's stack shallow.
-    function _loadRow(
-        uint256[] memory limbs,
-        uint256 flatPtr,
+    /// Fused row load: ONE pass over the opened row's wire limbs produces both
+    /// views the query needs - the packed extension elements the fold consumes
+    /// and the leaf digest the Merkle check authenticates - with no intermediate
+    /// limbs buffer, no second pass, and no separate range-check pass.
+    ///
+    /// The wire limbs are the Montgomery form of the canonical values: each
+    /// canonical limb v (checked v < P here, exactly as extLeaf did) becomes
+    /// w = v * R mod P written as four little-endian bytes into scratch above
+    /// the free pointer, and keccak covers exactly 4 * rowLimbs bytes. The
+    /// spill of each 4-byte store (one mstore writes 32) is overwritten by the
+    /// next limb's store; the final spill sits in the unread scratch tail.
+    ///
+    /// The caller guarantees the row shape (the round's checks run before the
+    /// first query): rowLimbs == rowElems for base rows, 4 * rowElems for
+    /// extension rows, and the source holds rowLimbs limbs at base.
+    function _loadRowFused(
+        uint256[] memory elems,
+        uint256[] memory flat,
         uint256 rowsCd,
         uint256 base,
-        uint256 rowLimbs
-    ) private pure {
+        uint256 rowLimbs,
+        uint256 rowElems,
+        bool rowsAreBase
+    ) private pure returns (bytes32 leaf) {
+        // rowElems is implied by rowLimbs and rowsAreBase (checked once per
+        // round by the caller); silence the unused-parameter warning.
+        rowElems;
+        bytes4 selTag = StirOpenings.LimbOutOfRange.selector;
         assembly ("memory-safe") {
-            let dst := add(limbs, 0x20)
-            switch rowsCd
-            case 0 {
-                mcopy(dst, add(add(flatPtr, 0x20), mul(base, 0x20)), mul(rowLimbs, 0x20))
+            let dst := add(mload(0x40), 0x20) // leaf scratch above the free pointer
+            let ep := add(elems, 0x20)
+            let p := 0x7f000001
+            let rr := 0x01fffffe
+            function swap32(x) -> y {
+                y := or(
+                    or(and(shl(24, x), 0xff000000), and(shl(8, x), 0xff0000)),
+                    or(and(shr(8, x), 0xff00), shr(24, x))
+                )
             }
-            default {
-                let src := add(rowsCd, mul(base, 4))
-                for { let j := 0 } lt(j, rowLimbs) { j := add(j, 1) } {
-                    let x := shr(224, calldataload(add(src, mul(j, 4))))
-                    let r := or(and(shr(8, x), 0x00ff00ff), and(shl(8, x), 0xff00ff00))
-                    r := or(and(shr(16, r), 0x0000ffff), and(shl(16, r), 0xffff0000))
-                    mstore(add(dst, mul(j, 0x20)), r)
+            // limb source: absolute calldata byte offset, or memory array data.
+            let src := rowsCd
+            switch rowsCd
+            case 0 { src := add(add(flat, 0x20), mul(base, 0x20)) }
+            default { src := add(rowsCd, mul(base, 4)) }
+            // One pass over the rowLimbs wire limbs: each canonical value v
+            // (range-checked here) feeds BOTH outputs - the Montgomery LE byte
+            // word for the leaf and the packed element lane for the fold.
+            // Base rows: limb j is element j, lane 0 only. Extension rows:
+            // limbs 4e..4e+3 fill element e top lane first; all four lanes are
+            // rewritten every query, so no stale bits survive the reuse.
+            // One pass over the rowLimbs wire limbs: each canonical value v
+            // (range-checked here) feeds BOTH outputs - the Montgomery LE
+            // byte word for the leaf and the packed element lane for the
+            // fold. Base rows: limb j is element j, lane 0 only. Extension
+            // rows: limbs 4e..4e+3 fill element e top lane first; every
+            // lane is rewritten each query, so buffer reuse is safe.
+            // The lane mask is a hoisted variable because forge-lint flags
+            // a literal value operand in shl as a suspected arg swap.
+            let m32 := 0xffffffff
+            for { let j := 0 } lt(j, rowLimbs) { j := add(j, 1) } {
+                let v := 0
+                switch rowsCd
+                case 0 { v := mload(add(src, shl(5, j))) }
+                default { v := swap32(shr(224, calldataload(add(src, shl(2, j))))) }
+                if iszero(lt(v, p)) { mstore(0, selTag) mstore(4, v) revert(0, 36) }
+                mstore(add(dst, shl(2, j)), shl(224, swap32(mod(mul(v, rr), p))))
+                switch rowsAreBase
+                case 1 { mstore(add(ep, shl(5, j)), shl(224, v)) }
+                default {
+                    let sh := sub(224, shl(5, and(j, 3)))
+                    let epw := add(ep, shl(5, shr(2, j)))
+                    mstore(epw, or(and(mload(epw), not(shl(sh, m32))), shl(sh, v)))
                 }
             }
-        }
-    }
 
-    /// elems[e] = limbs[4e] << 224 | limbs[4e+1] << 192 | limbs[4e+2] << 160
-    /// | limbs[4e+3] << 128 - the packed extension view of a limb row.
-    ///
-    /// The caller guarantees limbs.length >= 4 * elems.length (the round's
-    /// shape checks run before the first query); the loop skips Solidity's
-    /// per-index bounds checks, worth ~6,000 gas per query at rowElems = 16.
-    function _packElems(uint256[] memory elems, uint256[] memory limbs, uint256 n)
-        private
-        pure
-    {
-        assembly ("memory-safe") {
-            let lp := add(limbs, 0x20)
-            let ep := add(elems, 0x20)
-            for { let e := 0 } lt(e, n) { e := add(e, 1) } {
-                let b := shl(2, e)
-                let w :=
-                    or(
-                        or(shl(224, mload(add(lp, shl(5, b)))), shl(192, mload(add(lp, shl(5, add(b, 1)))))),
-                        or(shl(160, mload(add(lp, shl(5, add(b, 2))))), shl(128, mload(add(lp, shl(5, add(b, 3))))))
-                    )
-                mstore(add(ep, shl(5, e)), w)
-            }
+            leaf := keccak256(dst, mul(rowLimbs, 4))
         }
     }
 
@@ -540,6 +569,15 @@ library WhirVerifierCore {
         }
         if (input.rowElems != (uint256(1) << input.prevRandomness.length)) {
             revert RowBufferMismatch(uint256(1) << input.prevRandomness.length, input.rowElems);
+        }
+        // The row width relation the fused loader assumes: base rows send one
+        // wire limb per element, extension rows four. openAndFold used to
+        // enforce this per query; the loader folds the leaf and the elements
+        // in one pass, so the relation is checked once per round instead.
+        if (input.rowLimbs != input.rowElems
+            && input.rowLimbs != input.rowElems * KoalaBearExt4.DEGREE)
+        {
+            revert RowBufferMismatch(input.rowElems * KoalaBearExt4.DEGREE, input.rowLimbs);
         }
         uint256 expectedLimbs = input.numQueries * input.rowLimbs;
         uint256 haveLimbs = input.rowsCdBase == 0 ? input.rowsFlat.length : input.rowsLen;
@@ -576,42 +614,28 @@ library WhirVerifierCore {
 
         // --- 5: open and fold every query ------------------------------------------
         out.folds = new uint256[](input.numQueries);
-        uint256[] memory limbs = new uint256[](input.rowLimbs);
         uint256[] memory elems = new uint256[](input.rowElems);
         uint256[] memory flat = input.rowsFlat;
-        uint256 flatPtr;
-        uint256 limbsPtr;
-        assembly ("memory-safe") {
-            flatPtr := flat
-            limbsPtr := limbs
-        }
         uint256 rowsCd = input.rowsCdBase;
-        uint256 rowLimbs = input.rowLimbs;
         for (uint256 q; q < input.numQueries; ++q) {
-            uint256 base = q * input.rowLimbs;
-            _loadRow(limbs, flatPtr, rowsCd, base, rowLimbs);
-            if (input.rowsAreBase) {
-                // One base element per wire limb: limb j is element j.
-                for (uint256 j; j < input.rowElems; ++j) {
-                    elems[j] = StirOpenings.liftBase(limbs[j]);
-                }
-            } else {
-                // Four canonical limbs per extension element, low limb first.
-                // One assembly pass over the freshly loaded limbs: the
-                // Solidity loop paid a bounds check per limb read (~500 gas
-                // per element measured); the shapes are checked once per
-                // round above, so the indices here are in range by
-                // construction.
-                _packElems(elems, limbs, input.rowElems);
-            }
-            // The leaf authenticates the FLAT limbs (Montgomery wire form), the
-            // fold consumes the packed elements. Both views come from the same
-            // buffer, so they cannot disagree.
-            out.folds[q] = StirOpenings.openAndFold(
+            // One pass produces the packed fold inputs AND the authenticated
+            // leaf: the leaf covers the flat wire limbs (Montgomery form),
+            // the fold consumes the packed elements, both built from the same
+            // decode, so they cannot disagree.
+            bytes32 leaf = _loadRowFused(
+                elems,
+                flat,
+                rowsCd,
+                q * input.rowLimbs,
+                input.rowLimbs,
+                input.rowElems,
+                input.rowsAreBase
+            );
+            out.folds[q] = StirOpenings.openAndFoldLeaf(
                 input.prevCommitment,
                 indices[q],
                 input.logFoldedDomainSize,
-                limbs,
+                leaf,
                 elems,
                 input.pathsFlat,
                 q * input.logFoldedDomainSize,
@@ -784,6 +808,15 @@ library WhirVerifierCore {
         if (input.rowElems != (uint256(1) << input.prevRandomness.length)) {
             revert RowBufferMismatch(uint256(1) << input.prevRandomness.length, input.rowElems);
         }
+        // The row width relation the fused loader assumes: base rows send one
+        // wire limb per element, extension rows four. openAndFold used to
+        // enforce this per query; the loader folds the leaf and the elements
+        // in one pass, so the relation is checked once per round instead.
+        if (input.rowLimbs != input.rowElems
+            && input.rowLimbs != input.rowElems * KoalaBearExt4.DEGREE)
+        {
+            revert RowBufferMismatch(input.rowElems * KoalaBearExt4.DEGREE, input.rowLimbs);
+        }
         uint256 haveLimbsF = input.rowsCdBase == 0 ? input.rowsFlat.length : input.rowsLen;
         if (haveLimbsF != input.numQueries * input.rowLimbs) {
             revert RowBufferMismatch(input.numQueries * input.rowLimbs, haveLimbsF);
@@ -819,28 +852,24 @@ library WhirVerifierCore {
         }
 
         // --- open, fold, and check each query against the public polynomial ----------
-        uint256[] memory limbs = new uint256[](input.rowLimbs);
         uint256[] memory elems = new uint256[](input.rowElems);
         uint256[] memory flat = input.rowsFlat;
-        uint256 flatPtr;
-        uint256 limbsPtr;
-        assembly ("memory-safe") {
-            flatPtr := flat
-            limbsPtr := limbs
-        }
         uint256 rowsCd = input.rowsCdBase;
         for (uint256 q; q < input.numQueries; ++q) {
-            uint256 base = q * input.rowLimbs;
-            _loadRow(limbs, flatPtr, rowsCd, base, input.rowLimbs);
-            for (uint256 e; e < input.rowElems; ++e) {
-                elems[e] = (limbs[e * 4] << 224) | (limbs[e * 4 + 1] << 192)
-                    | (limbs[e * 4 + 2] << 160) | (limbs[e * 4 + 3] << 128);
-            }
-            uint256 fold = StirOpenings.openAndFold(
+            bytes32 leaf = _loadRowFused(
+                elems,
+                flat,
+                rowsCd,
+                q * input.rowLimbs,
+                input.rowLimbs,
+                input.rowElems,
+                false
+            );
+            uint256 fold = StirOpenings.openAndFoldLeaf(
                 input.lastCommitment,
                 indices[q],
                 input.logFoldedDomainSize,
-                limbs,
+                leaf,
                 elems,
                 input.pathsFlat,
                 q * input.logFoldedDomainSize,
