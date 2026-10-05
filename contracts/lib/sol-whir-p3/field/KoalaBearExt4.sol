@@ -226,23 +226,16 @@ library KoalaBearExt4 {
         if (point.length == 0) {
             return evals[0];
         }
-        if (point.length == 1) {
-            return _fold_once(evals[0], evals[1], point[0]);
-        }
-        if (point.length == 2) {
-            uint256 l0 = _fold_once(evals[0], evals[2], point[0]);
-            uint256 l1 = _fold_once(evals[1], evals[3], point[0]);
-            return _fold_once(l0, l1, point[1]);
-        }
-        if (point.length == 3) {
-            uint256 l0 = _fold_once(evals[0], evals[4], point[0]);
-            uint256 l1 = _fold_once(evals[1], evals[5], point[0]);
-            uint256 l2 = _fold_once(evals[2], evals[6], point[0]);
-            uint256 l3 = _fold_once(evals[3], evals[7], point[0]);
-            uint256 m0 = _fold_once(l0, l2, point[1]);
-            uint256 m1 = _fold_once(l1, l3, point[1]);
-            return _fold_once(m0, m1, point[2]);
-        }
+        // dims 1 and 2 have no unrolled path: WHIR folds 4 dimensions per
+        // round (rows of 16) and the closing sumcheck appends 3, so those
+        // shapes never occur in this protocol. The general loop below folds
+        // them correctly (in place - no caller reads evals after the fold);
+        // unrolling them cost 4 inlined fold copies of EIP-170 margin for a
+        // shape no vector exercises.
+        // dims 3 (the closing sumcheck's 3 randomness) also takes the general
+        // loop: 6 folds x ~100 gas of loop overhead, once per round - noise
+        // next to the EIP-170 margin it returns. The loop mutates evals in
+        // place; the final phase reads finalPoly one last time here.
         if (point.length == 4) {
             uint256 l0 = _fold_once(evals[0], evals[8], point[0]);
             uint256 l1 = _fold_once(evals[1], evals[9], point[0]);

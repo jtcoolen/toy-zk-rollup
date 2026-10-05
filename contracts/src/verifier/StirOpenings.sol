@@ -172,20 +172,14 @@ library StirOpenings {
         if (row.length != expected) {
             revert RowWidthMismatch(expected, row.length);
         }
-        // `evaluate_hypercube` contracts in place only on its general path
-        // (point.length > 4); the unrolled paths for dims 0-4 fold through
-        // registers and leave `evals` untouched. WHIR's folding factor is 4, so
-        // the protocol always takes a pure path and the copy is dead weight -
-        // a 16-word allocation + refill per query. Larger arities keep the
-        // defensive copy: the caller still needs the row to hash.
-        if (randomness.length <= 4) {
-            return KoalaBearExt4.evaluate_hypercube(row, randomness);
-        }
-        uint256[] memory scratch = new uint256[](row.length);
-        for (uint256 i; i < row.length; ++i) {
-            scratch[i] = row[i];
-        }
-        return KoalaBearExt4.evaluate_hypercube(scratch, randomness);
+        // `evaluate_hypercube` mutates `evals` in place only on its general
+        // path (point.length > 4); the unrolled paths for dims 0-4 fold
+        // through registers. WHIR's folding factor is 4, so the protocol
+        // always takes a pure path and a defensive copy would be dead weight -
+        // a 16-word allocation + refill per query. No live caller reads `row`
+        // after the fold: openAndFold hashes the leaf from the flat limbs
+        // BEFORE folding, and the query loop refills the row buffer per query.
+        return KoalaBearExt4.evaluate_hypercube(row, randomness);
     }
 
     /// Horner evaluation of a polynomial given as packed extension coefficients
