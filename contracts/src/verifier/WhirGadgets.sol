@@ -256,23 +256,30 @@ library WhirGadgets {
     )
         internal
         pure
-        returns (uint256)
+        returns (uint256 w)
     {
-        uint256 nEq = c.eqPoints.length;
-        uint256[] memory values = new uint256[](nEq + c.selVars.length);
-        for (uint256 i; i < nEq; ++i) {
-            values[i] = eqEval(localR, c.eqPoints[i]);
+        // Horner directly over the two groups instead of materialising the
+        // value array: powersCombination consumes values from the top down
+        // (values[len-1] first), so walking the groups backwards computes the
+        // identical sum with no allocation and no second pass. This runs once
+        // per query per round, and the array was pure overhead.
+        w = 0;
+        uint256 gamma = c.gamma;
+        for (uint256 i = c.selVars.length; i > 0; --i) {
+            w = KoalaBearExt4.add(
+                KoalaBearExt4.mul(w, gamma), selectEval(localR, c.selVars[i - 1])
+            );
         }
-        for (uint256 j; j < c.selVars.length; ++j) {
-            values[nEq + j] = selectEval(localR, c.selVars[j]);
+        for (uint256 i = c.eqPoints.length; i > 0; --i) {
+            w = KoalaBearExt4.add(
+                KoalaBearExt4.mul(w, gamma), eqEval(localR, c.eqPoints[i - 1])
+            );
         }
-        uint256 w = powersCombination(values, c.gamma);
         // initialPower is 0 or 1 in this protocol; the loop keeps it general and
         // costs nothing when it is zero.
         for (uint256 s; s < c.initialPower; ++s) {
-            w = KoalaBearExt4.mul(w, c.gamma);
+            w = KoalaBearExt4.mul(w, gamma);
         }
-        return w;
     }
 
     /// The batched constraint polynomial at the accumulated folding randomness.
