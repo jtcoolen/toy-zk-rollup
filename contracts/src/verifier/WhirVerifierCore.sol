@@ -373,8 +373,18 @@ library WhirVerifierCore {
         /// caller holds, never from the proof.
         uint256 numQueries;
         /// Opened rows, flattened canonical limbs: base-field limbs in round
-        /// 0, four limbs per extension element afterwards.
+        /// 0, four limbs per extension element afterwards. When the rows live
+        /// in calldata (the settlement path), rowsCdBase is the absolute
+        /// calldata byte offset of the flat limbs and rowsFlat is unused:
+        /// materializing 36k words of rows cost ~17M gas in memory expansion
+        /// alone at the heap's high-water mark, and the query loop copies each
+        /// row into its limbs buffer anyway. 0 selects the memory source (the
+        /// internal-API test harnesses build rows from JSON fixtures).
         uint256[] rowsFlat;
+        /// Absolute calldata byte offset of the flat rows, or 0 for memory.
+        uint256 rowsCdBase;
+        /// Total limbs available in the calldata source.
+        uint256 rowsLen;
         /// Canonical limbs per row (row width for base rows, 4x that for
         /// extension rows).
         uint256 rowLimbs;
@@ -451,6 +461,36 @@ library WhirVerifierCore {
     /// The step order is the transcript's, and steps 3-5 are interleaved the
     /// way the Rust interleaves them: the PoW sits between the OOD answers and
     /// the index draws, not next to the sumcheck.
+    /// Fill the reused limbs buffer with one opened row. rowsCd != 0 selects
+    /// the calldata source: rowLimbs u32 LE words at that byte offset,
+    /// expanded to canonical uint256 (byte-swap as in the section decoder).
+    /// rowsCd == 0 selects the memory source: rowLimbs words at flat + base.
+    /// A separate function keeps the query loop's stack shallow.
+    function _loadRow(
+        uint256[] memory limbs,
+        uint256 flatPtr,
+        uint256 rowsCd,
+        uint256 base,
+        uint256 rowLimbs
+    ) private pure {
+        assembly ("memory-safe") {
+            let dst := add(limbs, 0x20)
+            switch rowsCd
+            case 0 {
+                mcopy(dst, add(add(flatPtr, 0x20), mul(base, 0x20)), mul(rowLimbs, 0x20))
+            }
+            default {
+                let src := add(rowsCd, mul(base, 4))
+                for { let j := 0 } lt(j, rowLimbs) { j := add(j, 1) } {
+                    let x := shr(224, calldataload(add(src, mul(j, 4))))
+                    let r := or(and(shr(8, x), 0x00ff00ff), and(shl(8, x), 0xff00ff00))
+                    r := or(and(shr(16, r), 0x0000ffff), and(shl(16, r), 0xffff0000))
+                    mstore(add(dst, mul(j, 0x20)), r)
+                }
+            }
+        }
+    }
+
     function verifyRound(
         Transcript memory t,
         RoundSchedule memory s,
@@ -471,8 +511,9 @@ library WhirVerifierCore {
             revert RowBufferMismatch(uint256(1) << input.prevRandomness.length, input.rowElems);
         }
         uint256 expectedLimbs = input.numQueries * input.rowLimbs;
-        if (input.rowsFlat.length != expectedLimbs) {
-            revert RowBufferMismatch(expectedLimbs, input.rowsFlat.length);
+        uint256 haveLimbs = input.rowsCdBase == 0 ? input.rowsFlat.length : input.rowsLen;
+        if (haveLimbs != expectedLimbs) {
+            revert RowBufferMismatch(expectedLimbs, haveLimbs);
         }
         if (input.paths.length != input.numQueries) {
             revert RoundRowCountMismatch(input.numQueries, input.paths.length);
@@ -512,16 +553,15 @@ library WhirVerifierCore {
         uint256[] memory flat = input.rowsFlat;
         uint256 flatPtr;
         uint256 limbsPtr;
-        uint256 rowBytes = input.rowLimbs * 32;
         assembly ("memory-safe") {
             flatPtr := flat
             limbsPtr := limbs
         }
+        uint256 rowsCd = input.rowsCdBase;
+        uint256 rowLimbs = input.rowLimbs;
         for (uint256 q; q < input.numQueries; ++q) {
             uint256 base = q * input.rowLimbs;
-            assembly ("memory-safe") {
-                mcopy(add(limbsPtr, 0x20), add(add(flatPtr, 0x20), mul(base, 0x20)), rowBytes)
-            }
+            _loadRow(limbs, flatPtr, rowsCd, base, rowLimbs);
             if (input.rowsAreBase) {
                 // One base element per wire limb: limb j is element j.
                 for (uint256 j; j < input.rowElems; ++j) {
@@ -625,6 +665,11 @@ library WhirVerifierCore {
         /// Terminal opened rows (extension-valued), flattened canonical limbs,
         /// plus the same geometry as RoundInput's row fields.
         uint256[] rowsFlat;
+        /// Absolute calldata byte offset of the flat rows, or 0 for memory
+        /// (see RoundInput.rowsCdBase).
+        uint256 rowsCdBase;
+        /// Total limbs available in the calldata source.
+        uint256 rowsLen;
         uint256 rowLimbs;
         uint256 rowElems;
         /// Per-query Merkle paths against `lastCommitment`.
@@ -706,8 +751,9 @@ library WhirVerifierCore {
         if (input.rowElems != (uint256(1) << input.prevRandomness.length)) {
             revert RowBufferMismatch(uint256(1) << input.prevRandomness.length, input.rowElems);
         }
-        if (input.rowsFlat.length != input.numQueries * input.rowLimbs) {
-            revert RowBufferMismatch(input.numQueries * input.rowLimbs, input.rowsFlat.length);
+        uint256 haveLimbsF = input.rowsCdBase == 0 ? input.rowsFlat.length : input.rowsLen;
+        if (haveLimbsF != input.numQueries * input.rowLimbs) {
+            revert RowBufferMismatch(input.numQueries * input.rowLimbs, haveLimbsF);
         }
         if (input.paths.length != input.numQueries) {
             revert RoundRowCountMismatch(input.numQueries, input.paths.length);
@@ -748,16 +794,14 @@ library WhirVerifierCore {
         uint256[] memory flat = input.rowsFlat;
         uint256 flatPtr;
         uint256 limbsPtr;
-        uint256 rowBytes = input.rowLimbs * 32;
         assembly ("memory-safe") {
             flatPtr := flat
             limbsPtr := limbs
         }
+        uint256 rowsCd = input.rowsCdBase;
         for (uint256 q; q < input.numQueries; ++q) {
             uint256 base = q * input.rowLimbs;
-            assembly ("memory-safe") {
-                mcopy(add(limbsPtr, 0x20), add(add(flatPtr, 0x20), mul(base, 0x20)), rowBytes)
-            }
+            _loadRow(limbs, flatPtr, rowsCd, base, input.rowLimbs);
             for (uint256 e; e < input.rowElems; ++e) {
                 elems[e] = (limbs[e * 4] << 224) | (limbs[e * 4 + 1] << 192)
                     | (limbs[e * 4 + 2] << 160) | (limbs[e * 4 + 3] << 128);

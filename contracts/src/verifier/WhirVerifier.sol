@@ -477,7 +477,8 @@ contract WhirVerifier is IWhirVerifier {
         input.rowElems = rowElems;
         input.rowLimbs = rowElems * (rowsAreBase ? 1 : 4);
         input.rowsAreBase = rowsAreBase;
-        input.rowsFlat = _slice(p.rowsFlat, cur.rowOff, nq * input.rowLimbs);
+        input.rowsCdBase = p.rowsAbs + cur.rowOff * 4;
+        input.rowsLen = nq * input.rowLimbs;
         cur.rowOff += nq * input.rowLimbs;
 
         // Every query in round i opens at depth sched_log_folded[i].
@@ -618,7 +619,9 @@ contract WhirVerifier is IWhirVerifier {
         uint256[] initScA;
         uint256[] initScInf;
         uint256[] initScPow;
-        uint256[] rowsFlat;
+        // Flat rows stay in calldata: absolute byte offset + limb count.
+        uint256 rowsAbs;
+        uint256 rowsLen;
         // Merkle-path blobs stay in calldata: absolute calldata BYTE offsets
         // of the blob data (calldata refs cannot live in a memory struct, and
         // threading the proof through would blow the stack in _runOneInter-
@@ -689,7 +692,18 @@ contract WhirVerifier is IWhirVerifier {
         (p.initScA, no) = _extArr(m, no);
         (p.initScInf, no) = _extArr(m, no);
         (p.initScPow, no) = _arr(m, no);
-        (p.rowsFlat, no) = _arr(m, no);
+        {
+            // _arr prefix: count of u32 limbs (4 bytes each).
+            uint256 nLimbs;
+            (nLimbs, no) = _word(m, no);
+            uint256 abs;
+            assembly ("memory-safe") {
+                abs := add(m.offset, mul(no, 4))
+            }
+            p.rowsAbs = abs;
+            p.rowsLen = nLimbs;
+            no += nLimbs;
+        }
         {
             uint256 nBytes;
             (nBytes, no) = _word(m, no);
