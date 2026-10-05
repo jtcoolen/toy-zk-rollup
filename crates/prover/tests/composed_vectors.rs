@@ -8,8 +8,8 @@
 //! # The composition claim
 //!
 //! The settlement contract replays the batch transcript (pinned by
-//! batch_stark_vectors) and, at the delegate, runs its own WHIR core (ported in M1-M4
-//! from the walk pinned by whir_proof_vectors). Neither pin alone proves the two halves
+//! `batch_stark_vectors`) and, at the delegate, runs its own WHIR core (ported in M1-M4
+//! from the walk pinned by `whir_proof_vectors`). Neither pin alone proves the two halves
 //! compose: the batch fixture hands the WHIR core a per-round statement (stacked config,
 //! opening schedule, univariate points) that only exists at settlement shape, and the
 //! WHIR fixture never sees the batch transcript around it.
@@ -17,22 +17,22 @@
 //! This test closes that gap. It proves the settlement batch under the semantic config,
 //! replays the batch phases by hand, and inside transcript.delegate replaces the native
 //! PCS with the shared WHIR walk: for each of the five opening rounds it rebuilds the
-//! WHIR config and opening schedule from public ingredients (padded_arity,
-//! checked_stacked_num_variables, univariate_eq_point - the same construction
-//! round_schedule performs), drives verify_whir_round on the batch challenger, and
+//! WHIR config and opening schedule from public ingredients (`padded_arity`,
+//! `checked_stacked_num_variables`, `univariate_eq_point` - the same construction
+//! `round_schedule` performs), drives `verify_whir_round` on the batch challenger, and
 //! re-checks the claimed openings against the walk's bound evaluations with the
-//! univariate-eq scales. one_run then asserts the combined event program equals the
-//! native CircuitVerifier::verify run's - batch phases and WHIR core events alike.
+//! univariate-eq scales. `one_run` then asserts the combined event program equals the
+//! native `CircuitVerifier::verify` run's - batch phases and WHIR core events alike.
 //!
 //! If the programs agree, the Solidity composition is mechanical assembly of pieces
-//! each already pinned: BatchTranscript.sol up to the delegate, then WhirVerifierCore
+//! each already pinned: `BatchTranscript.sol` up to the delegate, then `WhirVerifierCore`
 //! per round with the statement exported here.
 #![recursion_limit = "256"]
 
 use std::error::Error;
 use std::path::PathBuf;
 
-use p3_field::{PrimeCharacteristicRing, PrimeField32};
+use p3_field::PrimeCharacteristicRing;
 use serde_json::json;
 
 use prover::semantic_blob::classify_observations;
@@ -52,9 +52,15 @@ use prover::whir_recursion::InnerWhirConfig;
 use shielded::keys::derive_spend_pk;
 use shielded::{Note, NullifierMap};
 
+// The ZK PCS type flag guards the randomization round: with ZK on, round 0 is
+// the randomization commitment and there are five opening rounds; without it
+// the five-round shape pin would already be wrong. Checked at compile time - a
+// const context rejects a false value, so this cannot rot into dead runtime code.
+const _: bool = <SemPcs as p3_commit::UnivariateStarkPcs<Challenge, SemChallenger>>::ZK;
+
 /// The linchpin: prove, verify natively, replay the batch phases with the shared WHIR
 /// walk in the delegate, and require the combined programs to agree (asserted inside
-/// one_run). Then export the per-round statements and the composed blob for Solidity.
+/// `one_run`). Then export the per-round statements and the composed blob for Solidity.
 ///
 /// Two runs, same circuit and config, each re-masking: classifying them splits the
 /// settlement event stream into config-fixed absorbs (the contract regenerates them
@@ -79,7 +85,7 @@ fn composed_program_equality_and_export() {
     );
     assert_eq!(starts_a, starts_b, "runs disagree on round boundaries");
 
-    let (fixed_raw, varying_raw) = classify_observations(&[program_a.clone(), program_b.clone()]);
+    let (fixed_raw, varying_raw) = classify_observations(&[program_a, program_b.clone()]);
     // Proof-data zeros: a config-fixed run whose every word is zero is not a
     // framing constant but a structurally-zero extension element (a high
     // final_poly coefficient, or a zero column of a claim's evaluations) that
@@ -144,13 +150,49 @@ fn composed_artifact_shape_is_pinned() {
     // Every round carries a completed walk: the terminal phase closed with a claim.
     for r in rounds {
         assert!(r["walk"]["terminal"]["claimed_after_final"].is_array());
-        assert!(r["walk"]["rounds"]["params"].as_array().unwrap().len() >= 1);
-        assert!(r["schedule"]["rounds"].as_array().unwrap().len() >= 1);
+        assert!(!r["walk"]["rounds"]["params"].as_array().unwrap().is_empty());
+        assert!(!r["schedule"]["rounds"].as_array().unwrap().is_empty());
     }
-    // The ZK PCS type flag guards the randomization round: with ZK on, round 0 is
-    // the randomization commitment and there are five rounds; without it the shape
-    // pin above would already be wrong, but assert the flag too.
-    assert!(<SemPcs as p3_commit::UnivariateStarkPcs<Challenge, SemChallenger>>::ZK);
+}
+
+/// Genesis data for the on-chain test, written as the small sidecar the
+/// Solidity E2E test reads (the full export is tens of MB and parsing it
+/// on-chain in setUp exhausts the EVM memory limit). Returns the extras the
+/// full export embeds.
+fn write_block_genesis(
+    note: Note,
+    out_note: Note,
+    pis: &[F],
+) -> Result<Vec<(&'static str, serde_json::Value)>, Box<dyn Error>> {
+    // The pool must start at the tree the block was witnessed against (the
+    // funded note's leaf), and the expected root after the block's output is
+    // appended pins the contract's own accumulator against the prover's tree.
+    let mut pool_tree = tree_with(&[note]).0;
+    pool_tree.append(&out_note.commit(&Keccak256Commitment));
+    let extras = vec![
+        (
+            "genesis_leaves",
+            json!([hex(note.commit(&Keccak256Commitment).as_bytes())]),
+        ),
+        (
+            "pool_root_after_hex",
+            json!(hex(pool_tree.root().as_bytes())),
+        ),
+    ];
+    let sidecar = serde_json::json!({
+        "statement": pis
+            .iter()
+            .map(p3_field::PrimeField32::as_canonical_u32)
+            .collect::<Vec<_>>(),
+        "genesis_leaves": extras[0].1.clone(),
+        "pool_root_after_hex": extras[1].1.clone(),
+    });
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../contracts/test/vectors");
+    std::fs::write(
+        dir.join("block_genesis.json"),
+        serde_json::to_string_pretty(&sidecar)?,
+    )?;
+    Ok(extras)
 }
 
 /// The real shielded block circuit through the same composed machinery.
@@ -158,7 +200,7 @@ fn composed_artifact_shape_is_pinned() {
 /// One client transfer (a funded note spent through the transfer circuit with a
 /// real SPHINCS+ signature, SHA3-256 note derivation and nullifier absence fold)
 /// recursed into the block circuit and settled under the Keccak WHIR config at
-/// BLOCK_LOG_MAX_LDE. The export is what the contract replays:
+/// `BLOCK_LOG_MAX_LDE`. The export is what the contract replays:
 /// `block_composed_vectors.{json,bin}` plus the block statement (shape header +
 /// child statement, canonical limbs) that `ShieldedPool.applyBlock` receives.
 ///
@@ -242,43 +284,7 @@ fn block_program_equality_and_export() -> Result<(), Box<dyn Error>> {
 
     let (fixed_raw, _varying_raw) = classify_observations(&[program_a, program_b.clone()]);
     let fixed = reclassify_zero_runs(&program_b, fixed_raw);
-    // Genesis data for the on-chain test: the pool must start at the tree the
-    // block was witnessed against (the funded note's leaf), and the expected
-    // root after the block's output is appended pins the contract's own
-    // accumulator against the prover's tree.
-    let mut pool_tree = tree_with(&[note]).0;
-    pool_tree.append(&out_note.commit(&Keccak256Commitment));
-    let extras = vec![
-        (
-            "genesis_leaves",
-            json!([hex(note.commit(&Keccak256Commitment).as_bytes())]),
-        ),
-        (
-            "pool_root_after_hex",
-            json!(hex(pool_tree.root().as_bytes())),
-        ),
-    ];
-    // Small sidecar for the Solidity test: the full export is tens of MB and
-    // parsing it on-chain in setUp exhausts the EVM memory limit. The E2E test
-    // reads only this file plus the bundle.
-    let sidecar = serde_json::json!({
-        "statement": pis.iter().map(|v| v.as_canonical_u32()).collect::<Vec<_>>(),
-        "genesis_leaves": extras
-            .iter()
-            .find(|(k, _)| *k == "genesis_leaves")
-            .map(|(_, v)| v.clone())
-            .unwrap(),
-        "pool_root_after_hex": extras
-            .iter()
-            .find(|(k, _)| *k == "pool_root_after_hex")
-            .map(|(_, v)| v.clone())
-            .unwrap(),
-    });
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../contracts/test/vectors");
-    std::fs::write(
-        dir.join("block_genesis.json"),
-        serde_json::to_string_pretty(&sidecar)?,
-    )?;
+    let extras = write_block_genesis(note, out_note, &pis)?;
     export_and_write(
         doc,
         &out,

@@ -37,12 +37,12 @@ use p3_circuit_prover::CircuitVerifier;
 use p3_lookup::LogUpGadget;
 
 use crate::constraint_ir::{instance_identity_json, EF};
-use crate::semantic_blob::replay_blob;
+use crate::semantic_blob::{classify_observations, replay_blob};
 use crate::semantic_trace::{SemChallenger, SemEvent, SemProgram};
 use crate::settlement_replay::{
     base_json, bus_layout, com_json, dom_json, ext_json, fib_recursion, hex, one_run_for,
-    settlement_params, Challenge, Dft, OpeningClaims, OpeningProof, ReplayOut, SemConfig,
-    CAP_HEIGHT,
+    settlement_params, settlement_params_for, Challenge, Dft, OpeningClaims, OpeningProof,
+    ReplayOut, SemConfig, CAP_HEIGHT,
 };
 use crate::whir::FOLDING_FACTOR;
 use crate::whir_recursion::{RecursionCircuit, LOG_MAX_LDE};
@@ -733,20 +733,25 @@ fn round_run_schedule(
         .collect()
 }
 
-/// Shared export tail: classification outputs + framing tables + blob written to
-/// `contracts/test/vectors/{name}.json` / `{name}.bin`. `statement` (canonical
-/// limbs) is embedded only when provided - the block export ships the statement
-/// ShieldedPool.applyBlock must pass alongside the proof.
-pub fn export_and_write(
+/// Shared export tail, in memory: classification outputs + framing tables +
+/// semantic blob, returned as `(vectors doc, blob)`.
+///
+/// This is the whole export computation with no filesystem attached - the node
+/// calls it to build a WBND bundle straight from a block artifact, while the
+/// test-side [`export_and_write`] stays a thin writer over the same code. One
+/// implementation, so the committed vectors and the node's bundle cannot
+/// drift. `statement` (canonical limbs) is embedded only when provided - the
+/// block export ships the statement ShieldedPool.applyBlock must pass
+/// alongside the proof.
+pub fn build_vectors_doc(
     doc: serde_json::Value,
     out: &ReplayOut,
     program: &SemProgram,
     fixed: &[Option<Vec<u32>>],
     starts: &[usize],
-    name: &str,
     statement: Option<&[F]>,
     extras: Vec<(&str, serde_json::Value)>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(serde_json::Value, Vec<u8>), Box<dyn Error>> {
     let varying = varying_positions(program, fixed);
     let blob = replay_blob(program, fixed).expect("composed blob");
     let mut doc = doc;
@@ -791,7 +796,25 @@ pub fn export_and_write(
         .iter()
         .find(|(n, _)| n == "before_delegate")
         .map(|(_, at)| *at));
+    Ok((doc, blob))
+}
 
+/// Shared export tail: classification outputs + framing tables + blob written to
+/// `contracts/test/vectors/{name}.json` / `{name}.bin`. `statement` (canonical
+/// limbs) is embedded only when provided - the block export ships the statement
+/// ShieldedPool.applyBlock must pass alongside the proof.
+pub fn export_and_write(
+    doc: serde_json::Value,
+    out: &ReplayOut,
+    program: &SemProgram,
+    fixed: &[Option<Vec<u32>>],
+    starts: &[usize],
+    name: &str,
+    statement: Option<&[F]>,
+    extras: Vec<(&str, serde_json::Value)>,
+) -> Result<(), Box<dyn Error>> {
+    let (doc, blob) = build_vectors_doc(doc, out, program, fixed, starts, statement, extras)?;
+    let const_words = doc["round_const_words"].as_array().map_or(0, Vec::len);
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../contracts/test/vectors");
     std::fs::create_dir_all(&dir).expect("vectors dir");
     std::fs::write(
@@ -872,4 +895,66 @@ fn round_framing_tables(
             })
         })
         .collect()
+}
+
+/// The node-facing bundle: prove a settlement batch and encode the WBND v4
+/// bundle the contract consumes, entirely in memory.
+///
+/// This is the same pipeline the block export test runs
+/// (`composed_program_equality_and_export`), minus the filesystem: two
+/// composed runs (the first only to classify constant runs against the
+/// second), the framing tables via [`build_vectors_doc`], then
+/// [`crate::wbnd::flat_from_vectors`] + [`crate::wbnd::encode_bundle`].
+/// The bundle embeds the proof of the SECOND run - the same run whose
+/// transcript events the blob carries - so what the contract verifies is
+/// exactly what the blob encodes; the caller's already-verified artifact
+/// proof is a different random run and is not shipped.
+///
+/// Returns the bundle bytes plus the vectors doc (the audit surface:
+/// statement limbs, constraint identity, framing tables) so the operator
+/// can pin or archive it.
+///
+/// Cost note: two settlement proofs per call (classification needs two
+/// observations). The sequencer's native verification is a third run.
+/// Accepted for now - correctness first, proof-count optimization is
+/// explicitly deferred.
+pub fn settlement_bundle(
+    rc: &RecursionCircuit,
+    statement: &[F],
+) -> Result<(Vec<u8>, serde_json::Value), Box<dyn Error>> {
+    let params = settlement_params_for(crate::block::BLOCK_LOG_MAX_LDE);
+    let mut rounds_a = Vec::new();
+    let mut starts_a = Vec::new();
+    let (_doc_a, _out_a, program_a) = composed_run_with(
+        statement,
+        rc,
+        &params,
+        crate::block::BLOCK_LOG_MAX_LDE,
+        &mut rounds_a,
+        &mut starts_a,
+    )?;
+    let mut rounds_b = Vec::new();
+    let mut starts_b = Vec::new();
+    let (doc, out, program_b) = composed_run_with(
+        statement,
+        rc,
+        &params,
+        crate::block::BLOCK_LOG_MAX_LDE,
+        &mut rounds_b,
+        &mut starts_b,
+    )?;
+    let (fixed_raw, _varying_raw) = classify_observations(&[program_a, program_b.clone()]);
+    let fixed = reclassify_zero_runs(&program_b, fixed_raw);
+    let (jj, blob) = build_vectors_doc(
+        doc,
+        &out,
+        &program_b,
+        &fixed,
+        &starts_b,
+        Some(statement),
+        Vec::new(),
+    )?;
+    let flat = crate::wbnd::flat_from_vectors(&jj);
+    let bundle = crate::wbnd::encode_bundle(&flat, &jj, &blob);
+    Ok((bundle, jj))
 }
