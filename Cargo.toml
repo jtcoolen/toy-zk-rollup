@@ -104,6 +104,7 @@ p3-batch-stark = "0.8.0"
 p3-sumcheck = "0.8.0"
 p3-whir = "0.8.0"
 p3-multilinear-util = "0.8.0"
+p3-poseidon2 = "0.8.0"
 p3-poseidon2-air = "0.8.0"
 
 # --- Infrastructure ---

@@ -16,8 +16,9 @@
 //! | Layer | Primitive | Why |
 //! |---|---|---|
 //! | Shielded (note/nullifier derivation) | SHA3-256 | User-mandated. FIPS-202, post-quantum. |
-//! | Commitment (Merkle tree, FRI) | Keccak-256 | Native EVM opcode `0x20`; ~30 gas per hash. |
-//! | Transcript (Fiat-Shamir) | Keccak-256 | Same opcode; the Solidity verifier replays it natively. |
+//! | Commitment (note Merkle tree) | Poseidon2 (`KoalaBear`, width 16) | The tree is hashed *in-circuit* now: the proof attests each append and the contract only stores roots. One Poseidon2 perm is one AIR row; Keccak-f would cost ~24. See D-088 and [`poseidon`]. |
+//! | Nullifier tree (in-circuit absence folds) | Keccak-256 | Already arithmetized with the vendored Keccak gadget; the contract never touches it. Untouched by D-088. |
+//! | Transcript (Fiat-Shamir) | Keccak-256 | Native EVM opcode; the Solidity verifier replays it natively. |
 //!
 //! Keccak-256 and SHA3-256 are the same sponge with a different domain-separation
 //! byte: Keccak-256 (the original) pads with `0x01`, FIPS-202 SHA3-256 pads with
@@ -39,18 +40,25 @@
 //!
 //! ## What this crate deliberately does not do
 //!
-//! It has no dependency on Plonky3. The Plonky3 challenger plumbing lives in
-//! `prover`, so this crate stays a pure, auditable crypto leaf.
+//! Its only Plonky3 dependency is the Poseidon2 commitment layer: pure-Rust
+//! field, permutation and sponge crates, no prover plumbing. The challenger
+//! machinery still lives in `prover`.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 mod commitment;
 mod digest;
+mod poseidon;
 mod shielded;
 mod traits;
 
 pub use commitment::Keccak256Commitment;
 pub use digest::{Digest32, MerkleRoot, NoteHash, Nullifier};
+pub use poseidon::{
+    bytes_to_field_elements, digest_to_elements, elements_to_digest, poseidon2_16, Field,
+    Poseidon2Commitment, Poseidon2Compress, Poseidon2Perm16, Poseidon2Sponge, DIGEST_ELEMS,
+    KOALABEAR_P_U32, RATE, WIDTH,
+};
 pub use shielded::Sha3_256Shielded;
 pub use traits::{CommitmentHasher, ShieldedHasher};
 

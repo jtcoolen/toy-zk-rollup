@@ -1992,6 +1992,11 @@ name = "pq-hash"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "p3-field",
+ "p3-koala-bear",
+ "p3-poseidon2",
+ "p3-symmetric",
+ "proptest",
  "sha3",
  "tiny-keccak",
 ]
