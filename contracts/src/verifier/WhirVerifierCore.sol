@@ -509,10 +509,18 @@ library WhirVerifierCore {
         out.folds = new uint256[](input.numQueries);
         uint256[] memory limbs = new uint256[](input.rowLimbs);
         uint256[] memory elems = new uint256[](input.rowElems);
+        uint256[] memory flat = input.rowsFlat;
+        uint256 flatPtr;
+        uint256 limbsPtr;
+        uint256 rowBytes = input.rowLimbs * 32;
+        assembly ("memory-safe") {
+            flatPtr := flat
+            limbsPtr := limbs
+        }
         for (uint256 q; q < input.numQueries; ++q) {
             uint256 base = q * input.rowLimbs;
-            for (uint256 j; j < input.rowLimbs; ++j) {
-                limbs[j] = input.rowsFlat[base + j];
+            assembly ("memory-safe") {
+                mcopy(add(limbsPtr, 0x20), add(add(flatPtr, 0x20), mul(base, 0x20)), rowBytes)
             }
             if (input.rowsAreBase) {
                 // One base element per wire limb: limb j is element j.
@@ -738,10 +746,18 @@ library WhirVerifierCore {
         // --- open, fold, and check each query against the public polynomial ----------
         uint256[] memory limbs = new uint256[](input.rowLimbs);
         uint256[] memory elems = new uint256[](input.rowElems);
+        uint256[] memory flat = input.rowsFlat;
+        uint256 flatPtr;
+        uint256 limbsPtr;
+        uint256 rowBytes = input.rowLimbs * 32;
+        assembly ("memory-safe") {
+            flatPtr := flat
+            limbsPtr := limbs
+        }
         for (uint256 q; q < input.numQueries; ++q) {
             uint256 base = q * input.rowLimbs;
-            for (uint256 j; j < input.rowLimbs; ++j) {
-                limbs[j] = input.rowsFlat[base + j];
+            assembly ("memory-safe") {
+                mcopy(add(limbsPtr, 0x20), add(add(flatPtr, 0x20), mul(base, 0x20)), rowBytes)
             }
             for (uint256 e; e < input.rowElems; ++e) {
                 uint256[4] memory coeffs;
