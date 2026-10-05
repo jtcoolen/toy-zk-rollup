@@ -106,7 +106,127 @@ EIP-170 constraint: margin is 385 B, so every added helper must pay for
 itself in removed code. Assembly `mcopy` loops are size-neutral-to-smaller
 than Solidity element loops under via_ir.
 
-## 6. Optimization log (before -> after)
+## 6. Fine-grained per-round profile (second instrumentation pass, reverted)
 
-_(numbers land here as each change is committed; every entry keeps
-`forge test` green, and the e2e node settlement re-verified at phase end.)_
+Brackets inside verifyRound step 5 (row copy vs openAndFold), verifyFinal
+(poly-bind vs terminal queries vs closing sumcheck vs terminal identity),
+and per-round decode. Instrumented total 1,089.5M (brackets add ~25M):
+
+| Round | decode | identity | row copy | open+fold | term queries | poly-bind | closing | total |
+|---|---|---|---|---|---|---|---|---|
+| r0 | 6.67M | 10.66M | 10.95M | 16.18M | 3.24M | 0.07M | 0.05M | 52.15M |
+| r1 | 20.53M | 100.48M | 19.62M | 27.93M | 4.02M | 0.09M | 0.06M | 189.42M |
+| r2 | 23.82M | 36.35M | 24.79M | 34.29M | 7.34M | 0.21M | 0.08M | 140.34M |
+| r3 | 32.71M | 58.05M | 34.92M | 45.24M | 6.32M | 0.10M | 0.05M | 187.25M |
+| r4 | 37.98M | 64.63M | 36.20M | 48.29M | 9.93M | 0.23M | 0.09M | 206.32M |
+| sum | 121.7M | 270.2M | 126.5M | 171.9M | 30.9M | 0.7M | 0.3M | 975.5M |
+
+The **terminal identity is the single largest consumer (270M, ~25%)**, not the
+openings. Its cost is extension-field arithmetic: eqEval (2 ext muls per
+coordinate) + selectEval (2-3 ext muls per coordinate) over 1,889 eq/sel
+points of 22-26 coordinates, dominated by r1 (100M: 585 points x 26 coords).
+Ext4 mul pays four full 256-bit `% MODULUS` divisions (~400-600 gas each) -
+the field layer is the multiplier behind identity, openAndFold folds, and
+sumcheck checks alike.
+
+## 7. Optimization log (before/after, all on test_verify_accepts_the_real_proof)
+
+Baseline 1,064,286,857 gas. Cumulative so far: **-183,313,383 (-17.2%)**.
+
+| # | Commit | Change | After | Delta |
+|---|---|---|---|---|
+| 1 | `84198c1` | Hoist per-query limbs/elems out of verifyRound loop (Solidity never rewinds free memory; 170-query rounds grew it monotonically, paying expansion+zeroing per query) | 933,914,346 | -130,372,511 |
+| 2 | `c55ed7e` | Same hoist in verifyFinal terminal query loop | 922,081,716 | -11,832,630 |
+| 3 | `0db21e7` | mcopy the decode copies (_slice, _ragged, _paths). _repeat stays a loop: mcopy copies a region, it does not repeat a pattern | 893,071,405 | -29,010,311 |
+| 4 | `d2c1620` | mcopy the per-query row fill from rowsFlat (both query loops) | 880,973,474 | -12,097,931 |
+
+applyBlock (full pool path): 1,781,295,114 -> 1,548,397,349 (-232.9M, -13.1%).
+WhirVerifier runtime code: 24,191 -> 23,872 B (EIP-170 margin 385 -> 704 B).
+All 130 forge tests pass at every step; e2e path untouched.
+
+Gotchas recorded the hard way:
+- `mcopy` scratch via `add(out, len)` corrupts memory under via_ir (out is not
+  necessarily the last allocation). Use `mload(0x40)` scratch or a real region.
+- Assembly cannot resolve struct member access (`input.rowLimbs`); bind locals
+  outside the asm block. `uint256[] memory` -> `uint256` casts need an asm move.
+- Library-level `internal` storage vars break `pure` - thread probes through
+  output structs instead.
+
+## 8. Proof-size feasibility: can one transaction carry the settlement?
+
+Measured on the real WBND v4 block bundle (block_composed_bundle.bin):
+
+| Quantity | Value |
+|---|---|
+| Bundle total | **2,825,568 B** (2.83 MB) |
+| CONFIG section | 235,348 B (8.3%) - trusted, pinned at deploy |
+| PROOF section | 2,587,128 B (91.6%) |
+| STATEMENT section | 3,076 B (0.1%) |
+| Calldata gas (16/nz + 4/z: 1.48M nz, 1.35M zero) | **29,063,856** |
+
+PROOF section field breakdown (exact, from the encoder):
+
+| Field | Bytes | % of PROOF |
+|---|---|---|
+| **eq_points (ext)** | **1,499,456** | **58.0%** |
+| **paths_hex (Merkle)** | **810,900** | **31.3%** |
+| rows_flat (u32) | 146,560 | 5.7% |
+| bound_evals (ext) | 60,128 | 2.3% |
+| final_paths + final_rows | 51,476 | 2.0% |
+| everything else | ~18,600 | 0.7% |
+
+### One-transaction verdict
+
+- **This appchain: yes, proven.** The node E2E settles in one tx (1.64B gas,
+  2.83 MB calldata) with `--block-gas-limit 20000000000 --no-request-size-limit`.
+  The RPC transport needs a raised body limit: hex-encoded calldata doubles
+  the payload (~5.7 MB JSON), which is why the node E2E runs anvil with
+  `--no-request-size-limit`.
+- **Mainnet-class chain: no.** Calldata alone costs 29.1M gas versus a ~36M
+  block gas limit - one settlement would eat ~80% of a block before executing.
+  EIP-4844 blobs cannot help: 6 blobs/tx = 786 KiB max, under a third of the
+  bundle. The ChunkVerifier multi-tx carry (sponge serialized across calls)
+  is the designed answer for constrained chains: split per round, each tx
+  carries that round's rows+paths (~30-190 MB/round worst case... realistically
+  per-query batches of ~100 queries ≈ 40 KB), state carries the transcript.
+
+### The eq_points finding (the size headline)
+
+The per-round `eq_points` (D-072 phase 1: zeta-derived OOD group points for
+the constraint identity) are **massively redundant**: 46,858 packed-ext
+entries, only **470 distinct** (99% duplicates - r1 sends 15,210 entries of
+which 105 are distinct). They are NOT univariate expansions (checked: entry
+squares do not chain), so they cannot be regenerated by expandFromUnivariate;
+they are the batch-layer OOD points, a deterministic function of the
+transcript-sampled zeta and per-matrix domain constants (config).
+
+Two size plays, in order of risk:
+1. **Dedup wire format (WBND v5)**: dictionary of distinct entries + u16 index
+   map. 1,499,456 B -> 108,756 B (-92.7%). Bundle 2.83 MB -> **1.43 MB**,
+   calldata 29.1M -> ~14.7M gas. Provably safe (same bytes, indexed), but
+   touches encoder + decoder + pin tests.
+2. **D-072 phase 2 (full derivation)**: recompute eq_points in the contract
+   from zeta + config, drop the field entirely: bundle -> **~1.33 MB**, and
+   removes their decode cost too (eq_points dominate the 121.7M decode).
+   Needs the exact zeta->point mapping ported from p3-batch-stark.
+
+Floor without eq_points: paths 811 KB + rows 147 KB + evals/sumchecks ~130 KB
+≈ **1.0 MB ≈ 10.5M calldata gas**. Paths are irreducible per-query Merkle
+authentication (the security of the opening); rows are the opened values
+themselves. Below ~1 MB you must change the proof system (smaller fields,
+fewer queries, or a different PCS), not the wire.
+
+### Compute floor estimate
+
+Gas is dominated by extension-field arithmetic: identity 270M + openAndFold
+folds 172M + row copies 126M + decode 122M (pre-mcopy). The Ext4 mul's four
+256-bit `% MODULUS` divisions are the single biggest multiplier: every
+identity term, every fold, every sumcheck check pays them. KoalaBear admits a
+fast reduce (products fit in 64 bits: fold hi*(2^28-2)+lo, then 31-bit fold +
+conditional subtract) replacing ~400-600 gas of division with ~100-150 gas of
+shifts. Realistic target: identity+openAndFold shrink 30-40% => verify()
+toward **~550-600M** without touching the proof system. Beyond that needs
+either the eq_points derivation (kills decode + identity r1 spike) or fewer
+queries (security-parameter change, out of scope).
+
+DOCEOF && wc -l .scratch/pq-shielded-rollup/verifier-optimizations.md
