@@ -1,0 +1,36 @@
+[package]
+name = "wallet-wasm"
+description = "Browser wallet crypto core: vault unlock, SPHINCS+ spend authorization, canonical statement encoding. Compiled to wasm32-unknown-unknown."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Every dependency here is the SAME crate the node uses: the vault format,
+# the SPHINCS+ scheme, the shielded key derivation and the canonical signing
+# message are shared code, not reimplementations. The wallet and the node
+# cannot disagree about bytes because there is one implementation of each.
+[dependencies]
+pq-hash = { workspace = true }
+pq-sign = { workspace = true }
+# only for the Keypair trait (SigningKey::verifying_key); same pinned version
+# pq-sign uses, so no duplicate crate.
+signature = { workspace = true }
+shielded = { workspace = true }
+vault = { workspace = true }
+zeroize = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+# std_rng only (chacha-based StdRng seeded from JS entropy): no getrandom,
+# which does not build for wasm32-unknown-unknown without JS glue.
+rand = { workspace = true, features = ["std_rng"] }
+
+[dev-dependencies]
+rand = { workspace = true, features = ["std_rng", "std"] }
+
+[lints]
+workspace = true

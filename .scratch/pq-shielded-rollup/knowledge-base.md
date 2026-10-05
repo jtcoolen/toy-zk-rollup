@@ -167,3 +167,19 @@ migration doc lists as required upstream work is ALREADY in registry
 `p3-whir` 0.8.0 (`QueryOpenings<F,EF,MT::MultiProof>`, `SharedProofOpening`).
 Our stack sits on the newer shape; the Solidity side must match OUR codec, not
 theirs.
+
+## wasm toolchain facts (wallet-wasm)
+
+- The workspace-local toolchain at `.rustup-home` (1.98.1) carries the
+  `wasm32-unknown-unknown` target; the global `~/.rustup` one does not.
+  Build wasm with `RUSTUP_HOME=$PWD/.rustup-home PATH=$PWD/.rustup-home/toolchains/1.98.1-aarch64-apple-darwin/bin:$PATH`.
+- That minimal install's `rust-lld` aborts (SIGABRT) unless
+  `libLLVM.dylib` is reachable from `.../bin/../lib/`; a symlink to the
+  toolchain's own `lib/libLLVM.dylib` fixes it permanently.
+- rand must be depended on with `features = ["std_rng"]` only in wasm-facing
+  crates: `thread_rng` pulls getrandom, which does not build for
+  wasm32-unknown-unknown. JS supplies entropy via `crypto.getRandomValues`.
+- `#[no_mangle]` and `#[export_name]` are both flagged by the
+  `unsafe_code` lint in edition 2024; a wasm cdylib cannot export without
+  one of them, hence the scoped crate-level allow in wallet-wasm.
+

@@ -1431,3 +1431,45 @@ witness wire format; the e2e milestone does not need remote proving, and the
 501 keeps the seam honest. The envelope validation is not a stub: signature
 parse + verify run for real on every request, so the wallet integration can
 be built and tested against it today.
+
+## D-084 - Wallet crypto lives in a wasm crate sharing the node's crates
+
+The browser extension must produce exactly what the node verifies: the vault
+format, the canonical signing message, the SPHINCS+ envelope. Re-implementing
+any of that in JavaScript means two codebases that can drift by one byte and
+silently reject each other - and hand-rolled JS crypto has already burned this
+project three times (the keccak attempts). So the crypto core is a Rust crate,
+`crates/wallet-wasm`, compiled to `wasm32-unknown-unknown` and depending on
+the *same* `vault`, `pq-sign`, `shielded` crates the node runs. The
+`the_signed_message_is_the_shared_canonical_encoding` test is the tripwire:
+it asserts the wallet's signature verifies over `shielded::encode_statement`
+output, so drift fails in CI, not in the popup.
+
+Design points:
+
+- **No wasm-bindgen.** The extension loads the module with the plain
+  `WebAssembly` API and a manual `extern "C"` ABI (u32 offsets + a single
+  out buffer). Fewer moving parts, no bundler magic, auditable surface: 13
+  exports, pinned by the smoke test.
+- **Zero unsafe code.** The workspace denies `unsafe_code`; the ABI reads
+  inputs through a Mutex-guarded buffer registry (`alloc` hands out offsets
+  of buffers it owns), so no raw-pointer deref is ever needed. The only
+  concession is the `#[unsafe(no_mangle)]` attribute (and `#[export_name]`
+  is classified the same) - a link-level naming assertion, not unsafe code.
+  The crate carries a scoped `#![allow(unsafe_code)]` documenting exactly
+  that, and semgrep still bans `unsafe { }` blocks inside it.
+- **Secrets lifetime.** Vault open yields `Zeroizing` halves that die inside
+  the call; input buffers are zeroized on `free`. The crate never touches
+  storage or network - JS owns persistence, Rust owns the math.
+- **Entropy direction.** wasm cannot hold an OS CSPRNG handle, so JS passes
+  32 bytes of `crypto.getRandomValues` per call; short entropy is refused,
+  never padded (`ERR_ENTROPY`).
+
+**Alternatives considered.** (a) JS-native crypto (noble-post-quantum et al.)
+- rejected: second implementation of Argon2id/AES-GCM/SPHINCS+ to audit and
+to keep byte-compatible with the node; (b) wasm-bindgen + bundler - rejected:
+adds a build toolchain between the audited artifact and what ships, for no
+security gain at this surface; (c) have the node sign for the wallet -
+rejected outright: the wallet exists precisely so keys never leave the
+browser.
+

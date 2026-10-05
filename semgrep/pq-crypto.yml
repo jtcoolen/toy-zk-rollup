@@ -139,6 +139,7 @@ rules:
         - /crates/pq-sign/**
         - /crates/shielded/**
         - /crates/vault/**
+        - /crates/wallet-wasm/**
     pattern-either:
       - pattern: unsafe { ... }
       - pattern: unsafe fn $F(...) { ... }
@@ -191,6 +192,7 @@ rules:
         - /crates/pq-sign/src/**
         - /crates/shielded/src/**
         - /crates/vault/src/**
+        - /crates/wallet-wasm/src/**
         - /crates/node/src/**
       exclude:
         - "**/tests/**"

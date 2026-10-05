@@ -5,6 +5,7 @@ members = [
     "crates/pq-sign",
     "crates/vault",
     "crates/shielded",
+    "crates/wallet-wasm",
     "crates/prover",
     "crates/node",
     "crates/recursion-test",
