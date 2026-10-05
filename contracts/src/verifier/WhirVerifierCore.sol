@@ -736,10 +736,10 @@ library WhirVerifierCore {
         }
 
         // --- open, fold, and check each query against the public polynomial ----------
+        uint256[] memory limbs = new uint256[](input.rowLimbs);
+        uint256[] memory elems = new uint256[](input.rowElems);
         for (uint256 q; q < input.numQueries; ++q) {
             uint256 base = q * input.rowLimbs;
-            uint256[] memory limbs = new uint256[](input.rowLimbs);
-            uint256[] memory elems = new uint256[](input.rowElems);
             for (uint256 j; j < input.rowLimbs; ++j) {
                 limbs[j] = input.rowsFlat[base + j];
             }
