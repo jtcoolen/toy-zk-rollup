@@ -1572,3 +1572,35 @@ per-call overhead inside hot loops; (b) per-proof code generation (GOAT
 proof_script) — initcode/deploy cost per proof, wrong trade on EVM where
 calldata is cheap-ish and deploys are not; (c) splitting traces — above;
 (d) EIP-2539 Verkle/compressed state — out of scope, no SNARKs.
+
+
+## D-086 — Redesign for the two hard limits: split contracts + derive-don't-ship bundle
+
+**Context.** EIP-170 margin at +40 B (any future verifier edit is blocked) and
+the 1.97 MB WBND v4 bundle (23.5M calldata gas; exceeds stock-node tx gates).
+Fresh study of GOAT (pruned.rs, proof_script.rs), IOHK (README/benchmark),
+midfall (lowering/calldata.rs, vk.rs, render/) on exactly these questions.
+
+**Decision.** Full proposal in verifier-redesign.md (D-086):
+- Contracts (midfall split at coarse boundaries): WhirConstants (data-only,
+  extcodecopy'd cfg constants), TerminalWeight satellite (42M phase, staticcall
+  with raw memory-frame passing, codehash+length pinned at construction),
+  WhirVerifier core. Frees ~6-8 KB, unblocking the gas queue.
+- Bundle WBND v5 (GOAT derive-don't-ship): drop eqPoints (derive from drawn
+  OOD scalars, -773 KB), drop cfg constants (deploy-once, -180 KB), ship p3's
+  NATIVE pruned frontier and do the amortized walk in-circuit (Solidity can
+  hold a frontier between queries - Bitcoin Script cannot, which is the only
+  reason GOAT expands; -700 KB). Target ~320 KB, calldata floor ~5.4M.
+- Execution order A-E in the doc; D (pruned walk) is the riskiest, gated by
+  differential tests (pruned-walk accept == full-path accept on every vector).
+
+**Alternatives rejected.** Per-phase satellites everywhere (per-call overhead
+fatal in 1,336-iteration loops); in-circuit path EXPANSION (GOAT pays the
+amortization back only because Script must - we keep the frontier instead);
+IOHK multi-tx splitting as primary (state threading across txs; kept as last
+resort under an unraisable 64 KiB gate); EIP-4844 blob (KZG trust + precompile
+path; goal's settlement chain has high limits); SNARK-wrap (forbidden).
+
+**Note on gas.** The redesign is about LIMITS, not the ~140M compute floor:
+net gas effect ~-4M (calldata minus derivation cost). The gas queue (assembly
+Merkle, sumcheck inlining) resumes after step A frees code space.
