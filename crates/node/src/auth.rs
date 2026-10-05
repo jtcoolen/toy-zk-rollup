@@ -270,7 +270,10 @@ impl Acl {
     pub fn default_policy() -> Self {
         Self {
             rules: vec![
-                // Public: health and metrics need no token at all.
+                // Reads: any authenticated caller. Health and metrics are
+                // deliberately NOT public (D-082): they leak height and
+                // timing to unauthenticated hosts. An operator who wants
+                // them public puts a reverse proxy in front.
                 ("/health".into(), Role::ReadOnly),
                 ("/metrics".into(), Role::ReadOnly),
                 // State reads: any authenticated caller.
@@ -280,6 +283,11 @@ impl Acl {
                 ("/v1/transfer".into(), Role::Submitter),
                 // Driving block production is admin-only.
                 ("/v1/block/produce".into(), Role::Admin),
+                // So is settlement: it is the one call that moves L1 state.
+                ("/v1/block/settle".into(), Role::Admin),
+                // The scripted demo prover (D-079) holds fixture spend keys,
+                // so it is an operator tool, not a wallet endpoint.
+                ("/v1/demo/transfer".into(), Role::Admin),
                 // Key/role management is admin-only.
                 ("/v1/admin/rotate-key".into(), Role::Admin),
             ],
