@@ -291,3 +291,45 @@ positive test passing proves nothing about rejection paths.
 4. elems packing loop in both query loops: `uint256[4] memory coeffs` per
    element per query - inline the shifts instead.
 5. eq_points dedupe on the wire (WBND v5, §8): -1.39 MB, -14M calldata gas.
+
+## 12. Optimization log continued (open path + decode)
+
+| # | Commit | Change | verify() | Delta |
+|---|---|---|---|---|
+| 7 | `eb2ff70` | allocation-free open path: extLeaf scratch, computeRoot scratch pair, foldRow no-copy for arity<=4 | 438,095,749 | -170,401,699 |
+| 8 | `9aa1942` | inline ext packing in both query loops (no uint256[4] memory per element) | 403,234,145 | -34,861,604 |
+| 9 | `e157366` | constraintWeight Horner without the values array | 399,932,547 | -3,301,602 |
+| 10 | `554191d` | decode straight from calldata - the 2.8 MB proof copy is gone | 330,926,128 | -68,996,419 |
+
+applyBlock: 945,207,817 -> 555,282,837. Cumulative from baseline:
+**-733,360,729 (-68.9%)**. EIP-170 margin: 158 -> 286 B (the allocation-free
+rewrites are smaller than what they replaced).
+
+### The two big lessons of this stretch
+
+1. **The proof copy was 92.4M gas by itself.** Measured directly with a
+   probe: `bytes memory m = proof` for the 2.8 MB bundle costs 92,440,927
+   gas (memory expansion quadratic term + zeroing + refill) vs 269,304 for
+   touching calldata. Every reader now takes `bytes calldata` and uses
+   `calldataload`/`calldatacopy`. Note: for a calldata bytes param, `x.offset`
+   points at the DATA (probed: calldataload(x.offset) = first data byte),
+   unlike `bytes memory` where the length word sits at the base.
+2. **Per-query allocations were the open path.** extLeaf (256 B row),
+   computeRoot (20 x 64 B encodePacked), foldRow (16-word scratch) = ~23
+   allocations per query x ~1,267 queries. Replacing each with scratch above
+   the free memory pointer (memory-safe region, keccak before anything else
+   claims it) removed expansion + zeroing + refill: -170M in one commit.
+
+### foldRow purity fact (worth remembering)
+
+`KoalaBearExt4.evaluate_hypercube` contracts in place ONLY on its general
+path (point.length > 4). The unrolled dims 0-4 fold through registers and
+never write `evals`. WHIR's folding factor is 4, so the defensive copy in
+foldRow was dead weight for every protocol row; arity > 4 keeps the copy.
+
+### Soundness note carried from the tamper test (see §10)
+
+After the calldata refactor the decode-time padding-canonical check moved
+with it (calldataload version) - tampered proofs still revert at decode.
+The negative tests caught a real regression during the eq/select rewrite;
+they keep earning their keep.
