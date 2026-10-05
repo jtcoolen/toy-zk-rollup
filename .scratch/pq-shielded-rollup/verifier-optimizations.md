@@ -411,3 +411,67 @@ regenerated from source by python; DELETE before gate):
 - emit in a pure chain: loosen ONLY the emitting chain or deny=warnings
   bites both directions (8961 vs 2018).
 
+
+
+## §14 Fused fold + unroll diet (commits `4da1cb4`, `d4552cf`)
+
+### Fused `_fold_once` (`4da1cb4` + `d4552cf`)
+
+`foldRow` = 16.9k gas/query x 1336 queries = **22.6M** of the open path
+(probe: leaf 3.7k + merkle 3.6k + foldRow 16.9k per query). Each of the
+15 folds/query ran `sub(); mul(); add()` = three pack/unpack cycles over
+the same four lanes. The fused version unpacks a0/a1/r once, keeps
+difference lanes unreduced in [1,2P) (the ext-mul reduces mod P anyway),
+and folds x_i into the raw product sums before ONE per-lane reduction.
+Bit-identical to `add(a0, mul(r, sub(a1, a0)))`; all vectors agree.
+
+verify 251,013,608 -> 244,672,378 (`4da1cb4`) -> **244,549,153** (`d4552cf`).
+applyBlock 448,922,974 -> **442,742,092**. Cumulative **-819.7M (-77.0%)**.
+
+### EIP-170 whack-a-mole (the fused fold costs ~270 B of code)
+
+The fused body x 15 inlined copies pushed runtime to 24,809 B (-233 over).
+Levers tried, measured:
+
+| lever | size delta | gas delta | verdict |
+|---|---|---|---|
+| `optimizer_runs` 200->100 | -3 B | +85k | no |
+| `optimizer_runs` 200->50 | -30 B | +50k | no |
+| dims-4 via general loop | -630 B | **+4.9M** | no (also broke non-mutation contract) |
+| foldRow >4 scratch copy removed | -26 B | -26k | yes |
+| dims 1/2 unrolled paths deleted | -125 B | ~0 | yes (shape never occurs: WHIR folds 4/round, closing sumcheck appends 3) |
+| dims 3 unrolled path deleted | -181 B | +~30k | yes (6 folds x 5 rounds, loop overhead is noise) |
+
+Final: runtime **24,432 B, margin +144 B**, 142 tests green.
+
+**Lesson**: with `via_ir` + 200 runs, code size is dominated by inlined
+assembly bodies x call sites. Deleting unrolled paths for shapes the
+protocol never produces is free gas-wise; the general loop is correct
+(in-place) because no caller reads `evals` after the fold EXCEPT the
+dims-4 path where the probe test caught a real dependency - keep dims-4
+unrolled (it is also the hot one: 15 folds/query).
+
+### Tamper-test weakness found
+
+`test_tampered_final_poly_reverts` did `finalPoly[0] += 1` - the LOW 128
+bits of a packed Ext4 word are padding, ignored by lane arithmetic. It
+only reverted by accident (via the terminal identity). Fixed to tamper
+lane 0 (`+ (1 << 224)`), a real polynomial change -> reverts at the STIR
+check. Padding-bit tampering is NOT a real polynomial change; any future
+tamper test must touch bits 128-255.
+
+### Query-level profile (probe, per query, 1336 queries total)
+
+| part | gas/query | total |
+|---|---|---|
+| leaf decode | 3.7k | 4.9M |
+| merkle path | 3.6k | 4.8M |
+| foldRow (15 folds) | 16.9k | 22.6M |
+
+### Terminal-weight is the final-phase hog (next target)
+
+Per round: domainPoints ~30k, final-openfold 0.84-1.9M, closing-sumcheck
+25-50k, **terminal-weight (evalConstraintsPoly over allR) 3.0 / 16.4 / 6.1M**
+- round 1 worst (most constraints x longest allR). Suspect: per-constraint
+`localR` allocation + `eq_poly_eval` recomputed per constraint instead of
+once per point.
