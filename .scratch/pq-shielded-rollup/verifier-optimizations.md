@@ -230,3 +230,64 @@ either the eq_points derivation (kills decode + identity r1 spike) or fewer
 queries (security-parameter change, out of scope).
 
 DOCEOF && wc -l .scratch/pq-shielded-rollup/verifier-optimizations.md
+
+## 9. Field micro-benchmarks (10k-iteration loops, overhead subtracted)
+
+Temporary harness (deleted after recording). Corrects the §5 assumption that
+`% MODULUS` divisions were the field bottleneck: EVM `mod` is priced by WORD
+count of the operands, not bit complexity, so a 256-bit `%` costs ~100 gas,
+not 400-600. The fast-reduce plan (fold hi*(2^27-1)+lo) is NOT the win it
+looked like; the real cost was (a) hidden memory allocations and (b) lane
+re-shuffling between packed ops.
+
+| op | before | after |
+|---|---|---|
+| ext mul (packed) | ~126 | ~126 |
+| ext add / sub (packed) | ~109 / ~97 | same |
+| _scalar_mul | **~1,465** (uint256[4] memory alloc) | ~124 |
+| eqEval(26 coords) | ~50.5k | **~27.6k** (register accumulator) |
+| selectEval(26 coords) | ~44.0k | **~16.3k** (base-scalar fast path) |
+| computeRoot(20 levels) | ~8.8k | (open) |
+| extLeaf(64 limbs) | ~22.3k | (open) |
+| foldRow(16 elems) | ~18.2k | (open) |
+
+## 10. Optimization log continued
+
+| # | Commit | Change | verify() | Delta |
+|---|---|---|---|---|
+| 5 | `dfa55d5` | allocation-free `_scalar_mul` + doubling-as-add in eq term | 668,478,351 | -212,495,123 |
+| 6 | `fc31c07` | register accumulators in eq_poly_eval + selectEval base fast path + decode-time padding-canonical check | 608,497,448 | -59,980,903 |
+
+applyBlock: 1,548,397,349 -> 1,033,870,020 -> 945,207,817. Cumulative from
+baseline: **-455,789,409 (-42.8%)**. EIP-170 margin: 704 -> 837 -> 158 B
+(the register loops cost code size; the dead generic selectEval path was
+deleted to claw some back).
+
+### The malleability finding (soundness, found by the tamper test)
+
+`test_verify_rejects_tampered_proof` flips one bit at len/3 - inside the
+low-128-bit PADDING of a packed ext element. The old packed `sub` borrowed
+across lanes and happened to make the identity mismatch, so the tamper was
+rejected by accident. The register rewrite ignores padding (as every other
+consumer does), so the tamper passed. Fix: `_extArr`/`_raw32Arr` now reject
+nonzero padding at decode - strictly stronger than the accidental
+behaviour, covers every consumer, and tampered proofs revert at 138M gas
+(decode) instead of 239M (deep identity). Lanes >= P remain tolerated:
+they reduce to their canonical value in every consumer, exactly as before.
+
+Lesson: when replacing arithmetic, re-run the NEGATIVE tests first. The
+positive test passing proves nothing about rejection paths.
+
+## 11. Open optimization targets (microbench-ranked)
+
+1. `extLeaf` (22.3k/query): 4 mstore8 per limb -> build 32-byte words from 8
+   limbs with shifts+or, one mstore per 8 limbs.
+2. `foldRow` (18.2k/query): scratch allocation per call + packed folds.
+   The caller's elems buffer is refilled per query anyway - fold can consume
+   it in place; and evaluate_hypercube's _fold_once chain can run in
+   registers like eq_poly_eval did.
+3. `computeRoot` (8.8k/query): abi.encodePacked allocates 64 B per level;
+   assembly scratch at mload(0x40) removes 20 allocations per query.
+4. elems packing loop in both query loops: `uint256[4] memory coeffs` per
+   element per query - inline the shifts instead.
+5. eq_points dedupe on the wire (WBND v5, §8): -1.39 MB, -14M calldata gas.
