@@ -36,6 +36,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Toolchain discovery: a bare shell (cron, CI runner, fresh terminal without
+# rustup's env sourced) has no cargo. Source rustup's env file if present,
+# else pick the newest installed toolchain. Fail with instructions, not 127.
+if ! command -v cargo >/dev/null 2>&1; then
+  [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+  tc=$(ls -1d "$HOME"/.rustup/toolchains/*/bin 2>/dev/null | sort | tail -1)
+  [ -n "$tc" ] && export PATH="$tc:$PATH"
+fi
+command -v cargo >/dev/null 2>&1 || die "cargo not found: install Rust via rustup or put cargo on PATH"
+command -v anvil >/dev/null 2>&1 || die "anvil not found: install Foundry (https://getfoundry.sh)"
+command -v forge >/dev/null 2>&1 || die "forge not found: install Foundry (https://getfoundry.sh)"
+
 wait_rpc() { # url, name
   for _ in $(seq 1 60); do
     if curl -sf -o /dev/null -X POST -H 'content-type: application/json' \

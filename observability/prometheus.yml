@@ -1,0 +1,22 @@
+# Prometheus scrape config for the rollup node.
+#
+# The node's /metrics endpoint requires a ReadOnly bearer token (D-082: the
+# ACL is the source of truth and /metrics leaks height and timing, so it is
+# not public). Provide the token via a file so it never lands in this config:
+#
+#   target/debug/node token --role readonly --ttl 86400 > observability/readonly.token
+#   chmod 600 observability/readonly.token
+#
+# Then: docker compose -f observability/docker-compose.yml up
+# (Prometheus :9090, Grafana :3001 -> dashboards/).
+scrape_configs:
+  - job_name: rollup-node
+    scrape_interval: 5s
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/readonly.token
+    static_configs:
+      - targets: ["host.docker.internal:3000"]
+        labels:
+          service: pq-shielded-rollup-node

@@ -30,3 +30,4 @@ contracts/deployments/
 # bitcoin-stark-verifier). The committed source of truth for the Solidity
 # verifier is contracts/lib/sol-whir-p3; these are throwaway study copies.
 .scratch/refs/
+observability/readonly.token
