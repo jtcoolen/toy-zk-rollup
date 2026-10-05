@@ -273,8 +273,46 @@ library KoalaBearExt4 {
         return evals[0];
     }
 
-    function _fold_once(uint256 a0, uint256 a1, uint256 r) internal pure returns (uint256) {
-        return add(a0, mul(r, sub(a1, a0)));
+    function _fold_once(uint256 a0, uint256 a1, uint256 r) internal pure returns (uint256 out) {
+        // out = a0 + r * (a1 - a0), fused: unpack the three operands once and
+        // carry the difference through the extension multiply without the
+        // intermediate pack/reduce cycles of sub(); mul(); add(). The
+        // difference lanes are kept unreduced in [1, 2P) by pre-adding P -
+        // the extension multiply reduces every lane mod P anyway, and the
+        // final add reduces again, so the result is bit-identical to the
+        // three-call formulation (same formulas as eq_poly_eval).
+        assembly ("memory-safe") {
+            let P := 0x7f000001
+            let M := 0xffffffff
+            let W := 3
+            let x0 := shr(224, a0)
+            let x1 := and(shr(192, a0), M)
+            let x2 := and(shr(160, a0), M)
+            let x3 := and(shr(128, a0), M)
+            let d0 := add(sub(shr(224, a1), x0), P)
+            let d1 := add(sub(and(shr(192, a1), M), x1), P)
+            let d2 := add(sub(and(shr(160, a1), M), x2), P)
+            let d3 := add(sub(and(shr(128, a1), M), x3), P)
+            let c0 := shr(224, r)
+            let c1 := and(shr(192, r), M)
+            let c2 := and(shr(160, r), M)
+            let c3 := and(shr(128, r), M)
+
+            let t0 := add(mul(c0, d0), mul(W, add(add(mul(c1, d3), mul(c2, d2)), mul(c3, d1))))
+            let t1 := add(add(mul(c0, d1), mul(c1, d0)), mul(W, add(mul(c2, d3), mul(c3, d2))))
+            let t2 := add(add(add(mul(c0, d2), mul(c1, d1)), mul(c2, d0)), mul(W, mul(c3, d3)))
+            let t3 := add(add(add(mul(c0, d3), mul(c1, d2)), mul(c2, d1)), mul(c3, d0))
+            t0 := mod(t0, P)
+            t1 := mod(t1, P)
+            t2 := mod(t2, P)
+            t3 := mod(t3, P)
+
+            out :=
+                or(
+                    or(shl(224, mod(add(x0, t0), P)), shl(192, mod(add(x1, t1), P))),
+                    or(shl(160, mod(add(x2, t2), P)), shl(128, mod(add(x3, t3), P)))
+                )
+        }
     }
 
     /// Scalar multiplication lane-by-lane, WITHOUT a memory array.

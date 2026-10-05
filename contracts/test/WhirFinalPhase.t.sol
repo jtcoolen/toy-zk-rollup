@@ -345,7 +345,11 @@ contract WhirFinalPhaseTest is Test {
             _final(j, lastRandomness);
         input.allRandomness = allRandomness;
         input.constraints = _constraints(j, oodPoint0);
-        input.finalPoly[0] = input.finalPoly[0] + 1;
+        // Tamper a REAL field lane: the packed word's low 128 bits are
+        // padding, rejected at decode (PAD_MASK) and ignored by the lane-wise
+        // field arithmetic, so +1 there is not a polynomial change. Lane 0
+        // (bits 224-255) is the first coefficient's first coordinate.
+        input.finalPoly[0] = input.finalPoly[0] + (uint256(1) << 224);
 
         FinalHarness harness = new FinalHarness();
         vm.expectRevert();
