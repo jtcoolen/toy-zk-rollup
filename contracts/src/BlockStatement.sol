@@ -6,59 +6,44 @@ import {LimbCodec} from "./LimbCodec.sol";
 /// Parsing of a verified block statement into the actions it authorises.
 ///
 /// The statement layout is fixed by the Rust prover
-/// (`crates/prover/src/block.rs`, `TransferShape`) and mirrored here exactly:
+/// (`crates/prover/src/block.rs`, `block_statement`) and mirrored here exactly:
 ///
 /// ```text
 /// [ n, (inputs_0, outputs_0), ..., (inputs_{n-1}, outputs_{n-1}),
-///   transfer 0: nullifiers..., outputs..., root, rootAfter, nfRootBefore, nfRootAfter, fee,
-///   transfer 1: ... ]
+///   statementRoot, rootBefore, rootAfter, nfRootBefore, nfRootAfter,
+///   fee_0, ..., fee_{n-1} ]
 /// ```
 ///
-/// Four digests sit between a transfer's hashes and its fee: the commitment
-/// root its inputs opened against and the root its own output appends produce
-/// (D-088 - the circuit proves the append, so the root is attested, not
-/// re-derived), and the nullifier-map root before and after this transfer's
-/// nullifiers were inserted.
+/// `statementRoot` is a Poseidon2 fold over the children's full public-input
+/// statements (D-089): the circuit folds each child's *verified* statement
+/// targets into one running digest and exports the result, so one 32-byte
+/// digest attests to every per-transfer nullifier, output commitment and
+/// intermediate root without any of them being re-exposed. The contract
+/// cannot open the fold - Poseidon2 is not cheap on the EVM - and does not
+/// need to: the fold is bound by the proof, exactly like the roots it sits
+/// beside. What the pool acts on is the four block digests and the fees.
 ///
 /// The header is part of the *verified* statement, exported by the circuit as
-/// constants. That matters: if the contract were told the split instead, a prover
-/// could declare a split that makes the contract read an output commitment as a
-/// nullifier, or skip a real nullifier and spend it again in a later block.
-/// Reading the split from the proof removes that degree of freedom.
+/// constants. That matters: if the contract were told the split instead, a
+/// prover could declare a shape that disagrees with what was verified. Reading
+/// the split from the proof removes that degree of freedom.
 library BlockStatement {
     using LimbCodec for uint256[];
-
-    /// Digests per transfer that are not nullifiers or outputs: the commitment
-    /// root before and after this transfer's appends (D-088), plus the
-    /// nullifier-map root pair.
-    uint256 public constant ROOTS_PER_TRANSFER = 4;
 
     /// Fee limbs per transfer (`VALUE_LIMBS` in the transfer circuit).
     uint256 public constant FEE_LIMBS = 4;
 
-    /// One transfer's worth of actions, decoded.
-    struct Transfer {
-        /// Nullifiers this transfer spends, in order.
-        bytes32[] nullifiers;
-        /// Note commitments to append to the tree, in order.
-        bytes32[] outputs;
-        /// The commitment-tree root this transfer was witnessed against.
-        bytes32 rootBefore;
-        /// The commitment-tree root after this transfer's output appends,
-        /// attested in-circuit (D-088).
-        bytes32 rootAfter;
-        /// The nullifier-map root before this transfer's nullifiers.
-        bytes32 nullifierBefore;
-        /// The nullifier-map root after they were inserted.
-        bytes32 nullifierAfter;
-        /// The fee, in base units.
-        uint64 fee;
-    }
+    /// Digests exported after the fold root: the commitment-tree root pair and
+    /// the nullifier-map root pair the block transitions between.
+    uint256 public constant BLOCK_DIGESTS = 4;
 
     /// A whole block, decoded.
     struct Block {
-        /// The transfers, in statement order.
-        Transfer[] transfers;
+        /// Number of transfers in the block (the header's first limb).
+        uint256 numTransfers;
+        /// The Poseidon2 fold over the children's full statements (D-089).
+        /// Opaque on-chain by design: it is pinned by the proof, not opened.
+        bytes32 statementRoot;
         /// The commitment root the block starts from: the first transfer's
         /// `rootBefore`.
         bytes32 rootBefore;
@@ -71,23 +56,18 @@ library BlockStatement {
         /// The nullifier-map root the block ends at: the last transfer's
         /// `nullifierAfter`.
         bytes32 nullifierAfter;
-        /// Total fees across all transfers.
+        /// Total fees across all transfers, summed from the per-transfer limbs.
         uint256 totalFee;
     }
 
-    /// Number of statement limbs for `numTransfers` transfers carrying
-    /// `totalHashes` hashes between them.
+    /// Number of statement limbs for a block of `numTransfers` transfers.
     ///
-    /// Header (1 + 2 per transfer), then per transfer: its hashes, four root
-    /// digests, one fee. Both the root term and the fee term scale with the
-    /// transfer count, not with the statement as a whole.
-    function expectedLen(uint256 numTransfers, uint256 totalHashes)
-        internal
-        pure
-        returns (uint256)
-    {
-        return 1 + 2 * numTransfers
-            + (totalHashes + ROOTS_PER_TRANSFER * numTransfers) * LimbCodec.LIMBS_PER_DIGEST
+    /// Header (1 + 2 per transfer), the fold root, the four block digests, and
+    /// one fee per transfer. Note the child statements themselves are *not*
+    /// here - that is the whole point of the fold: the length is `81 + 6n`,
+    /// independent of how many nullifiers and outputs each transfer carries.
+    function expectedLen(uint256 numTransfers) internal pure returns (uint256) {
+        return 1 + 2 * numTransfers + (1 + BLOCK_DIGESTS) * LimbCodec.LIMBS_PER_DIGEST
             + FEE_LIMBS * numTransfers;
     }
 
@@ -102,74 +82,32 @@ library BlockStatement {
         require(n >= 1, "block has no transfers");
         require(n <= type(uint16).max, "block too large");
 
-        uint256 cursor = 1;
-        uint256 totalHashes = 0;
-        uint256[] memory inputs = new uint256[](n);
-        uint256[] memory outputs = new uint256[](n);
+        // Skip the shape counts: they are part of the verified statement but
+        // the fold already covers the child statements they describe, and the
+        // length check below pins the header to the statement that ships with
+        // it. A header that disagrees with the statement cannot decode.
+        uint256 cursor = 1 + 2 * n;
+        require(statement.length == expectedLen(n), "statement length disagrees with header");
+
+        block_.numTransfers = n;
+        block_.statementRoot = statement.digestFromLimbs(cursor);
+        cursor += LimbCodec.LIMBS_PER_DIGEST;
+        block_.rootBefore = statement.digestFromLimbs(cursor);
+        cursor += LimbCodec.LIMBS_PER_DIGEST;
+        block_.rootAfter = statement.digestFromLimbs(cursor);
+        cursor += LimbCodec.LIMBS_PER_DIGEST;
+        block_.nullifierBefore = statement.digestFromLimbs(cursor);
+        cursor += LimbCodec.LIMBS_PER_DIGEST;
+        block_.nullifierAfter = statement.digestFromLimbs(cursor);
+        cursor += LimbCodec.LIMBS_PER_DIGEST;
+
         for (uint256 i; i < n; ++i) {
-            inputs[i] = statement[cursor++];
-            outputs[i] = statement[cursor++];
-            totalHashes += inputs[i] + outputs[i];
-        }
-
-        // The header must account for the whole statement; a mismatch means the
-        // statement was not produced by the prover that exported this header.
-        uint256 expected = expectedLen(n, totalHashes);
-        require(statement.length == expected, "statement length disagrees with header");
-
-        block_.transfers = new Transfer[](n);
-        for (uint256 i; i < n; ++i) {
-            uint256 nin = inputs[i];
-            uint256 nout = outputs[i];
-
-            bytes32[] memory nfs = new bytes32[](nin);
-            for (uint256 j; j < nin; ++j) {
-                nfs[j] = statement.digestFromLimbs(cursor);
-                cursor += LimbCodec.LIMBS_PER_DIGEST;
-            }
-            bytes32[] memory outs = new bytes32[](nout);
-            for (uint256 j; j < nout; ++j) {
-                outs[j] = statement.digestFromLimbs(cursor);
-                cursor += LimbCodec.LIMBS_PER_DIGEST;
-            }
-            bytes32 root = statement.digestFromLimbs(cursor);
-            cursor += LimbCodec.LIMBS_PER_DIGEST;
-            bytes32 rootAfter = statement.digestFromLimbs(cursor);
-            cursor += LimbCodec.LIMBS_PER_DIGEST;
-            bytes32 nfBefore = statement.digestFromLimbs(cursor);
-            cursor += LimbCodec.LIMBS_PER_DIGEST;
-            bytes32 nfAfter = statement.digestFromLimbs(cursor);
-            cursor += LimbCodec.LIMBS_PER_DIGEST;
-            uint64 fee = statement.u64FromLimbs(cursor);
+            block_.totalFee += statement.u64FromLimbs(cursor);
             cursor += FEE_LIMBS;
-
-            if (i == 0) {
-                block_.rootBefore = root;
-                block_.nullifierBefore = nfBefore;
-            } else {
-                // Redundant with the in-circuit chains, but a contract should
-                // not rely on the circuit having remembered to constrain
-                // something. These are cheap reads of values that were already
-                // proven, and they make the contract's own invariant explicit
-                // rather than implied. Since D-088 the commitment roots chain
-                // like the nullifier roots always did: each transfer attests
-                // the root its own appends produce.
-                require(root == block_.transfers[i - 1].rootAfter, "commitment chain broken");
-                require(nfBefore == block_.transfers[i - 1].nullifierAfter, "nullifier chain broken");
-            }
-
-            block_.transfers[i] = Transfer({
-                nullifiers: nfs,
-                outputs: outs,
-                rootBefore: root,
-                rootAfter: rootAfter,
-                nullifierBefore: nfBefore,
-                nullifierAfter: nfAfter,
-                fee: fee
-            });
-            block_.totalFee += fee;
         }
-        block_.rootAfter = block_.transfers[n - 1].rootAfter;
-        block_.nullifierAfter = block_.transfers[n - 1].nullifierAfter;
+        // The fee loop consumed exactly the statement; the length check above
+        // already guarantees this, but a decoder should not rely on its caller
+        // having checked.
+        require(cursor == statement.length, "trailing limbs after fees");
     }
 }

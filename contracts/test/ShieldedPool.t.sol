@@ -5,8 +5,9 @@ import {Test} from "forge-std/Test.sol";
 import {ShieldedPool} from "../src/ShieldedPool.sol";
 import {IWhirVerifier} from "../src/interfaces/IWhirVerifier.sol";
 import {BlockStatement} from "../src/BlockStatement.sol";
+import {LimbCodec} from "../src/LimbCodec.sol";
 
-/// A verifier whose behaviour the test pins. It is `view` like the real seam,
+/// A verifier whose behaviour the test pins. It is view like the real seam,
 /// so it records nothing; instead it accepts only the claim it was told to
 /// accept, which pins verbatim passthrough: if the pool altered the statement
 /// or the proof on the way in, the hash would not match and the pool would
@@ -42,23 +43,28 @@ contract DecodeHarness {
 
 /// The settlement state machine, driven by a real prover block.
 ///
-/// Statement, roots, nullifier and output commitment all come from
-/// `block_vectors.json`, produced by `prove_client_transfer`: a real SPHINCS+
-/// spend of a funded note through the transfer circuit. The pool is deployed
-/// at the Poseidon2 EMPTY root while the vector block names the funded-note
-/// root, so the root limbs are rewritten to the state the pool is actually in -
-/// the stub does not check the statement, and the WHIR verifier is pinned
-/// elsewhere. D-088: both roots are attested, so the rewrite sets the pair
-/// (rootBefore, rootAfter) the pool must chain and store.
+/// Statement, roots, fold root and fee all come from block_vectors.json,
+/// produced by prove_client_transfer plus the folded block-statement builder:
+/// a real SPHINCS+ spend of a funded note through the transfer circuit, folded
+/// (D-089) into [header, statementRoot, rootBefore, rootAfter, nfBefore,
+/// nfAfter, fee]. The pool is deployed at the Poseidon2 EMPTY root while the
+/// vector block names the funded-note root, so the endpoint limbs are
+/// rewritten to the state the pool is actually in - the stub does not check the
+/// statement, and the WHIR verifier is pinned elsewhere. D-088: both roots are
+/// attested, so the rewrite sets the pair (rootBefore, rootAfter) the pool must
+/// chain and store.
 contract ShieldedPoolTest is Test {
     string internal constant VECTOR = "test/vectors/block_vectors.json";
 
-    /// The block statement is the transfer statement plus the shape header
-    /// [n, nin, nout] the block circuit exports in front of it.
-    uint256 internal constant HEADER_LIMBS = 3;
+    /// The folded statement for one transfer: header(3) + statementRoot(16) +
+    /// four digests + fee(4) = 87 limbs.
+    uint256 internal constant STATEMENT_LIMBS = 87;
 
-    /// The transfer's root limbs start after header(3) + nullifier(16) + output(16).
-    uint256 internal constant ROOT_LIMB_OFFSET = 3 + 32;
+    /// The fold root sits right after the header [n, nin, nout].
+    uint256 internal constant FOLD_LIMB_OFFSET = 3;
+
+    /// The block rootBefore sits right after the fold root.
+    uint256 internal constant ROOT_LIMB_OFFSET = 3 + 16;
 
     /// The Poseidon2 empty commitment-tree root (D-088 hasher): the root of a
     /// depth-32 tree of zero leaves under the Poseidon2 sponge/perm fold. The
@@ -73,36 +79,30 @@ contract ShieldedPoolTest is Test {
 
     uint256[] statement;
     bytes proof;
+    bytes32 statementRoot;
     bytes32 rootBefore;
     bytes32 rootAfter;
     bytes32 nullifierBefore;
     bytes32 nullifierAfter;
-    bytes32 outputLeaf;
     uint64 fee;
 
     function setUp() public {
         string memory j = vm.readFile(VECTOR);
-        uint256[] memory transfer = vm.parseJsonUintArray(j, ".statement");
-        statement = new uint256[](HEADER_LIMBS + transfer.length);
-        statement[0] = 1; // one transfer
-        statement[1] = 1; // one input
-        statement[2] = 1; // one output
-        for (uint256 i; i < transfer.length; ++i) {
-            statement[HEADER_LIMBS + i] = transfer[i];
-        }
+        statement = vm.parseJsonUintArray(j, ".statement");
+        assertEq(statement.length, STATEMENT_LIMBS, "folded statement is 87 limbs for n=1");
         // Any bytes stand in for the proof: the stub records them verbatim and
         // never parses them. The real proof bytes are pinned by the WHIR tests.
         proof = hex"deadbeef00112233";
+        statementRoot = _asBytes32(vm.parseJsonBytes(j, ".statement_root_hex"));
         rootBefore = _asBytes32(vm.parseJsonBytes(j, ".root_before_hex"));
         rootAfter = _asBytes32(vm.parseJsonBytes(j, ".root_after_hex"));
         nullifierBefore = _asBytes32(vm.parseJsonBytes(j, ".nullifier_before_hex"));
         nullifierAfter = _asBytes32(vm.parseJsonBytes(j, ".nullifier_after_hex"));
-        outputLeaf = _asBytes32(vm.parseJsonBytesArray(j, ".outputs_hex")[0]);
         fee = uint64(vm.parseJsonUint(j, ".total_fee"));
 
         verifier = new StubVerifier();
         // Empty genesis: the Poseidon2 empty root, empty nullifier map
-        // (bytes32(0) sentinel: the contract computes the prover's empty root).
+        // (bytes32(0) sentinel: the contract computes the prover empty root).
         pool = new ShieldedPool(verifier, address(0xB0B), EMPTY_ROOT, bytes32(0));
         decoder = new DecodeHarness();
     }
@@ -124,7 +124,7 @@ contract ShieldedPoolTest is Test {
         }
     }
 
-    /// Rewrite the transfer's commitment-root pair and nullifier-before limb so
+    /// Rewrite the block commitment-root pair and nullifier-before limb so
     /// the block extends whatever state the pool is in and lands wherever the
     /// test wants. The stub verifier does not check the statement, so this only
     /// drives the state machine; the WHIR verifier is pinned by the phase tests.
@@ -142,19 +142,29 @@ contract ShieldedPoolTest is Test {
 
     function test_decode_matches_the_provers_public_values() public view {
         BlockStatement.Block memory b = decoder.decode(statement);
-        assertEq(b.transfers.length, 1, "one transfer");
+        assertEq(b.numTransfers, 1, "one transfer");
+        assertEq(b.statementRoot, statementRoot, "statement fold root");
         assertEq(b.rootBefore, rootBefore, "rootBefore");
         assertEq(b.rootAfter, rootAfter, "rootAfter");
         assertEq(b.nullifierBefore, nullifierBefore, "nullifierBefore");
         assertEq(b.nullifierAfter, nullifierAfter, "nullifierAfter");
         assertEq(b.totalFee, fee, "totalFee");
-        assertEq(b.transfers[0].outputs[0], outputLeaf, "output commitment");
-        assertEq(b.transfers[0].nullifiers.length, 1, "one nullifier");
+    }
+
+    /// The fold root the decoder reads must be the digest the prover recorded -
+    /// the statement own limbs and the native fold agree byte for byte. The
+    /// contract cannot open the fold; pinning it against the prover own value
+    /// is what makes the export trustworthy at the boundary.
+    function test_statement_root_is_pinned_by_the_statement() public view {
+        BlockStatement.Block memory b = decoder.decode(statement);
+        bytes32 fromLimbs = LimbCodec.digestFromLimbs(statement, FOLD_LIMB_OFFSET);
+        assertEq(fromLimbs, statementRoot, "fold limbs vs recorded fold root");
+        assertEq(b.statementRoot, fromLimbs, "decoder reads the fold at the right offset");
     }
 
     function test_applyBlock_advances_both_roots() public {
         // The attested pair: this block starts where the pool is and lands on
-        // the roots the prover attests (rewritten to the pool's own state).
+        // the roots the prover attests (rewritten to the pool own state).
         uint256[] memory s = _withRoots(
             statement, pool.currentRoot(), rootAfter, pool.currentNullifierRoot());
         verifier.setAcceptedClaim(keccak256(abi.encode(s, proof)));
@@ -198,35 +208,34 @@ contract ShieldedPoolTest is Test {
         pool.applyBlock(statement, proof);
     }
 
-    /// A block whose attested `rootAfter` contradicts the statement's own chain
-    /// (transfer 0 ends where transfer 1 does not begin) must not decode, even
-    /// if a malicious prover exported it: the decoder enforces the chain the
-    /// circuit enforces, so the contract never stores a root no chain reached.
-    function test_decode_rejects_a_broken_commitment_chain() public {
-        // The vector is one transfer: header(3) + 100 limbs. Two transfers,
-        // one input and one output each, are header(5) + two 100-limb blocks.
-        uint256[] memory two = new uint256[](statement.length + 102);
-        two[0] = 2;
-        two[1] = 1; two[2] = 1; // transfer 0: one in, one out
-        two[3] = 1; two[4] = 1; // transfer 1: one in, one out
-        // Transfer 0: the vector transfer verbatim.
-        for (uint256 i; i < 100; ++i) {
-            two[5 + i] = statement[3 + i];
+    /// A statement whose length disagrees with its own header must not decode:
+    /// the folded length is 81 + 6n, so a truncated or padded statement is not
+    /// one this prover could have exported for that header.
+    function test_decode_rejects_a_length_that_disagrees_with_the_header() public {
+        // Same header (n = 1), one limb short.
+        uint256[] memory short_ = new uint256[](statement.length - 1);
+        for (uint256 i; i < short_.length; ++i) {
+            short_[i] = statement[i];
         }
-        // Transfer 1: the same block verbatim, then patched so it is the only
-        // thing that can fail: its nullifier-before continues transfer 0's
-        // nullifier chain, but its commitment rootBefore names a root
-        // transfer 0 never attested.
-        for (uint256 i; i < 100; ++i) {
-            two[105 + i] = statement[3 + i];
+        vm.expectRevert("statement length disagrees with header");
+        decoder.decode(short_);
+
+        // One limb of trailing junk after the fees.
+        uint256[] memory long_ = new uint256[](statement.length + 1);
+        for (uint256 i; i < statement.length; ++i) {
+            long_[i] = statement[i];
         }
-        // Within a transfer: nullifier(16), output(16), root(16), rootAfter(16),
-        // nfBefore(16), nfAfter(16), fee(4).
-        _putDigest(two, 105 + 32, bytes32(uint256(0xdead))); // bogus rootBefore
-        _putDigest(two, 105 + 64, nullifierAfter); // nfBefore: valid chain, so the
-        // only thing that can fail is the commitment chain.
-        vm.expectRevert("commitment chain broken");
-        decoder.decode(two);
+        vm.expectRevert("statement length disagrees with header");
+        decoder.decode(long_);
+
+        // A header claiming two transfers over a one-transfer statement.
+        uint256[] memory lying = new uint256[](statement.length);
+        for (uint256 i; i < statement.length; ++i) {
+            lying[i] = statement[i];
+        }
+        lying[0] = 2;
+        vm.expectRevert("statement length disagrees with header");
+        decoder.decode(lying);
     }
 
     function test_blocks_chain_across_transfers() public {
@@ -234,13 +243,22 @@ contract ShieldedPoolTest is Test {
             _withRoots(statement, pool.currentRoot(), rootAfter, pool.currentNullifierRoot()),
             proof);
         assertEq(pool.currentRoot(), rootAfter, "first block landed");
-        // Second block: same statement, roots rewritten to where the first
-        // block landed. The pool stores what the proof attests - it cannot
-        // tell this from a real tree transition, which is exactly the point:
-        // the continuity check is the contract's whole contribution.
-        pool.applyBlock(_withRoots(statement, rootAfter, outputLeaf, nullifierAfter), proof);
+        // The same block verbatim must fail: its rootBefore names the state the
+        // first block started from, not the one after it. (Rewriting rootBefore
+        // would be a different block - and the real proof would not verify
+        // against rewritten limbs; the WHIR side pins that, not this test.)
+        vm.expectRevert(
+            abi.encodeWithSelector(ShieldedPool.RootMismatch.selector, rootAfter, rootBefore));
+        pool.applyBlock(statement, proof);
+        // A second block that continues from the first applies: the roots are
+        // rewritten so the pair chains. The fold root is unchanged - the stub
+        // does not check it, and the continuity check is the contract whole
+        // contribution.
+        pool.applyBlock(
+            _withRoots(statement, rootAfter, nullifierAfter, nullifierAfter),
+            proof);
         assertEq(pool.blockNumber(), 2, "two blocks");
-        assertEq(pool.currentRoot(), outputLeaf, "second attested root stored");
+        assertEq(pool.currentRoot(), nullifierAfter, "second attested root stored");
         assertEq(pool.currentNullifierRoot(), nullifierAfter, "nullifier root re-chained");
     }
 

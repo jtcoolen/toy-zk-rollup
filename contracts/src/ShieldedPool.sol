@@ -155,7 +155,6 @@ contract ShieldedPool {
         // continuity against its own state is the only fact no proof can own.
         currentRoot = block_.rootAfter;
         currentNullifierRoot = block_.nullifierAfter;
-        currentNullifierRoot = block_.nullifierAfter;
 
         unchecked {
             ++blockNumber;

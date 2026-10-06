@@ -81,8 +81,10 @@ contract BlockE2ETest is Test {
     /// (proving the check fires, not just that some byte matters).
     ///
     /// Terminal word offset inside the bundle: header(4w) + cfgWords + prf len(1w)
-    /// + mainDigest(8w) + pv blob(1 len + 103 words) + lookupPow(1w) +
+    /// + mainDigest(8w) + pv blob(1 len + 87 words) + lookupPow(1w) +
     /// permDigest(8w) + terminal count(1w). All fixed by the block shape.
+    /// D-089: the block statement is the folded form - 87 limbs for one
+    /// transfer, independent of the child statement's 100.
     function test_tampered_terminal_fails_the_sum_check() public {
         bytes memory proof = _proof();
         uint256 cfgWords;
@@ -91,7 +93,7 @@ contract BlockE2ETest is Test {
             cfgWords := shr(224, mload(add(add(proof, 32), 8)))
         }
         cfgWords = _swapBytes(cfgWords);
-        uint256 termWord = 4 + cfgWords + 1 + 8 + 1 + 103 + 1 + 8 + 1;
+        uint256 termWord = 4 + cfgWords + 1 + 8 + 1 + 87 + 1 + 8 + 1;
         // Sanity: the 6 terminals' limb sums must be zero before tampering.
         // (The honest proof passing test_real_block_applies already proves this.)
         // Data word W sits at file byte 4W: the 16-byte header IS words 0-3.
