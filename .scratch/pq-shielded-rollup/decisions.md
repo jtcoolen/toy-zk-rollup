@@ -1606,7 +1606,7 @@ net gas effect ~-4M (calldata minus derivation cost). The gas queue (assembly
 Merkle, sumcheck inlining) resumes after step A frees code space.
 
 
-## D-088 — Commitment tree moves to Poseidon2; the contract stores roots instead of rebuilding them
+## D-088 — Commitment tree moves to Poseidon2; the contract stores roots instead of rebuilding them ✅ DONE (8ab3dea, 2ee73fd, f7ec1d9, d55df1e, da09295, 7264fff)
 
 **Decision.** The note commitment tree is re-hashed from Keccak-256 to
 Poseidon2 (KoalaBear, width 16 — the WHIR MMCS's own permutation), the
@@ -1681,7 +1681,11 @@ vectors regenerate.
 6. Regenerate all vectors (composed bundle, block bundle, genesis).
 7. Contracts: `BlockStatement` rootAfter, `ShieldedPool` roots-only
    (drop `MerkleAccumulator`), tests + Deploy updates.
-8. Node/wallet plumbing (root is now attested, not derived), full gate.
+8. Node/wallet plumbing (root is now attested, not derived), full gate. ✅
+   (e2e green on roots-only; wasm rebuilt 7264fff; full check.sh green.
+   Note: the "~152M gas" premise in **Why** was wrong - measured pool body
+   was ~0.5M; see d088-observations.md O-14. The decision stands on
+correctness grounds.)
 
 
 ## D-089 — Fold client-proof public inputs to one statement root in the final proof (QUEUED: next after D-088)

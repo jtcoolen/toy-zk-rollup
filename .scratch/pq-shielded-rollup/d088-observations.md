@@ -291,3 +291,20 @@ chain before the intended failure.
   WhirVerifier 24,536 B (+40), ShieldedPool 3,267 B. Untracked D-086 probe
   files (GasProbe* etc.) moved to /tmp/d086_probes - GasProbeVerifier exceeds
   EIP-170 and is scratch, not production.
+
+## O-15 (step 8: node/wallet audit + e2e green on roots-only)
+
+- Wallet side needed no code change: wallet-wasm already carries
+  root_after in the client statement (d55df1e), popup.js sends
+  root_after = current root with the honest comment that the prover
+  recomputes the true post-append root (D-079 witness path). The shipped
+  wasm artifact was STALE (built pre-D-088) - rebuilt via
+  scripts/build_extension.sh (the workspace .rustup-home toolchain carries
+  the wasm target; the home toolchain does not) and smoke-verified;
+  committed 7264fff.
+- pool_state.mjs / settle_block.mjs: no leafCount selector, unaffected.
+- scripts/e2e_local.sh GREEN on the roots-only pool (8th consecutive e2e):
+  node genesis (2 leaves, genesis_root_hex) -> deploy -> demo transfer ->
+  auto produce+settle -> on-chain currentRoot == node root
+  (f86bed09...), blockNumber 1, settlement tx 201,142,627 gas.
+
