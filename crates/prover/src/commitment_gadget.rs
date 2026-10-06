@@ -366,6 +366,38 @@ pub fn p2_sponge_limbs(
     Ok(final_out)
 }
 
+/// Fold one child statement into a running statement digest (D-089).
+///
+/// The chain rule, shared exactly with the native `block_statement` builder:
+///
+/// ```text
+/// running_0 = 0^8
+/// running_i = sponge(running_{i-1} || child_i statement limbs)
+/// ```
+///
+/// The running digest is decomposed to its 8 base coefficients (ALU-constrained,
+/// so they *are* the digest's elements) and absorbed as the first rate block of a
+/// fresh sponge run over the child's statement limbs. One permutation per 8
+/// limbs of statement, so a 100-limb transfer costs 14 perms — the reason the
+/// fold is Poseidon2 and not Keccak: the contract never opens this digest, it
+/// pins it, so only in-circuit cost matters.
+///
+/// # Errors
+///
+/// Propagates [`CircuitBuilderError`] from decomposition or perm rows.
+pub fn fold_statement(
+    builder: &mut CircuitBuilder<Challenge>,
+    running: &DigestExpr,
+    statement: &[ExprId],
+) -> Result<DigestExpr, CircuitBuilderError> {
+    let mut input = Vec::with_capacity(DIGEST_ELEMS + statement.len());
+    for &ext in running {
+        input.extend(builder.decompose_ext_to_base_coeffs_via_alu::<F>(ext)?);
+    }
+    input.extend_from_slice(statement);
+    p2_sponge_limbs(builder, &input)
+}
+
 /// Export a digest (two extension expressions) as [`DIGEST_LIMBS`] wire limbs.
 ///
 /// Each extension element decomposes to 4 base coefficients (ALU chain, so
@@ -574,6 +606,7 @@ mod tests {
     use p3_circuit::ops::{generate_poseidon2_trace, generate_recompose_trace};
     use p3_poseidon2_circuit_air::KoalaBearD4Width16;
     use pq_hash::bytes_to_field_elements;
+    use pq_hash::elements_to_digest;
     use pq_hash::Poseidon2Commitment;
     use shielded::tree::CommitmentTree;
 
@@ -754,6 +787,91 @@ mod tests {
                 .run()
                 .unwrap_or_else(|err| panic!("append at n={n} must verify: {err}"));
         }
+    }
+
+    /// The statement fold (D-089) must equal the native chain of sponges:
+    /// `running_i = sponge(running_{i-1} || child_i)`, running_0 = 0.
+    ///
+    /// Child lengths are chosen so the second fold's combined input (8 + 68)
+    /// ends mid-chunk: the partial-chunk carry must agree with the native
+    /// overwrite-mode sponge, not just the full-chunk case.
+    #[test]
+    fn fold_statement_matches_native() {
+        let h = hasher();
+        let children: Vec<Vec<u16>> = vec![
+            (0..100u32).map(|i| u16::try_from((i * 7919) % 65536).expect("fits")).collect(),
+            (0..68u32).map(|i| u16::try_from((i * 104729) % 65536).expect("fits")).collect(),
+        ];
+
+        // Native chain.
+        let mut running = [F::ZERO; DIGEST_ELEMS];
+        for child in &children {
+            let mut input: Vec<F> = running.to_vec();
+            input.extend(child.iter().map(|&l| F::from_u16(l)));
+            running = h.hash_elements(&input);
+        }
+        let native = elements_to_digest(&running);
+
+        // Circuit chain.
+        let mut builder = CircuitBuilder::<Challenge>::new();
+        enable_perm(&mut builder);
+        let allocs: Vec<Vec<ExprId>> = children
+            .iter()
+            .map(|c| builder.alloc_private_inputs(c.len(), "stmt"))
+            .collect();
+        let zero = builder.define_const(Challenge::ZERO);
+        let mut running_expr = [zero, zero];
+        for (child, exprs) in children.iter().zip(&allocs) {
+            assert_eq!(child.len(), exprs.len());
+            running_expr = fold_statement(&mut builder, &running_expr, exprs).expect("fold builds");
+        }
+        let exported = export_digest_limbs(&mut builder, &running_expr).expect("export");
+        let expected = const_limbs(&mut builder, native.as_bytes());
+        for (got, want) in exported.iter().zip(&expected) {
+            builder.connect(*got, *want);
+        }
+
+        let circuit = builder.build().expect("circuit builds");
+        let mut runner = circuit.runner();
+        runner.set_public_inputs(&[]).expect("no publics");
+        let witness: Vec<Challenge> = children
+            .iter()
+            .flat_map(|c| c.iter().map(|&l| Challenge::from_u16(l)))
+            .collect();
+        runner.set_private_inputs(&witness).expect("witness fits");
+        runner.run().expect("fold matches native");
+    }
+
+    /// A tampered statement limb must break the fold: the exported digest is
+    /// pinned, so any child statement that differs from what was folded fails.
+    #[test]
+    fn fold_rejects_tampered_statement() {
+        let h = hasher();
+        let child: Vec<u16> = (0..100u32).map(|i| u16::try_from(i % 65536).expect("fits")).collect();
+        let mut input: Vec<F> = vec![F::ZERO; DIGEST_ELEMS];
+        input.extend(child.iter().map(|&l| F::from_u16(l)));
+        let native = elements_to_digest(&h.hash_elements(&input));
+
+        let mut builder = CircuitBuilder::<Challenge>::new();
+        enable_perm(&mut builder);
+        let exprs = builder.alloc_private_inputs(child.len(), "stmt");
+        let zero = builder.define_const(Challenge::ZERO);
+        let folded = fold_statement(&mut builder, &[zero, zero], &exprs).expect("fold builds");
+        let exported = export_digest_limbs(&mut builder, &folded).expect("export");
+        let expected = const_limbs(&mut builder, native.as_bytes());
+        for (got, want) in exported.iter().zip(&expected) {
+            builder.connect(*got, *want);
+        }
+
+        let circuit = builder.build().expect("circuit builds");
+        let mut runner = circuit.runner();
+        runner.set_public_inputs(&[]).expect("no publics");
+        let mut witness: Vec<Challenge> = child.iter().map(|&l| Challenge::from_u16(l)).collect();
+        // Tamper with one limb after the fold input was read.
+        let last = witness.len() - 1;
+        witness[last] += Challenge::from_u16(1);
+        runner.set_private_inputs(&witness).expect("witness fits");
+        assert!(runner.run().is_err(), "a tampered statement must not fold to the pinned digest");
     }
 
     /// A frontier that does not fold to the pinned root must be rejected.
