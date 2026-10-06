@@ -43,6 +43,7 @@
 
 pub mod block;
 pub mod client;
+pub mod commitment_gadget;
 pub mod composed_export;
 pub mod config;
 pub mod constraint_ir;
