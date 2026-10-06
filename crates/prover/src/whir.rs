@@ -211,6 +211,14 @@ pub const fn protocol_params() -> ProtocolParameters {
 /// Never. A compile-time assertion guarantees `SECURITY_LEVEL > 0`, so the search
 /// runs at least once and always yields an error to report when no budget fits.
 pub fn required_pow_bits(num_variables: usize) -> Result<usize, WhirConfigError> {
+    required_pow_bits_with(num_variables, 1)
+}
+
+/// [`required_pow_bits`] at an explicit starting inverse rate.
+pub fn required_pow_bits_with(
+    num_variables: usize,
+    starting_log_inv_rate: usize,
+) -> Result<usize, WhirConfigError> {
     const _: () = assert!(SECURITY_LEVEL > 0, "security level must be positive");
     let mut last_error = None;
     // Back off from the requested arity down to zero. The first arity that builds
@@ -219,6 +227,7 @@ pub fn required_pow_bits(num_variables: usize) -> Result<usize, WhirConfigError>
         for budget in 0..SECURITY_LEVEL {
             let params = ProtocolParameters {
                 pow_bits: budget,
+                starting_log_inv_rate,
                 ..protocol_params()
             };
             match WhirConfig::<Challenge, F, Challenger>::new(arity, params) {
@@ -257,9 +266,23 @@ pub fn required_pow_bits(num_variables: usize) -> Result<usize, WhirConfigError>
 /// Returns the WHIR configuration error if `num_variables` cannot reach
 /// [`SECURITY_LEVEL`].
 pub fn config(cap_height: usize, num_variables: usize) -> Result<Config, WhirConfigError> {
-    let pow_bits = required_pow_bits(num_variables + ZK_ARITY_SLACK)?;
+    config_with(cap_height, num_variables, 1)
+}
+
+/// [`config`] at an explicit starting inverse rate. Rate 2 (quarter-rate)
+/// roughly halves the STIR query budget - the dominant term of the on-chain
+/// proof - at the cost of one more arity of committed domain; the final
+/// layer's arity budget is what decides whether it fits. Soundness stays
+/// `JohnsonBound` (the proven regime) at every rate.
+pub fn config_with(
+    cap_height: usize,
+    num_variables: usize,
+    starting_log_inv_rate: usize,
+) -> Result<Config, WhirConfigError> {
+    let pow_bits = required_pow_bits_with(num_variables + ZK_ARITY_SLACK, starting_log_inv_rate)?;
     let params = ProtocolParameters {
         pow_bits,
+        starting_log_inv_rate,
         ..protocol_params()
     };
     let pcs = Pcs::new(

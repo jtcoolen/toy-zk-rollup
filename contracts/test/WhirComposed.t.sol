@@ -49,7 +49,14 @@ contract WhirComposedTest is Test {
     TerminalRef internal terminalRef = new TerminalRef();
 
     function _flat() private view returns (string memory) {
-        return vm.readFile(FLAT);
+        // WHIR_FLAT points the harness at another shape (e.g. the recursion
+        // chain vectors, D-092 batch 19); default is the Fibonacci settlement.
+        return vm.readFile(vm.envOr("WHIR_FLAT", string(FLAT)));
+    }
+
+    /// The semantic blob matching [_flat]; WHIR_BLOB switches both together.
+    function _blob() private view returns (string memory) {
+        return vm.envOr("WHIR_BLOB", string(BLOB));
     }
 
     /// Slice a flat uint array out of a longer one.
@@ -133,7 +140,7 @@ contract WhirComposedTest is Test {
     /// the blob. Round 0 starts at the batch delegate event; each later round
     /// starts where the previous round's walk ended (round_starts).
     function _seedSponge(uint256 site) private view returns (WhirVerifierCore.Transcript memory t) {
-        SemanticBlob.Blob memory b = SemanticBlob.load(BLOB);
+        SemanticBlob.Blob memory b = SemanticBlob.load(_blob());
         SemanticBlob.Walk memory w = SemanticBlob.walkTo(b, site, true, false);
         t.state = w.state;
     }

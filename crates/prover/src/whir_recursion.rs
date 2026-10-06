@@ -180,13 +180,26 @@ pub fn whir_mmcs(cap_height: usize) -> WhirMmcs {
 /// this is the less conjectural choice, not merely the one that fits.
 #[must_use]
 pub const fn protocol_params(pow_bits: usize) -> ProtocolParameters {
+    protocol_params_with(pow_bits, 1)
+}
+
+/// [`protocol_params`] with an explicit starting inverse rate. Rate 2 (a
+/// quarter-rate code) roughly halves the STIR query budget - and with it the
+/// Merkle-path bytes, the dominant term of the on-chain proof - at the cost
+/// of doubling every committed domain, one arity higher. The soundness
+/// assumption stays `JohnsonBound` (the proven regime) at every rate.
+#[must_use]
+pub const fn protocol_params_with(
+    pow_bits: usize,
+    starting_log_inv_rate: usize,
+) -> ProtocolParameters {
     ProtocolParameters {
         security_level: SECURITY_LEVEL,
         pow_bits,
         round_log_inv_rates: Vec::new(),
         folding_factor: FoldingFactor::Constant(FOLDING_FACTOR),
         soundness_type: SecurityAssumption::JohnsonBound,
-        starting_log_inv_rate: 1,
+        starting_log_inv_rate,
     }
 }
 
@@ -210,11 +223,19 @@ pub const fn protocol_params(pow_bits: usize) -> ProtocolParameters {
 /// Returns the last WHIR configuration error if no arity from `num_variables`
 /// down to zero yields a feasible schedule.
 pub fn required_pow_bits(num_variables: usize) -> Result<usize, WhirConfigError> {
+    required_pow_bits_with(num_variables, 1)
+}
+
+/// [`required_pow_bits`] at an explicit starting inverse rate.
+pub fn required_pow_bits_with(
+    num_variables: usize,
+    starting_log_inv_rate: usize,
+) -> Result<usize, WhirConfigError> {
     const _: () = assert!(SECURITY_LEVEL > 0, "security level must be positive");
     let mut last_error = None;
     for arity in (0..=num_variables).rev() {
         for budget in 0..SECURITY_LEVEL {
-            let params = protocol_params(budget);
+            let params = protocol_params_with(budget, starting_log_inv_rate);
             match WhirConfig::<Challenge, F, WhirChallenger>::new(arity, params) {
                 Ok(schedule) => return Ok(schedule.max_pow_bits()),
                 Err(err) => last_error = Some(err),
@@ -265,10 +286,23 @@ impl InnerWhirConfig {
         log_max_lde_height: usize,
         cap_height: usize,
     ) -> Result<Self, WhirVerifierParamsError> {
+        Self::new_with(log_max_lde_height, cap_height, 1)
+    }
+
+    /// [`InnerWhirConfig::new`] at an explicit starting inverse rate (see
+    /// [`protocol_params_with`]).
+    pub fn new_with(
+        log_max_lde_height: usize,
+        cap_height: usize,
+        starting_log_inv_rate: usize,
+    ) -> Result<Self, WhirVerifierParamsError> {
         // Blinding doubles the committed height, so the schedule must be sized
         // one arity above the trace bound. See `crate::whir::ZK_ARITY_SLACK`.
-        let pow_bits = required_pow_bits(log_max_lde_height + crate::whir::ZK_ARITY_SLACK)?;
-        let params = protocol_params(pow_bits);
+        let pow_bits = required_pow_bits_with(
+            log_max_lde_height + crate::whir::ZK_ARITY_SLACK,
+            starting_log_inv_rate,
+        )?;
+        let params = protocol_params_with(pow_bits, starting_log_inv_rate);
         let challenger = WhirChallenger::new(whir_perm());
         let pcs = WhirPcs::new(
             params.clone(),

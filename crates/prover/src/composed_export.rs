@@ -167,7 +167,15 @@ pub fn composed_run(
 ) -> Result<(serde_json::Value, ReplayOut, SemProgram), Box<dyn Error>> {
     let (pis, rc) = fib_recursion();
     let params = settlement_params();
-    composed_run_with(&pis, &rc, &params, LOG_MAX_LDE, rounds_json, round_starts)
+    composed_run_with(
+        &pis,
+        &rc,
+        &params,
+        LOG_MAX_LDE,
+        1,
+        rounds_json,
+        round_starts,
+    )
 }
 
 /// The constraint-identity block for one settlement batch, built from the SAME
@@ -248,6 +256,7 @@ pub fn composed_run_with(
     rc: &RecursionCircuit,
     params: &p3_whir::parameters::ProtocolParameters,
     log_max_lde: usize,
+    rate: usize,
     rounds_json: &mut Vec<serde_json::Value>,
     round_starts: &mut Vec<usize>,
 ) -> Result<(serde_json::Value, ReplayOut, SemProgram), Box<dyn Error>> {
@@ -373,7 +382,7 @@ pub fn composed_run_with(
             Ok(())
         };
         let (program, out, verifier, proof) =
-            one_run_for(pis, rc, Some(&mut replacer), log_max_lde);
+            one_run_for(pis, rc, Some(&mut replacer), log_max_lde, rate);
         let constraint_identity = constraint_identity_block(&verifier, &proof, &out, pis)?;
         let doc = json!({
             "description": "composed settlement-shape WHIR walk: the shared walk driven
@@ -922,7 +931,19 @@ pub fn settlement_bundle(
     rc: &RecursionCircuit,
     statement: &[F],
 ) -> Result<(Vec<u8>, serde_json::Value), Box<dyn Error>> {
-    let params = settlement_params_for(crate::block::BLOCK_LOG_MAX_LDE);
+    let (bundle, jj, _blob) = settlement_bundle_with_blob(rc, statement, 1)?;
+    Ok((bundle, jj))
+}
+
+/// [settlement_bundle] plus the semantic blob, so a test can seed the
+/// Solidity transcript the way the composed harness does (the blob is the
+/// third bundle input and otherwise only lives inside the WBND frame).
+pub fn settlement_bundle_with_blob(
+    rc: &RecursionCircuit,
+    statement: &[F],
+    rate: usize,
+) -> Result<(Vec<u8>, serde_json::Value, Vec<u8>), Box<dyn Error>> {
+    let params = settlement_params_for(crate::block::BLOCK_LOG_MAX_LDE, rate);
     let mut rounds_a = Vec::new();
     let mut starts_a = Vec::new();
     let (_doc_a, _out_a, program_a) = composed_run_with(
@@ -930,6 +951,7 @@ pub fn settlement_bundle(
         rc,
         &params,
         crate::block::BLOCK_LOG_MAX_LDE,
+        rate,
         &mut rounds_a,
         &mut starts_a,
     )?;
@@ -940,6 +962,7 @@ pub fn settlement_bundle(
         rc,
         &params,
         crate::block::BLOCK_LOG_MAX_LDE,
+        rate,
         &mut rounds_b,
         &mut starts_b,
     )?;
@@ -956,5 +979,5 @@ pub fn settlement_bundle(
     )?;
     let flat = crate::wbnd::flat_from_vectors(&jj);
     let bundle = crate::wbnd::encode_bundle(&flat, &jj, &blob);
-    Ok((bundle, jj))
+    Ok((bundle, jj, blob))
 }

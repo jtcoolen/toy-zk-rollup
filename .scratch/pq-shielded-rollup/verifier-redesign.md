@@ -1023,3 +1023,178 @@ Schedule experiment (cheapest possible big lever, test before building):
 - Experiment: rerun recursion_chain with round_log_inv_rates = vec![2; ...]
   on BOTH configs, print sizes + whether LDE 24 still settles.
 
+
+---
+
+## Batch 19 — proof-size sweep: what the 1.23 MB is made of, and which WHIR knobs move it
+
+**The wire anatomy of the recursion-chain bundle (1,228,244 B WBND, flat 1,226,997 B):**
+
+| section | bytes | share |
+|---|---|---|
+| PROOF paths_hex (5 rounds) | 795,675 | 64.8% |
+| PROOF rows_flat | 146,560 | 11.9% |
+| CONFIG (schedule + constraints) | 182,444 | 14.9% |
+| PROOF final_paths_hex | 34,459 | 2.8% |
+| PROOF final_rows_ext | 16,128 | 1.3% |
+| STATEMENT | 3,072 | 0.25% |
+| everything else | ~50,000 | 4% |
+
+Inside CONFIG: ~154 KB is CONSTRAINTS (eq_points — the terminal weight
+circuits), ~28 KB framing_hex, 492 B batch config. The schedule itself is
+tiny. So the wire is: **paths (65%) + terminal-weight constraints (13%) +
+rows (13%)**.
+
+**Paths = queries x depth x 32 B.** The measured schedule (rate 1/2,
+folding 4, JohnsonBound, min grind): first sub-round of EVERY round carries
+170 queries at depth 18-23; later sub-rounds 38/22/15. Total ~1,160 paths
+per proof. This is why query count is the lever that matters.
+
+**Schedule probe (instant, no proving) — `crates/prover/tests/whir_sweep.rs`**
+
+- Grinding budget is a WEAK lever: at arity 24, pow 23 -> 32 buys only
+  245 -> 215 queries (-12%) for 512x prover grind work. pow 48 -> 161
+  (-34%) but 2^48 prover work is absurd. The solver already allocates
+  queries efficiently; grinding cannot get near the 300 KB target.
+- Starting inverse rate is the STRONG lever: rate 2 (quarter-rate) at
+  arity 24: 262 -> 148 queries (-44%); rate 3: 108 (-59%). Cost: every
+  committed domain doubles (one more arity).
+- Folding factor 8 also helps a lot (192 queries at rate 1) but the user
+  ruled it out: folding 2-4 is sufficient, and folding 8 would churn the
+  Solidity terminal (FINAL_FOLDING_FACTOR=4).
+- Soundness ladder in p3-security: UniqueDecoding (proven, weakest radius)
+  < JohnsonBound (PROVEN at delta = 1 - sqrt(rho) - eta; current) <
+  CapacityBound (conjectured). **Standing instruction: always JohnsonBound.**
+
+**Correction to batch 18: rate 2 is NOT "dead for the final layer".**
+The claim assumed the final layer must keep the CURRENT recursion-circuit
+size at LDE 24: arity 24 + rate 2 = 25 > KoalaBear TWO_ADICITY 24. But
+arity is not fixed: (a) a smaller base trace shrinks the recursion circuit
+(the circuit re-verifies the inner proof; its trace height tracks the
+inner proof size, not the base trace directly), and (b) inner layers at
+rate 2 produce SMALLER inner proofs (fewer queries -> shorter paths ->
+fewer Poseidon2 rows in the circuit that verifies them), which shrinks the
+final circuit below 2^23 rows and leaves room for rate 2 at the final
+layer. The ceiling is on the FINAL circuit only; inner layers at rate 2
+need their own +1 arity but their circuits are smaller. Empirical sweep
+running: `crates/prover/tests/chain_sweep.rs` (env-driven: WHIR_BASE_TRACE,
+WHIR_LDE, WHIR_RATE_INNER, WHIR_RATE_FINAL), grid base {64,256,1024} x
+rate_inner {1,2} x rate_final {1,2}, results in /tmp/sweep_results.log.
+
+**New API surface (all JohnsonBound, folding 4 unchanged):**
+- `whir_recursion::protocol_params_with(pow_bits, starting_log_inv_rate)`
+- `whir_recursion::required_pow_bits_with(num_variables, rate)`
+- `InnerWhirConfig::new_with(log_max_lde, cap_height, rate)`
+- `whir::config_with(cap_height, num_variables, rate)`
+- `whir::required_pow_bits_with(num_variables, rate)`
+Existing constructors delegate with rate 1 — no behavior change anywhere.
+
+**Next levers after the grid:**
+1. Cap height (currently 0): cap_height h shortens EVERY path by h levels
+   for 2^h field elements of extra commitment per matrix per layer. At
+   ~1,160 paths x 32 B, h=2 saves ~150 KB for ~24 KB. Need to check the
+   recursion engine supports cap openings (mmcs.rs says cap_height=0 is
+   the single-element cap case — the generic path exists).
+2. Step D pruned multiproof (frontier): the paths are already a pruned
+   multiproof on the prover side but emitted expanded; the frontier
+   encoding removes shared internal nodes — orthogonal to all of the above.
+3. CONFIG constraints section (154 KB): the eq_points for the terminal
+   weights are schedule-derived; if the redesigned verifier computes them
+   instead of reading them, they leave the wire entirely.
+
+---
+
+## Batch 20 — chain grid results: rate 2 is live at EVERY layer (the "dead" claim was wrong)
+
+`crates/prover/tests/chain_sweep.rs` (env: WHIR_BASE_TRACE, WHIR_LDE,
+WHIR_RATE_INNER, WHIR_RATE_FINAL, WHIR_LAYERS, WHIR_CAP), 2 InSC layers +
+Keccak final, all JohnsonBound, folding 4. Final postcard bytes:
+
+| base | rate_inner | rate_final | layer1 | layer2 | final | vs baseline |
+|---|---|---|---|---|---|---|
+| 1024 | 1 | 1 | 664,932 | 764,519 | **764,167** | baseline |
+| 1024 | 1 | 2 | 665,988 | 765,351 | **527,822** | −31% |
+| 1024 | 2 | 1 | 425,497 | 505,038 | 727,879 | −5% |
+| 1024 | 2 | 2 | 423,513 | 503,854 | **503,598** | **−34%** |
+| 256 | 2 | 1 | — | — | 729,319 | −5% |
+| 256 | 2 | 2 | 423,481 | 505,006 | **503,022** | −34% |
+
+**Why rate 2 at the final layer works (correction of batch 18):**
+`config_with(cap, lde, rate)` sizes the schedule via
+`required_pow_bits_with(lde + ZK_ARITY_SLACK, rate)`, which BACKS OFF the
+arity until the schedule builds. The arity that matters is the one the
+FINAL circuit actually needs (rc trace x blinding x rate), not the
+configured budget of 24. With rate 2 the final settle ran at the backed-off
+arity under TWO_ADICITY 24 and verified + tamper-checked. The ceiling only
+bites when (circuit arity + 1 + rate) > 24 — and shrinking the circuit
+(smaller inner proofs) buys rate headroom back. Exactly the user point:
+circuit minimisation and final-layer parameters interact.
+
+**New in-circuit constraint discovered (base=256, rate_inner=1):**
+`rc1: InvalidProofShape("final phase: num_queries (177) >=
+folded_domain_size (128); saturating STIR query counts are not yet
+supported in-circuit")`. When the inner proof is small, its folded domain
+can fall BELOW its query count and the recursion circuit refuses it. So
+the base trace cannot be shrunk arbitrarily at rate 1 — rate 2 fixes it
+here (fewer queries, bigger domain). Rule of thumb: keep inner schedules
+at num_queries < folded_domain_size at every layer.
+
+**base=64 fails at the base prove**: HidingBudgetExceeded (mask_height 128
+vs 64x2 domain) — HVZK blinding needs trace >= 128 rows. Floor for the
+base trace is ~128-256 rows for this AIR.
+
+**Interim best: rate_inner=2 + rate_final=2 at 503 KB postcard (−34%).**
+Grid 2 running: WHIR_CAP {2,4} (shortens every path by cap levels; the
+recursion engine multiplexes cap entries in-circuit —
+vendor/p3-recursion mmcs.rs verify_batch_circuit), rate 3 (probe said 108
+queries at arity 24), base 512. Postcard is the chain metric; the WBND
+flat/bundle size for the winning config gets measured next (the on-chain
+number is the bundle, ~1.6-1.8x postcard today).
+
+---
+
+## Batch 21 — grid 2: rate 3 reaches 422 KB; cap height is dead in the WHIR path
+
+chain_sweep grid 2 (2 InSC layers + Keccak final, base 1024 unless noted):
+
+| rate_inner | rate_final | cap | final postcard | vs baseline |
+|---|---|---|---|---|
+| 2 | 2 | 0 | 503,598 | −34% |
+| 2 | 3 | 0 | **423,089** | **−45%** |
+| 3 | 3 | 0 | **422,545** | **−45%** |
+| 2 | 2 | 2 | FAIL: rc1 "Not enough op_ids for the restored WHIR Merkle paths" | — |
+| 2 | 2 | 4 | FAIL (same) | — |
+| 2 | 1 | 2 | FAIL (same) | — |
+| 512 base, 2/2 | 502,862 | −34% (base size barely matters once rate dominates) |
+| 512 base, 2/3 | 423,313 | −45% |
+
+**Cap height: dead for now.** The generic cap circuit exists in
+vendor/p3-recursion/recursion/src/pcs/mmcs.rs (select_cap_entry,
+path_depth = max_height_log − cap_height) but the WHIR uni path that
+builds the recursion circuit cannot consume a capped opening: rc1 fails
+with "Not enough op_ids for the restored WHIR Merkle paths". Wiring cap
+height through the WHIR uni recursion path is a vendor change — parked.
+
+**Rate 3 works at both layers** (422 KB, −45%): the arity back-off in
+required_pow_bits_with absorbs the extra arity, and the final circuit
+still fits under TWO_ADICITY 24. Rate 4 would need arity +2 again; the
+probe said it stays feasible at arity 24 (queries 88 at fold 4) but the
+circuit ceiling is the question — test next.
+
+**Base trace size is a weak lever** (1024 vs 512 vs 256: ±1% on the
+final) once rate dominates: the recursion circuit size is driven by the
+inner PROOF size (paths), not the base trace. Floor: base >= 128 rows
+(HidingBudgetExceeded below that: mask_height 128).
+
+**Rate plumbing now threaded through the composed export path** so the
+WBND bundle can be generated at any rate:
+- settlement_replay: settlement_params_for(lde, rate), sem_config_for(+rate),
+  settle_sem_for(+rate), one_run_for(+rate) — all default call sites pass 1.
+- composed_export: composed_run_with(+rate), settlement_bundle_with_blob(+rate);
+  settlement_bundle (node path) delegates at rate 1.
+- recursion_chain export test: WHIR_RATE_INNER / WHIR_RATE_FINAL env,
+  **defaults now 2/2** — the winning config is the default shape.
+
+Next: regenerate the WBND bundle at 2/2, measure flat size + gas on the
+existing verifier, then iterate toward 300 KB (rate 3/3, then per-round
+gas decomposition to see what the shrink did to compute).

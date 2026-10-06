@@ -110,18 +110,23 @@ pub fn sem_challenger_with(sink: &SemSink) -> SemChallenger {
 /// recomputes the WHIR schedule from these parameters, so a mismatch fails the opening.
 #[must_use]
 pub fn settlement_params() -> p3_whir::parameters::ProtocolParameters {
-    settlement_params_for(LOG_MAX_LDE)
+    settlement_params_for(LOG_MAX_LDE, 1)
 }
 
 /// The same budget derived for an arbitrary `log_max_lde`. The block circuit
 /// settles at a larger LDE (25) than the recursion circuit (22), and the grind
 /// budget is read off the config's own arity, so the fixture must build either.
 #[must_use]
-pub fn settlement_params_for(log_max_lde: usize) -> p3_whir::parameters::ProtocolParameters {
-    let pow_bits = crate::whir::required_pow_bits(log_max_lde + crate::whir::ZK_ARITY_SLACK)
-        .expect("settlement shape reaches the security target");
+pub fn settlement_params_for(
+    log_max_lde: usize,
+    rate: usize,
+) -> p3_whir::parameters::ProtocolParameters {
+    let pow_bits =
+        crate::whir::required_pow_bits_with(log_max_lde + crate::whir::ZK_ARITY_SLACK, rate)
+            .expect("settlement shape reaches the security target");
     p3_whir::parameters::ProtocolParameters {
         pow_bits,
+        starting_log_inv_rate: rate,
         ..crate::whir::protocol_params()
     }
 }
@@ -129,14 +134,14 @@ pub fn settlement_params_for(log_max_lde: usize) -> p3_whir::parameters::Protoco
 /// A semantic settlement config whose challenger records into sink.
 #[must_use]
 pub fn sem_config(sink: &SemSink) -> SemConfig {
-    sem_config_for(sink, LOG_MAX_LDE)
+    sem_config_for(sink, LOG_MAX_LDE, 1)
 }
 
 /// `sem_config` at an explicit `log_max_lde`.
 #[must_use]
-pub fn sem_config_for(sink: &SemSink, log_max_lde: usize) -> SemConfig {
+pub fn sem_config_for(sink: &SemSink, log_max_lde: usize, rate: usize) -> SemConfig {
     let pcs = SemPcs::new(
-        settlement_params_for(log_max_lde),
+        settlement_params_for(log_max_lde, rate),
         Dft::default(),
         crate::config::mmcs(CAP_HEIGHT),
         sem_challenger_with(sink),
@@ -178,7 +183,7 @@ pub fn settle_sem(
     CircuitVerifier<SemConfig>,
     p3_circuit_prover::BatchStarkProof<SemConfig>,
 ) {
-    settle_sem_for(rc, sink, LOG_MAX_LDE)
+    settle_sem_for(rc, sink, LOG_MAX_LDE, 1)
 }
 
 /// `settle_sem` at an explicit `log_max_lde` (the block circuit settles at 25).
@@ -187,11 +192,12 @@ pub fn settle_sem_for(
     rc: &RecursionCircuit,
     sink: &SemSink,
     log_max_lde: usize,
+    rate: usize,
 ) -> (
     CircuitVerifier<SemConfig>,
     p3_circuit_prover::BatchStarkProof<SemConfig>,
 ) {
-    let settlement = sem_config_for(sink, log_max_lde);
+    let settlement = sem_config_for(sink, log_max_lde, rate);
     let shared = Poseidon2Config::KOALA_BEAR_D4_W16.for_shared_challenger_table();
     let preprocessors: Vec<Box<dyn NpoPreprocessor<F>>> = vec![
         Box::new(Poseidon2SharedPreprocessor::new(vec![shared])),
@@ -578,7 +584,7 @@ pub fn one_run(
     CircuitVerifier<SemConfig>,
     p3_circuit_prover::BatchStarkProof<SemConfig>,
 ) {
-    one_run_for(pis, rc, opening, LOG_MAX_LDE)
+    one_run_for(pis, rc, opening, LOG_MAX_LDE, 1)
 }
 
 /// `one_run` at an explicit `log_max_lde`.
@@ -588,6 +594,7 @@ pub fn one_run_for(
     rc: &RecursionCircuit,
     opening: Option<&mut OpeningReplacer<'_>>,
     log_max_lde: usize,
+    rate: usize,
 ) -> (
     SemProgram,
     ReplayOut,
@@ -595,7 +602,7 @@ pub fn one_run_for(
     p3_circuit_prover::BatchStarkProof<SemConfig>,
 ) {
     let sink = SemSink::new();
-    let (verifier, proof) = settle_sem_for(rc, &sink, log_max_lde);
+    let (verifier, proof) = settle_sem_for(rc, &sink, log_max_lde, rate);
 
     // The prover shares the sink; mark where the verifier's program begins.
     let mark = sink.program().len();
@@ -612,7 +619,7 @@ pub fn one_run_for(
         .expect("table public values");
 
     let sink_manual = SemSink::new();
-    let manual_config = sem_config_for(&sink_manual, log_max_lde);
+    let manual_config = sem_config_for(&sink_manual, log_max_lde, rate);
     let out = manual_replay(
         &manual_config,
         &verifier,

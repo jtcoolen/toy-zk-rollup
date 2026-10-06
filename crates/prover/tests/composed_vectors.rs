@@ -253,7 +253,7 @@ fn block_program_equality_and_export() -> Result<(), Box<dyn Error>> {
     // builder the circuit's export mirrors.
     let pis: Vec<F> = block_statement([shape].iter(), [client.statement.as_slice()])?;
 
-    let params = settlement_params_for(prover::block::BLOCK_LOG_MAX_LDE);
+    let params = settlement_params_for(prover::block::BLOCK_LOG_MAX_LDE, 1);
 
     let mut rounds_a = Vec::new();
     let mut starts_a = Vec::new();
@@ -262,6 +262,7 @@ fn block_program_equality_and_export() -> Result<(), Box<dyn Error>> {
         &rc,
         &params,
         prover::block::BLOCK_LOG_MAX_LDE,
+        1,
         &mut rounds_a,
         &mut starts_a,
     )?;
@@ -273,6 +274,7 @@ fn block_program_equality_and_export() -> Result<(), Box<dyn Error>> {
         &rc,
         &params,
         prover::block::BLOCK_LOG_MAX_LDE,
+        1,
         &mut rounds_b,
         &mut starts_b,
     )?;

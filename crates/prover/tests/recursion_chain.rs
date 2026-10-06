@@ -16,6 +16,28 @@ use prover::whir_recursion::{
 
 const BASE_TRACE: usize = 1024;
 
+/// Starting inverse rate for the final (Keccak) settlement of the exported
+/// chain bundle. Rate 2 halves the STIR query budget - the dominant term of
+/// the on-chain wire - and the final circuit fits it under TWO_ADICITY 24
+/// (D-092 batch 20). Set WHIR_RATE_FINAL=1 to reproduce the rate-1 baseline.
+fn rate_final() -> usize {
+    std::env::var("WHIR_RATE_FINAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2)
+}
+
+/// Starting inverse rate for the inner (Poseidon2) layers. Rate 2 shrinks
+/// every intermediate proof (fewer queries -> shorter paths -> fewer
+/// Poseidon2 rows in the next circuit), which is what buys the final layer
+/// its rate headroom (D-092 batch 20).
+fn rate_inner() -> usize {
+    std::env::var("WHIR_RATE_INNER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2)
+}
+
 /// The recursion circuit's own trace grows with the inner proof it re-verifies
 /// (every Merkle path node is a Poseidon2 row), so the chain needs a larger
 /// LDE budget than the single-layer tests: layer 2 overflows 2^22 with
@@ -41,7 +63,8 @@ const fn per_mille(bytes: usize, prev: usize) -> usize {
 #[test]
 #[ignore = "layer-chain harness; run with --release"]
 fn layer_chain_convergence() {
-    let inner = InnerWhirConfig::new(CHAIN_LOG_MAX_LDE, CAP_HEIGHT).expect("inner config");
+    let inner = InnerWhirConfig::new_with(CHAIN_LOG_MAX_LDE, CAP_HEIGHT, rate_inner())
+        .expect("inner config");
     let air = FibonacciAir {};
     let trace = generate_trace_rows::<F>(0, 1, BASE_TRACE);
     let pis = vec![F::ZERO, F::ONE, fibonacci_output(BASE_TRACE)];
@@ -98,7 +121,8 @@ fn layer_chain_convergence() {
 #[test]
 #[ignore = "writes vectors; run with --release when regenerating"]
 fn export_chain_bundle() {
-    let inner = InnerWhirConfig::new(CHAIN_LOG_MAX_LDE, CAP_HEIGHT).expect("inner config");
+    let inner = InnerWhirConfig::new_with(CHAIN_LOG_MAX_LDE, CAP_HEIGHT, rate_inner())
+        .expect("inner config");
     let air = FibonacciAir {};
     let trace = generate_trace_rows::<F>(0, 1, BASE_TRACE);
     let pis = vec![F::ZERO, F::ONE, fibonacci_output(BASE_TRACE)];
@@ -115,9 +139,18 @@ fn export_chain_bundle() {
             .expect("next recursion circuit");
     }
 
-    let (bundle, _jj) = prover::composed_export::settlement_bundle(&rc, &pis)
-        .expect("composed bundle for the chain");
+    let (bundle, jj, blob) =
+        prover::composed_export::settlement_bundle_with_blob(&rc, &pis, rate_final())
+            .expect("composed bundle for the chain");
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contracts/test/vectors");
+    // The vectors doc too: gen_composed_flat.mjs turns it into the flat form
+    // the WhirComposed harness drives (WHIR_FLAT env, batch 19).
+    std::fs::write(
+        format!("{dir}/recursion_chain_vectors.json"),
+        jj.to_string(),
+    )
+    .expect("write vectors");
+    std::fs::write(format!("{dir}/recursion_chain_vectors.bin"), &blob).expect("write blob");
     std::fs::write(format!("{dir}/recursion_chain_bundle.bin"), &bundle).expect("write bundle");
     let stmt: Vec<u64> = pis
         .iter()
