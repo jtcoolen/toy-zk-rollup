@@ -29,21 +29,31 @@
 //! either the recursion config (to chain further) or the Keccak settlement
 //! config (to reach L1).
 //!
-//! ## Statement
+//! ## Statement (D-089)
 //!
-//! The exported statement is a shape header followed by the children's statement
-//! values concatenated in order:
+//! The children's full statements are *not* re-exported. Each child statement
+//! is folded through the Poseidon2 sponge into one running digest —
+//! `running_i = sponge(running_{i-1} || child_i statement)` — and the exported
+//! statement is that fold plus the handful of values the pool acts on:
 //!
 //! ```text
 //! [ n, (inputs_0, outputs_0), ..., (inputs_{n-1}, outputs_{n-1}),
-//!   transfer 0: nullifiers..., outputs..., root, root_after, nf roots..., fee,
-//!   transfer 1: ..., ... ]
+//!   statementRoot, rootBefore, rootAfter, nfRootBefore, nfRootAfter,
+//!   fee_0, ..., fee_{n-1} ]
 //! ```
+//!
+//! 81 + 6n limbs instead of the children's ~100n — and the fold is binding:
+//! the fold input is the same statement targets the in-circuit verifier
+//! constrained against each child proof, so the exported digest attests *the
+//! public inputs of the proofs that were verified*, not a re-declared copy.
+//! Anything inside a child statement (nullifiers, output commitments, per-
+//! transfer roots) is pinned by the fold without being re-exposed; the pool
+//! never reads them, it acts on the four block digests and the fees.
 //!
 //! The header is exported as circuit constants, so the split is **bound by the
 //! proof**. The settlement contract reads it from the verified statement rather
-//! than being told it: a prover cannot declare a split that makes the contract
-//! read an output commitment as a nullifier, or skip a real nullifier.
+//! than being told it: a prover cannot declare a split that makes the fold
+//! cover something other than what was verified.
 //!
 //! That is what the settlement layer and L1 read to apply the state update.
 //!
@@ -79,6 +89,7 @@
 //! chain of roots cannot be extended — the absent-fold inside each child's
 //! proof fails against the root it inherited.
 
+use crate::commitment_gadget::{export_digest_limbs, fold_statement, DigestExpr};
 use crate::whir_recursion::{Challenge, InnerWhirConfig, RecursionCircuit, WhirMmcs, DIGEST_ELEMS};
 use p3_circuit::{CircuitBuilder, ExprId, NonPrimitiveOpId, StatementExport};
 use p3_circuit_prover::common::{NpoAirBuilder, NpoPreprocessor};
@@ -195,6 +206,12 @@ impl TransferShape {
     pub const fn nullifier_after_offset(&self) -> usize {
         LIMBS_PER_HASH * (self.num_nullifiers + self.num_outputs + 3)
     }
+
+    /// Offset of the 4 fee limbs at the end of the statement.
+    #[must_use]
+    pub const fn fee_offset(&self) -> usize {
+        self.statement_len() - FEE_LIMBS
+    }
 }
 
 /// Width of the exported shape header for a block of `num_children` transfers:
@@ -238,6 +255,119 @@ pub fn shape_header<'a>(
     Ok(header)
 }
 
+/// Limbs of one 32-byte digest in a statement (32 bytes / 16-bit limbs).
+///
+/// Same width as [`LIMBS_PER_HASH`] by construction — a digest and a hash
+/// commitment occupy a statement identically — but the name says which one a
+/// call site means.
+pub const DIGEST_LIMBS: usize = LIMBS_PER_HASH;
+
+/// Total limbs of a folded block statement for `num_children` transfers:
+/// shape header, the statement fold root, the four block endpoint digests,
+/// and one fee per transfer.
+pub const fn block_statement_len(num_children: usize) -> usize {
+    shape_header_len(num_children) + DIGEST_LIMBS + 4 * LIMBS_PER_HASH + FEE_LIMBS * num_children
+}
+
+/// Fold child statements natively, exactly as the circuit does.
+///
+/// `running_0 = 0⁸`; `running_i = sponge(running_{i-1} ‖ child_i limbs)` with
+/// the Poseidon2 overwrite sponge. The circuit's [`fold_statement`] chain and
+/// this function agree element-for-element — pinned by
+/// `commitment_gadget::fold_statement_matches_native`.
+#[must_use = "the fold root is the point"]
+pub fn fold_statement_native<'a>(
+    children: impl IntoIterator<Item = &'a [F]>,
+) -> [F; DIGEST_ELEMS] {
+    let hasher = pq_hash::Poseidon2Commitment::new();
+    let mut running = [F::ZERO; DIGEST_ELEMS];
+    for child in children {
+        let mut input = Vec::with_capacity(DIGEST_ELEMS + child.len());
+        input.extend_from_slice(&running);
+        input.extend_from_slice(child);
+        running = hasher.hash_elements(&input);
+    }
+    running
+}
+
+/// Encode 8 fold elements as 16 little-endian `u16` limbs, matching what
+/// [`export_digest_limbs`] produces in-circuit: per base coefficient, the low
+/// 16 bits then the high 15 bits of its canonical `u32`.
+fn digest_to_limbs(elements: &[F; DIGEST_ELEMS]) -> Vec<F> {
+    let digest = pq_hash::elements_to_digest(elements);
+    let bytes = digest.as_bytes();
+    let mut limbs = Vec::with_capacity(DIGEST_LIMBS);
+    for word in bytes.chunks_exact(4) {
+        let w = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+        limbs.push(F::from_u16((w & 0xFFFF) as u16));
+        limbs.push(F::from_u16((w >> 16) as u16));
+    }
+    limbs
+}
+
+/// Reconstruct the statement a block proof must verify against (D-089).
+///
+/// `[header, statementRoot, rootBefore, rootAfter, nfBefore, nfAfter, fee_0,
+/// …, fee_{n-1}]` — the folded form the circuit exports. Shared by the node's
+/// block driver, the vector generators, and the tests, so no consumer
+/// re-derives the layout by hand. Each child statement must match its shape.
+///
+/// # Errors
+///
+/// Returns a message if a shape disagrees with its statement, if the counts
+/// overflow a `u16` limb, or if the two iterators disagree on the child count.
+pub fn block_statement<'a>(
+    shapes: impl IntoIterator<Item = &'a TransferShape>,
+    children: impl IntoIterator<Item = &'a [F]>,
+) -> Result<Vec<F>, String> {
+    let shapes: Vec<&TransferShape> = shapes.into_iter().collect();
+    let statements: Vec<&[F]> = children.into_iter().collect();
+    if shapes.len() != statements.len() {
+        return Err(format!(
+            "{} shapes but {} child statements",
+            shapes.len(),
+            statements.len()
+        ));
+    }
+    if shapes.is_empty() {
+        return Err("a block must have at least one transfer".to_string());
+    }
+    for (shape, statement) in shapes.iter().zip(&statements) {
+        if statement.len() != shape.statement_len() {
+            return Err(format!(
+                "child statement has {} limbs, shape {shape:?} implies {}",
+                statement.len(),
+                shape.statement_len()
+            ));
+        }
+    }
+
+    let mut out: Vec<F> = shape_header(shapes.iter().copied())?
+        .iter()
+        .map(|&v| F::from_u16(v))
+        .collect();
+    let fold = fold_statement_native(statements.iter().copied());
+    out.extend(digest_to_limbs(&fold));
+
+    let (first_shape, first) = (shapes[0], statements[0]);
+    let (last_shape, last) = (shapes[shapes.len() - 1], statements[statements.len() - 1]);
+    out.extend_from_slice(&first[first_shape.root_offset()..first_shape.root_offset() + LIMBS_PER_HASH]);
+    out.extend_from_slice(
+        &last[last_shape.root_after_offset()..last_shape.root_after_offset() + LIMBS_PER_HASH],
+    );
+    out.extend_from_slice(
+        &first[first_shape.nullifier_before_offset()..first_shape.nullifier_before_offset() + LIMBS_PER_HASH],
+    );
+    out.extend_from_slice(
+        &last[last_shape.nullifier_after_offset()..last_shape.nullifier_after_offset() + LIMBS_PER_HASH],
+    );
+    for (shape, statement) in shapes.iter().zip(&statements) {
+        out.extend_from_slice(&statement[shape.fee_offset()..shape.fee_offset() + FEE_LIMBS]);
+    }
+    debug_assert_eq!(out.len(), block_statement_len(shapes.len()));
+    Ok(out)
+}
+
 /// A client-produced transfer proof, presented for verification inside a block.
 ///
 /// The verifier travels with the proof: transfers of different shapes (different
@@ -264,13 +394,15 @@ impl core::fmt::Debug for ChildProof<'_> {
     }
 }
 
-/// Verify every child transfer proof inside one circuit and export their
-/// statements concatenated.
+/// Verify every child transfer proof inside one circuit and export the folded
+/// statement described in the module docs (D-089).
 ///
 /// Each child is re-verified through the trusted entry point, so a child's
 /// relation comes from its retained verifier rather than from anything the proof
-/// asserts. The exported statement is the concatenation of the children's
-/// statement values in order.
+/// asserts. Each child's *verified* statement targets are folded into the
+/// running statement digest — the fold consumes the same targets the verifier
+/// constrained, so the exported root attests to the public inputs of the proofs
+/// that were actually verified.
 ///
 /// # Errors
 ///
@@ -308,6 +440,14 @@ pub fn build_multi_transfer_circuit(
     // The nullifier-map root chain across children. See "Nullifier roots are
     // chained, not pinned" in the module docs.
     let mut nullifiers = NullifierChain::default();
+    // The running statement fold (D-089): `running_i = sponge(running_{i-1}
+    // ‖ child_i statement)`, seeded with the zero digest. Fed with each child's
+    // *verified* statement targets, so the final digest is a commitment to the
+    // public inputs of exactly the proofs this circuit verified.
+    let zero_c = builder.define_const(Challenge::ZERO);
+    let mut statement_fold: DigestExpr = [zero_c, zero_c];
+    // Per-child fee limbs, exported flattened after the endpoint digests.
+    let mut fee_limbs: Vec<ExprId> = Vec::with_capacity(FEE_LIMBS * children.len());
 
     // Shape header, exported as circuit constants so the split is bound by the
     // proof rather than asserted by the caller. Without this the settlement
@@ -369,14 +509,35 @@ pub fn build_multi_transfer_circuit(
             perm,
         )?;
 
-        // Bind the statement: the exported base values are the AIR public
-        // targets of this child's statement table instance — exactly the targets
-        // the in-circuit verifier constrained against the child proof.
+        // The child's statement targets: the AIR public values of its statement
+        // table instance — exactly the targets the in-circuit verifier
+        // constrained against the child proof. Everything the block exports
+        // about a child is read out of this slice.
         let statement_targets = verifier_inputs
             .air_public_targets
             .get(statement_instance)
             .ok_or("statement table instance absent from verifier inputs")?;
-        exports.extend(statement_targets.iter().copied().map(StatementExport::Base));
+        if statement_targets.len() != child.statement.len() {
+            return Err(format!(
+                "statement targets ({} limbs) disagree with the statement ({} limbs)",
+                statement_targets.len(),
+                child.statement.len()
+            )
+            .into());
+        }
+
+        // Fold the verified statement into the running digest (D-089). This is
+        // the binding: the fold input is the constrained targets themselves, not
+        // a re-declared copy, so the exported root cannot describe statements
+        // other than the ones that were verified.
+        statement_fold = fold_statement(&mut builder, &statement_fold, statement_targets)?;
+
+        // Collect this child's fee limbs for the flattened fee tail.
+        fee_limbs.extend_from_slice(
+            statement_targets
+                .get(child.shape.fee_offset()..child.shape.fee_offset() + FEE_LIMBS)
+                .ok_or("fee limbs outside statement target range")?,
+        );
 
         // Chain this child's commitment transition onto the previous one's.
         commitment.advance(&mut builder, child.shape, statement_targets)?;
@@ -398,6 +559,31 @@ pub fn build_multi_transfer_circuit(
             op_ids,
         });
     }
+
+    // The folded statement root: one digest attesting to every child statement,
+    // exported as 16 limbs (two base coefficients per extension element, each
+    // split into two 16-bit limbs — the same encoding the contract's LimbCodec
+    // reassembles).
+    for limb in export_digest_limbs(&mut builder, &statement_fold)? {
+        exports.push(StatementExport::Base(limb));
+    }
+    // The block's four endpoint digests, straight from the chains: the first
+    // child's `root`/`nullifier_before` and the last child's `root_after`/
+    // `nullifier_after`. The chains already constrained every intermediate
+    // transition, so these four limbs-groups are the whole state update the
+    // settlement layer applies.
+    let (root_before, root_after) = commitment
+        .endpoints()
+        .ok_or("commitment chain produced no endpoints")?;
+    let (nf_before, nf_after) = nullifiers
+        .endpoints()
+        .ok_or("nullifier chain produced no endpoints")?;
+    for limbs in [root_before, root_after, nf_before, nf_after] {
+        exports.extend(limbs.iter().copied().map(StatementExport::Base));
+    }
+    // The flattened fees, one 4-limb group per transfer, in child order.
+    exports.extend(fee_limbs.iter().copied().map(StatementExport::Base));
+    debug_assert_eq!(exports.len(), block_statement_len(children.len()));
 
     let schema = builder.set_statement_exports::<F>(&exports)?;
     let circuit = builder.build()?;
@@ -481,6 +667,8 @@ struct CommitmentChain {
     /// The previous child's `root_after`, which the next child's `root` must
     /// match; `None` until the first child pins the block's `rootBefore`.
     expected_before: Option<[ExprId; LIMBS_PER_HASH]>,
+    /// The first child's `root`, i.e. the block's own `rootBefore`.
+    first_before: Option<[ExprId; LIMBS_PER_HASH]>,
     /// The most recent `root_after`, i.e. the block's own `rootAfter`.
     latest_after: Option<[ExprId; LIMBS_PER_HASH]>,
 }
@@ -497,10 +685,18 @@ impl CommitmentChain {
         let after = take_limbs(targets, shape.root_after_offset(), "root after")?;
         if let Some(prev_after) = self.expected_before {
             assert_limbs_equal(builder, &prev_after, &before);
+        } else {
+            self.first_before = Some(before);
         }
         self.expected_before = Some(after);
         self.latest_after = Some(after);
         Ok(())
+    }
+
+    /// The block's `(rootBefore, rootAfter)` once at least one child advanced
+    /// the chain.
+    fn endpoints(&self) -> Option<([ExprId; LIMBS_PER_HASH], [ExprId; LIMBS_PER_HASH])> {
+        Some((self.first_before?, self.latest_after?))
     }
 }
 
@@ -519,6 +715,8 @@ impl CommitmentChain {
 struct NullifierChain {
     /// The previous child's `after`, which the next child's `before` must match.
     expected_before: Option<[ExprId; LIMBS_PER_HASH]>,
+    /// The first child's `before`, i.e. the block's own `nullifierBefore`.
+    first_before: Option<[ExprId; LIMBS_PER_HASH]>,
     /// The most recent `after`, i.e. the block's own `root_after`.
     latest_after: Option<[ExprId; LIMBS_PER_HASH]>,
 }
@@ -535,10 +733,18 @@ impl NullifierChain {
         let after = take_limbs(targets, shape.nullifier_after_offset(), "nullifier after")?;
         if let Some(prev_after) = self.expected_before {
             assert_limbs_equal(builder, &prev_after, &before);
+        } else {
+            self.first_before = Some(before);
         }
         self.expected_before = Some(after);
         self.latest_after = Some(after);
         Ok(())
+    }
+
+    /// The block's `(nullifierBefore, nullifierAfter)` once at least one child
+    /// advanced the chain.
+    fn endpoints(&self) -> Option<([ExprId; LIMBS_PER_HASH], [ExprId; LIMBS_PER_HASH])> {
+        Some((self.first_before?, self.latest_after?))
     }
 }
 
@@ -851,23 +1057,6 @@ mod tests {
         Ok(())
     }
 
-    /// Reconstruct the statement a block proof must verify against: the shape
-    /// header, then each child's statement in order. Derived through the same
-    /// [`shape_header`] the circuit exported, so neither side can drift.
-    fn block_statement(
-        shapes: [TransferShape; 2],
-        children: [&[F]; 2],
-    ) -> Result<Vec<F>, Box<dyn Error>> {
-        let mut expected: Vec<F> = shape_header(shapes.iter())?
-            .iter()
-            .map(|&v| F::from_u16(v))
-            .collect();
-        for child in children {
-            expected.extend_from_slice(child);
-        }
-        Ok(expected)
-    }
-
     /// A block that verifies two independently-produced client transfer proofs.
     ///
     /// This is the shape the whole design turns on: the recursive prover verifies
@@ -929,11 +1118,13 @@ mod tests {
         let rc = build_multi_transfer_circuit(&inner, &children)?;
         let (block_proof, block_verifier) = settle_block_circuit(&rc, BLOCK_LOG_MAX_LDE)?;
 
-        // The block statement is the shape header, then both transfers'
-        // statements in order. Rebuilt through the same `shape_header` the
-        // circuit used, so the two cannot drift on where the header ends.
-        let expected =
-            block_statement([ONE_IN_ONE_OUT, ONE_IN_ONE_OUT], [&client_a.2, &client_b.2])?;
+        // The folded block statement (D-089): header, statement fold root, the
+        // four endpoint digests, the fees. Rebuilt through the same shared
+        // builder the circuit's export mirrors, so the two cannot drift.
+        let expected = block_statement(
+            [ONE_IN_ONE_OUT, ONE_IN_ONE_OUT].iter(),
+            [client_a.2.as_slice(), client_b.2.as_slice()],
+        )?;
         block_verifier.verify(&block_proof, &expected)?;
 
         // Tampering with either half must be rejected.
@@ -1020,8 +1211,10 @@ mod tests {
                 );
             }
         }
-        let statement =
-            block_statement([ONE_IN_ONE_OUT, ONE_IN_ONE_OUT], [&client_a.2, &client_b.2])?;
+        let statement = block_statement(
+            [ONE_IN_ONE_OUT, ONE_IN_ONE_OUT].iter(),
+            [client_a.2.as_slice(), client_b.2.as_slice()],
+        )?;
         // Each statement limb is a base-field element serialized as one
         // little-endian u32, so the statement's wire size is 4 bytes per limb.
         let stmt_bytes = statement.len() * 4;
