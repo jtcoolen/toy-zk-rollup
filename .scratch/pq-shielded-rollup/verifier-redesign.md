@@ -725,3 +725,270 @@ Full suite: **143/143 pass** (140 + 3 new). `cargo fmt` gate fixed.
 check.sh re-running; step C is complete end-to-end: impl + e2e + parity +
 gate. Next: Step D (pruned-frontier Merkle paths).
 
+
+
+---
+
+## Batch 12 — Step D measurement (frontier savings) + pivot to D-092
+
+Step C committed: `1936c24 feat(d086): derive terminal eq groups from the
+public statement (mode 2)`. Full gate green (143/143, check.sh ALL PASSED).
+
+Measured the ACTUAL path bytes in the v5 bundle (composed_flat.json):
+rounds ship 246-262 paths each, 3,849-5,367 nodes, total 23,495 nodes =
+**752 KB** of Merkle paths (paths_hex per round: 123/172/147/163/147 KB).
+
+Pruned-frontier estimate (ancestors-union per tree, random-index model):
+a depth-16 tree with 160 queries ships 160x16 = 2,560 nodes but needs
+~2+4+...+128 + 8x160 = ~1,534 frontier nodes: ~40% saving at that shape,
+~30% at depth 21/182 queries. Realistic total: **~250-300 KB wire, ~7-8M
+gas** - LESS than the earlier -700 KB guess (that assumed more sharing than
+random indices give). Exact pairing of paths to query indices requires the
+Rust structures (flat JSON groups differ: 183 paths of depth 16 vs 160
+queries - some queries open two matrices), so the precise frontier must be
+computed in the export, not offline.
+
+DECISION: Step D stays queued (worth ~7M gas, medium risk: encoder +
+verifier + vectors all move). The goal names D-092 explicitly - the
+RECURSIVE 300 KB proof and a redesigned verifier BESIDE the existing one -
+so D-092 Phase 1 goes first: recursion proof -> WBND sidecar -> size +
+verifier-cost measurement. Steps D/B then apply to the recursive shape
+where the same levers are cheaper to land (new library, no migration).
+
+
+
+---
+
+## Batch 13 — Can the EXISTING verifier verify the recursive proof? (user question)
+
+Answer: mechanically yes (with a schedule regen + statement rebind), but it
+CANNOT land as a settlement tx - and the numbers are now measured, not
+estimated.
+
+**Protocol compatibility (the key finding).** The earlier "SemConfig !=
+whir::Config, must bridge" note was about RUST TYPES, not wire bytes:
+- whir::Config (recursion settle): KoalaBear + BinomialExt4 +
+  SerializingChallenger32(HashChallenger Keccak256) [whir.rs:70-89]
+- SemConfig (composed path): KoalaBear + BinomialExt4 + SemChallenger =
+  the SAME SerializingChallenger32(HashChallenger Keccak256) wrapped in a
+  recording sink [settlement_replay.rs:79-89]
+Byte streams identical -> the existing verifier's transcript, ext-field
+arithmetic (4-limb packing), sumcheck and STIR machinery apply UNCHANGED
+to the recursive proof. The WBND encoder is already shape-generic (cfg
+carries the schedule).
+
+**Measured sizes (recursion_bench rerun, BASE_TRACE=1024):**
+- layer-1 settle proof: **677,572 B postcard** (~10.8M gas calldata alone)
+- base proof 130,802 B; settle prove 2.0 s; settle verify 9 ms
+- the ~300 KB figure is the LAYER-N convergence (332->302->300 KB), not
+  layer 1.
+
+**Gas reality:** at today's ~155 gas/byte: 300 KB -> ~47M (over the
+~30-36M block gas limit); 677 KB -> ~105M. So the existing verifier can
+verify the recursive proof in a FOUNDRY TEST (foundry's gas cap is high)
+but it cannot settle on mainnet. That is exactly the D-092 thesis: the
+C/D/B levers + gas queue are what close 47M -> <=30M.
+
+**What running it through the existing verifier actually needs:**
+1. recursion_export.rs: flatten layer-N BatchStarkProof<whir::Config> ->
+   flat sidecar -> encode_bundle (encoder shape-generic; needs the walk
+   instrumentation - composed_export drives verify_whir_round via a replay
+   delegate inside the prover; the recursion path needs the same, or a
+   SemChallenger swap-in since bytes are identical).
+2. Regenerated WhirFixedConfig for the recursion schedule (log_max_lde 22
+   vs 25: NUM_VARIABLES, round table, grind bits all differ).
+3. Statement rebind: recursion public inputs = D-088 folded root; absorb
+   in the prover's order; verifier checks root == expected(block).
+4. OPEN QUESTION: does the recursion AIR fit the mode-2 constraint-identity
+   shape (statement-derived eq groups), or does the terminal layer need a
+   mode 3? The recursion AIR's constants (Poseidon2 round constants) are
+   much larger than the composed AIR's - step B satellites matter more here.
+
+DECISION: yes - do this NOW as Phase 1 (it was already the plan's next
+step). It validates wire + core on the real recursion shape and produces
+the exact gas number the redesign must beat. The redesigned library beside
+the existing one then targets <=30M on the SAME vectors.
+
+
+
+---
+
+## Batch 14 — MILESTONE M1 recorded: recursive proof through the EXISTING verifier
+
+**M1 (D-092 Phase 1a).** Run a real RECURSIVE proof through the existing
+Solidity verifier and measure it. Steps:
+1. Build the layer chain to convergence (base -> rc1 -> settle -> rc2 -> ...
+   until the proof size stops shrinking; expect ~300 KB postcard).
+2. Export layer-N through the EXISTING composed export path - composed_run_with
+   is generic over RecursionCircuit, so it should take the layer-N rc unchanged.
+3. Regenerate WhirFixedConfig for the layer-N schedule (fixed_config.rs
+   generator, --ignored test).
+4. Foundry test: existing WhirVerifier verifies the real layer-N bundle;
+   reject battery (wrong statement, truncated).
+5. Record the gas number. PREDICTION (batch 13): ~40-80M - the number the
+   beside-sitting redesign must beat to <=30M.
+
+Structural findings this span (grounding M1):
+- The composed bundle IS already a recursive proof: composed_run ->
+  fib_recursion() -> settle_sem_for(rc) settles the RECURSION circuit under
+  SemConfig, whose challenger bytes are identical to whir::Config's Keccak
+  challenger. So "verify a recursive proof" is not new machinery - it is the
+  SAME machinery at a different rc.
+- Flat/postcard ratio measured: 1.19 MB WBND vs 677,572 B postcard for the
+  same layer-1 shape = 1.76x. A 300 KB postcard layer-N proof therefore
+  lands ~530 KB flat -> ~82M gas at today's 155 gas/B. The 47M estimate in
+  the proposal assumed 300 KB FLAT; the honest number is worse, which makes
+  the redesign case STRONGER, not weaker.
+- Chain typing: intermediate layers must settle under InnerWhirConfig
+  (Poseidon2 InSC) because build_batch_recursion_circuit verifies
+  BatchStarkProof<InnerWhirConfig>; only the LAST layer settles under the
+  Keccak config. settle_recursion_circuit hardcodes whir::config -> needs a
+  generic settle_recursion_circuit_with(rc, config) variant (small refactor;
+  check whether the AIR builders are config-generic or whir::Config-keyed).
+- No existing 2-layer chain in the tree (build_batch_recursion_circuit is
+  used only by transfer.rs, one layer). The 332->302->300 KB convergence
+  number needs re-measuring in-tree as part of step 1.
+
+Course correction vs the proposal: Phase 1 originally said "new
+recursion_export.rs". CORRECTED: no new export module needed - the export
+path is already generic over the circuit; what is missing is the InSC-settle
+variant + the chain harness + the schedule regen. Smaller diff than planned.
+
+
+
+### M1 execution log (running)
+
+- settle_recursion_circuit_with<SC> landed (whir_recursion.rs): generic over
+  SC with the transfer.rs bound pattern + one extra pin the compiler forced:
+  Domain::Val = F (preprocessors are keyed on the DOMAIN value type, not
+  Val<SC>). settle_recursion_circuit is now a 2-line wrapper. cargo check
+  green.
+- New ignored test recursion_chain.rs: base fib -> rc1 -> 4x (InSC settle +
+  recurse) -> final Keccak settle, printing postcard size per layer.
+- First run FAILED at layer 2: PowBitsExceedBudget { required: 19, budget: 18 }
+  at InnerWhirConfig::new(LOG_MAX_LDE=22) - the recursion circuit's own trace
+  (Poseidon2 rows for the inner proof's Merkle paths) needs arity 23+ once
+  the inner proof is itself a recursion proof. Raised chain to LDE 24
+  (KoalaBear TWO_ADICITY 24 ceiling; grind budget 24+2-slack... watch for the
+  same error at 24 - if it recurs the chain needs the tuned schedule, not a
+  bigger LDE).
+- Layer sizes so far: base 131,090 B -> layer-1 InSC settle 676,195 B (x5.16).
+  The recursion proof is BIGGER than what it proves - convergence to ~300 KB
+  needs the fan-in/log_blowup tuned schedule from issues/16, not the default
+  protocol_params. If the chain doesn't converge at defaults, M1 measures the
+  DEFAULT-schedule size honestly and the tuning becomes an explicit sub-step.
+- Verifier schedule source confirmed: the bundle CONFIG carries the schedule
+  (WhirFixedConfig.sol is only referenced for FINAL_FOLDING_FACTOR=4, same
+  for the recursion shape) - so NO schedule regen is needed to verify a
+  recursion-shape bundle; the cfg blob carries it. Batch-14 step 3 dropped.
+
+
+
+## Batch 15 - M1 step 1 DONE: layer-chain convergence measured (defaults)
+
+recursion_chain.rs (ignored test, LDE 24, base fib 1024 rows):
+
+    layer 0 (base fib proof)      127,968 B
+    layer 1 (InSC settle)         664,996 B  (x5.197)
+    layer 2 (InSC settle)         762,311 B  (x1.146)
+    layer 3 (InSC settle)         765,767 B  (x1.005)
+    layer 4 (InSC settle)         766,151 B  (x1.001)
+    final   (Keccak settle)       762,823 B  (x0.996)
+
+HONEST FINDING: with the production schedule (KoalaBear, BinomialExt D=4,
+folding 4, rate 1/2, JohnsonBound, min grind) the chain does NOT converge to
+300 KB - it plateaus at ~766 KB postcard. The 332->302->300 KB figure in
+map.md/issues-16 was measured on the OTHER config (D=5 quintic, log_blowup 2
+= rate 1/4) and does not transfer. Correcting the record: the recursion
+target for the beside-sitting verifier is a ~766 KB postcard proof, i.e.
+~1.35 MB flat at the 1.76x ratio, ~210M gas at today's 155 gas/B for the
+EXISTING verifier - not the ~82M estimate (which assumed 300 KB).
+
+Why the plateau sits there: rate 1/2 + folding 4 + 109-bit JohnsonBound
+ceiling forces ~182 queries; the recursion circuit's own trace is dominated
+by the in-circuit Merkle gadget rows of the proof it re-verifies, so each
+layer re-commits roughly the same volume. The tuning lever that moved the
+old measurement was log_inv_rate 2 (rate 1/4): fewer queries per bit at the
+cost of a bigger LDE. Whether to adopt it is a schedule decision (soundness
+is schedule-computed either way; it is a proof-size/LDE tradeoff), recorded
+as an open knob, NOT applied silently.
+
+Also proven by the run: statement binding survives the whole chain (final
+Keccak verifier accepts only the original pis, rejects fib+1), and the
+generic settle works under both InnerWhirConfig and Keccak Config.
+
+
+
+## Batch 16 - M1 DONE: existing verifier on the real recursion proof
+
+recursion_chain.rs export_chain_bundle wrote recursion_chain_bundle.bin
+(WBND v5, 1,228,244 B flat) for the 2-layer chain (base fib -> rc1 -> 2x
+InSC settle+recurse -> Keccak settle), statement [0, 1, fib(1024)=377841674].
+contracts/test/RecursionChainE2E.t.sol runs the existing WhirVerifier on it
+with ZERO verifier changes - batch 14's wire-compatibility prediction holds
+end to end:
+
+    test_real_recursion_chain_verifies   PASS   175,396,812 gas
+    test_rejects_wrong_statement         PASS    26,621,625 gas (reverts at stmt check)
+    test_rejects_tampered_proof          PASS    43,185,902 gas (reverts mid-walk)
+    test_rejects_truncated_proof         PASS   166,634,964 gas (reverts at section table)
+
+THE M1 NUMBER: 175.4M gas. ~5.8x over the 21M/30M targets, ~5x over a
+mainnet block. Flat/postcard ratio here 1.81x (1,228,244 / 762,311 - close
+to the 1.76x measured on the block shape). Effective rate ~143 gas/B.
+
+Redesign budget breakdown implied (to reach <=30M from 175M):
+- calldata alone: 1.23 MB x 16 gas/B non-zero ~= 19.6M (with ~65% zeros at
+  4 gas/B: ~12-15M). So even a FREE compute verifier is ~15M on this wire -
+  the wire itself must shrink (Step D pruned paths + Step B cfg satellites
+  + possibly rate-1/4 schedule) AND compute must drop.
+- compute today ~= 175M - ~15M calldata ~= 160M: dominated by the assembly
+  Merkle walk over ~182 queries x 5 rounds and the sumcheck absorb loop.
+  The gas queue (assembly walk -4.5M, absorb batching -8M...) was sized for
+  the 1.19 MB block shape; the recursion shape has MORE rounds of similar
+  size, so the same levers apply at ~1.4x scale.
+
+Course note: M1 proves the pipeline works end-to-end TODAY (no verifier
+fork needed to verify recursion proofs) and prices the gap honestly.
+D-092 Phase 2 (beside-sitting redesign) now has its baseline: beat 175.4M
+to <=30M on these exact vectors.
+
+
+
+## Batch 17 - D-092 Phase 2 plan (beside-sitting verifier), anchored on M1
+
+Baseline to beat: 175.4M gas on recursion_chain_bundle.bin (1,228,244 B).
+Decomposition of the 175M (measured + estimated):
+  calldata ~19.6M worst case (1.23 MB x 16 gas/B; ~40% zeros -> ~13M real)
+  compute  ~155-160M: 5 rounds x ~182 queries x (Merkle walk + fold) +
+           sumcheck absorbs (24+499+128+188+200 groups) + transcript replays.
+
+Phase 2 attack plan (each step measured against the SAME vectors):
+ P2a WIRE SHRINK (biggest lever, verifier-agnostic):
+   - Step D pruned-frontier paths: paths_hex is 751,840 B of the 1.23 MB;
+     frontier pruning measured -30..40% on the block shape -> -250..300 KB.
+     Exact frontier must be computed in the Rust export (offline attempt
+     failed: some queries open two matrices, batch 13 note).
+   - Step B cfg satellites: CONFIG section carries the schedule + Poseidon2
+     round constants; recursion shape's cfg is bigger than the block's.
+     Chunked code satellites (<=24,576 B each, constructor-pinned) move it
+     out of calldata entirely: -calldata 16 gas/B, +deploy once.
+   - Schedule knob (rate 1/4 via round_log_inv_rates): halves query count
+     (~91 instead of ~182) at +1 LDE bit per layer. Soundness is
+     schedule-computed either way; needs the chain to fit LDE 24 at rate 1/4
+     (25 would exceed KoalaBear capacity with grind). TEST, don't assume.
+ P2b COMPUTE (new library beside the existing one, same wire):
+   - assembly Merkle walk (StarkMkle.sol today: ~4.5M on block shape)
+   - sumcheck absorb batching (-8M class)
+   - mode-2 constraint identity ALREADY WORKS on the recursion shape - the
+     M1 export ran through settlement_bundle (constraint identity + mode-2
+     frames) and the existing verifier consumed it. No mode 3 needed.
+ Target arithmetic: wire 1.23 MB -> ~0.6 MB (D+B) = ~8M calldata; compute
+ 155M -> ~20M needs the walk+absorb+batching levers at recursion scale.
+ 30M is plausible but tight; rate-1/4 is the lever that makes it if compute
+ doesn't fall far enough (halves both walk and fold work).
+
+Order of work: Step D (Rust export + Solidity walk) -> re-measure -> Step B
+-> re-measure -> schedule experiment -> P2b compute library. Each step
+lands with a gas number in this file.
+

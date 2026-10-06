@@ -540,14 +540,65 @@ pub fn settle_recursion_circuit(
     Box<dyn std::error::Error>,
 > {
     let settlement = crate::whir::config(CAP_HEIGHT, log_max_lde)?;
+    settle_recursion_circuit_with(rc, settlement)
+}
+
+/// [`settle_recursion_circuit`] under an arbitrary WHIR config.
+///
+/// The recursion circuit relation (Poseidon2 + recompose + statement tables)
+/// is config-agnostic - the same argument
+/// [`crate::transfer::settle_transfer_circuit_with`] makes for transfers: the
+/// preprocessors are keyed on the base field, the AIR builders are generic
+/// over SC, and only the PCS and challenger differ. Settling an INTERMEDIATE
+/// layer under [`InnerWhirConfig`] (Poseidon2 `InSC`) is what lets the next
+/// [`build_batch_recursion_circuit`] consume it; only the final layer settles
+/// under the Keccak [`crate::whir::Config`].
+///
+/// # Errors
+///
+/// Returns a prover error if circuit preparation or proving fails under the config.
+pub fn settle_recursion_circuit_with<SC>(
+    rc: &RecursionCircuit,
+    settlement: SC,
+) -> Result<
+    (
+        p3_circuit_prover::BatchStarkProof<SC>,
+        p3_circuit_prover::CircuitVerifier<SC>,
+    ),
+    Box<dyn std::error::Error>,
+>
+where
+    SC: p3_uni_stark::StarkGenericConfig<Challenge = Challenge> + Send + Sync + Clone + 'static,
+    p3_uni_stark::Val<SC>: p3_field::PrimeField64
+        + p3_field::Field
+        + p3_circuit_prover::config::StarkField
+        + p3_field::extension::BinomiallyExtendable<4>,
+    Challenge: p3_field::ExtensionField<p3_uni_stark::Val<SC>>
+        + p3_field::BasedVectorSpace<p3_uni_stark::Val<SC>>
+        + From<p3_uni_stark::Val<SC>>
+        + p3_circuit_prover::field_params::ExtractBinomialW<p3_uni_stark::Val<SC>>,
+    SC::Challenger: p3_challenger::GrindingChallenger<Witness = p3_uni_stark::Val<SC>>,
+    p3_uni_stark::PcsProverError<SC>: Send,
+    SC::Pcs: Sync,
+    <SC::Pcs as p3_commit::Pcs<Challenge, SC::Challenger>>::Domain:
+        p3_commit::PolynomialSpace<Val = F> + Send + Sync,
+    <SC::Pcs as p3_commit::Pcs<Challenge, SC::Challenger>>::ProverData: Sync,
+    <SC::Pcs as p3_commit::Pcs<Challenge, SC::Challenger>>::Commitment: Sync,
+    p3_air::SymbolicExpressionExt<p3_uni_stark::Val<SC>, Challenge>: p3_field::Algebra<p3_uni_stark::SymbolicExpression<p3_uni_stark::Val<SC>>>
+        + p3_field::Algebra<Challenge>,
+    p3_circuit_prover::batch_stark_prover::Poseidon2AirBuilderForConfig<4>:
+        p3_circuit_prover::common::NpoAirBuilder<SC, 4>,
+    p3_circuit_prover::batch_stark_prover::RecomposeAirBuilder<4>:
+        p3_circuit_prover::common::NpoAirBuilder<SC, 4>,
+{
     let shared = Poseidon2Config::KOALA_BEAR_D4_W16.for_shared_challenger_table();
-    let preprocessors: Vec<Box<dyn NpoPreprocessor<F>>> = vec![
+    let preprocessors: Vec<Box<dyn NpoPreprocessor<p3_uni_stark::Val<SC>>>> = vec![
         Box::new(Poseidon2SharedPreprocessor::new(vec![shared])),
-        recompose_preprocessor::<F>(true),
+        recompose_preprocessor::<p3_uni_stark::Val<SC>>(true),
         Box::new(StatementPreprocessor::new(rc.schema.clone())),
     ];
-    let mut air_builders: Vec<Box<dyn NpoAirBuilder<crate::whir::Config, 4>>> =
-        poseidon2_air_builders_for_configs::<crate::whir::Config, 4>(vec![shared]);
+    let mut air_builders: Vec<Box<dyn NpoAirBuilder<SC, 4>>> =
+        poseidon2_air_builders_for_configs::<SC, 4>(vec![shared]);
     air_builders.push(Box::new(RecomposeAirBuilder::<4>::new(1, true)));
     air_builders.push(Box::new(StatementAirBuilder::<4>::new(rc.schema.clone())));
 

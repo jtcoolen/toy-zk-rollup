@@ -98,6 +98,13 @@ Three hashes, each chosen for a different cost environment. Never mix them by ac
   domain. End to end per block: base prove 0.05 s, circuit build 0.06 s, settle prove
   1.85 s, settle verify 8 ms — under 2 s.
 
+   **SUPERSEDED again by the layer-chain measurement (D-092 M1, batch 15/16):** with the
+   production schedule (D=4, rate 1/2, JohnsonBound) the chain plateaus at **766 KB
+   postcard** (base 128 KB -> L1 665 KB -> L2 762 KB -> L4 766 KB), NOT 300 KB - the
+   332/302/300 numbers were the D=5 rate-1/4 config. The existing verifier accepts the
+   exported 2-layer proof (WBND 1.23 MB flat) with zero changes at **175.4M gas**
+   (contracts/test/RecursionChainE2E.t.sol) - the honest baseline the beside-sitting
+   redesign must bring to <=30M.
 - [Settlement Merkle tree is byte-native Keccak-256](decisions.md): **D-050.** Leaf = `keccak256(concat of 4-byte LE limbs)`, node = `keccak256(left || right)`, digest = 32 raw bytes, replayed by the native `keccak256` opcode at ~250 gas/node. Do NOT port Keccak-f[1600] to Solidity (~30–50k gas/node) and do NOT reuse the vendored `MerkleVerifier.sol` convention (it uses `0x00`/`0x01` prefixes, BE32, and 20-byte masked digests).
 - [HVZK blinding is a compile-time guarantee](decisions.md): **D-051.** `const _: () = assert!(Pcs::ZK)` in `crates/prover/src/lib.rs` for both layers, so an upstream flip breaks the build rather than a test run. Blinding folds the mask into the committed trace, so the trace commitment is per-proof fresh and a block cannot be identified by it.
 - [Golden vectors must not self-rewrite](decisions.md): **D-052.** Generators are `#[ignore]`d; an always-on `golden_vectors_are_current` re-derives the deterministic content and fails on drift. Pinned by four mutation tests.
