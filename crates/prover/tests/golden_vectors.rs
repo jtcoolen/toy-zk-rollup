@@ -429,10 +429,8 @@ fn block_vectors() -> Result<(), Box<dyn Error>> {
         num_nullifiers: 1,
         num_outputs: 1,
     };
-    let block_statement = prover::block::block_statement(
-        [shape].iter(),
-        [artifacts.statement.as_slice()],
-    )?;
+    let block_statement =
+        prover::block::block_statement([shape].iter(), [artifacts.statement.as_slice()])?;
 
     // The statement in both forms, from the same slice.
     let forms: StatementForms = statement_forms(&block_statement);
@@ -808,12 +806,16 @@ fn check_block_vectors() -> Result<(), Box<dyn Error>> {
     // drifts, the statement's own limbs and this pin disagree and the contract
     // would store a root no prover attested.
     let child = fixture.child_statement();
-    let now_root = hex(pq_hash::elements_to_digest(
-        &prover::block::fold_statement_native(std::iter::once(child.as_slice())),
-    )
-    .as_bytes());
+    let now_root = hex(
+        pq_hash::elements_to_digest(&prover::block::fold_statement_native(std::iter::once(
+            child.as_slice(),
+        )))
+        .as_bytes(),
+    );
     assert_eq!(
-        v["statement_root_hex"].as_str().expect("statement_root_hex"),
+        v["statement_root_hex"]
+            .as_str()
+            .expect("statement_root_hex"),
         now_root,
         "block_vectors.json statement_root_hex no longer matches the native fold"
     );

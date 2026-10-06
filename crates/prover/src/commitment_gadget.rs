@@ -790,7 +790,7 @@ mod tests {
     }
 
     /// The statement fold (D-089) must equal the native chain of sponges:
-    /// `running_i = sponge(running_{i-1} || child_i)`, running_0 = 0.
+    /// `running_i = sponge(running_{i-1} || child_i)`, `running_0` = 0.
     ///
     /// Child lengths are chosen so the second fold's combined input (8 + 68)
     /// ends mid-chunk: the partial-chunk carry must agree with the native
@@ -799,8 +799,12 @@ mod tests {
     fn fold_statement_matches_native() {
         let h = hasher();
         let children: Vec<Vec<u16>> = vec![
-            (0..100u32).map(|i| u16::try_from((i * 7919) % 65536).expect("fits")).collect(),
-            (0..68u32).map(|i| u16::try_from((i * 104729) % 65536).expect("fits")).collect(),
+            (0..100u32)
+                .map(|i| u16::try_from((i * 7919) % 65536).expect("fits"))
+                .collect(),
+            (0..68u32)
+                .map(|i| u16::try_from((i * 104_729) % 65536).expect("fits"))
+                .collect(),
         ];
 
         // Native chain.
@@ -847,7 +851,9 @@ mod tests {
     #[test]
     fn fold_rejects_tampered_statement() {
         let h = hasher();
-        let child: Vec<u16> = (0..100u32).map(|i| u16::try_from(i % 65536).expect("fits")).collect();
+        let child: Vec<u16> = (0..100u32)
+            .map(|i| u16::try_from(i % 65536).expect("fits"))
+            .collect();
         let mut input: Vec<F> = vec![F::ZERO; DIGEST_ELEMS];
         input.extend(child.iter().map(|&l| F::from_u16(l)));
         let native = elements_to_digest(&h.hash_elements(&input));
@@ -871,7 +877,10 @@ mod tests {
         let last = witness.len() - 1;
         witness[last] += Challenge::from_u16(1);
         runner.set_private_inputs(&witness).expect("witness fits");
-        assert!(runner.run().is_err(), "a tampered statement must not fold to the pinned digest");
+        assert!(
+            runner.run().is_err(),
+            "a tampered statement must not fold to the pinned digest"
+        );
     }
 
     /// A frontier that does not fold to the pinned root must be rejected.

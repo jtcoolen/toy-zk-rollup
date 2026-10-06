@@ -36,9 +36,6 @@ const ONE_IN_ONE_OUT: TransferShape = TransferShape {
     num_outputs: 1,
 };
 
-/// Shape-header length for a two-transfer block: one block count plus two
-/// limbs per transfer.
-
 /// Prove one client transfer and wrap it in a signed envelope.
 ///
 /// Mirrors the wallet's job: build the witness locally, prove, sign the

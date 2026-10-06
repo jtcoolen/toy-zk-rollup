@@ -265,6 +265,7 @@ pub const DIGEST_LIMBS: usize = LIMBS_PER_HASH;
 /// Total limbs of a folded block statement for `num_children` transfers:
 /// shape header, the statement fold root, the four block endpoint digests,
 /// and one fee per transfer.
+#[must_use]
 pub const fn block_statement_len(num_children: usize) -> usize {
     shape_header_len(num_children) + DIGEST_LIMBS + 4 * LIMBS_PER_HASH + FEE_LIMBS * num_children
 }
@@ -276,9 +277,7 @@ pub const fn block_statement_len(num_children: usize) -> usize {
 /// this function agree element-for-element — pinned by
 /// `commitment_gadget::fold_statement_matches_native`.
 #[must_use = "the fold root is the point"]
-pub fn fold_statement_native<'a>(
-    children: impl IntoIterator<Item = &'a [F]>,
-) -> [F; DIGEST_ELEMS] {
+pub fn fold_statement_native<'a>(children: impl IntoIterator<Item = &'a [F]>) -> [F; DIGEST_ELEMS] {
     let hasher = pq_hash::Poseidon2Commitment::new();
     let mut running = [F::ZERO; DIGEST_ELEMS];
     for child in children {
@@ -297,7 +296,7 @@ fn digest_to_limbs(elements: &[F; DIGEST_ELEMS]) -> Vec<F> {
     let digest = pq_hash::elements_to_digest(elements);
     let bytes = digest.as_bytes();
     let mut limbs = Vec::with_capacity(DIGEST_LIMBS);
-    for word in bytes.chunks_exact(4) {
+    for word in bytes.as_chunks::<4>().0 {
         let w = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
         limbs.push(F::from_u16((w & 0xFFFF) as u16));
         limbs.push(F::from_u16((w >> 16) as u16));
@@ -351,15 +350,19 @@ pub fn block_statement<'a>(
 
     let (first_shape, first) = (shapes[0], statements[0]);
     let (last_shape, last) = (shapes[shapes.len() - 1], statements[statements.len() - 1]);
-    out.extend_from_slice(&first[first_shape.root_offset()..first_shape.root_offset() + LIMBS_PER_HASH]);
+    out.extend_from_slice(
+        &first[first_shape.root_offset()..first_shape.root_offset() + LIMBS_PER_HASH],
+    );
     out.extend_from_slice(
         &last[last_shape.root_after_offset()..last_shape.root_after_offset() + LIMBS_PER_HASH],
     );
     out.extend_from_slice(
-        &first[first_shape.nullifier_before_offset()..first_shape.nullifier_before_offset() + LIMBS_PER_HASH],
+        &first[first_shape.nullifier_before_offset()
+            ..first_shape.nullifier_before_offset() + LIMBS_PER_HASH],
     );
     out.extend_from_slice(
-        &last[last_shape.nullifier_after_offset()..last_shape.nullifier_after_offset() + LIMBS_PER_HASH],
+        &last[last_shape.nullifier_after_offset()
+            ..last_shape.nullifier_after_offset() + LIMBS_PER_HASH],
     );
     for (shape, statement) in shapes.iter().zip(&statements) {
         out.extend_from_slice(&statement[shape.fee_offset()..shape.fee_offset() + FEE_LIMBS]);
@@ -409,6 +412,7 @@ impl core::fmt::Debug for ChildProof<'_> {
 /// Returns an error if `children` is empty, if a child verifier carries no
 /// statement table, if a child proof fails native verification, or if the
 /// circuit cannot be witnessed.
+#[allow(clippy::too_many_lines)] // one linear builder pass: verify each child, fold, chain, export; splitting scatters the spec
 pub fn build_multi_transfer_circuit(
     inner: &InnerWhirConfig,
     children: &[ChildProof<'_>],
