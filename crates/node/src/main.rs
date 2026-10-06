@@ -227,6 +227,15 @@ enum Cmd {
         fee: u64,
         reply: oneshot::Sender<Result<SubmitOk, String>>,
     },
+    /// State pre-check for a proofless wallet envelope (D-090): double-spend
+    /// and stale roots against the committed state - the same roots
+    /// `/v1/roots` reports. The full admission (pending projections, child
+    /// proof) still happens at proof time; this only answers what a signed
+    /// envelope can already be judged on.
+    CheckAdmit {
+        public: shielded::TransferPublic,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Produce {
         reply: oneshot::Sender<Result<serde_json::Value, String>>,
     },
@@ -478,6 +487,19 @@ impl Actor {
                 let r = self.prove_and_submit(input_index, out_value, fee);
                 let _ = reply.send(r);
             }
+            Cmd::CheckAdmit { public, reply } => {
+                // Committed-state check only: the wallet witnessed the roots
+                // /v1/roots reported, which are the committed ones. A queued
+                // transfer that later makes this stale is caught again at
+                // proof-time admission; this answers the wallet's question
+                // without touching the proving machinery.
+                let r = self
+                    .seq
+                    .state()
+                    .check_admit(&public)
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(r);
+            }
             Cmd::Produce { reply } => {
                 let r = self.produce();
                 let _ = reply.send(r);
@@ -587,22 +609,52 @@ async fn metrics_route(State(st): State<AppState>) -> Response {
 
 /// The wallet-facing endpoint: validates the SPHINCS+ envelope end to end
 /// (parse at exact scheme sizes, verify over the statement encoding), then
-/// answers 501 - admitting a remote proof needs the production verifier-
-/// rebuild path deferred in D-079. Validation runs here, not in the actor:
-/// one hash-based signature check is milliseconds.
-async fn submit(Json(wire): Json<TransferWire>) -> Response {
-    match wire.to_envelope() {
-        Ok(_) => (
+/// asks the actor whether the statement is admissible against the committed
+/// state - a spent nullifier or a stale root is a 422, not a shrug (D-090).
+/// A valid, state-plausible envelope still answers 501: admitting a remote
+/// proof needs the production verifier-rebuild path deferred in D-079.
+/// Validation runs here (one hash-based signature check is milliseconds);
+/// the state check goes through the actor so it reads the same state the
+/// block driver mutates - no torn reads, no lock inversion.
+async fn submit(State(st): State<AppState>, Json(wire): Json<TransferWire>) -> Response {
+    let envelope = match wire.to_envelope() {
+        Ok(e) => e,
+        Err(e) => {
+            ::metrics::counter!(names::TX_REJECTIONS, "reason" => "envelope").increment(1);
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("envelope rejected: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if st
+        .tx
+        .send(Cmd::CheckAdmit {
+            public: envelope.public.clone(),
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, "actor gone").into_response();
+    }
+    match reply_rx.await {
+        Ok(Ok(())) => (
             StatusCode::NOT_IMPLEMENTED,
             "envelope valid; remote proof admission is deferred (D-079) - \
              the demo prover is /v1/demo/transfer",
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("envelope rejected: {e}"),
-        )
-            .into_response(),
+        Ok(Err(reason)) => {
+            ::metrics::counter!(names::TX_REJECTIONS, "reason" => "state").increment(1);
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("state rejected: {reason}"),
+            )
+                .into_response()
+        }
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "actor dropped").into_response(),
     }
 }
 

@@ -9,10 +9,15 @@
 // Endpoints used:
 //   GET  /v1/roots     (ReadOnly)  -> {root, nullifier_root}
 //   POST /v1/transfer  (Submitter) -> validates the SPHINCS+ envelope, then
-//                                     501: remote proof admission is deferred
+//                                     checks the statement against the node's
+//                                     state: a spent nullifier or a stale
+//                                     root is a 422 (D-090). A valid,
+//                                     state-plausible envelope gets 501:
+//                                     remote proof admission is deferred
 //                                     (D-083). The 501 is a *success* signal
 //                                     for the envelope: it means the
-//                                     signature verified on the node.
+//                                     signature verified on the node AND the
+//                                     state accepted the statement.
 //   POST /v1/demo/transfer (Admin) -> the working demo prover path.
 
 'use strict';
