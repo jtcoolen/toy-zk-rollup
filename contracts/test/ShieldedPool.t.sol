@@ -44,10 +44,12 @@ contract DecodeHarness {
 ///
 /// Statement, roots, nullifier and output commitment all come from
 /// `block_vectors.json`, produced by `prove_client_transfer`: a real SPHINCS+
-/// spend of a funded note through the transfer circuit. The pool starts from
-/// the EMPTY tree while the vector block names the funded-note root, so the
-/// root limbs are rewritten to the state the pool is actually in - the stub
-/// does not check the statement, and the WHIR verifier is pinned elsewhere.
+/// spend of a funded note through the transfer circuit. The pool is deployed
+/// at the Poseidon2 EMPTY root while the vector block names the funded-note
+/// root, so the root limbs are rewritten to the state the pool is actually in -
+/// the stub does not check the statement, and the WHIR verifier is pinned
+/// elsewhere. D-088: both roots are attested, so the rewrite sets the pair
+/// (rootBefore, rootAfter) the pool must chain and store.
 contract ShieldedPoolTest is Test {
     string internal constant VECTOR = "test/vectors/block_vectors.json";
 
@@ -58,9 +60,12 @@ contract ShieldedPoolTest is Test {
     /// The transfer's root limbs start after header(3) + nullifier(16) + output(16).
     uint256 internal constant ROOT_LIMB_OFFSET = 3 + 32;
 
-    /// The empty commitment-tree root, pinned by MerkleVectors.t.sol.
+    /// The Poseidon2 empty commitment-tree root (D-088 hasher): the root of a
+    /// depth-32 tree of zero leaves under the Poseidon2 sponge/perm fold. The
+    /// pool is deployed here; the vector block names a different (funded) root,
+    /// so the honest block must be rejected on continuity.
     bytes32 internal constant EMPTY_ROOT =
-        0x27ae5ba08d7291c96c8cbddcc148bf48a6d68c7974b94356f53754ef6171d757;
+        0x7a92872da0d9532a933f5f5a8d140b60bba8c80cde1fe868edc23b538844d82e;
 
     ShieldedPool pool;
     StubVerifier verifier;
@@ -69,10 +74,10 @@ contract ShieldedPoolTest is Test {
     uint256[] statement;
     bytes proof;
     bytes32 rootBefore;
+    bytes32 rootAfter;
     bytes32 nullifierBefore;
     bytes32 nullifierAfter;
     bytes32 outputLeaf;
-    bytes32 poolRootAfter;
     uint64 fee;
 
     function setUp() public {
@@ -89,16 +94,16 @@ contract ShieldedPoolTest is Test {
         // never parses them. The real proof bytes are pinned by the WHIR tests.
         proof = hex"deadbeef00112233";
         rootBefore = _asBytes32(vm.parseJsonBytes(j, ".root_before_hex"));
+        rootAfter = _asBytes32(vm.parseJsonBytes(j, ".root_after_hex"));
         nullifierBefore = _asBytes32(vm.parseJsonBytes(j, ".nullifier_before_hex"));
         nullifierAfter = _asBytes32(vm.parseJsonBytes(j, ".nullifier_after_hex"));
         outputLeaf = _asBytes32(vm.parseJsonBytesArray(j, ".outputs_hex")[0]);
-        poolRootAfter = _asBytes32(vm.parseJsonBytes(j, ".pool_root_after_hex"));
         fee = uint64(vm.parseJsonUint(j, ".total_fee"));
 
         verifier = new StubVerifier();
-        // Empty genesis: no leaves, empty nullifier map (bytes32(0) sentinel).
-        bytes32[] memory noLeaves = new bytes32[](0);
-        pool = new ShieldedPool(verifier, address(0xB0B), noLeaves, bytes32(0));
+        // Empty genesis: the Poseidon2 empty root, empty nullifier map
+        // (bytes32(0) sentinel: the contract computes the prover's empty root).
+        pool = new ShieldedPool(verifier, address(0xB0B), EMPTY_ROOT, bytes32(0));
         decoder = new DecodeHarness();
     }
 
@@ -119,11 +124,11 @@ contract ShieldedPoolTest is Test {
         }
     }
 
-    /// Rewrite the transfer's commitment root and nullifier-before limbs so the
-    /// block extends whatever state the pool is in. The stub verifier does not
-    /// check the statement, so this only drives the state machine; the WHIR
-    /// verifier is pinned by the phase tests.
-    function _withRoots(uint256[] memory s, bytes32 newRoot, bytes32 newNfBefore)
+    /// Rewrite the transfer's commitment-root pair and nullifier-before limb so
+    /// the block extends whatever state the pool is in and lands wherever the
+    /// test wants. The stub verifier does not check the statement, so this only
+    /// drives the state machine; the WHIR verifier is pinned by the phase tests.
+    function _withRoots(uint256[] memory s, bytes32 newRoot, bytes32 newRootAfter, bytes32 newNfBefore)
         internal pure returns (uint256[] memory out)
     {
         out = new uint256[](s.length);
@@ -131,13 +136,15 @@ contract ShieldedPoolTest is Test {
             out[i] = s[i];
         }
         _putDigest(out, ROOT_LIMB_OFFSET, newRoot);
-        _putDigest(out, ROOT_LIMB_OFFSET + 16, newNfBefore);
+        _putDigest(out, ROOT_LIMB_OFFSET + 16, newRootAfter);
+        _putDigest(out, ROOT_LIMB_OFFSET + 32, newNfBefore);
     }
 
     function test_decode_matches_the_provers_public_values() public view {
         BlockStatement.Block memory b = decoder.decode(statement);
         assertEq(b.transfers.length, 1, "one transfer");
         assertEq(b.rootBefore, rootBefore, "rootBefore");
+        assertEq(b.rootAfter, rootAfter, "rootAfter");
         assertEq(b.nullifierBefore, nullifierBefore, "nullifierBefore");
         assertEq(b.nullifierAfter, nullifierAfter, "nullifierAfter");
         assertEq(b.totalFee, fee, "totalFee");
@@ -146,21 +153,22 @@ contract ShieldedPoolTest is Test {
     }
 
     function test_applyBlock_advances_both_roots() public {
+        // The attested pair: this block starts where the pool is and lands on
+        // the roots the prover attests (rewritten to the pool's own state).
         uint256[] memory s = _withRoots(
-            statement, pool.currentRoot(), pool.currentNullifierRoot());
+            statement, pool.currentRoot(), rootAfter, pool.currentNullifierRoot());
         verifier.setAcceptedClaim(keccak256(abi.encode(s, proof)));
         pool.applyBlock(s, proof);
         assertEq(pool.blockNumber(), 1, "block number");
-        assertEq(pool.currentRoot(), poolRootAfter, "root advanced by the output leaf");
+        assertEq(pool.currentRoot(), rootAfter, "attested root stored");
         assertEq(pool.currentNullifierRoot(), nullifierAfter, "nullifier root chained");
-        assertEq(pool.leafCount(), 1, "one leaf appended");
     }
 
     /// The stub only accepts the exact (statement, proof) pair it was told
     /// about, so a pool that edited either on the way in reverts NotVerified.
     function test_verifier_receives_the_statement_and_proof_verbatim() public {
         uint256[] memory s = _withRoots(
-            statement, pool.currentRoot(), pool.currentNullifierRoot());
+            statement, pool.currentRoot(), rootAfter, pool.currentNullifierRoot());
         verifier.setAcceptedClaim(keccak256(abi.encode(s, proof)));
         pool.applyBlock(s, proof); // passes only on a verbatim handover
         assertEq(pool.blockNumber(), 1, "applied");
@@ -190,25 +198,49 @@ contract ShieldedPoolTest is Test {
         pool.applyBlock(statement, proof);
     }
 
+    /// A block whose attested `rootAfter` contradicts the statement's own chain
+    /// (transfer 0 ends where transfer 1 does not begin) must not decode, even
+    /// if a malicious prover exported it: the decoder enforces the chain the
+    /// circuit enforces, so the contract never stores a root no chain reached.
+    function test_decode_rejects_a_broken_commitment_chain() public {
+        // The vector is one transfer: header(3) + 100 limbs. Two transfers,
+        // one input and one output each, are header(5) + two 100-limb blocks.
+        uint256[] memory two = new uint256[](statement.length + 102);
+        two[0] = 2;
+        two[1] = 1; two[2] = 1; // transfer 0: one in, one out
+        two[3] = 1; two[4] = 1; // transfer 1: one in, one out
+        // Transfer 0: the vector transfer verbatim.
+        for (uint256 i; i < 100; ++i) {
+            two[5 + i] = statement[3 + i];
+        }
+        // Transfer 1: the same block verbatim, then patched so it is the only
+        // thing that can fail: its nullifier-before continues transfer 0's
+        // nullifier chain, but its commitment rootBefore names a root
+        // transfer 0 never attested.
+        for (uint256 i; i < 100; ++i) {
+            two[105 + i] = statement[3 + i];
+        }
+        // Within a transfer: nullifier(16), output(16), root(16), rootAfter(16),
+        // nfBefore(16), nfAfter(16), fee(4).
+        _putDigest(two, 105 + 32, bytes32(uint256(0xdead))); // bogus rootBefore
+        _putDigest(two, 105 + 64, nullifierAfter); // nfBefore: valid chain, so the
+        // only thing that can fail is the commitment chain.
+        vm.expectRevert("commitment chain broken");
+        decoder.decode(two);
+    }
+
     function test_blocks_chain_across_transfers() public {
         pool.applyBlock(
-            _withRoots(statement, pool.currentRoot(), pool.currentNullifierRoot()), proof);
-        assertEq(pool.currentRoot(), poolRootAfter, "first block landed");
+            _withRoots(statement, pool.currentRoot(), rootAfter, pool.currentNullifierRoot()),
+            proof);
+        assertEq(pool.currentRoot(), rootAfter, "first block landed");
         // Second block: same statement, roots rewritten to where the first
-        // block landed.
-        pool.applyBlock(_withRoots(statement, poolRootAfter, nullifierAfter), proof);
+        // block landed. The pool stores what the proof attests - it cannot
+        // tell this from a real tree transition, which is exactly the point:
+        // the continuity check is the contract's whole contribution.
+        pool.applyBlock(_withRoots(statement, rootAfter, outputLeaf, nullifierAfter), proof);
         assertEq(pool.blockNumber(), 2, "two blocks");
-        assertEq(pool.leafCount(), 2, "two leaves");
-        // Two identical leaves close a complete height-1 subtree; the root
-        // folds empty subtrees above it.
-        bytes32 pair = keccak256(abi.encodePacked(outputLeaf, outputLeaf));
-        bytes32 empty1 = keccak256(abi.encodePacked(bytes32(0), bytes32(0)));
-        bytes32 expect = pair;
-        for (uint256 h = 1; h < 32; ++h) {
-            expect = keccak256(abi.encodePacked(expect, empty1));
-            empty1 = keccak256(abi.encodePacked(empty1, empty1));
-        }
-        assertEq(pool.currentRoot(), expect, "two-leaf root");
+        assertEq(pool.currentRoot(), outputLeaf, "second attested root stored");
         assertEq(pool.currentNullifierRoot(), nullifierAfter, "nullifier root re-chained");
     }
 

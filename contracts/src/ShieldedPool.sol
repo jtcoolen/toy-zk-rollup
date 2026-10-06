@@ -3,18 +3,24 @@ pragma solidity 0.8.28;
 
 import {IWhirVerifier} from "./interfaces/IWhirVerifier.sol";
 import {BlockStatement} from "./BlockStatement.sol";
-import {MerkleAccumulator} from "./MerkleAccumulator.sol";
 
 /// Settlement for the post-quantum shielded pool: a state-root tracker.
 ///
 /// This contract holds **two roots and nothing else that matters**. Every block
 /// must present a proof that carries the chain from the roots it currently
-/// stores to a new pair of roots, and the contract records the new pair.
+/// stores to a new pair of roots, and the contract records the new pair. Both
+/// roots are *attested*: the contract checks continuity and stores what the
+/// proof says, and derives nothing.
 ///
-/// * **Commitment tree** — note commitments. The contract appends the block's
-///   outputs and derives the new root itself, because the circuit deliberately
-///   does not prove the post-append root. Appending is deterministic given the
-///   statement, so the contract is the right place for it.
+/// * **Commitment tree** — note commitments. Since D-088 the transfer circuit
+///   re-derives every output append in-circuit (Poseidon2 frontier fold) and
+///   exports the post-append root as a public value, chained child by child in
+///   the block circuit. The contract therefore stores the attested root exactly
+///   like the nullifier root: a continuity check and two storage writes, with
+///   no tree re-derivation at all (the whole applyBlock body, stub verifier
+///   aside, is ~0.5M gas regardless of output count). The old Keccak
+///   accumulator re-hashed every leaf on-chain; that work now happens once,
+///   in-circuit, where a false root makes the block unwitnessable.
 /// * **Nullifier map** — spent nullifiers. The contract stores the root and
 ///   chains it; it does **not** hold a set of nullifiers and performs no replay
 ///   check of its own.
@@ -54,7 +60,7 @@ import {MerkleAccumulator} from "./MerkleAccumulator.sol";
 /// conservation, so `sum(inputs) = sum(outputs) + fee` already holds. It does
 /// not check that a transfer's outputs are well-formed — the circuit commits to
 /// them. Anything the circuit proves is not repeated here.
-contract ShieldedPool is MerkleAccumulator {
+contract ShieldedPool {
     using BlockStatement for uint256[];
 
     /// Verifies the recursive WHIR proof. Immutable: the settlement rules cannot
@@ -90,10 +96,11 @@ contract ShieldedPool is MerkleAccumulator {
 
     /// Deploy at an explicit genesis state.
     ///
-    /// The commitment tree is seeded by appending `genesisLeaves_` here, so the
-    /// starting root is *derived*, not claimed - the pool cannot be deployed at
-    /// a root its own accumulator disagrees with. Pass an empty array for a pool
-    /// that starts from nothing (its first block then extends the empty tree).
+    /// `genesisRoot_` is the commitment-tree root the genesis state has - the
+    /// Poseidon2 root of the tree holding the funded notes (D-088: roots are
+    /// attested, not derived, so the deployer names the root the first block
+    /// will be witnessed against; the genesis file emitted by the prover export
+    /// or `node genesis` carries exactly that value).
     ///
     /// `genesisNullifierRoot_` is the nullifier-map root the genesis state has.
     /// Pass `bytes32(0)` to mean "an empty nullifier map": the contract then
@@ -101,23 +108,20 @@ contract ShieldedPool is MerkleAccumulator {
     /// empty[h] = keccak(empty[h-1] || empty[h-1]) - a constant of that scheme,
     /// ~256 keccak at deploy) rather than trusting a first block to name it.
     ///
-    /// The genesis roots are not trusted blindly either way: the first applied
-    /// block must prove a transition *from* them, so a wrong genesis simply
-    /// makes every real block revert with RootMismatch / NullifierRootMismatch.
+    /// Neither root is trusted blindly: the first applied block must prove a
+    /// transition *from* them, so a wrong genesis simply makes every real block
+    /// revert with RootMismatch / NullifierRootMismatch.
     constructor(
         IWhirVerifier verifier_,
         address feeRecipient_,
-        bytes32[] memory genesisLeaves_,
+        bytes32 genesisRoot_,
         bytes32 genesisNullifierRoot_
     ) {
         require(address(verifier_) != address(0), "verifier required");
         require(feeRecipient_ != address(0), "fee recipient required");
         verifier = verifier_;
         feeRecipient = feeRecipient_;
-        for (uint256 i; i < genesisLeaves_.length; ++i) {
-            _append(genesisLeaves_[i]);
-        }
-        currentRoot = root();
+        currentRoot = genesisRoot_;
         currentNullifierRoot =
             genesisNullifierRoot_ == bytes32(0) ? _emptyNullifierRoot() : genesisNullifierRoot_;
     }
@@ -143,21 +147,14 @@ contract ShieldedPool is MerkleAccumulator {
             revert NullifierRootMismatch(currentNullifierRoot, block_.nullifierBefore);
         }
 
-        // Append every output commitment. The tree advances exactly as the
-        // proven statement says, and the resulting root becomes the next
-        // block's required `rootBefore`.
-        for (uint256 i; i < block_.transfers.length; ++i) {
-            bytes32[] memory outs = block_.transfers[i].outputs;
-            for (uint256 j; j < outs.length; ++j) {
-                _append(outs[j]);
-            }
-        }
-
-        bytes32 rootAfter = root();
-        currentRoot = rootAfter;
-        // The nullifier root is not recomputed — it is taken from the proof.
-        // That is the whole point of proving the transition in-circuit: the
-        // contract records an endpoint it cannot derive but can verify.
+        // Both roots are taken from the proof. That is the whole point of
+        // proving the transition in-circuit: the circuit re-derives the tree
+        // append (D-088) and the nullifier insertions, chains every transfer's
+        // `after` to the next transfer's `before`, and exports the endpoints.
+        // The contract records endpoints it cannot derive but can verify -
+        // continuity against its own state is the only fact no proof can own.
+        currentRoot = block_.rootAfter;
+        currentNullifierRoot = block_.nullifierAfter;
         currentNullifierRoot = block_.nullifierAfter;
 
         unchecked {
@@ -166,7 +163,7 @@ contract ShieldedPool is MerkleAccumulator {
         emit BlockApplied(
             blockNumber,
             block_.rootBefore,
-            rootAfter,
+            block_.rootAfter,
             block_.nullifierBefore,
             block_.nullifierAfter,
             block_.totalFee

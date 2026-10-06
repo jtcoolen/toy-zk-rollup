@@ -251,3 +251,43 @@ Block/node test adapters now advance the tree between chained children - the
 adapter mirrors what the sequencer does on apply, which is what makes the
 block's commitment-chain tests meaningful instead of accidentally tripping the
 chain before the intended failure.
+
+## O-14 (step 6+7 landed; the gas story was wrong and is now measured)
+
+- Roots-only pool landed: ShieldedPool stores attested `rootAfter` (no
+  MerkleAccumulator, no leafCount, no output loop). BlockStatement decodes the
+  4-digest transfer tail (root, rootAfter, nfBefore, nfAfter) and chains
+  rootAfter->root across transfers ("commitment chain broken").
+- **The "~150M gas saved" claim was false.** Measured at 42d8cea vs HEAD:
+  - pool body alone (stub verifier): 536,961 -> 533,459 gas. The Keccak
+    accumulator append of ONE leaf was ~100K gas, never 150M.
+  - The 151.8M gap between applyBlock (331.7M) and the standalone verify test
+    (179.9M) was the *block proof* being bigger than the batch_stark proof the
+    verify test uses - pool-side work was ~0.5M all along.
+  - Full e2e applyBlock: 331,732,998 -> 353,975,800 (+22.2M). Cause: the block
+    circuit now carries Poseidon2 perm tables, so the composed proof grew
+    (bundle 2,825,568 -> 2,964,384 B, +34,704 words) and its replay costs
+    correspondingly more. The append work moved on-chain -> in-circuit, and the
+    proof carries the cost.
+  - Honest framing: roots-only is a correctness/simplicity win (contract can
+    never diverge from the prover's tree; one fewer lib; ~4K gas), not a gas
+    win. The gas win of D-088 is prover-side: Poseidon2 fold (1 perm/row) is
+    cheap enough to afford doing the append in-circuit at all.
+- MerkleAccumulator.sol deleted (no production user). MerkleProof.sol stays:
+  reference Keccak fold cross-checked against StarkMerkle (StarkMerkle.t.sol)
+  and pinned by the regenerated MerkleVectors.t.sol. contract_vectors.rs no
+  longer writes merkle.json (the generated test embeds the openings; the JSON
+  was never read).
+- block_vectors.json: dropped pool_root_after_hex (no pool-side tree to
+  mirror); added root_after_hex. block_genesis.json: added genesis_root_hex
+  (Poseidon2 root of the funded-note tree); pool_root_after_hex there is now
+  the P2 tree-after-append - BlockE2E asserts the pool stores exactly it, so
+  it cross-checks the in-circuit fold against an independent Rust tree walk.
+- P2 empty root pinned in ShieldedPool.t.sol:
+  0x7a92872da0d9532a933f5f5a8d140b60bba8c80cde1fe868edc23b538844d82e.
+- forge: 130 tests green (was 146; the drop is mostly the untracked D-086
+  probe suites moved out of the tree, plus the deleted accumulator vector
+  test; the pool suite gained a decode-chain test and keeps 9). EIP-170:
+  WhirVerifier 24,536 B (+40), ShieldedPool 3,267 B. Untracked D-086 probe
+  files (GasProbe* etc.) moved to /tmp/d086_probes - GasProbeVerifier exceeds
+  EIP-170 and is scratch, not production.

@@ -3,23 +3,14 @@
 // DO NOT EDIT BY HAND — regenerate with:
 //     cargo test -p shielded --test contract_vectors
 //
-// Pins the on-chain Merkle implementation to the Rust tree that produces
-// the real commitments. Both halves matter: the append-only accumulator
-// root, and the membership openings the settlement verifier actually
-// performs. The negative cases matter as much as the positive ones — a
-// verifier that always returns true passes every positive vector.
+// Pins the reference Keccak fold (`MerkleProof`, cross-checked against
+// `StarkMerkle`) to the Rust tree that produces the real openings. The
+// negative cases matter as much as the positive ones — a verifier that
+// always returns true passes every positive vector.
 pragma solidity ^0.8.28;
 
 import {Test} from "forge-std/Test.sol";
-import {MerkleAccumulator} from "../src/MerkleAccumulator.sol";
 import {MerkleProof} from "../src/MerkleProof.sol";
-
-/// Concrete wrapper so the append-only accumulator can be driven from a test.
-contract TestAccumulator is MerkleAccumulator {
-    function appendLeaf(bytes32 leaf) external {
-        _append(leaf);
-    }
-}
 
 contract MerkleVectorTest is Test {
     /// The tree depth the generated vectors were built at.
@@ -29,22 +20,6 @@ contract MerkleVectorTest is Test {
     /// disagree the vectors are testing the wrong tree.
     function test_depth_agrees_with_library() public pure {
         assertEq(MerkleProof.DEPTH, DEPTH, "vector depth != library depth");
-    }
-
-    /// Append-only roots, replayed against the Rust `CommitmentTree`.
-    function test_append_roots_match_rust() public {
-        TestAccumulator acc = new TestAccumulator();
-        assertEq(acc.root(), bytes32(0x27ae5ba08d7291c96c8cbddcc148bf48a6d68c7974b94356f53754ef6171d757), "empty root");
-        acc.appendLeaf(bytes32(0x0101010101010101010101010101010101010101010101010101010101010101)); // leaf 1
-        assertEq(acc.root(), bytes32(0xbb8f0efcecad856c94b9253d646c8c615d625e213c91521566f7a09f95971f06), "root after 1 leaves");
-        acc.appendLeaf(bytes32(0x0202020202020202020202020202020202020202020202020202020202020202)); // leaf 2
-        assertEq(acc.root(), bytes32(0x55347c4ed719f8c167e70f6a0dc3bf65e68905325ddb73c445e9386c3c60a71e), "root after 2 leaves");
-        acc.appendLeaf(bytes32(0x0303030303030303030303030303030303030303030303030303030303030303)); // leaf 3
-        assertEq(acc.root(), bytes32(0xb358f03f25ba8818ca8bcb192a971f29f023ae4d2b562d77292da2aedc622bae), "root after 3 leaves");
-        acc.appendLeaf(bytes32(0x0404040404040404040404040404040404040404040404040404040404040404)); // leaf 4
-        assertEq(acc.root(), bytes32(0x40896a9a5693b788e7ab7c128165d8d4364656cd1f220fb9497474a0ab8a5157), "root after 4 leaves");
-        acc.appendLeaf(bytes32(0x0505050505050505050505050505050505050505050505050505050505050505)); // leaf 5
-        assertEq(acc.root(), bytes32(0x088cc9a205cbb7aaf226bbbc2c53ca7a5fedff2e4478bed324bd563cd42fdc40), "root after 5 leaves");
     }
 
     /// Membership openings under the final root.

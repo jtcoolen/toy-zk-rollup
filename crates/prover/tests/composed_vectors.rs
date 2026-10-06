@@ -165,13 +165,19 @@ fn write_block_genesis(
     pis: &[F],
 ) -> Result<Vec<(&'static str, serde_json::Value)>, Box<dyn Error>> {
     // The pool must start at the tree the block was witnessed against (the
-    // funded note's leaf), and the expected root after the block's output is
-    // appended pins the contract's own accumulator against the prover's tree.
+    // funded note's leaf). D-088: the contract no longer re-derives the tree -
+    // it stores the attested `rootAfter` - so the sidecar names the genesis
+    // ROOT (what the constructor takes) and the expected root after the block
+    // (what applyBlock must store). The root-after is computed by appending
+    // the output to the genesis tree, so it still cross-checks the prover's
+    // own frontier fold against an independent tree walk.
     let p2 = pq_hash::Poseidon2Commitment::default();
     let mut pool_tree = tree_with(&[note]).0;
+    let genesis_root = pool_tree.root();
     pool_tree.append(&out_note.commit(&p2));
     let extras = vec![
         ("genesis_leaves", json!([hex(note.commit(&p2).as_bytes())])),
+        ("genesis_root_hex", json!(hex(genesis_root.as_bytes()))),
         (
             "pool_root_after_hex",
             json!(hex(pool_tree.root().as_bytes())),
@@ -183,7 +189,8 @@ fn write_block_genesis(
             .map(p3_field::PrimeField32::as_canonical_u32)
             .collect::<Vec<_>>(),
         "genesis_leaves": extras[0].1.clone(),
-        "pool_root_after_hex": extras[1].1.clone(),
+        "genesis_root_hex": extras[1].1.clone(),
+        "pool_root_after_hex": extras[2].1.clone(),
     });
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../contracts/test/vectors");
     std::fs::write(

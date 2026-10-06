@@ -9,9 +9,9 @@
   "outputs_hex": [
     "fd841a3442d0107c68a83404eb43246d7de642106e55282ad5a2f7025d5c7a3d"
   ],
-  "pool_root_after_hex": "4fde7c524250ad075d0b8fe7a47b9bcc0b83fe9b5b1a9409e46a3bdb77116c17",
-  "proof_keccak_hex": "b9b48ef77e161808374a78f69bcc2f81b7fc0dddfa5b06acc5a71a48777bc417",
-  "proof_len": 870519,
+  "proof_keccak_hex": "3b0610a1bf68d316a7dabc65052dc1a19d37bbc7ffbb6a5d4069c3c696297678",
+  "proof_len": 872695,
+  "root_after_hex": "3688d14b53556219cbd34d540e65c321cc78f93e8aaeab50f035c91911a17c61",
   "root_before_hex": "4976eb2ae7c0b6527f6df100fdb7c838a329c842b6550a0d4d2ee72a38c6285a",
   "statement": [
     2136,

@@ -29,7 +29,8 @@ pragma solidity ^0.8.28;
 /// a 32-byte digest, only one of them is the right one.
 library MerkleProof {
     /// Tree depth in levels above the leaves. Must equal `DEPTH` in
-    /// `crates/shielded/src/tree.rs` and `MerkleAccumulator.DEPTH`.
+    /// `crates/shielded/src/tree.rs`. Pinned by the generated
+    /// `test/MerkleVectors.t.sol`.
     uint256 public constant DEPTH = 32;
 
     /// Recompute the root from a leaf and its opening.

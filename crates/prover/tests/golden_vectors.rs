@@ -398,7 +398,6 @@ fn block_vectors() -> Result<(), Box<dyn Error>> {
     use prover::transfer::LOG_MAX_LDE;
     use prover::whir_recursion::InnerWhirConfig;
     use shielded::keys::derive_spend_pk;
-    use shielded::tree::CommitmentTree;
 
     use pq_hash::Keccak256Commitment;
 
@@ -433,17 +432,14 @@ fn block_vectors() -> Result<(), Box<dyn Error>> {
     let bundle = prover::export::bundle(&artifacts.statement, &artifacts.proof, 1, spec.fee)
         .expect("bundle builds");
 
-    // The pool-side view of the same block: the roots ShieldedPool chains and
-    // the digests it appends, as hex so the Solidity test can compare them
-    // against what it decodes from the statement limbs. These are the public
-    // values the circuit proved, read off the same run that made the proof.
+    // The roots and digests ShieldedPool chains, as hex so the Solidity test
+    // can compare them against what it decodes from the statement limbs. These
+    // are the public values the circuit proved, read off the same run that made
+    // the proof. D-088: there is no pool-side tree to mirror any more - the
+    // contract stores the attested `rootAfter` - so the statement's own roots
+    // are the whole story.
     let public = &artifacts.public;
     let roots_hex = |r: &pq_hash::MerkleRoot| r.to_hex();
-    // The pool starts from the EMPTY commitment tree and appends this block's
-    // outputs; pin the root the Rust tree computes for exactly that sequence,
-    // so the on-chain accumulator is checked against the prover's own tree.
-    let mut pool_tree = CommitmentTree::new(Keccak256Commitment);
-    pool_tree.append(&output.commit(&Keccak256Commitment));
 
     let digests_hex = |ds: &[pq_hash::Nullifier]| -> Vec<String> {
         ds.iter().map(pq_hash::Nullifier::to_hex).collect()
@@ -474,11 +470,11 @@ fn block_vectors() -> Result<(), Box<dyn Error>> {
             "proof_len": bundle.proof.len(),
             "proof_keccak_hex": proof_keccak,
             "root_before_hex": roots_hex(&public.root),
+            "root_after_hex": roots_hex(&public.root_after),
             "nullifier_before_hex": roots_hex(&public.nullifier_roots.before),
             "nullifier_after_hex": roots_hex(&public.nullifier_roots.after),
             "nullifiers_hex": digests_hex(&public.nullifiers),
             "outputs_hex": outputs_hex,
-            "pool_root_after_hex": pool_tree.root().to_hex(),
         }),
     )?;
     println!(
@@ -790,11 +786,8 @@ fn check_block_vectors() -> Result<(), Box<dyn Error>> {
         let got = v[key].as_str().unwrap_or_else(|| panic!("{key} missing"));
         assert_eq!(got, want, "{key} drifted from the fixture's public values");
     };
-    let mut pool_tree = shielded::CommitmentTree::new(pq_hash::Keccak256Commitment);
-    pool_tree.append(&fixture.output.commit(&pq_hash::Keccak256Commitment));
-    expect_hex("pool_root_after_hex", pool_tree.root().to_hex());
-
     expect_hex("root_before_hex", public.root.to_hex());
+    expect_hex("root_after_hex", public.root_after.to_hex());
     expect_hex(
         "nullifier_before_hex",
         public.nullifier_roots.before.to_hex(),

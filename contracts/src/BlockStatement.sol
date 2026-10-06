@@ -10,13 +10,15 @@ import {LimbCodec} from "./LimbCodec.sol";
 ///
 /// ```text
 /// [ n, (inputs_0, outputs_0), ..., (inputs_{n-1}, outputs_{n-1}),
-///   transfer 0: nullifiers..., outputs..., root, nfRootBefore, nfRootAfter, fee,
+///   transfer 0: nullifiers..., outputs..., root, rootAfter, nfRootBefore, nfRootAfter, fee,
 ///   transfer 1: ... ]
 /// ```
 ///
-/// Three digests sit between a transfer's hashes and its fee: the commitment
-/// root its inputs opened against, and the nullifier-map root before and after
-/// this transfer's nullifiers were inserted.
+/// Four digests sit between a transfer's hashes and its fee: the commitment
+/// root its inputs opened against and the root its own output appends produce
+/// (D-088 - the circuit proves the append, so the root is attested, not
+/// re-derived), and the nullifier-map root before and after this transfer's
+/// nullifiers were inserted.
 ///
 /// The header is part of the *verified* statement, exported by the circuit as
 /// constants. That matters: if the contract were told the split instead, a prover
@@ -27,8 +29,9 @@ library BlockStatement {
     using LimbCodec for uint256[];
 
     /// Digests per transfer that are not nullifiers or outputs: the commitment
-    /// root plus the nullifier-map root pair.
-    uint256 public constant ROOTS_PER_TRANSFER = 3;
+    /// root before and after this transfer's appends (D-088), plus the
+    /// nullifier-map root pair.
+    uint256 public constant ROOTS_PER_TRANSFER = 4;
 
     /// Fee limbs per transfer (`VALUE_LIMBS` in the transfer circuit).
     uint256 public constant FEE_LIMBS = 4;
@@ -41,6 +44,9 @@ library BlockStatement {
         bytes32[] outputs;
         /// The commitment-tree root this transfer was witnessed against.
         bytes32 rootBefore;
+        /// The commitment-tree root after this transfer's output appends,
+        /// attested in-circuit (D-088).
+        bytes32 rootAfter;
         /// The nullifier-map root before this transfer's nullifiers.
         bytes32 nullifierBefore;
         /// The nullifier-map root after they were inserted.
@@ -53,9 +59,12 @@ library BlockStatement {
     struct Block {
         /// The transfers, in statement order.
         Transfer[] transfers;
-        /// The commitment root every transfer shares, enforced in-circuit by the
-        /// anchor.
+        /// The commitment root the block starts from: the first transfer's
+        /// `rootBefore`.
         bytes32 rootBefore;
+        /// The commitment root the block ends at: the last transfer's
+        /// `rootAfter`, chained in-circuit child by child (D-088).
+        bytes32 rootAfter;
         /// The nullifier-map root the block starts from: the first transfer's
         /// `nullifierBefore`.
         bytes32 nullifierBefore;
@@ -69,7 +78,7 @@ library BlockStatement {
     /// Number of statement limbs for `numTransfers` transfers carrying
     /// `totalHashes` hashes between them.
     ///
-    /// Header (1 + 2 per transfer), then per transfer: its hashes, three root
+    /// Header (1 + 2 per transfer), then per transfer: its hashes, four root
     /// digests, one fee. Both the root term and the fee term scale with the
     /// transfer count, not with the statement as a whole.
     function expectedLen(uint256 numTransfers, uint256 totalHashes)
@@ -109,7 +118,6 @@ library BlockStatement {
         require(statement.length == expected, "statement length disagrees with header");
 
         block_.transfers = new Transfer[](n);
-        bytes32 sharedRoot = bytes32(0);
         for (uint256 i; i < n; ++i) {
             uint256 nin = inputs[i];
             uint256 nout = outputs[i];
@@ -126,6 +134,8 @@ library BlockStatement {
             }
             bytes32 root = statement.digestFromLimbs(cursor);
             cursor += LimbCodec.LIMBS_PER_DIGEST;
+            bytes32 rootAfter = statement.digestFromLimbs(cursor);
+            cursor += LimbCodec.LIMBS_PER_DIGEST;
             bytes32 nfBefore = statement.digestFromLimbs(cursor);
             cursor += LimbCodec.LIMBS_PER_DIGEST;
             bytes32 nfAfter = statement.digestFromLimbs(cursor);
@@ -134,15 +144,17 @@ library BlockStatement {
             cursor += FEE_LIMBS;
 
             if (i == 0) {
-                sharedRoot = root;
+                block_.rootBefore = root;
                 block_.nullifierBefore = nfBefore;
             } else {
-                // Redundant with the in-circuit anchor and nullifier chain, but a
-                // contract should not rely on the circuit having remembered to
-                // constrain something. These are cheap reads of values that were
-                // already proven, and they make the contract's own invariant
-                // explicit rather than implied.
-                require(root == sharedRoot, "transfers disagree on root");
+                // Redundant with the in-circuit chains, but a contract should
+                // not rely on the circuit having remembered to constrain
+                // something. These are cheap reads of values that were already
+                // proven, and they make the contract's own invariant explicit
+                // rather than implied. Since D-088 the commitment roots chain
+                // like the nullifier roots always did: each transfer attests
+                // the root its own appends produce.
+                require(root == block_.transfers[i - 1].rootAfter, "commitment chain broken");
                 require(nfBefore == block_.transfers[i - 1].nullifierAfter, "nullifier chain broken");
             }
 
@@ -150,13 +162,14 @@ library BlockStatement {
                 nullifiers: nfs,
                 outputs: outs,
                 rootBefore: root,
+                rootAfter: rootAfter,
                 nullifierBefore: nfBefore,
                 nullifierAfter: nfAfter,
                 fee: fee
             });
             block_.totalFee += fee;
         }
-        block_.rootBefore = sharedRoot;
+        block_.rootAfter = block_.transfers[n - 1].rootAfter;
         block_.nullifierAfter = block_.transfers[n - 1].nullifierAfter;
     }
 }

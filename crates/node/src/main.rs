@@ -55,7 +55,7 @@ use axum::{Json, Router};
 use governor::{Quota, RateLimiter};
 use nonzero_ext::nonzero;
 use p3_field::PrimeField32;
-use pq_hash::{Keccak256Commitment, Sha3_256Shielded};
+use pq_hash::{Poseidon2Commitment, Sha3_256Shielded};
 use prover::client::{prove_client_transfer, ClientSpec};
 use prover::fixtures::{funded_note, seed};
 use rand::rngs::SysRng;
@@ -266,7 +266,7 @@ impl Actor {
             GENESIS.iter().map(|(b, v)| funded_note(*b, *v)).collect();
         let hashes: Vec<_> = notes
             .iter()
-            .map(|(n, _)| n.commit(&Keccak256Commitment))
+            .map(|(n, _)| n.commit(&Poseidon2Commitment::default()))
             .collect();
         let seq = Sequencer::funded(LOG_MAX_LDE, hashes).map_err(|e| format!("sequencer: {e}"))?;
         let demo = notes
@@ -808,17 +808,26 @@ fn arg_after(args: &[String], flag: &str) -> Option<String> {
 }
 
 /// `node genesis [--out PATH]`: emit the genesis leaves the node's demo
-/// notes commit to, in the shape `Deploy.s.sol` reads. The deployed pool
-/// must start at exactly the tree the node witnessed against - the pool
-/// enforces `rootBefore == currentRoot`, so any other genesis reverts.
+/// notes commit to, plus the Poseidon2 root of the tree holding them, in the
+/// shape `Deploy.s.sol` reads (D-088: the pool is seeded with the ROOT, not
+/// the leaves - roots are attested, not re-derived). The deployed pool must
+/// start at exactly the tree the node witnessed against - the pool enforces
+/// `rootBefore == currentRoot`, so any other genesis reverts.
 fn write_genesis_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let out =
         arg_after(args, "--out").unwrap_or_else(|| "contracts/deployments/genesis.json".into());
-    let leaves: Vec<String> = GENESIS
-        .iter()
-        .map(|(b, v)| funded_note(*b, *v).0.commit(&Keccak256Commitment).to_hex())
-        .collect();
-    let doc = serde_json::json!({ "genesis_leaves": leaves });
+    let hasher = Poseidon2Commitment::default();
+    let mut tree = shielded::tree::CommitmentTree::new(hasher.clone());
+    let mut leaves: Vec<String> = Vec::new();
+    for (b, v) in GENESIS {
+        let leaf = funded_note(b, v).0.commit(&hasher);
+        tree.append(&leaf);
+        leaves.push(leaf.to_hex());
+    }
+    let doc = serde_json::json!({
+        "genesis_leaves": leaves,
+        "genesis_root_hex": tree.root().to_hex(),
+    });
     std::fs::write(&out, serde_json::to_string_pretty(&doc)?)?;
     eprintln!("wrote {out} ({} leaves)", leaves.len());
     Ok(())
