@@ -235,8 +235,22 @@ contract WhirVerifier is IWhirVerifier {
         // The u32 LE fields need a byte swap; the version byte does not.
         cfgWords = _swapBytes(cfgWords);
         prfWords = _swapBytes(prfWords);
-        if (version != 4) revert BadVersion(version);
-        if (proof.length < 16 + (cfgWords + prfWords) * 4) revert ProofTooShort();
+        if (version != 5) revert BadVersion(version);
+        if (proof.length < 20 + (cfgWords + prfWords) * 4) revert ProofTooShort();
+        // v5 header tail: u32 LE STATEMENT word count right after PROOF.
+        StmRef memory stm;
+        assembly ("memory-safe") {
+            // shr(224) leaves the u32's four bytes big-endian in the LOW 32
+            // bits: b0 (the LE LSB) at bits 31..24. Reverse for the LE value.
+            let w := shr(224, calldataload(add(proof.offset, add(16, mul(add(cfgWords, prfWords), 4)))))
+            w := or(
+                or(and(shr(24, w), 0xff), and(shr(8, w), 0xff00)),
+                or(and(shl(8, w), 0xff0000), and(shl(24, w), 0xff000000))
+            )
+            mstore(stm, mul(w, 4)) // len
+            mstore(add(stm, 32), add(proof.offset, mul(add(5, add(cfgWords, prfWords)), 4))) // abs
+        }
+        if (proof.length < 20 + (cfgWords + prfWords) * 4 + stm.len) revert ProofTooShort();
 
         // Word offsets into the proof data: the 16-byte header is 4 words, so
         // CONFIG starts at word 4 and PROOF right after the CONFIG words.
@@ -277,25 +291,11 @@ contract WhirVerifier is IWhirVerifier {
         WhirVerifierCore.Transcript memory t;
         t.state = s.sponge;
 
-        // --- CONFIG: schedule ------------------------------------------------------
-        uint256 numRounds;
-        (numRounds, co) = _word(proof, co);
+        // --- CONFIG: schedule + per opening round -------------------------------
         // The constraint identity (D-076) needs each round's bound evaluations
         // after the walk: keep them (rounds 1..4; round 0 is the random round).
-        uint256[][] memory boundEvalsOf = new uint256[][](numRounds);
-        // round_starts is a test-harness artifact (per-round sponge seeding);
-        // the on-chain walk is continuous, so it is skipped, not consumed.
-        (, co) = _arr(proof, co);
-
-        // --- per opening round -------------------------------------------------------
-        for (uint256 r; r < numRounds; ++r) {
-            RoundCfg memory c;
-            (c, co) = _decodeRoundCfg(proof, co);
-            RoundPrf memory p;
-            (p, po) = _decodeRoundPrf(proof, po);
-            boundEvalsOf[r] = p.boundEvals;
-            _runRound(t, c, p);
-        }
+        uint256[][] memory boundEvalsOf;
+        (co, boundEvalsOf) = _runRounds(proof, co, po, t, stm);
 
         // --- the constraint identity (D-076) ------------------------------------
         // The last layer of verify_batch: per instance, recompute every opened
@@ -307,6 +307,34 @@ contract WhirVerifier is IWhirVerifier {
         _checkIdentity(cc, boundEvalsOf, zeta, constraintAlpha, lookupAlpha, beta, prf.terminals, statement);
 
         return true;
+    }
+
+    /// Walk the schedule: decode each round's CONFIG + PROOF blocks and run
+    /// its WHIR opening. Split out of verify() purely for stack depth - the
+    /// post-loop values (zeta, the alphas) no longer have to stay live
+    /// through the loop body. Returns the config cursor and each round's
+    /// bound evaluations.
+    function _runRounds(
+        bytes calldata proof,
+        uint256 co,
+        uint256 po,
+        WhirVerifierCore.Transcript memory t,
+        StmRef memory stm
+    ) private view returns (uint256 no, uint256[][] memory boundEvalsOf) {
+        uint256 numRounds;
+        (numRounds, no) = _word(proof, co);
+        boundEvalsOf = new uint256[][](numRounds);
+        // round_starts is a test-harness artifact (per-round sponge seeding);
+        // the on-chain walk is continuous, so it is skipped, not consumed.
+        (, no) = _arr(proof, no);
+        for (uint256 r; r < numRounds; ++r) {
+            RoundCfg memory c;
+            (c, no) = _decodeRoundCfg(proof, no);
+            RoundPrf memory p;
+            (p, po) = _decodeRoundPrf(proof, po);
+            boundEvalsOf[r] = p.boundEvals;
+            _runRound(t, c, p, stm, r);
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -410,10 +438,18 @@ contract WhirVerifier is IWhirVerifier {
         uint256[] allRandomness;
     }
 
+    /// Where the raw STATEMENT section lives in the proof calldata (v5).
+    struct StmRef {
+        uint256 len;
+        uint256 abs;
+    }
+
     function _runRound(
         WhirVerifierCore.Transcript memory t,
         RoundCfg memory c,
-        RoundPrf memory p
+        RoundPrf memory p,
+        StmRef memory stm,
+        uint256 roundIdx
     ) private view {
         // Each round re-binds its framing constants (D-070): the config bytes are
         // consumed by count, and the cursor restarts with the round.
@@ -449,8 +485,14 @@ contract WhirVerifier is IWhirVerifier {
         constraints[0].numVariables = c.numVariables;
         constraints[0].gamma = init.alpha;
         constraints[0].initialPower = 0;
-        constraints[0].eqCdBase = p.eqPointsCdBase;
-        constraints[0].eqLens = c.eqPointsLens;
+        // Mode 2 (D-086 step C): the eq groups are DERIVED from the public
+        // STATEMENT section (opening points) plus the transcript-drawn virtual
+        // claim points - the satellite walks the slice itself, nothing
+        // proof-supplied enters the weight.
+        constraints[0].stmCdBase = stm.abs;
+        constraints[0].stmLen = stm.len;
+        constraints[0].stmRound = roundIdx;
+        constraints[0].virtualPoints = init.virtualPoints;
 
         Threading memory th = _runIntermediates(t, c, p, init, constraints);
         _runFinal(t, c, p, th, constraints);
@@ -711,15 +753,22 @@ contract WhirVerifier is IWhirVerifier {
             let cb := add(constraints, 32)
             for { let i := 0 } lt(i, m) { i := add(i, 1) } {
                 // ConstraintWeight field order: [0]numVariables [1]gamma
-                // [2]initialPower [3]eqPoints [4]eqCdBase [5]eqLens [6]selVars.
+                // [2]initialPower [3]eqPoints [4]eqCdBase [5]eqLens [6]selVars
+                // [7]stmCdBase [8]stmLen [9]stmRound [10]virtualPoints
+                // [11]groupDescs.
                 // The array is a POINTER array (the struct has dynamic
                 // members), so slot i holds the address of the struct.
                 let base := mload(add(cb, mul(i, 32)))
                 let eqCd := mload(add(base, 128))
-                let mode := iszero(iszero(eqCd))
+                let stmCd := mload(add(base, 224))
+                let mode := 0
+                if iszero(stmCd) { if eqCd { mode := 1 } }
+                if stmCd { mode := 2 }
                 // The group source pointer follows the mode: eqLens (+160) for
-                // wire groups, eqPoints (+96) for derived ones.
-                let src := mload(add(base, add(96, mul(mode, 64))))
+                // wire groups, eqPoints (+96) for derived ones; mode 2 has no
+                // shipped groups at all.
+                let src := 0
+                if iszero(stmCd) { src := mload(add(base, add(96, mul(mode, 64)))) }
                 let nGroups := 0
                 if src { nGroups := mload(src) }
                 let selPtr := mload(add(base, 192))
@@ -746,6 +795,27 @@ contract WhirVerifier is IWhirVerifier {
                     }
                     calldatacopy(c, eqCd, mul(total, 32))
                     c := add(c, mul(total, 32))
+                }
+                case 2 {
+                    // Statement-derived groups (D-086 step C): the raw
+                    // STATEMENT slice moves verbatim from the proof calldata
+                    // into the satellite's calldata, preceded by the slice
+                    // length, the round index, and the virtual claim points.
+                    let stmLen := mload(add(base, 256))
+                    let stmRound := mload(add(base, 288))
+                    let vp := mload(add(base, 320))
+                    let nVp := 0
+                    if vp { nVp := mload(vp) }
+                    mstore(c, stmLen)
+                    mstore(add(c, 32), stmRound)
+                    mstore(add(c, 64), nVp)
+                    c := add(c, 96)
+                    if vp {
+                        mcopy(c, add(vp, 32), mul(nVp, 32))
+                        c := add(c, mul(nVp, 32))
+                    }
+                    calldatacopy(c, stmCd, stmLen)
+                    c := add(c, stmLen)
                 }
                 default {
                     // Derived groups: k words each, ragged in memory.
@@ -826,8 +896,6 @@ contract WhirVerifier is IWhirVerifier {
         uint256 framingBatching;
         uint256[] framingSeps;
         uint256[] claimWidths;
-        uint256[] eqPointsLens;
-        uint256[] eqGroupLens;
         uint256 numVariables;
         uint256 startingPowBits;
         uint256 commitmentOodSamples;
@@ -878,7 +946,6 @@ contract WhirVerifier is IWhirVerifier {
         uint256[] finalScA;
         uint256[] finalScInf;
         uint256[] finalScPow;
-        uint256 eqPointsCdBase;
     }
 
     function _decodeRoundCfg(bytes calldata m, uint256 off)
@@ -895,8 +962,6 @@ contract WhirVerifier is IWhirVerifier {
         (c.framingBatching, no) = _word(m, no);
         (c.framingSeps, no) = _arr(m, no);
         (c.claimWidths, no) = _arr(m, no);
-        (c.eqPointsLens, no) = _arr(m, no);
-        (c.eqGroupLens, no) = _arr(m, no);
         (c.numVariables, no) = _word(m, no);
         (c.startingPowBits, no) = _word(m, no);
         (c.commitmentOodSamples, no) = _word(m, no);
@@ -974,18 +1039,8 @@ contract WhirVerifier is IWhirVerifier {
         (p.finalScA, no) = _extArr(m, no);
         (p.finalScInf, no) = _extArr(m, no);
         (p.finalScPow, no) = _arr(m, no);
-        {
-            // eq points stay in calldata: each group is consumed exactly once
-            // (constraintWeight), so a 773 KB memory copy is pure overhead.
-            uint256 nBytes;
-            (nBytes, no) = _word(m, no);
-            uint256 abs;
-            assembly ("memory-safe") {
-                abs := add(m.offset, mul(no, 4))
-            }
-            p.eqPointsCdBase = abs;
-            no += nBytes / 4;
-        }
+        // v5 (D-086 step C): the per-round eq-points blob is GONE from the
+        // wire; the initial constraint derives its groups from STATEMENT.
     }
 
     // ---------------------------------------------------------------------

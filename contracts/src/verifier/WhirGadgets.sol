@@ -86,7 +86,30 @@ library WhirGadgets {
         uint256[] eqLens;
         /// STIR domain scalars, one per query, each lifted into the extension.
         uint256[] selVars;
+        /// Mode 2 (WBND v5, D-086 step C): absolute calldata byte offset of
+        /// the raw STATEMENT section, or 0 when the eq groups come from one of
+        /// the sources above. The satellite derives every eq group value from
+        /// the statement's opening points (public inputs) plus
+        /// `virtualPoints`, instead of reading shipped coordinates.
+        uint256 stmCdBase;
+        /// Byte length of the statement slice at `stmCdBase`.
+        uint256 stmLen;
+        /// Which round of the statement section this constraint consumes
+        /// (the satellite skips the preceding rounds itself).
+        uint256 stmRound;
+        /// Virtual-claim univariate points, drawn from the transcript.
+        uint256[] virtualPoints;
+        /// Mode 2 only: derived group descriptors, three words per group
+        /// `[arity, zeta, selIndex]` in shipped group order (matrix groups in
+        /// placement order, then the virtual block). The satellite's frame
+        /// parse fills this once per frame from the statement section; the
+        /// per-query walk below only evaluates. `selIndex` is the bit-reversed
+        /// slot index, or `NO_SELECTOR` for virtual groups.
+        uint256[] groupDescs;
     }
+
+    /// `groupDescs` selector word marking "no selector bits" (virtual groups).
+    uint256 internal constant NO_SELECTOR = type(uint256).max;
 
     /// Lift a univariate point to the `n`-dimensional multilinear point
     /// `[z^(2^(n-1)), ..., z^2, z]`.
@@ -159,6 +182,79 @@ library WhirGadgets {
             revert NonBaseDomainPoint();
         }
         return selectEvalBase(point, z >> 224);
+    }
+
+    /// The equality weight of ONE derived group at `localR` (D-086 step C).
+    ///
+    /// A group is a univariate opening at `zeta` over `arity` stack variables,
+    /// optionally pinned to one column slot by `nv = localR.length - arity`
+    /// selector bits (`selIndex`, big-endian, bit-reversed slot index). The
+    /// reference ships the group's coordinates - `c_i / (1 + c_i)` for
+    /// `c_i = zeta^(2^(arity-1-i))` - and evaluates `eq(localR, coords)`.
+    /// This derives the SAME value from `zeta` directly with ONE inversion:
+    ///
+    ///   eq(localR, coords) = prod_i (1 - r_i + r_i*c_i) / prod_i (1 + c_i)
+    ///
+    /// because `(1-p)(1-q) + p*q` with `q = c/(1+c)` collapses to
+    /// `(1 - p + p*c) / (1 + c)`. Selector coordinates are 0/1, so their eq
+    /// factors are just `1 - r` and `r`. The denominator is never zero: the
+    /// opening point is out-of-domain, so no `1 + c_i` vanishes (the same
+    /// guarantee `univariate_eq_point` asserts in Rust).
+    function eqGroupValue(
+        uint256[] memory localR,
+        uint256 arity,
+        uint256 zeta,
+        uint256 selIndex
+    ) internal pure returns (uint256) {
+        uint256 nv = localR.length - arity;
+        // Virtual groups (NO_SELECTOR): the transcript draw IS the expanded
+        // point - coords[i] = zeta^(2^(arity-1-i)) with no bridge transform
+        // (verified against the v4 ground-truth eq_points). Each eq factor
+        // (1-p)(1-q)+p*q with q = c collapses to 1 - p - c + 2pc: a bare
+        // product, no denominator, no inversion.
+        if (selIndex == NO_SELECTOR) {
+            uint256 raw = KoalaBearExt4.ONE;
+            uint256 cc = zeta;
+            for (uint256 i = arity; i > 0; --i) {
+                uint256 rr = localR[i - 1];
+                raw = KoalaBearExt4.mul(
+                    raw,
+                    KoalaBearExt4.add(
+                        KoalaBearExt4.sub(KoalaBearExt4.sub(KoalaBearExt4.ONE, rr), cc),
+                        KoalaBearExt4.mul(KoalaBearExt4.add(rr, rr), cc)
+                    )
+                );
+                cc = KoalaBearExt4.square(cc);
+            }
+            return raw;
+        }
+        uint256 num = KoalaBearExt4.ONE;
+        uint256 den = KoalaBearExt4.ONE;
+        uint256 c = zeta;
+        // localR[i] pairs with c_i = zeta^(2^(arity-1-i)): walking i downwards
+        // from arity-1 starts at zeta^(2^0) and squares, same order as
+        // expand_from_univariate fills from the back.
+        for (uint256 i = arity; i > 0; --i) {
+            uint256 r = localR[i - 1];
+            // num *= (1 - r) + r*c ; den *= 1 + c
+            num = KoalaBearExt4.mul(
+                num,
+                KoalaBearExt4.add(
+                    KoalaBearExt4.sub(KoalaBearExt4.ONE, r), KoalaBearExt4.mul(r, c)
+                )
+            );
+            den = KoalaBearExt4.mul(den, KoalaBearExt4.add(KoalaBearExt4.ONE, c));
+            c = KoalaBearExt4.square(c);
+        }
+        // Selector bits, big-endian: bit (nv-1-j) of selIndex pins localR[arity+j].
+        for (uint256 j; j < nv; ++j) {
+            uint256 r = localR[arity + j];
+            uint256 bit = (selIndex >> (nv - 1 - j)) & 1;
+            num = KoalaBearExt4.mul(
+                num, bit == 1 ? r : KoalaBearExt4.sub(KoalaBearExt4.ONE, r)
+            );
+        }
+        return KoalaBearExt4.mul(num, KoalaBearExt4.inv(den));
     }
 
     /// `selectEval` with the base-lifted scalar `v0` (z = lift(v0)).
@@ -279,7 +375,21 @@ library WhirGadgets {
                 KoalaBearExt4.mul(w, gamma), selectEval(localR, c.selVars[i - 1])
             );
         }
-        if (c.eqCdBase == 0) {
+        if (c.stmCdBase != 0) {
+            // Mode 2 (D-086 step C): every eq group value is DERIVED from the
+            // statement section (public opening points) and the transcript-
+            // drawn virtual points - nothing proof-supplied. The descriptors
+            // were built once per frame by the satellite's parse; this is the
+            // same backwards Horner walk the other sources take.
+            uint256[] memory d = c.groupDescs;
+            for (uint256 i = d.length / 3; i > 0; --i) {
+                uint256 b = (i - 1) * 3;
+                w = KoalaBearExt4.add(
+                    KoalaBearExt4.mul(w, gamma),
+                    eqGroupValue(localR, d[b], d[b + 1], d[b + 2])
+                );
+            }
+        } else if (c.eqCdBase == 0) {
             for (uint256 i = c.eqPoints.length; i > 0; --i) {
                 w = KoalaBearExt4.add(
                     KoalaBearExt4.mul(w, gamma), eqEval(localR, c.eqPoints[i - 1])

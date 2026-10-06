@@ -185,6 +185,12 @@ library WhirVerifierCore {
         /// The point the initial sumcheck reduces to, one coordinate per
         /// folding factor.
         uint256[] randomness;
+        /// The virtual claims' univariate points: drawn from the transcript
+        /// BEFORE each answer was absorbed, one per OOD answer. WBND v5 no
+        /// longer ships the virtual eq groups - the terminal identity derives
+        /// them from these points, which is strictly sounder than trusting
+        /// proof-supplied coordinates.
+        uint256[] virtualPoints;
     }
 
     /// Flat eval order for the batched claim: constraint position ->
@@ -255,9 +261,12 @@ library WhirVerifierCore {
     ) internal pure returns (InitialOutput memory out) {
         // --- claim registration ------------------------------------------------
         // Virtual claims: framing, then draw the point, then bind the answer.
+        // The drawn point is the virtual eq group's univariate point; v5 keeps
+        // it for the terminal identity instead of discarding it.
+        out.virtualPoints = new uint256[](input.oodAnswers.length);
         for (uint256 i; i < input.oodAnswers.length; ++i) {
             absorbConstants(t, s.preClaimsConstants[i]);
-            drawExt(t); // the virtual claim's univariate point; unused here
+            out.virtualPoints[i] = drawExt(t);
             observeExt(t, input.oodAnswers[i]);
         }
 

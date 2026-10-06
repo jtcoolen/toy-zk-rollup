@@ -1752,3 +1752,34 @@ crypto layering table (SHA3-256 shielded / Poseidon2 commitment / Keccak
 transcript), crate map, how to run the gate (scripts/check.sh), how to run
 the local e2e (Anvil + node + extension), and pointers to
 .scratch/pq-shielded-rollup/{map,decisions}.md.
+
+
+## D-092 — The 30M gas target: settlement verifies the RECURSIVE proof (PROPOSAL)
+
+User question: sol-whir-p3 does 106.6 KB at 12.9M tx gas - 300 KB should be
+~30M? Yes for the recursive proof, no for the composed bundle, and the gap
+decides the architecture. Full plan in verifier-redesign.md ("D-092 PROPOSAL",
+sixth observation batch has the four-reference gas study: sol-whir-p3 audit
+retained-wins, GOAT derive-don't-ship + grind/query trade, midfall precompile
+batching + split, IOHK op-count budget).
+
+**Decision.** The 30M target is unreachable on the composed proof at any size
+(exec floor ~127M for that shape); it is the natural landing zone for the
+layer-N RECURSIVE proof (~300 KB measured, ~50-120 KB after the same C/D/B
+levers applied to its shape). Settlement therefore moves to verifying the
+recursive proof with the statement bound as one folded Poseidon2 root (D-089).
+Phases: 0 = finish D-086 on composed (in progress; every technique is built
+and differential-tested there first); 1 = recursion proof through WBND +
+D-089 folded root + size sweep; 2 = recursive verifier (same codebase, new
+schedule cfg + statement shape) with the gas queue applied (assembly Merkle,
+sumcheck batching, fixed-base gamma tables, radix final evaluator - the
+sol-whir-p3 retained-win list); 3 = proof-shape co-design if needed
+(grouped terminal -17.7%, grind/query retune); 4 = settlement integration +
+MetaMask e2e at <=30M. Composed verify stays as audit mode/fallback.
+
+**Budget.** ~17-28M projected (table in the proposal). 30M is the gate, not
+the expectation; margin levers are listed and ordered.
+
+**Not in the plan.** Trace splitting (D-085), per-proof codegen, EIP-4844,
+SNARK wrap, monolithic 64 KB contracts, ext-field precompiles (fork-only).
+

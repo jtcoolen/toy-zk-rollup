@@ -77,6 +77,40 @@ fn check_shape(src: &str, flat: &str, bundle: &str) {
     }
 }
 
+/// Regenerate the committed flat sidecars and bundles from the committed
+/// vectors JSON using the RUST encoder. Run this whenever the wire format
+/// changes (v5 dropped the proof eq section); the pin tests above then lock
+/// the bytes in. The JS generators are superseded - the encoder is the
+/// producer of record, so artifacts must come from it.
+#[test]
+#[ignore = "regenerates committed artifacts; run explicitly after a wire change"]
+fn regenerate_committed_bundles() {
+    for (src, flat, bundle) in [
+        (
+            "composed_vectors.json",
+            "composed_flat.json",
+            "composed_bundle.bin",
+        ),
+        (
+            "block_composed_vectors.json",
+            "block_composed_flat.json",
+            "block_composed_bundle.bin",
+        ),
+    ] {
+        let jj: Value = serde_json::from_slice(&read_vec(src)).expect("composed vectors json");
+        let bin = read_vec(&src.replace(".json", ".bin"));
+        let mine_flat = wbnd::flat_from_vectors(&jj);
+        let mine_bundle = wbnd::encode_bundle(&mine_flat, &jj, &bin);
+        std::fs::write(
+            vectors_dir().join(flat),
+            serde_json::to_vec_pretty(&mine_flat).expect("flat json"),
+        )
+        .expect("write flat");
+        std::fs::write(vectors_dir().join(bundle), &mine_bundle).expect("write bundle");
+        println!("{bundle}: {} bytes", mine_bundle.len());
+    }
+}
+
 #[test]
 fn wbnd_encoder_matches_js_fib_artifact() {
     check_shape(

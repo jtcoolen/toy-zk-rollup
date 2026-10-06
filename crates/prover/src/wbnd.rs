@@ -648,8 +648,6 @@ pub fn encode_bundle(j: &Value, jj: &Value, bin: &[u8]) -> Vec<u8> {
             m.word(as_u64(&rd["framing_batching"]) as u32);
             m.arr(&u32_vec(&rd["framing_seps"]));
             m.arr(&u32_vec(&rd["claim_widths"]));
-            m.arr(&u32_vec(&rd["eq_points_lens"]));
-            m.arr(&u32_vec(&rd["eq_group_lens"]));
             m.word(as_u64(&rd["num_variables"]) as u32);
             m.word(as_u64(&rd["starting_folding_pow_bits"]) as u32);
             m.word(as_u64(&rd["commitment_ood_samples"]) as u32);
@@ -720,8 +718,11 @@ pub fn encode_bundle(j: &Value, jj: &Value, bin: &[u8]) -> Vec<u8> {
             m.ext_arr(&hex_strings(&rd["final_sumcheck_ca"]));
             m.ext_arr(&hex_strings(&rd["final_sumcheck_cinf"]));
             m.arr(&u32_vec(&rd["final_sumcheck_pow_witnesses"]));
-            // D-072 phase 1: zeta-derived per-proof data lives in PROOF.
-            m.ext_arr(&hex_strings(&rd["eq_points"]));
+            // v5 (D-086 step C): the per-round eq section is GONE. The eq
+            // groups are now derived on-chain from the STATEMENT section's
+            // opening points plus the transcript-drawn virtual claim points
+            // (TerminalWeight frame mode 2) - 386 KB of wire bought back, and
+            // the groups stop being proof-supplied.
             // domain_points DROPPED (v3): the verifier recomputes g^index from
             // the indices its own transcript samples.
         }
@@ -762,7 +763,7 @@ pub fn encode_bundle(j: &Value, jj: &Value, bin: &[u8]) -> Vec<u8> {
     // ---- header + body ----
     let mut out = vec![0u8; 16];
     out[..4].copy_from_slice(b"WBND");
-    out[4] = 4;
+    out[4] = 5;
     out[8..12].copy_from_slice(&(cfg.len() as u32).to_le_bytes());
     out[12..16].copy_from_slice(&(prf.len() as u32).to_le_bytes());
     for w in &cfg {

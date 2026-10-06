@@ -183,4 +183,150 @@ contract TerminalWeightTest is Test {
         vm.expectRevert(TerminalWeight.BadFrameLength.selector);
         _call(cut);
     }
+
+    // ---------------------------------------------------------------------
+    // Mode 2 (D-086 step C): statement-derived groups.
+    //
+    // A tiny statement section exercising every branch of the derivation:
+    //   matrix A: log_size 3 -> PADDED arity 4 (the folding-factor floor),
+    //             width 1, one point zA.
+    //   matrix B: log_size 4 -> arity 4, width 1, one point zB.
+    // Equal padded arities: the reverse walk places B (later source index)
+    // first, slot raw 0 -> sel 0; A second, raw 1 -> sel 1 (k=5, one
+    // selector bit). Then one virtual group: raw expansion, no selector.
+    // The mode-0 frame spells the same three groups out as explicit
+    // coordinates (bridge form for the matrices, raw for the virtual one),
+    // so agreement proves the derivation, not just the evaluation.
+    // ---------------------------------------------------------------------
+
+    function _u32le(uint256 x) private pure returns (bytes memory b) {
+        b = new bytes(4);
+        b[0] = bytes1(uint8(x & 0xff));
+        b[1] = bytes1(uint8((x >> 8) & 0xff));
+        b[2] = bytes1(uint8((x >> 16) & 0xff));
+        b[3] = bytes1(uint8((x >> 24) & 0xff));
+    }
+
+    /// Bridge-form coordinates for a matrix group: coords[i] =
+    /// y_i/(1+y_i) with y_i = z^(2^(arity-1-i)), then one selector bit.
+    function _bridgeCoords(uint256 z, uint256 selBit)
+        private
+        pure
+        returns (uint256[] memory c)
+    {
+        uint256 arity = 4;
+        uint256[] memory ys = new uint256[](arity);
+        ys[0] = z;
+        for (uint256 i = 1; i < arity; ++i) ys[i] = KoalaBearExt4.square(ys[i - 1]);
+        c = new uint256[](arity + 1);
+        for (uint256 i; i < arity; ++i) {
+            uint256 y = ys[arity - 1 - i];
+            c[i] = KoalaBearExt4.mul(
+                y, KoalaBearExt4.inv(KoalaBearExt4.add(KoalaBearExt4.ONE, y))
+            );
+        }
+        c[arity] = selBit == 1 ? KoalaBearExt4.fromBase(1) : 0;
+    }
+
+    /// Raw expansion for the virtual group: coords[i] = v^(2^(k-1-i)).
+    function _rawCoords(uint256 v, uint256 k)
+        private
+        pure
+        returns (uint256[] memory c)
+    {
+        uint256[] memory ys = new uint256[](k);
+        ys[0] = v;
+        for (uint256 i = 1; i < k; ++i) ys[i] = KoalaBearExt4.square(ys[i - 1]);
+        c = new uint256[](k);
+        for (uint256 i; i < k; ++i) c[i] = ys[k - 1 - i];
+    }
+
+    uint256 private constant Z_A = 11 << 224;
+    uint256 private constant Z_B = 13 << 224;
+    uint256 private constant V_P = 17 << 224;
+
+    function _statement() private pure returns (bytes memory stm) {
+        stm = bytes.concat(_u32le(1), _u32le(2));
+        // matrix A: raw log_size 3 (padded to 4), width 1, one point.
+        stm = bytes.concat(stm, _u32le(3), _u32le(1), _u32le(1), _u32le(32), _w(Z_A));
+        // matrix B: log_size 4, width 1, one point.
+        stm = bytes.concat(stm, _u32le(4), _u32le(1), _u32le(1), _u32le(32), _w(Z_B));
+    }
+
+    function _tail() private view returns (bytes memory f) {
+        f = _w(_poly.length);
+        for (uint256 i; i < _poly.length; ++i) f = bytes.concat(f, _w(_poly[i]));
+        f = bytes.concat(f, _w(_closing.length));
+        for (uint256 i; i < _closing.length; ++i) f = bytes.concat(f, _w(_closing[i]));
+    }
+
+    function _frameMode2(uint256 k) private view returns (bytes memory f) {
+        bytes memory stm = _statement();
+        f = _w(TerminalWeight(satellite).MAGIC());
+        f = bytes.concat(f, _allFrame());
+        f = bytes.concat(f, _w(1));
+        f = bytes.concat(f, _w(k), _w(KoalaBearExt4.fromBase(5)), _w(0), _w(2), _w(0), _w(0));
+        f = bytes.concat(f, _w(stm.length), _w(0), _w(1), _w(V_P), stm);
+        f = bytes.concat(f, _tail());
+    }
+
+    /// The same three groups spelled out as mode-0 coordinates, placement
+    /// order: B (sel 0), A (sel 1), virtual (raw).
+    function _frameMode2Spelled() private view returns (bytes memory f) {
+        uint256[] memory gb = _bridgeCoords(Z_B, 0);
+        uint256[] memory ga = _bridgeCoords(Z_A, 1);
+        uint256[] memory gv = _rawCoords(V_P, 5);
+        f = _w(TerminalWeight(satellite).MAGIC());
+        f = bytes.concat(f, _allFrame());
+        f = bytes.concat(f, _w(1));
+        f = bytes.concat(f, _w(5), _w(KoalaBearExt4.fromBase(5)), _w(0), _w(0), _w(3), _w(0));
+        for (uint256 i; i < 5; ++i) f = bytes.concat(f, _w(gb[i]));
+        for (uint256 i; i < 5; ++i) f = bytes.concat(f, _w(ga[i]));
+        for (uint256 i; i < 5; ++i) f = bytes.concat(f, _w(gv[i]));
+        f = bytes.concat(f, _tail());
+    }
+
+    function test_frame_mode2_matches_spelled_groups() public {
+        _shape();
+        (bool ok2, bytes memory r2) = _call(_frameMode2(5));
+        (bool ok0, bytes memory r0) = _call(_frameMode2Spelled());
+        assertTrue(ok2, "mode 2 reverted");
+        assertTrue(ok0, "mode 0 reverted");
+        assertEq(r2, r0, "mode 2 disagrees with the spelled-out groups");
+    }
+
+    /// The spelled groups must also match the independent reference.
+    function test_frame_mode2_matches_the_reference() public {
+        _shape();
+        WhirGadgets.ConstraintWeight[] memory cs =
+            new WhirGadgets.ConstraintWeight[](1);
+        cs[0].numVariables = 5;
+        cs[0].gamma = KoalaBearExt4.fromBase(5);
+        cs[0].eqPoints = new uint256[][](3);
+        cs[0].eqPoints[0] = _bridgeCoords(Z_B, 0);
+        cs[0].eqPoints[1] = _bridgeCoords(Z_A, 1);
+        cs[0].eqPoints[2] = _rawCoords(V_P, 5);
+        (bool ok, bytes memory ret) = _call(_frameMode2(5));
+        assertTrue(ok, "mode 2 reverted");
+        (, uint256 weight, uint256 value) = abi.decode(ret, (uint256, uint256, uint256));
+        assertEq(
+            KoalaBearExt4.mul(weight, value),
+            referenceImpl.expected(_allR, _closing, cs, _poly),
+            "mode 2 weight * value != reference");
+    }
+
+    /// A constraint narrower than the folding factor cannot host the padded
+    /// matrices: BadArity(4, 3), the padded arity, not the raw log_size.
+    function test_mode2_bad_arity_reverts() public {
+        _shape();
+        (bool ok, bytes memory ret) = _call(_frameMode2(3));
+        assertFalse(ok, "k=3 must not accept arity-4 matrices");
+        // staticcall revert data bubbles up verbatim; compare it directly
+        // (expectRevert does not intercept the caught staticcall here).
+        assertEq(
+            keccak256(ret),
+            keccak256(abi.encodeWithSelector(TerminalWeight.BadArity.selector, 4, 3)),
+            "wrong revert");
+    }
+
 }
