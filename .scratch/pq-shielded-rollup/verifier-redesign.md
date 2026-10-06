@@ -992,3 +992,34 @@ Order of work: Step D (Rust export + Solidity walk) -> re-measure -> Step B
 -> re-measure -> schedule experiment -> P2b compute library. Each step
 lands with a gas number in this file.
 
+
+
+## Batch 18 - Step D frontier analysis + schedule experiment plan
+
+Frontier math on the block vectors (offline, /tmp/frontier3.py):
+- paths_hex is 751,840 B = 61% of the 1.23 MB recursion bundle - THE wire.
+- Query indices are all distinct (262/275 per round) but path counts are
+  246/262 and path depths vary per matrix ([14,15,16] round 0): the walk
+  opens TWO matrices per round and the query->(matrix,path) pairing is NOT
+  recoverable offline. Confirmed twice now: the frontier MUST be computed
+  inside whir_walk.rs where dims/indices/proof are in scope.
+- Key realization: the prover's MerkleProof IS already a pruned multiproof
+  (restore_and_recompute_paths expands it). Step D ships the PRUNED form:
+  per depth a node list + skip counts (p3 MerkleProof.layers format), and
+  the Solidity walk rebuilds the (depth, sibling-index) -> node map from
+  the query indices it already derives from the transcript. Same roots,
+  fewer bytes AND fewer hashes (shared segments hash once).
+
+Schedule experiment (cheapest possible big lever, test before building):
+- protocol_params round_log_inv_rates is empty = rate 1/2 everywhere. Rate
+  1/4 (log_inv_rate 2) roughly HALVES the query count (each query buys 2
+  proximity bits) - halving both the walk compute and most of the wire.
+- Risk: recursion circuit trace doubles (4x LDE rows) - the chain needed
+  LDE 24 at rate 1/2; if rate 1/4 needs 25 it exceeds KoalaBear TWO_ADICITY
+  24 and the lever is dead for the chain (may still work for the block).
+- Soundness is schedule-computed either way (JohnsonBound ceiling ~109 bits
+  at rate 1/2; rate 1/4 list size ~5.8 bits, ceiling still >100). Not a
+  security downgrade - a proof-size/LDE tradeoff the solver enforces.
+- Experiment: rerun recursion_chain with round_log_inv_rates = vec![2; ...]
+  on BOTH configs, print sizes + whether LDE 24 still settles.
+
