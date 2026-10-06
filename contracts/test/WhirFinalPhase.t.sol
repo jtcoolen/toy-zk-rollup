@@ -2,10 +2,12 @@
 pragma solidity ^0.8.28;
 
 import {Test} from "forge-std/Test.sol";
+import {StirOpenings} from "../src/verifier/StirOpenings.sol";
 import {WhirVerifierCore} from "../src/verifier/WhirVerifierCore.sol";
 import {WhirGadgets} from "../src/verifier/WhirGadgets.sol";
 import {KoalaBearExt4} from "../lib/sol-whir-p3/field/KoalaBearExt4.sol";
 import {WhirInitialPhaseHarness as Init} from "./utils/WhirInitialPhaseHarness.sol";
+import {TerminalRef} from "./utils/TerminalRef.sol";
 
 /// External wrapper: a library call is inlined, so a revert inside
 /// WhirVerifierCore.verifyFinal happens at the same call depth as the
@@ -35,12 +37,19 @@ contract FinalHarness {
 ///   polynomial reverts before the sumcheck runs.
 /// - foldedClaim pins the closing sumcheck end to end.
 /// - randomness pins the closing point the final evaluation folds at.
-/// - the terminal identity (claim == weight * poly(r)) is checked inside
-///   verifyFinal against the constraint weights the test assembles from the
-///   exported points: a wrong gamma power, a wrong localR slice, or a wrong
-///   selection weight reverts.
+/// - the terminal identity (claim == weight * poly(r)) is the CALLER's check
+///   since D-086 step A: verifyFinal returns the folded claim and the closing
+///   point, and the identity is evaluated here against the constraint weights
+///   the test assembles from the exported points. In production the same
+///   identity runs in the pinned TerminalWeight satellite; here it runs inline
+///   through WhirGadgets, so a wrong gamma power, a wrong localR slice, or a
+///   wrong selection weight still fails the assertion.
 contract WhirFinalPhaseTest is Test {
     string constant ARTIFACT = "test/vectors/whir_proof_vectors.json";
+
+    /// The harness's stand-in for the pinned TerminalWeight satellite (see
+    /// test/utils/TerminalRef.sol).
+    TerminalRef internal terminalRef = new TerminalRef();
 
     function _flatPaths(
         string memory j,
@@ -237,8 +246,6 @@ contract WhirFinalPhaseTest is Test {
                 vm.parseJsonUint(j, string.concat(".final_sumcheck_pow_witnesses[", _u(i), "]"));
         }
         input.sumcheckPowBits = vm.parseJsonUint(j, ".schedule.final_round.folding_pow_bits");
-        input.allRandomness = new uint256[](0); // filled by the caller
-        input.constraints = new WhirGadgets.ConstraintWeight[](0); // filled by the caller
     }
 
     /// The constraint weights the terminal identity batches over: the initial
@@ -306,8 +313,6 @@ contract WhirFinalPhaseTest is Test {
 
         (WhirVerifierCore.FinalSchedule memory s, WhirVerifierCore.FinalInput memory input) =
             _final(j, lastRandomness);
-        input.allRandomness = allRandomness;
-        input.constraints = _constraints(j, oodPoint0);
 
         uint256 g0 = gasleft();
         WhirVerifierCore.FinalOutput memory out =
@@ -325,8 +330,14 @@ contract WhirFinalPhaseTest is Test {
                 Init.extAt(j, ".final_randomness", i),
                 string.concat("closing randomness ", _u(i)));
         }
-        // The terminal identity itself (folded == weight * poly(r)) is checked
-        // inside verifyFinal: reaching here at all is the assertion.
+        // The terminal identity, now the caller's (D-086 step A), checked
+        // against TerminalRef: a separate contract holding the identity in
+        // plain Solidity, the harness's stand-in for the pinned satellite (and
+        // the only way the eval chain fits beside the final phase's locals).
+        assertEq(
+            out.foldedClaim,
+            terminalRef.expected(allRandomness, out.randomness, _constraints(j, oodPoint0), input.finalPoly),
+            "terminal identity");
     }
 
     /// A tampered public polynomial must break the terminal STIR check: the
@@ -334,18 +345,13 @@ contract WhirFinalPhaseTest is Test {
     /// coefficient table, so the verifier reverts instead of accepting.
     function test_tampered_final_poly_reverts() public {
         string memory j = vm.readFile(ARTIFACT);
-        (
-            WhirVerifierCore.Transcript memory t,
-            uint256 carried,
-            uint256[] memory lastRandomness,
-            uint256[] memory allRandomness,
-            uint256[] memory oodPoint0
-        ) = _beforeFinal(j);
+        // The closing randomness and OOD point feed only the terminal
+        // identity, which this test never reaches.
+        (WhirVerifierCore.Transcript memory t, uint256 carried, uint256[] memory lastRandomness,,) =
+            _beforeFinal(j);
 
         (WhirVerifierCore.FinalSchedule memory s, WhirVerifierCore.FinalInput memory input) =
             _final(j, lastRandomness);
-        input.allRandomness = allRandomness;
-        input.constraints = _constraints(j, oodPoint0);
         // Tamper a REAL field lane: the packed word's low 128 bits are
         // padding, rejected at decode (PAD_MASK) and ignored by the lane-wise
         // field arithmetic, so +1 there is not a polynomial change. Lane 0
@@ -353,7 +359,16 @@ contract WhirFinalPhaseTest is Test {
         input.finalPoly[0] = input.finalPoly[0] + (uint256(1) << 224);
 
         FinalHarness harness = new FinalHarness();
-        vm.expectRevert();
+        // The poly is absorbed into the transcript BEFORE the queries are
+        // sampled, so a forged coefficient table moves the transcript, moves
+        // the sampled indices, and the Merkle authentication of the opening
+        // fails before the horner statement check is ever reached. Either way
+        // the tamper is caught inside verifyFinal - the terminal identity is
+        // not what rejects it.
+        // Index 11 is this artifact's first query whose sampled index no longer
+        // matches an authenticated row; the selector is the point, not the index.
+        vm.expectRevert(
+            abi.encodeWithSelector(StirOpenings.OpeningNotAuthenticated.selector, 11));
         harness.finalPhase(t, s, input, carried);
     }
 }

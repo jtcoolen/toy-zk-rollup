@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {WhirVerifier} from "../src/verifier/WhirVerifier.sol";
+import {TerminalWeight} from "../src/verifier/TerminalWeight.sol";
 import {ShieldedPool} from "../src/ShieldedPool.sol";
 
 /// The whole point, on one screen: a real shielded block - one client transfer,
@@ -45,7 +46,7 @@ contract BlockE2ETest is Test {
         bytes32 genesisRoot = vm.parseJsonBytes32(j, ".genesis_root_hex");
         expectedRootAfter = _asBytes32(vm.parseJsonBytes(j, ".pool_root_after_hex"));
 
-        WhirVerifier verifier = new WhirVerifier();
+        WhirVerifier verifier = new WhirVerifier(address(new TerminalWeight()));
         pool = new ShieldedPool(verifier, address(0xB0B), genesisRoot, bytes32(0));
     }
 

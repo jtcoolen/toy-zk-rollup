@@ -15,6 +15,7 @@ pragma solidity ^0.8.28;
 
 import {Script, console} from "forge-std/Script.sol";
 import {WhirVerifier} from "../src/verifier/WhirVerifier.sol";
+import {TerminalWeight} from "../src/verifier/TerminalWeight.sol";
 import {ShieldedPool} from "../src/ShieldedPool.sol";
 
 contract Deploy is Script {
@@ -34,7 +35,10 @@ contract Deploy is Script {
         // --unlocked --sender); msg.sender inside run() is that account.
         address deployer = msg.sender;
         vm.startBroadcast();
-        WhirVerifier verifier = new WhirVerifier();
+        // D-086 step A: the terminal-weight satellite first - the verifier
+        // pins its codehash at construction and re-checks it before every call.
+        TerminalWeight terminalWeight = new TerminalWeight();
+        WhirVerifier verifier = new WhirVerifier(address(terminalWeight));
         // The nullifier root: bytes32(0) makes ShieldedPool compute the empty
         // sparse-tree root itself; the genesis file may pin one explicitly.
         bytes32 nullifierRoot = bytes32(0);
@@ -44,6 +48,7 @@ contract Deploy is Script {
         string memory manifest = string.concat(
             "{\n",
             '  "verifier": "', vm.toString(address(verifier)), '",\n',
+            '  "terminalWeight": "', vm.toString(address(terminalWeight)), '",\n',
             '  "pool": "', vm.toString(address(pool)), '",\n',
             '  "deployer": "', vm.toString(deployer), '",\n',
             '  "chainId": ', vm.toString(block.chainid), "\n",
@@ -51,6 +56,7 @@ contract Deploy is Script {
         vm.createDir("deployments", true);
         vm.writeFile("deployments/local.json", manifest);
         console.log("verifier", address(verifier));
+        console.log("terminal weight", address(terminalWeight));
         console.log("pool", address(pool));
         console.log("genesis root", vm.toString(genesisRoot));
     }

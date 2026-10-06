@@ -6,6 +6,7 @@ import {KoalaBearExt4} from "../lib/sol-whir-p3/field/KoalaBearExt4.sol";
 import {WhirVerifierCore} from "../src/verifier/WhirVerifierCore.sol";
 import {WhirGadgets} from "../src/verifier/WhirGadgets.sol";
 import {SemanticBlob} from "./utils/SemanticBlob.sol";
+import {TerminalRef} from "./utils/TerminalRef.sol";
 
 /// The composed settlement verifier: the WHIR core driven at the REAL opening
 /// shapes, seeded from the batch transcript at the delegate point.
@@ -41,6 +42,11 @@ contract WhirComposedTest is Test {
     /// The delegate event: the batch layer's last absorbed event is the
     /// commitment at 155; the WHIR core's first event is 161.
     uint256 internal constant DELEGATE_SITE = 161;
+
+    /// The harness's stand-in for the pinned TerminalWeight satellite: the
+    /// terminal identity evaluated in plain Solidity, in its own contract so
+    /// the eval chain stays out of the final phase's stack frame.
+    TerminalRef internal terminalRef = new TerminalRef();
 
     function _flat() private view returns (string memory) {
         return vm.readFile(FLAT);
@@ -418,7 +424,7 @@ contract WhirComposedTest is Test {
         uint256 carried,
         uint256[] memory lastRandomness,
         uint256[] memory allRandomness
-    ) private pure {
+    ) private view {
         string memory R = ctx.R;
         WhirVerifierCore.FinalSchedule memory sf;
         sf.finalPolyConstants = 0;
@@ -450,11 +456,21 @@ contract WhirComposedTest is Test {
         fi.sumcheckCInf = vm.parseJsonUintArray(ctx.j, string.concat(R, ".final_sumcheck_cinf"));
         fi.sumcheckPowWitnesses = vm.parseJsonUintArray(ctx.j, string.concat(R, ".final_sumcheck_pow_witnesses"));
         fi.sumcheckPowBits = vm.parseJsonUint(ctx.j, string.concat(R, ".final_folding_pow_bits"));
-        fi.allRandomness = allRandomness;
-        fi.constraints = _constraints(ctx.j, r);
 
         WhirVerifierCore.FinalOutput memory fout = WhirVerifierCore.verifyFinal(t, sf, fi, carried);
         assertEq(fout.foldedClaim, vm.parseJsonUint(ctx.j, string.concat(R, ".claimed_after_final")), "final folded");
+
+        // The terminal identity (D-086 step A): verifyFinal no longer evaluates
+        // it - the eval chain moved to the pinned TerminalWeight satellite, and
+        // the equality became the caller's job. This harness is a caller, so it
+        // checks it against TerminalRef, a separate contract holding the same
+        // identity in plain Solidity: an independent second opinion on what the
+        // satellite computes, and the only way the eval chain fits alongside the
+        // final phase without blowing the stack.
+        assertEq(
+            fout.foldedClaim,
+            terminalRef.expected(allRandomness, fout.randomness, _constraints(ctx.j, r), fi.finalPoly),
+            "terminal identity (weight * poly(r))");
     }
 
     /// An array of `n` copies of `v`.

@@ -741,24 +741,16 @@ library WhirVerifierCore {
         uint256[] sumcheckCInf;
         uint256[] sumcheckPowWitnesses;
         uint256 sumcheckPowBits;
-        /// Every folding randomness in protocol order: initial, then each
-        /// round, then the closing sumcheck's (appended by this function).
-        uint256[] allRandomness;
-        /// The constraint weights of every constraint the run accumulated,
-        /// in order, for the terminal identity.
-        WhirGadgets.ConstraintWeight[] constraints;
     }
 
     /// What the final phase produces.
     struct FinalOutput {
         /// The claim after the closing sumcheck folded it.
         uint256 foldedClaim;
-        /// The point the closing sumcheck reduces to.
+        /// The point the closing sumcheck reduces to. The caller concatenates
+        /// this onto its accumulated folding randomness to form all_r for the
+        /// terminal identity (D-086 step A).
         uint256[] randomness;
-        /// The combined constraint weight evaluated at the full folding point.
-        uint256 weight;
-        /// The final polynomial evaluated at the closing randomness.
-        uint256 finalValue;
         /// The terminal query indices the transcript sampled, in query order:
         /// the caller's source for each query's domain point (D-072).
         uint256[] queryIndices;
@@ -766,26 +758,28 @@ library WhirVerifierCore {
 
     /// A terminal query's folded row disagrees with the public polynomial.
     error StirChallengeFailed(uint256 query);
-    /// The terminal identity failed: the claim does not equal the constraint
-    /// weight times the polynomial evaluation. This is the verifier's last
-    /// line: everything before it is Fiat-Shamir bookkeeping.
-    error TerminalClaimMismatch(uint256 expected, uint256 actual);
     /// The folding randomness is shorter than a constraint's arity.
     error RandomnessTooShort(uint256 need, uint256 have);
 
-    /// Replay the final phase and check the terminal identity.
+    /// Replay the final phase.
     ///
     /// Mirrors `replay`'s final block: bind the public polynomial,
     /// terminal PoW, terminal query indices, open each query against the last
     /// root and fold it at the last round's randomness, then check each fold
     /// against the public polynomial at the query's domain point (the STIR
     /// statement verified directly - the terminal claims are NOT batched into
-    /// the running claim), run the closing sumcheck, and finally check
+    /// the running claim), then run the closing sumcheck.
+    ///
+    /// The terminal identity
     ///
     ///     claimed == eval_constraints_poly(all_r) * final_poly(final_r)
     ///
+    /// is NOT evaluated here (D-086 step A): the eval chain is the largest
+    /// single block of verifier bytecode and runs exactly once per verify, so
+    /// it lives in the pinned TerminalWeight satellite. The caller performs
+    /// the equality against the foldedClaim and randomness returned here.
     /// There is no transcript checkpoint after the closing sumcheck: the
-    /// algebra IS the checkpoint.
+    /// algebra IS the checkpoint, wherever it is evaluated.
     function verifyFinal(
         Transcript memory t,
         FinalSchedule memory s,
@@ -888,27 +882,5 @@ library WhirVerifierCore {
         );
         out.foldedClaim = folded;
         out.randomness = randomness;
-
-        // --- the terminal identity ----------------------------------------------------------
-        //
-        // all_r is every folding randomness in protocol order with the closing
-        // sumcheck's appended; each constraint reads the LAST k of them (Prefix
-        // order). The weight is the batched constraint polynomial; the value is
-        // the public polynomial folded at the closing randomness.
-        uint256[] memory allR = new uint256[](input.allRandomness.length + randomness.length);
-        for (uint256 i; i < input.allRandomness.length; ++i) {
-            allR[i] = input.allRandomness[i];
-        }
-        for (uint256 i; i < randomness.length; ++i) {
-            allR[input.allRandomness.length + i] = randomness[i];
-        }
-        uint256 weight = WhirGadgets.evalConstraintsPoly(allR, input.constraints, false);
-        uint256 value = KoalaBearExt4.evaluate_hypercube(input.finalPoly, randomness);
-        uint256 expected = KoalaBearExt4.mul(weight, value);
-        if (folded != expected) {
-            revert TerminalClaimMismatch(expected, folded);
-        }
-        out.weight = weight;
-        out.finalValue = value;
     }
 }

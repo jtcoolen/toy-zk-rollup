@@ -95,6 +95,43 @@ contract WhirVerifier is IWhirVerifier {
     /// The CONSTRAINTS section is missing or misframed (wire v4).
     error BadConstraints();
 
+    /// The terminal-weight satellite's runtime code is not the code pinned at
+    /// construction. Checked before every call (D-086 step A). The satellite can
+    /// only make verification FAIL - the caller does the final equality - so a
+    /// swap is not a soundness hole, but the pin is what makes one loud.
+    error SatelliteUnpinned();
+
+    /// The satellite did not answer with a well-formed [magic, weight, value]
+    /// reply. Its own revert data bubbles up when it carried any.
+    error SatelliteCallFailed();
+
+    /// The terminal identity failed: the claim does not equal the constraint
+    /// weight times the polynomial evaluation. This is the verifier's last
+    /// line: everything before it is Fiat-Shamir bookkeeping.
+    error TerminalClaimMismatch(uint256 expected, uint256 actual);
+
+    /// The terminal-weight frame magic: ASCII "TWIGHT", matching TerminalWeight.
+    uint256 private constant TERMINAL_MAGIC = 0x5457_4947_4854;
+
+    /// The pinned TerminalWeight satellite: the terminal weight and value, out
+    /// of the core's bytecode and into a contract of its own (D-086 step A).
+    address private immutable SATELLITE;
+
+    /// `SATELLITE.codehash` as seen at construction, re-checked before every
+    /// call. A satellite deployed behind a proxy or swapped afterwards is not
+    /// the code the core was sized and reviewed against.
+    bytes32 private immutable SATELLITE_CODEHASH;
+
+    /// Pin the terminal-weight satellite. Empty code is rejected here rather
+    /// than discovered as a failed call on the first verify.
+    constructor(address terminalWeight) {
+        if (terminalWeight == address(0) || terminalWeight.code.length == 0) {
+            revert SatelliteUnpinned();
+        }
+        SATELLITE = terminalWeight;
+        SATELLITE_CODEHASH = terminalWeight.codehash;
+    }
+
     // ---------------------------------------------------------------------
     // Two-adic generators (canonical base elements)
     //
@@ -165,9 +202,14 @@ contract WhirVerifier is IWhirVerifier {
 
     /// Replay the batch verification. Reverts on any failure; returns true only
     /// when every challenge, opening, and the terminal identity check out.
+    ///
+    /// `view`, not `pure`: the terminal identity is evaluated by the pinned
+    /// TerminalWeight satellite over a staticcall (D-086 step A), which keeps
+    /// the eval chain out of this contract's bytecode. Everything else here
+    /// reads nothing but the arguments.
     function verify(uint256[] calldata statement, bytes calldata proof)
         external
-        pure
+        view
         override
         returns (bool)
     {
@@ -372,7 +414,7 @@ contract WhirVerifier is IWhirVerifier {
         WhirVerifierCore.Transcript memory t,
         RoundCfg memory c,
         RoundPrf memory p
-    ) private pure {
+    ) private view {
         // Each round re-binds its framing constants (D-070): the config bytes are
         // consumed by count, and the cursor restarts with the round.
         t.constants = c.framingHex;
@@ -543,7 +585,7 @@ contract WhirVerifier is IWhirVerifier {
         RoundPrf memory p,
         Threading memory th,
         WhirGadgets.ConstraintWeight[] memory constraints
-    ) private pure {
+    ) private view {
         uint256 nInter = c.nInter;
         WhirVerifierCore.FinalSchedule memory sf;
         sf.finalPolyConstants = 0;
@@ -573,10 +615,201 @@ contract WhirVerifier is IWhirVerifier {
         fi.sumcheckCInf = p.finalScInf;
         fi.sumcheckPowWitnesses = p.finalScPow;
         fi.sumcheckPowBits = c.finalFoldPowBits;
-        fi.allRandomness = th.allRandomness;
-        fi.constraints = constraints;
 
-        WhirVerifierCore.verifyFinal(t, sf, fi, th.carried);
+        WhirVerifierCore.FinalOutput memory out =
+            WhirVerifierCore.verifyFinal(t, sf, fi, th.carried);
+
+        // The terminal identity, the caller's job since D-086 step A. Its own
+        // function: the frame packer's assembly block needs most of the stack
+        // for itself and cannot share a stack frame with the final phase.
+        _checkTerminalIdentity(
+            th.allRandomness, out.randomness, constraints, fi.finalPoly, out.foldedClaim);
+    }
+
+    /// The terminal identity (D-086 step A):
+    ///
+    ///     foldedClaim == eval_constraints_poly(all_r) * final_poly(final_r)
+    ///
+    /// all_r is every folding randomness in protocol order with the closing
+    /// sumcheck's appended; each constraint reads the LAST k of them (Prefix
+    /// order). The eval chain itself runs in the pinned TerminalWeight
+    /// satellite - it is the largest single block of verifier bytecode and it
+    /// runs once per round, so keeping it out of this contract is what leaves
+    /// room under EIP-170. The EQUALITY is checked here, by the caller: a
+    /// faulty or malicious satellite can only make verification FAIL.
+    function _checkTerminalIdentity(
+        uint256[] memory allRandomness,
+        uint256[] memory closing,
+        WhirGadgets.ConstraintWeight[] memory constraints,
+        uint256[] memory finalPoly,
+        uint256 foldedClaim
+    ) private view {
+        uint256[] memory allR = _concat(allRandomness, closing);
+        (uint256 weight, uint256 value) =
+            _terminalWeight(allR, constraints, finalPoly, closing);
+        uint256 expected = KoalaBearExt4.mul(weight, value);
+        if (foldedClaim != expected) {
+            revert TerminalClaimMismatch(expected, foldedClaim);
+        }
+    }
+
+    /// Ask the pinned TerminalWeight satellite for the constraint weight at
+    /// allR and the public polynomial at randomness.
+    ///
+    /// Split into pack + call so the frame builder stays its own function:
+    /// inlined into the final phase, the assembly block's live set pushed the
+    /// via-IR scheduler past the stack limit.
+    function _terminalWeight(
+        uint256[] memory allR,
+        WhirGadgets.ConstraintWeight[] memory constraints,
+        uint256[] memory finalPoly,
+        uint256[] memory randomness
+    ) private view returns (uint256 weight, uint256 value) {
+        // Re-check the pin: the code that runs must be the code that was sized,
+        // reviewed, and deployed alongside this verifier.
+        if (SATELLITE_CODEHASH != SATELLITE.codehash) revert SatelliteUnpinned();
+        (uint256 frame, uint256 size) =
+            _packTerminalFrame(allR, constraints, finalPoly, randomness);
+        return _callTerminalWeight(frame, size);
+    }
+
+    /// Build the TWIGHT frame at the free pointer and return its base and
+    /// length. Raw words, no ABI codec - the satellite's fallback parses the
+    /// same layout from the other side.
+    ///
+    /// The one thing that costs something: the wire eq groups live in THIS
+    /// call's calldata and the satellite reads eq groups from its own, so the
+    /// flat eq section is copied into the frame (~773 KB at the settlement
+    /// shape, once per round). Read-don't-decode is preserved on both sides of
+    /// the boundary; only the boundary itself pays.
+    function _packTerminalFrame(
+        uint256[] memory allR,
+        WhirGadgets.ConstraintWeight[] memory constraints,
+        uint256[] memory finalPoly,
+        uint256[] memory randomness
+    ) private pure returns (uint256 frame, uint256 size) {
+        assembly ("memory-safe") {
+            // Single pass: the free pointer IS the cursor. Nothing allocates
+            // through Solidity until the frame is complete.
+            frame := mload(0x40)
+            let c := frame
+
+            mstore(c, TERMINAL_MAGIC)
+            c := add(c, 32)
+
+            // --- allR ---
+            let n := mload(allR)
+            mstore(c, n)
+            c := add(c, 32)
+            mcopy(c, add(allR, 32), mul(n, 32))
+            c := add(c, mul(n, 32))
+
+            // --- constraints ---
+            let m := mload(constraints)
+            mstore(c, m)
+            c := add(c, 32)
+            let cb := add(constraints, 32)
+            for { let i := 0 } lt(i, m) { i := add(i, 1) } {
+                // ConstraintWeight field order: [0]numVariables [1]gamma
+                // [2]initialPower [3]eqPoints [4]eqCdBase [5]eqLens [6]selVars.
+                // The array is a POINTER array (the struct has dynamic
+                // members), so slot i holds the address of the struct.
+                let base := mload(add(cb, mul(i, 32)))
+                let eqCd := mload(add(base, 128))
+                let mode := iszero(iszero(eqCd))
+                // The group source pointer follows the mode: eqLens (+160) for
+                // wire groups, eqPoints (+96) for derived ones.
+                let src := mload(add(base, add(96, mul(mode, 64))))
+                let nGroups := 0
+                if src { nGroups := mload(src) }
+                let selPtr := mload(add(base, 192))
+                let nSel := 0
+                if selPtr { nSel := mload(selPtr) }
+
+                mstore(c, mload(base))
+                mstore(add(c, 32), mload(add(base, 32)))   // gamma
+                mstore(add(c, 64), mload(add(base, 64)))   // initialPower
+                mstore(add(c, 96), mode)
+                mstore(add(c, 128), nGroups)
+                mstore(add(c, 160), nSel)
+                c := add(c, 192)
+
+                switch mode
+                case 1 {
+                    // Wire groups: lengths, then the flat words copied out of
+                    // the proof calldata so they become the satellite's own.
+                    mcopy(c, add(src, 32), mul(nGroups, 32))
+                    c := add(c, mul(nGroups, 32))
+                    let total := 0
+                    for { let j := 0 } lt(j, nGroups) { j := add(j, 1) } {
+                        total := add(total, mload(add(add(src, 32), mul(j, 32))))
+                    }
+                    calldatacopy(c, eqCd, mul(total, 32))
+                    c := add(c, mul(total, 32))
+                }
+                default {
+                    // Derived groups: k words each, ragged in memory.
+                    let pd := add(src, 32)
+                    let k := mload(base)
+                    for { let j := 0 } lt(j, nGroups) { j := add(j, 1) } {
+                        let grp := mload(add(pd, mul(j, 32)))
+                        mcopy(c, add(grp, 32), mul(k, 32))
+                        c := add(c, mul(k, 32))
+                    }
+                }
+                if selPtr {
+                    mcopy(c, add(selPtr, 32), mul(nSel, 32))
+                    c := add(c, mul(nSel, 32))
+                }
+            }
+
+            // --- finalPoly, randomness ---
+            let nf := mload(finalPoly)
+            mstore(c, nf)
+            c := add(c, 32)
+            mcopy(c, add(finalPoly, 32), mul(nf, 32))
+            c := add(c, mul(nf, 32))
+            let nr := mload(randomness)
+            mstore(c, nr)
+            c := add(c, 32)
+            mcopy(c, add(randomness, 32), mul(nr, 32))
+            c := add(c, mul(nr, 32))
+
+            size := sub(c, frame)
+            // Reserve the frame plus the 96-byte reply buffer the call lands in.
+            mstore(0x40, add(c, 96))
+        }
+    }
+
+    /// staticcall the frame and read back [magic, weight, value].
+    function _callTerminalWeight(uint256 frame, uint256 size)
+        private
+        view
+        returns (uint256 weight, uint256 value)
+    {
+        // Left-aligned so a 4-byte revert payload carries the selector.
+        uint256 failSel = uint256(bytes32(SatelliteCallFailed.selector));
+        // Assembly cannot name an immutable; bind them to locals first.
+        address satellite = SATELLITE;
+        uint256 magic;
+        uint256 rdSize;
+        uint256 reply = frame + size;
+        assembly ("memory-safe") {
+            let ok := staticcall(gas(), satellite, frame, size, reply, 96)
+            rdSize := returndatasize()
+            switch ok
+            case 0 {
+                // Bubble the satellite's own revert data when it carried any:
+                // a malformed frame says so instead of vanishing into a bool.
+                switch rdSize
+                case 0 { mstore(0, failSel) revert(0, 4) }
+                default { returndatacopy(0, 0, rdSize) revert(0, rdSize) }
+            }
+            magic := mload(reply)
+            weight := mload(add(reply, 32))
+            value := mload(add(reply, 64))
+        }
+        if (rdSize != 96 || magic != TERMINAL_MAGIC) revert SatelliteCallFailed();
     }
 
     // ---------------------------------------------------------------------
