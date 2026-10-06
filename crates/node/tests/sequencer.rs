@@ -38,7 +38,6 @@ const ONE_IN_ONE_OUT: TransferShape = TransferShape {
 
 /// Shape-header length for a two-transfer block: one block count plus two
 /// limbs per transfer.
-const HEADER_LIMBS: usize = 5;
 
 /// Prove one client transfer and wrap it in a signed envelope.
 ///
@@ -169,9 +168,15 @@ fn two_client_proofs_settle_into_one_verified_block() -> Result<(), Box<dyn std:
 
     // `submit` takes ownership, so anything the assertions need is captured
     // before the move.
-    let expected_len = HEADER_LIMBS + tx_a.statement.len() + tx_b.statement.len();
     let final_nf_root = tx_b.public.nullifier_roots.after;
     let nf_a = note_a.nullifier(&Sha3_256Shielded, &sk_a);
+    // The folded block statement (D-089), rebuilt independently from the two
+    // child statements: header, fold root, endpoint digests, fees.
+    let expected_statement = prover::block::block_statement(
+        [tx_a.shape, tx_b.shape].iter(),
+        [tx_a.statement.as_slice(), tx_b.statement.as_slice()],
+    )
+    .expect("folded block statement builds");
 
     // The sequencer starts from a tree that already holds both notes, which
     // is what the transfers' witnessed root commits to.
@@ -184,12 +189,18 @@ fn two_client_proofs_settle_into_one_verified_block() -> Result<(), Box<dyn std:
     assert_eq!(block.num_transfers, 2);
     assert_eq!(block.total_fee, 200);
 
-    // The statement is the shape header followed by both transfers'
-    // statements — the exact layout `BlockStatement.sol` decodes.
+    // The statement is the folded form (D-089): header(5) + fold root(16) +
+    // four endpoint digests(64) + two fees(8) = 93 limbs - the exact layout
+    // `BlockStatement.sol` decodes, and byte-identical to the independent
+    // rebuild above.
     assert_eq!(
         block.statement.len(),
-        expected_len,
-        "block statement = header({HEADER_LIMBS}) + two transfer statements"
+        prover::block::block_statement_len(2),
+        "folded block statement is 81 + 6n limbs"
+    );
+    assert_eq!(
+        block.statement, expected_statement,
+        "the sequencer statement must equal the shared folded builder"
     );
 
     // The settled proof verifies against the statement the contract is handed.

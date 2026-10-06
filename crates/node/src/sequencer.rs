@@ -458,35 +458,24 @@ impl Sequencer {
     }
 }
 
-/// Reconstruct the block statement from children: shape header, then each
-/// child's statement, concatenated.
+/// Reconstruct the folded block statement (D-089) from children.
 ///
-/// Mirrors the contract's `BlockStatement.decode` exactly. The header is
-/// derived from the children's shapes, not supplied, so the contract and the
-/// prover cannot disagree about where the header ends.
+/// Delegates to the prover's shared `block::block_statement`, the same builder
+/// the circuit's export and the vector generators use: shape header, the
+/// statement fold root, the four block endpoint digests, and the flattened
+/// fees. Nothing here re-derives the layout, so the node and the circuit cannot
+/// drift on what a block statement is.
 ///
 /// # Errors
 ///
-/// Returns [`SequencerError::Proving`] if a shape header cannot be encoded —
-/// a block with more than 65 535 transfers, or a transfer with more than
-/// 65 535 inputs. Both are far beyond what the mempool admits, but the
-/// failure is propagated rather than assumed away: a wrong header would pin
-/// the shared-root anchor to the wrong limbs.
+/// Returns [`SequencerError::Proving`] if a shape disagrees with its statement
+/// or a count overflows a `u16` limb. Both are far beyond what the mempool
+/// admits, but the failure is propagated rather than assumed away: a wrong
+/// statement would fail verification at the settlement boundary.
 fn block_statement(children: &[ChildProof<'_>]) -> Result<Vec<prover::F>, SequencerError> {
-    let header = block::shape_header(children.iter().map(|c| &c.shape))
-        .map_err(|e| SequencerError::Proving(format!("shape header: {e}")))?;
-    let mut out: Vec<prover::F> = Vec::with_capacity(
-        header.len() + children.iter().map(|c| c.statement.len()).sum::<usize>(),
-    );
-    // Fully qualified `from_u16`: `Vec<F>` implements both `Extend<&F>` and
-    // `Extend<F>`, so an unannotated closure leaves inference unresolved.
-    out.extend(
-        header
-            .iter()
-            .map(|&v| <prover::F as p3_field::PrimeCharacteristicRing>::from_u16(v)),
-    );
-    for child in children {
-        out.extend_from_slice(child.statement);
-    }
-    Ok(out)
+    block::block_statement(
+        children.iter().map(|c| &c.shape),
+        children.iter().map(|c| c.statement),
+    )
+    .map_err(|e| SequencerError::Proving(format!("block statement: {e}")))
 }

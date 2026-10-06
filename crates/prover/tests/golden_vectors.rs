@@ -421,15 +421,28 @@ fn block_vectors() -> Result<(), Box<dyn Error>> {
     };
     let artifacts = prove_client_transfer(&inner, &spec, &tree, &mut map)?;
 
+    // D-089: the block statement is the FOLDED form - header, statement fold
+    // root, endpoint digests, fee - built by the same shared builder the circuit
+    // export mirrors. The transfer statement itself is the fold input, not a
+    // part of what the contract sees.
+    let shape = prover::block::TransferShape {
+        num_nullifiers: 1,
+        num_outputs: 1,
+    };
+    let block_statement = prover::block::block_statement(
+        [shape].iter(),
+        [artifacts.statement.as_slice()],
+    )?;
+
     // The statement in both forms, from the same slice.
-    let forms: StatementForms = statement_forms(&artifacts.statement);
+    let forms: StatementForms = statement_forms(&block_statement);
     assert_eq!(
         forms.canonical.len(),
-        artifacts.statement.len(),
+        block_statement.len(),
         "both forms must cover the whole statement"
     );
 
-    let bundle = prover::export::bundle(&artifacts.statement, &artifacts.proof, 1, spec.fee)
+    let bundle = prover::export::bundle(&block_statement, &artifacts.proof, 1, spec.fee)
         .expect("bundle builds");
 
     // The roots and digests ShieldedPool chains, as hex so the Solidity test
@@ -457,6 +470,15 @@ fn block_vectors() -> Result<(), Box<dyn Error>> {
         hex(&p3_keccak::Keccak256Hash.hash_iter(bundle.proof.iter().copied()))
     };
 
+    // The folded statement root, computed natively over the child statement -
+    // the same chain the circuit performs in-circuit (pinned element-for-element
+    // by `commitment_gadget::fold_statement_matches_native`). The Solidity test
+    // compares this against what it decodes from the statement limbs.
+    let statement_root_hex = hex(pq_hash::elements_to_digest(
+        &prover::block::fold_statement_native(std::iter::once(artifacts.statement.as_slice())),
+    )
+    .as_bytes());
+
     let path = write_vector(
         "block_vectors.json",
         &serde_json::json!({
@@ -470,6 +492,7 @@ fn block_vectors() -> Result<(), Box<dyn Error>> {
             "proof_len": bundle.proof.len(),
             "proof_keccak_hex": proof_keccak,
             "root_before_hex": roots_hex(&public.root),
+            "statement_root_hex": statement_root_hex,
             "root_after_hex": roots_hex(&public.root_after),
             "nullifier_before_hex": roots_hex(&public.nullifier_roots.before),
             "nullifier_after_hex": roots_hex(&public.nullifier_roots.after),
@@ -575,8 +598,23 @@ impl BlockFixture {
     ///
     /// This is the cheap half of what `prove_client_transfer` computes, and it is
     /// the half the contract actually verifies, so it is the half worth pinning
-    /// on every cargo test run.
+    /// on every cargo test run. D-089: the block statement is the FOLDED form,
+    /// so the transfer statement is first built, then folded through the same
+    /// shared builder the circuit export mirrors - the check pins exactly what
+    /// the contract will be handed, not the fold's input.
     fn statement(&self) -> Vec<prover::whir::F> {
+        let child = self.child_statement();
+        let shape = prover::block::TransferShape {
+            num_nullifiers: 1,
+            num_outputs: 1,
+        };
+        prover::block::block_statement([shape].iter(), [child.as_slice()])
+            .expect("fixture block statement builds")
+    }
+
+    /// The child (transfer) statement — the fold's input, exposed separately so
+    /// the check can recompute the fold root without re-deriving the fixture.
+    fn child_statement(&self) -> Vec<prover::whir::F> {
         let map = shielded::NullifierMap::new(pq_hash::Keccak256Commitment);
         let transfer = self.transfer();
         let (public, witnesses, frontier) =
@@ -764,6 +802,20 @@ fn check_block_vectors() -> Result<(), Box<dyn Error>> {
     assert_eq!(
         now_words, words,
         "block_vectors.json transcript_words no longer match the Montgomery form of the statement"
+    );
+    // D-089: the fold root recorded in the vector must be the native fold of
+    // the child statement - the same chain the circuit performs. If the fold
+    // drifts, the statement's own limbs and this pin disagree and the contract
+    // would store a root no prover attested.
+    let child = fixture.child_statement();
+    let now_root = hex(pq_hash::elements_to_digest(
+        &prover::block::fold_statement_native(std::iter::once(child.as_slice())),
+    )
+    .as_bytes());
+    assert_eq!(
+        v["statement_root_hex"].as_str().expect("statement_root_hex"),
+        now_root,
+        "block_vectors.json statement_root_hex no longer matches the native fold"
     );
     // The pool-side hex fields must describe the same public values the
     // statement encodes. Decoding them from the statement limbs here would

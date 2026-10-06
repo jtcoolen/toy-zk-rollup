@@ -32,7 +32,6 @@
 use std::error::Error;
 use std::path::PathBuf;
 
-use p3_field::PrimeCharacteristicRing;
 use serde_json::json;
 
 use prover::semantic_blob::classify_observations;
@@ -45,7 +44,7 @@ use prover::composed_export::{
 use prover::settlement_replay::{hex, settlement_params_for, Challenge, SemPcs};
 
 use pq_hash::{Keccak256Commitment, Sha3_256Shielded};
-use prover::block::{build_multi_transfer_circuit, shape_header, ChildProof, TransferShape};
+use prover::block::{block_statement, build_multi_transfer_circuit, ChildProof, TransferShape};
 use prover::client::{prove_client_transfer, ClientSpec};
 use prover::fixtures::{funded_note, seed, tree_with};
 use prover::whir_recursion::InnerWhirConfig;
@@ -248,13 +247,11 @@ fn block_program_equality_and_export() -> Result<(), Box<dyn Error>> {
     }];
     let rc = build_multi_transfer_circuit(&inner, &children).expect("block circuit");
 
-    // The block statement: shape header, then the child's statement - exactly
-    // what the native block verifier accepts and what applyBlock must pass.
-    let mut pis: Vec<F> = shape_header([shape].iter())?
-        .iter()
-        .map(|&v| F::from_u16(v))
-        .collect();
-    pis.extend_from_slice(&client.statement);
+    // The folded block statement (D-089): header, statement fold root, the
+    // four endpoint digests, the fee - exactly what the contract's decoder
+    // parses and what applyBlock must be handed. Built by the same shared
+    // builder the circuit's export mirrors.
+    let pis: Vec<F> = block_statement([shape].iter(), [client.statement.as_slice()])?;
 
     let params = settlement_params_for(prover::block::BLOCK_LOG_MAX_LDE);
 
