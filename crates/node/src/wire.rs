@@ -31,6 +31,8 @@ pub struct TransferWire {
     pub outputs: Vec<Hex32>,
     /// The commitment-tree root the inputs were proven against.
     pub root: Hex32,
+    /// The commitment-tree root after this transfer's output appends (D-088).
+    pub root_after: Hex32,
     /// The nullifier-map root before this transfer.
     pub nullifier_root_before: Hex32,
     /// The nullifier-map root after this transfer.
@@ -83,6 +85,7 @@ impl TransferWire {
             nullifiers,
             outputs,
             root: MerkleRoot::from_digest(digest32(&self.root)?),
+            root_after: MerkleRoot::from_digest(digest32(&self.root_after)?),
             nullifier_roots: shielded::NullifierRoots {
                 before: MerkleRoot::from_digest(digest32(&self.nullifier_root_before)?),
                 after: MerkleRoot::from_digest(digest32(&self.nullifier_root_after)?),
@@ -231,6 +234,7 @@ mod tests {
             nullifiers: vec![nf],
             outputs: vec![out],
             root: MerkleRoot::from_digest(Digest32::new([7u8; 32])),
+            root_after: MerkleRoot::from_digest(Digest32::new([10u8; 32])),
             nullifier_roots: shielded::NullifierRoots {
                 before: MerkleRoot::from_digest(Digest32::new([8u8; 32])),
                 after: MerkleRoot::from_digest(Digest32::new([9u8; 32])),
@@ -248,6 +252,7 @@ mod tests {
             nullifiers: vec![nf.to_hex()],
             outputs: vec![out.to_hex()],
             root: "07".repeat(32),
+            root_after: "0a".repeat(32),
             nullifier_root_before: "08".repeat(32),
             nullifier_root_after: "09".repeat(32),
             fee: 100,

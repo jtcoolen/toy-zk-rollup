@@ -25,7 +25,7 @@
 //! structure. A bug that "fixes" a root by writing it would have nowhere to
 //! live here.
 
-use pq_hash::{Keccak256Commitment, MerkleRoot, NoteHash, Nullifier};
+use pq_hash::{Keccak256Commitment, MerkleRoot, NoteHash, Nullifier, Poseidon2Commitment};
 use shielded::nullifier_tree::NullifierMap;
 use shielded::tree::CommitmentTree;
 
@@ -33,14 +33,19 @@ use crate::tx::TxError;
 
 /// The pool's canonical state at a point in the chain.
 ///
-/// Both trees use the same hasher — Keccak-256 — because both are opened by
-/// proofs the settlement contract verifies, and the contract's cheap hash is
-/// the native `keccak256` opcode. The shielded layer's SHA3-256 never appears
-/// in a tree; it is confined to note and nullifier derivation, off-tree.
+/// The two trees use different hashers, and the split is the whole point of
+/// D-088: the commitment tree is Poseidon2 because the transfer circuit proves
+/// its own appends in-circuit (one permutation per row instead of twenty-four
+/// Keccak rounds), so the contract stores the attested root instead of
+/// re-deriving it, and the hasher behind the tree is the circuit's choice, not
+/// the EVM's. The nullifier map stays Keccak-256: its absence fold was built
+/// and measured there, and nothing about D-088 asks it to move. The shielded
+/// layer's SHA3-256 never appears in a tree; it is confined to note and
+/// nullifier derivation, off-tree.
 #[derive(Clone)]
 pub struct PoolState {
-    /// The append-only note commitment tree.
-    tree: CommitmentTree<Keccak256Commitment>,
+    /// The append-only note commitment tree (Poseidon2, D-088).
+    tree: CommitmentTree<Poseidon2Commitment>,
     /// The nullifier map: which nullifiers have been spent.
     nullifiers: NullifierMap<Keccak256Commitment>,
     /// Number of blocks applied to reach this state.
@@ -102,7 +107,7 @@ impl PoolState {
     #[must_use]
     pub fn genesis() -> Self {
         Self {
-            tree: CommitmentTree::new(Keccak256Commitment),
+            tree: CommitmentTree::new(Poseidon2Commitment::default()),
             nullifiers: NullifierMap::new(Keccak256Commitment),
             block_number: 0,
         }
@@ -190,42 +195,41 @@ impl PoolState {
     /// or [`StateError::StaleRoot`] / [`StateError::StaleNullifierRoot`] if
     /// the transfer was witnessed against a different state.
     pub fn check_admit(&self, public: &shielded::TransferPublic) -> Result<(), StateError> {
-        self.check_admit_against(public, self.nullifier_root())
+        self.check_admit_against(public, self.root(), self.nullifier_root())
     }
 
-    /// Check a transfer against the committed *tree* root and a supplied
-    /// nullifier root.
+    /// Check a transfer against supplied tree and nullifier roots.
     ///
-    /// Taking the nullifier root as an argument rather than reading it from
-    /// `self` is what lets one check serve two cases that genuinely differ:
+    /// Taking both roots as arguments rather than reading them from `self` is
+    /// what lets one check serve two cases that genuinely differ:
     ///
     /// * admission against the **committed** state (this crate's
     ///   [`Self::check_admit`]), and
-    /// * admission against a **pending** projection that already contains the
-    ///   mempool's nullifiers.
+    /// * admission against the sequencer's **pending** projections, which
+    ///   already contain the mempool's outputs and nullifiers.
     ///
-    /// The two roots move on different schedules within a batch. Every
-    /// transfer in a batch witnesses the *same* committed tree root — the
-    /// outputs a transfer creates are not spendable until its block lands —
-    /// while the nullifier root chains forward transfer by transfer, because
-    /// double-spend must be excluded against everything already queued, not
-    /// just what has settled. A check that read both roots from one snapshot
-    /// could express neither.
+    /// Since D-088 both roots chain transfer by transfer within a batch: each
+    /// transfer attests the root its own appends produce (`root_after`), and
+    /// the block circuit pins each child's `root` to its predecessor's
+    /// `root_after`, so the honest `before` for a queued transfer is the
+    /// projection's root, not the committed one. A check hardwired to one
+    /// snapshot could express neither case.
     ///
     /// # Errors
     ///
-    /// Returns the same errors as [`Self::check_admit`], with
-    /// `expected_nullifier_root` standing in for the committed nullifier root.
+    /// Returns the same errors as [`Self::check_admit`], with the arguments
+    /// standing in for the committed roots.
     ///
     /// [`Self::check_admit`]: PoolState::check_admit
     pub fn check_admit_against(
         &self,
         public: &shielded::TransferPublic,
+        expected_tree_root: MerkleRoot,
         expected_nullifier_root: MerkleRoot,
     ) -> Result<(), StateError> {
-        if public.root != self.root() {
+        if public.root != expected_tree_root {
             return Err(StateError::StaleRoot {
-                actual: self.root(),
+                actual: expected_tree_root,
                 claimed: public.root,
             });
         }
@@ -297,11 +301,37 @@ impl PoolState {
             });
         }
 
-        self.nullifiers = probe;
+        // Same probe discipline for the commitment tree: the proof attests the
+        // append (D-088), so a claimed `root_after` that the appends do not
+        // produce means the statement and the state disagree, and the state
+        // must not move.
+        let mut tree_probe = self.tree.clone();
         for out in &public.outputs {
-            self.tree.append(out);
+            tree_probe.append(out);
         }
+        if tree_probe.root() != public.root_after {
+            return Err(StateError::StaleRoot {
+                actual: tree_probe.root(),
+                claimed: public.root_after,
+            });
+        }
+
+        self.nullifiers = probe;
+        self.tree = tree_probe;
         Ok(())
+    }
+
+    /// A clone of the commitment tree.
+    ///
+    /// The sequencer maintains a *pending* projection of the tree exactly the
+    /// way it projects the nullifier map (see `sequencer`): queued transfers
+    /// chain from each other's `root_after`, so admission and proving run
+    /// against the projection, not the committed state. Handing out a clone
+    /// keeps the tree's internals private while giving the sequencer a
+    /// structure it can append to and recompute roots from.
+    #[must_use]
+    pub fn commitment_tree(&self) -> CommitmentTree<Poseidon2Commitment> {
+        self.tree.clone()
     }
 
     /// Advance the block counter. Called once per applied block.
@@ -385,10 +415,16 @@ mod tests {
             let _ = clone_state.nullifiers.insert(n);
             map_probe = clone_state.nullifiers.root();
         }
+        // root_after the same way: append the outputs to a clone of the tree.
+        let mut tree_probe = state.tree.clone();
+        for o in &outputs {
+            tree_probe.append(o);
+        }
         shielded::TransferPublic {
             nullifiers,
             outputs,
             root: state.root(),
+            root_after: tree_probe.root(),
             nullifier_roots: NullifierRoots {
                 before: state.nullifier_root(),
                 after: map_probe,
@@ -438,10 +474,13 @@ mod tests {
 
         // Rebuild the same statement against the *new* state so the only
         // difference is the replayed nullifier.
+        let mut tree_probe = state.tree.clone();
+        tree_probe.append(&note_hash(10));
         let replay = shielded::TransferPublic {
             nullifiers: public.nullifiers.clone(),
             outputs: vec![note_hash(10)],
             root: state.root(),
+            root_after: tree_probe.root(),
             nullifier_roots: NullifierRoots {
                 before: state.nullifier_root(),
                 after: state.nullifier_root(),
@@ -513,6 +552,7 @@ mod tests {
             nullifiers: vec![nf(1), nf(1)],
             outputs: single.outputs.clone(),
             root: state.root(),
+            root_after: single.root_after,
             // Reuse the single-insert `after`. A set-based insert would
             // deduplicate the repeat and land on exactly this root, so the
             // root check would pass and the transfer would sail through. The

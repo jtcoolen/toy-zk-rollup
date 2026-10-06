@@ -152,6 +152,13 @@ async function signAndSubmit() {
       nullifiers: [nf],
       outputs: [out],
       root: state.roots.root,
+      // root_after (D-088) is what the tree looks like after `out` is
+      // appended. The manual send path is envelope-only - the node answers 501
+      // (D-079) - so the true root_after is computed by the prover on the demo
+      // path (/v1/demo/transfer), which proves against the sequencer's
+      // pending tree. The field is present so the signature covers the full
+      // canonical statement the node re-encodes.
+      root_after: state.roots.root,
       nullifier_root_before: state.roots.nullifier_root,
       nullifier_root_after: state.roots.nullifier_root,
       fee: Number($('sFee').value),

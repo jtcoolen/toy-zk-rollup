@@ -407,10 +407,9 @@ fn block_vectors() -> Result<(), Box<dyn Error>> {
     let recipient = derive_spend_pk(&pq_hash::Sha3_256Shielded, &seed(9));
     let output = shielded::Note::new(900, seed(0x51), seed(0x52), recipient);
 
-    let mut tree = CommitmentTree::new(Keccak256Commitment);
-    tree.append(&note.commit(&Keccak256Commitment));
-    let root = tree.root();
-    let path = tree.path(0).expect("path exists").siblings;
+    // D-088: the commitment tree is Poseidon2; the nullifier map stays Keccak.
+    let (tree, paths) = prover::fixtures::tree_with(&[note]);
+    let path = paths[0].clone();
 
     let mut map = shielded::NullifierMap::new(Keccak256Commitment);
     let spec = ClientSpec {
@@ -421,7 +420,7 @@ fn block_vectors() -> Result<(), Box<dyn Error>> {
         output: &output,
         fee: 100,
     };
-    let artifacts = prove_client_transfer(&inner, &spec, root, &mut map)?;
+    let artifacts = prove_client_transfer(&inner, &spec, &tree, &mut map)?;
 
     // The statement in both forms, from the same slice.
     let forms: StatementForms = statement_forms(&artifacts.statement);
@@ -525,23 +524,20 @@ struct BlockFixture {
     index: usize,
     output: shielded::Note,
     fee: u64,
-    root: pq_hash::MerkleRoot,
+    tree: shielded::tree::CommitmentTree<pq_hash::Poseidon2Commitment>,
 }
 
 impl BlockFixture {
     fn build() -> Self {
         use prover::fixtures::{funded_note, seed};
         use shielded::keys::derive_spend_pk;
-        use shielded::tree::CommitmentTree;
 
         let (note, sk_d) = funded_note(11, 1_000);
         let recipient = derive_spend_pk(&pq_hash::Sha3_256Shielded, &seed(9));
         let output = shielded::Note::new(900, seed(0x51), seed(0x52), recipient);
 
-        let mut tree = CommitmentTree::new(pq_hash::Keccak256Commitment);
-        tree.append(&note.commit(&pq_hash::Keccak256Commitment));
-        let root = tree.root();
-        let path = tree.path(0).expect("path exists").siblings;
+        let (tree, paths) = prover::fixtures::tree_with(&[note]);
+        let path = paths[0].clone();
         Self {
             note,
             sk_d,
@@ -549,7 +545,7 @@ impl BlockFixture {
             index: 0,
             output,
             fee: 100,
-            root,
+            tree,
         }
     }
 
@@ -574,8 +570,8 @@ impl BlockFixture {
     fn public_values(&self) -> shielded::TransferPublic {
         let map = shielded::NullifierMap::new(pq_hash::Keccak256Commitment);
         let transfer = self.transfer();
-        let (public, _witnesses) =
-            prover::fixtures::public_and_witnesses_from(&transfer, self.root, map);
+        let (public, _witnesses, _frontier) =
+            prover::fixtures::public_and_witnesses_from(&transfer, &self.tree, map);
         public
     }
 
@@ -587,9 +583,9 @@ impl BlockFixture {
     fn statement(&self) -> Vec<prover::whir::F> {
         let map = shielded::NullifierMap::new(pq_hash::Keccak256Commitment);
         let transfer = self.transfer();
-        let (public, witnesses) =
-            prover::fixtures::public_and_witnesses_from(&transfer, self.root, map);
-        prover::transfer::build_transfer_circuit(&transfer, &public, &witnesses)
+        let (public, witnesses, frontier) =
+            prover::fixtures::public_and_witnesses_from(&transfer, &self.tree, map);
+        prover::transfer::build_transfer_circuit(&transfer, &public, &witnesses, &frontier)
             .expect("fixture circuit builds")
             .statement()
             .to_vec()

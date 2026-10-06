@@ -36,8 +36,8 @@
 //!
 //! ```text
 //! [ n, (inputs_0, outputs_0), ..., (inputs_{n-1}, outputs_{n-1}),
-//!   transfer 0: nullifiers..., outputs..., root, fee,
-//!   transfer 1: nullifiers..., outputs..., root, fee, ... ]
+//!   transfer 0: nullifiers..., outputs..., root, root_after, nf roots..., fee,
+//!   transfer 1: ..., ... ]
 //! ```
 //!
 //! The header is exported as circuit constants, so the split is **bound by the
@@ -47,21 +47,23 @@
 //!
 //! That is what the settlement layer and L1 read to apply the state update.
 //!
-//! ## Shared anchor
+//! ## Commitment roots are chained (D-088)
 //!
-//! Every child is constrained to prove against the **same** commitment root.
-//! Concatenating statements without that link would let a prover assemble a
-//! block from transfers witnessed against *different* tree states — each child
-//! individually valid, the set collectively describing a tree that never
-//! existed. The anchor equality is what makes the concatenated statement
-//! describe one real state transition, so it is enforced here, not left to the
-//! settlement layer.
+//! Each child attests to a full commitment-tree transition: the transfer
+//! circuit folds its spend paths to `root` and re-derives `root_after` by
+//! appending its own outputs, so the pair is a proven edge, not a claim.
+//! The children are then **chained**: child *i*'s `root_after` is constrained
+//! equal to child *i+1*'s `root`. Concatenating statements without that link
+//! would let a prover assemble a block from transfers witnessed against
+//! *different* tree states — each child individually valid, the set
+//! collectively describing a tree that never existed.
 //!
-//! Pinning rather than chaining the commitment root means a note created by one
-//! transfer in a block cannot be spent by another transfer in the same block.
-//! That is a deliberate restriction, not an oversight: it keeps the block's
-//! commitment transition trivial (`root_before == root_after`, outputs appended
-//! afterwards) and removes any question about ordering semantics.
+//! The block therefore attests to one tree transition, from the first child's
+//! `root` to the last child's `root_after`, and the settlement contract can
+//! apply the block by checking those two endpoints against its stored root
+//! instead of re-deriving the Merkle updates itself. Ordering within the block
+//! is now meaningful: a transfer spends against the tree state its predecessor
+//! left behind, exactly like the nullifier chain below.
 //!
 //! ## Nullifier roots are chained, not pinned
 //!
@@ -150,8 +152,8 @@ const FEE_LIMBS: usize = 4;
 /// The shape of a transfer statement, needed to locate fields inside it.
 ///
 /// A transfer exports, in this order:
-/// `[nullifier_0…, output_0…, root, nf_root_before, nf_root_after, fee]` —
-/// 16 limbs per hash, 4 for the fee. The block circuit needs this to find each
+/// `[nullifier_0…, output_0…, root, root_after, nf_root_before, nf_root_after,
+/// fee]` — 16 limbs per hash, 4 for the fee. The block circuit needs this to find each
 /// child's roots without guessing, so a shape that does not match the statement
 /// it describes is rejected rather than silently constraining the wrong limbs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,7 +168,7 @@ impl TransferShape {
     /// Total statement limbs this shape implies.
     #[must_use]
     pub const fn statement_len(&self) -> usize {
-        LIMBS_PER_HASH * (self.num_nullifiers + self.num_outputs + 3) + FEE_LIMBS
+        LIMBS_PER_HASH * (self.num_nullifiers + self.num_outputs + 4) + FEE_LIMBS
     }
 
     /// Offset of the 16 root limbs within the statement.
@@ -175,16 +177,23 @@ impl TransferShape {
         LIMBS_PER_HASH * (self.num_nullifiers + self.num_outputs)
     }
 
+    /// Offset of the commitment-tree root *after* this transfer's appends
+    /// (D-088: the append is in-circuit, so the transition is attested).
+    #[must_use]
+    pub const fn root_after_offset(&self) -> usize {
+        LIMBS_PER_HASH * (self.num_nullifiers + self.num_outputs + 1)
+    }
+
     /// Offset of the nullifier-map root *before* this transfer.
     #[must_use]
     pub const fn nullifier_before_offset(&self) -> usize {
-        LIMBS_PER_HASH * (self.num_nullifiers + self.num_outputs + 1)
+        LIMBS_PER_HASH * (self.num_nullifiers + self.num_outputs + 2)
     }
 
     /// Offset of the nullifier-map root *after* this transfer.
     #[must_use]
     pub const fn nullifier_after_offset(&self) -> usize {
-        LIMBS_PER_HASH * (self.num_nullifiers + self.num_outputs + 2)
+        LIMBS_PER_HASH * (self.num_nullifiers + self.num_outputs + 3)
     }
 }
 
@@ -293,9 +302,9 @@ pub fn build_multi_transfer_circuit(
     // verification allocated. They cannot be merged: the replay drives one
     // child's transcript.
     let mut replays: Vec<Replay<'_>> = Vec::new();
-    // The first child's root limbs, against which every later child's root is
-    // constrained. See "Shared anchor" in the module docs.
-    let mut anchor = RootAnchor::default();
+    // The commitment-root chain across children. See "Commitment roots are
+    // chained" in the module docs.
+    let mut commitment = CommitmentChain::default();
     // The nullifier-map root chain across children. See "Nullifier roots are
     // chained, not pinned" in the module docs.
     let mut nullifiers = NullifierChain::default();
@@ -369,8 +378,8 @@ pub fn build_multi_transfer_circuit(
             .ok_or("statement table instance absent from verifier inputs")?;
         exports.extend(statement_targets.iter().copied().map(StatementExport::Base));
 
-        // Pin this child's root to the block's shared root.
-        anchor.pin(&mut builder, child.shape, statement_targets)?;
+        // Chain this child's commitment transition onto the previous one's.
+        commitment.advance(&mut builder, child.shape, statement_targets)?;
         // Chain this child's nullifier transition onto the previous one's.
         nullifiers.advance(&mut builder, child.shape, statement_targets)?;
 
@@ -450,31 +459,47 @@ fn take_limbs(
     Ok(limbs)
 }
 
-/// The block's shared commitment-root invariant.
+/// The block's commitment-root chain (D-088).
 ///
-/// The first child observed defines the anchor; every later child is constrained
-/// equal to it. Callers cannot inspect or bypass the pinned value — the only way
-/// to use this is to feed it each child in turn, which is exactly the invariant
-/// the block needs.
+/// With the append gadget inside the transfer circuit, each child attests to a
+/// full tree transition (`root` → `root_after`), so the children can be
+/// *chained* the way the nullifier roots always were: child *i*'s `root_after`
+/// is constrained equal to child *i+1*'s `root`. The block therefore attests
+/// to one commitment-tree transition, from the first child's `root` (the
+/// block's `rootBefore`, which the contract pins against its stored root) to
+/// the last child's `root_after` (the block's `rootAfter`), with every
+/// intermediate state pinned.
+///
+/// This strictly replaces the old pin-everything-to-one-root scheme: pinning
+/// was only sound because outputs were appended outside the circuit, and it
+/// forbade any ordering between a transfer's spends and another transfer's
+/// outputs. Chaining keeps the same "one real tree" guarantee — a block
+/// assembled from different tree states still cannot witness — and the
+/// contract no longer has to re-derive the root from the output commitments.
 #[derive(Default)]
-struct RootAnchor {
-    pinned: Option<[ExprId; LIMBS_PER_HASH]>,
+struct CommitmentChain {
+    /// The previous child's `root_after`, which the next child's `root` must
+    /// match; `None` until the first child pins the block's `rootBefore`.
+    expected_before: Option<[ExprId; LIMBS_PER_HASH]>,
+    /// The most recent `root_after`, i.e. the block's own `rootAfter`.
+    latest_after: Option<[ExprId; LIMBS_PER_HASH]>,
 }
 
-impl RootAnchor {
-    /// Constrain `targets[shape.root_offset()..]` to the block's shared root,
-    /// or adopt it as the anchor if this is the first child.
-    fn pin(
+impl CommitmentChain {
+    /// Check one child's commitment transition against the chain and advance.
+    fn advance(
         &mut self,
         builder: &mut CircuitBuilder<Challenge>,
         shape: TransferShape,
         targets: &[ExprId],
     ) -> Result<(), Box<dyn Error>> {
-        let limbs = take_limbs(targets, shape.root_offset(), "root")?;
-        match self.pinned {
-            None => self.pinned = Some(limbs),
-            Some(first) => assert_limbs_equal(builder, &first, &limbs),
+        let before = take_limbs(targets, shape.root_offset(), "root")?;
+        let after = take_limbs(targets, shape.root_after_offset(), "root after")?;
+        if let Some(prev_after) = self.expected_before {
+            assert_limbs_equal(builder, &prev_after, &before);
         }
+        self.expected_before = Some(after);
+        self.latest_after = Some(after);
         Ok(())
     }
 }
@@ -582,8 +607,9 @@ mod tests {
     use crate::fixtures::{funded_note, seed, tree_with};
     use crate::transfer::LOG_MAX_LDE;
     use p3_field::PrimeCharacteristicRing;
-    use pq_hash::{Keccak256Commitment, Sha3_256Shielded};
+    use pq_hash::{Keccak256Commitment, Poseidon2Commitment, Sha3_256Shielded};
     use shielded::keys::derive_spend_pk;
+    use shielded::tree::CommitmentTree;
     use shielded::{Note, NullifierMap};
 
     /// Every transfer in these tests spends one note and creates one.
@@ -606,10 +632,13 @@ mod tests {
     type NullifierStore = NullifierMap<Keccak256Commitment>;
 
     /// One client's transfer witness, as it would exist on the spender's machine.
+    ///
+    /// No membership path here: the adapter reads it from the tree at the
+    /// current root, which is exactly what a real prover does - and the only way
+    /// the block's commitment chain can mean anything.
     struct ClientSpec<'a> {
         note: &'a Note,
         sk_d: &'a [u8; 32],
-        path: &'a [pq_hash::Digest32],
         index: usize,
         out_value: u64,
     }
@@ -624,20 +653,24 @@ mod tests {
     fn prove_client_transfer(
         inner: &InnerWhirConfig,
         spec: &ClientSpec<'_>,
-        root: pq_hash::MerkleRoot,
+        tree: &mut CommitmentTree<Poseidon2Commitment>,
         recipient: shielded::SpendPublicKey,
         map: &mut NullifierStore,
     ) -> Result<ClientTransfer, Box<dyn Error>> {
         let out = Note::new(spec.out_value, seed(200), seed(201), recipient);
+        let path = tree.path(spec.index).expect("note is in the tree").siblings;
         let client_spec = crate::client::ClientSpec {
             note: spec.note,
             sk_d: spec.sk_d,
-            path: spec.path,
+            path: &path,
             index: spec.index,
             output: &out,
             fee: 100,
         };
-        let artifacts = crate::client::prove_client_transfer(inner, &client_spec, root, map)?;
+        let artifacts = crate::client::prove_client_transfer(inner, &client_spec, tree, map)?;
+        // The block applies this transfer, so the next client witnesses the
+        // tree this one left behind - the sequencer's tree service, in miniature.
+        tree.append(&out.commit(&Poseidon2Commitment::default()));
         Ok((artifacts.verifier, artifacts.proof, artifacts.statement))
     }
 
@@ -656,8 +689,8 @@ mod tests {
         let inner = InnerWhirConfig::new(LOG_MAX_LDE, 0).expect("inner config");
 
         // Two *separate* trees, so the two transfers carry different roots.
-        let (tree_a, paths_a) = tree_with(&[n1]);
-        let (tree_b, paths_b) = tree_with(&[n2]);
+        let (mut tree_a, _) = tree_with(&[n1]);
+        let (mut tree_b, _) = tree_with(&[n2]);
         assert_ne!(
             tree_a.root(),
             tree_b.root(),
@@ -667,20 +700,18 @@ mod tests {
         let spec_a = ClientSpec {
             note: &n1,
             sk_d: &sk1,
-            path: &paths_a[0],
             index: 0,
             out_value: 900,
         };
         let spec_b = ClientSpec {
             note: &n2,
             sk_d: &sk2,
-            path: &paths_b[0],
             index: 0,
             out_value: 1_900,
         };
         let mut map = NullifierMap::new(Keccak256Commitment);
-        let client_a = prove_client_transfer(&inner, &spec_a, tree_a.root(), recipient, &mut map)?;
-        let client_b = prove_client_transfer(&inner, &spec_b, tree_b.root(), recipient, &mut map)?;
+        let client_a = prove_client_transfer(&inner, &spec_a, &mut tree_a, recipient, &mut map)?;
+        let client_b = prove_client_transfer(&inner, &spec_b, &mut tree_b, recipient, &mut map)?;
 
         let children = children_of(std::iter::once(&client_a).chain(std::iter::once(&client_b)));
 
@@ -716,32 +747,31 @@ mod tests {
     fn block_rejects_a_broken_nullifier_chain() -> Result<(), Box<dyn Error>> {
         let (n1, sk1) = funded_note(11, 1_000);
         let (n2, sk2) = funded_note(22, 2_000);
-        let (tree, paths) = tree_with(&[n1, n2]);
-        let root = tree.root();
+        let (mut tree, _) = tree_with(&[n1, n2]);
         let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
         let inner = InnerWhirConfig::new(LOG_MAX_LDE, 0).expect("inner config");
 
         let spec_a = ClientSpec {
             note: &n1,
             sk_d: &sk1,
-            path: &paths[0],
             index: 0,
             out_value: 900,
         };
         let spec_b = ClientSpec {
             note: &n2,
             sk_d: &sk2,
-            path: &paths[1],
             index: 1,
             out_value: 1_900,
         };
 
-        // Same tree, but client B was witnessed against its own fresh map, so
-        // its `before` is the empty-map root rather than client A's `after`.
+        // Same tree - the adapter advances it between clients, so the
+        // commitment chain is intact - but client B was witnessed against its
+        // own fresh map, so its `before` is the empty-map root rather than
+        // client A's `after`.
         let mut map_a = NullifierMap::new(Keccak256Commitment);
         let mut map_b = NullifierMap::new(Keccak256Commitment);
-        let client_a = prove_client_transfer(&inner, &spec_a, root, recipient, &mut map_a)?;
-        let client_b = prove_client_transfer(&inner, &spec_b, root, recipient, &mut map_b)?;
+        let client_a = prove_client_transfer(&inner, &spec_a, &mut tree, recipient, &mut map_a)?;
+        let client_b = prove_client_transfer(&inner, &spec_b, &mut tree, recipient, &mut map_b)?;
         assert_ne!(
             map_a.root(),
             map_b.root(),
@@ -779,27 +809,25 @@ mod tests {
     fn block_rejects_shape_statement_mismatch() -> Result<(), Box<dyn Error>> {
         let (n1, sk1) = funded_note(11, 1_000);
         let (n2, sk2) = funded_note(22, 2_000);
-        let (tree, paths) = tree_with(&[n1, n2]);
+        let (mut tree, _) = tree_with(&[n1, n2]);
         let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
         let inner = InnerWhirConfig::new(LOG_MAX_LDE, 0).expect("inner config");
 
         let spec_a = ClientSpec {
             note: &n1,
             sk_d: &sk1,
-            path: &paths[0],
             index: 0,
             out_value: 900,
         };
         let spec_b = ClientSpec {
             note: &n2,
             sk_d: &sk2,
-            path: &paths[1],
             index: 1,
             out_value: 1_900,
         };
         let mut map = NullifierMap::new(Keccak256Commitment);
-        let client_a = prove_client_transfer(&inner, &spec_a, tree.root(), recipient, &mut map)?;
-        let client_b = prove_client_transfer(&inner, &spec_b, tree.root(), recipient, &mut map)?;
+        let client_a = prove_client_transfer(&inner, &spec_a, &mut tree, recipient, &mut map)?;
+        let client_b = prove_client_transfer(&inner, &spec_b, &mut tree, recipient, &mut map)?;
 
         // Same valid children, but the second claims two outputs.
         let mut children = children_of(std::iter::once(&client_a));
@@ -859,30 +887,29 @@ mod tests {
     fn block_verifies_two_client_transfer_proofs() -> Result<(), Box<dyn Error>> {
         let (n1, sk1) = funded_note(11, 1_000);
         let (n2, sk2) = funded_note(22, 2_000);
-        let (tree, paths) = tree_with(&[n1, n2]);
-        let root = tree.root();
+        let (mut tree, _) = tree_with(&[n1, n2]);
         let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
 
         let inner = InnerWhirConfig::new(LOG_MAX_LDE, 0).expect("inner config");
 
-        // Two clients, each proving their own transfer locally.
+        // Two clients, each proving their own transfer locally. The tree
+        // advances between them - client B witnesses the state client A's
+        // outputs left behind, which is what the block's chain constrains.
         let spec_a = ClientSpec {
             note: &n1,
             sk_d: &sk1,
-            path: &paths[0],
             index: 0,
             out_value: 900,
         };
         let spec_b = ClientSpec {
             note: &n2,
             sk_d: &sk2,
-            path: &paths[1],
             index: 1,
             out_value: 1_900,
         };
         let mut map = NullifierMap::new(Keccak256Commitment);
-        let client_a = prove_client_transfer(&inner, &spec_a, root, recipient, &mut map)?;
-        let client_b = prove_client_transfer(&inner, &spec_b, root, recipient, &mut map)?;
+        let client_a = prove_client_transfer(&inner, &spec_a, &mut tree, recipient, &mut map)?;
+        let client_b = prove_client_transfer(&inner, &spec_b, &mut tree, recipient, &mut map)?;
 
         let children = vec![
             ChildProof {
@@ -943,28 +970,25 @@ mod tests {
     fn measure_final_proof_size() -> Result<(), Box<dyn Error>> {
         let (n1, sk1) = funded_note(11, 1_000);
         let (n2, sk2) = funded_note(22, 2_000);
-        let (tree, paths) = tree_with(&[n1, n2]);
-        let root = tree.root();
+        let (mut tree, _) = tree_with(&[n1, n2]);
         let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
         let inner = InnerWhirConfig::new(LOG_MAX_LDE, 0).expect("inner config");
 
         let spec_a = ClientSpec {
             note: &n1,
             sk_d: &sk1,
-            path: &paths[0],
             index: 0,
             out_value: 900,
         };
         let spec_b = ClientSpec {
             note: &n2,
             sk_d: &sk2,
-            path: &paths[1],
             index: 1,
             out_value: 1_900,
         };
         let mut map = NullifierMap::new(Keccak256Commitment);
-        let client_a = prove_client_transfer(&inner, &spec_a, root, recipient, &mut map)?;
-        let client_b = prove_client_transfer(&inner, &spec_b, root, recipient, &mut map)?;
+        let client_a = prove_client_transfer(&inner, &spec_a, &mut tree, recipient, &mut map)?;
+        let client_b = prove_client_transfer(&inner, &spec_b, &mut tree, recipient, &mut map)?;
         let children = children_of(std::iter::once(&client_a).chain(std::iter::once(&client_b)));
 
         let rc = build_multi_transfer_circuit(&inner, &children)?;
@@ -1051,18 +1075,16 @@ mod tests {
                 notes.push(funded_note(u8::try_from(i + 1).expect("small"), 1_000));
             }
             let plain: Vec<Note> = notes.iter().map(|(n, _)| *n).collect();
-            let (tree, paths) = tree_with(&plain);
-            let root = tree.root();
+            let (mut tree, _) = tree_with(&plain);
             for (i, (note, sk)) in notes.iter().enumerate() {
                 let spec = ClientSpec {
                     note,
                     sk_d: sk,
-                    path: &paths[i],
                     index: i,
                     out_value: 900,
                 };
                 clients.push(prove_client_transfer(
-                    &inner, &spec, root, recipient, &mut map,
+                    &inner, &spec, &mut tree, recipient, &mut map,
                 )?);
             }
             let children = children_of(clients.iter());

@@ -163,6 +163,7 @@ mod tests {
                 .map(|i| NoteHash::from_digest(digest(i.wrapping_add(128))))
                 .collect(),
             root: MerkleRoot::from_digest(digest(0xaa)),
+            root_after: MerkleRoot::from_digest(digest(0xad)),
             nullifier_roots: NullifierRoots {
                 before: MerkleRoot::from_digest(digest(0xbb)),
                 after: MerkleRoot::from_digest(digest(0xcc)),

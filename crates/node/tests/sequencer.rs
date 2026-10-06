@@ -19,7 +19,7 @@
 use node::{
     ClientTransferProof, PoolState, Sequencer, SequencerError, ShieldedTransfer, StateError,
 };
-use pq_hash::{Keccak256Commitment, MerkleRoot, Sha3_256Shielded};
+use pq_hash::{Keccak256Commitment, MerkleRoot, Poseidon2Commitment, Sha3_256Shielded};
 use pq_sign::rand::{rngs::StdRng, SeedableRng};
 use pq_sign::{SpendAuth, SphincsPlusAuth};
 use prover::block::TransferShape;
@@ -28,6 +28,7 @@ use prover::fixtures::{funded_note, seed, tree_with};
 use prover::transfer::LOG_MAX_LDE;
 use prover::whir_recursion::InnerWhirConfig;
 use shielded::keys::derive_spend_pk;
+use shielded::tree::CommitmentTree;
 
 /// One input, one output — the shape every transfer in these tests has.
 const ONE_IN_ONE_OUT: TransferShape = TransferShape {
@@ -54,24 +55,27 @@ fn client_prove(
     inner: &InnerWhirConfig,
     note: &shielded::Note,
     sk_d: &[u8; 32],
-    path: &[pq_hash::Digest32],
     index: usize,
     out_value: u64,
     recipient: shielded::SpendPublicKey,
-    root: MerkleRoot,
+    tree: &mut CommitmentTree<Poseidon2Commitment>,
     map: &mut shielded::NullifierMap<Keccak256Commitment>,
     key_seed: u64,
 ) -> Result<ClientTransferProof, Box<dyn std::error::Error>> {
     let output = shielded::Note::new(out_value, seed(0x51), seed(0x52), recipient);
+    let path = tree.path(index).expect("note is in the tree").siblings;
     let spec = ClientSpec {
         note,
         sk_d,
-        path,
+        path: &path,
         index,
         output: &output,
         fee: 100,
     };
-    let artifacts = prove_client_transfer(inner, &spec, root, map)?;
+    let artifacts = prove_client_transfer(inner, &spec, tree, map)?;
+    // The sequencer would apply this transfer and append its output; the next
+    // client must witness the tree this one left behind (D-088 chaining).
+    tree.append(&output.commit(&Poseidon2Commitment::default()));
     let envelope = sign_statement(&artifacts.public, key_seed);
     Ok(ClientTransferProof {
         verifier: artifacts.verifier,
@@ -103,34 +107,31 @@ fn sign_statement(public: &shielded::TransferPublic, key_seed: u64) -> ShieldedT
     }
 }
 
-/// A tree holding both notes, with its root and both membership paths.
+/// A tree holding both notes.
 ///
-/// Both transfers must witness the *same* root, and it must be the root of
-/// the tree that actually holds them — a root read from some other tree would
-/// leave the block's shared-root anchor testing nothing.
+/// The transfers chain through this one tree: each witnesses the root its
+/// predecessor's outputs left behind (D-088), and `client_prove` advances the
+/// tree exactly as the sequencer would on apply — so the chain the block
+/// circuit pins is the chain these proofs actually attest.
 fn shared_tree(
     note_a: &shielded::Note,
     note_b: &shielded::Note,
-) -> (MerkleRoot, Vec<Vec<pq_hash::Digest32>>) {
-    let (tree, paths) = tree_with(&[*note_a, *note_b]);
-    (tree.root(), paths)
+) -> CommitmentTree<Poseidon2Commitment> {
+    tree_with(&[*note_a, *note_b]).0
 }
 
 /// The initial distribution: both notes, committed.
 fn genesis_notes(note_a: &shielded::Note, note_b: &shielded::Note) -> Vec<pq_hash::NoteHash> {
-    vec![
-        note_a.commit(&Keccak256Commitment),
-        note_b.commit(&Keccak256Commitment),
-    ]
+    let p2 = Poseidon2Commitment::default();
+    vec![note_a.commit(&p2), note_b.commit(&p2)]
 }
 
 /// The root of a tree holding `notes`, computed independently of
 /// `PoolState::funded`.
 fn tree_root_of(notes: &[shielded::Note]) -> MerkleRoot {
-    use shielded::tree::CommitmentTree;
-    let mut tree = CommitmentTree::new(Keccak256Commitment);
+    let mut tree = CommitmentTree::new(Poseidon2Commitment::default());
     for n in notes {
-        tree.append(&n.commit(&Keccak256Commitment));
+        tree.append(&n.commit(&Poseidon2Commitment::default()));
     }
     tree.root()
 }
@@ -142,22 +143,25 @@ fn two_client_proofs_settle_into_one_verified_block() -> Result<(), Box<dyn std:
 
     let (note_a, sk_a) = funded_note(11, 1_000);
     let (note_b, sk_b) = funded_note(22, 2_000);
-    let (root, paths) = shared_tree(&note_a, &note_b);
+    let mut tree = shared_tree(&note_a, &note_b);
 
     // One map across both transfers: the chain constraint only means
     // something if they are transitions of the same nullifier trie.
     let mut map = shielded::NullifierMap::new(Keccak256Commitment);
 
     let tx_a = client_prove(
-        &inner, &note_a, &sk_a, &paths[0], 0, 900, recipient, root, &mut map, 1,
+        &inner, &note_a, &sk_a, 0, 900, recipient, &mut tree, &mut map, 1,
     )?;
     let tx_b = client_prove(
-        &inner, &note_b, &sk_b, &paths[1], 1, 1_900, recipient, root, &mut map, 2,
+        &inner, &note_b, &sk_b, 1, 1_900, recipient, &mut tree, &mut map, 2,
     )?;
 
     // Preconditions the block's soundness rests on, asserted rather than
-    // assumed: same tree root, chained nullifier roots.
-    assert_eq!(tx_a.public.root, tx_b.public.root);
+    // assumed: chained commitment roots (D-088) and chained nullifier roots.
+    assert_eq!(
+        tx_a.public.root_after, tx_b.public.root,
+        "the second transfer must witness the tree the first's outputs left"
+    );
     assert_eq!(
         tx_a.public.nullifier_roots.after, tx_b.public.nullifier_roots.before,
         "the second transfer must chain from the first's nullifier root"
@@ -214,11 +218,11 @@ fn a_double_spend_across_the_batch_is_rejected_at_admission(
     let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
     let (note_a, sk_a) = funded_note(11, 1_000);
     let (note_b, sk_b) = funded_note(22, 2_000);
-    let (root, paths) = shared_tree(&note_a, &note_b);
+    let mut tree = shared_tree(&note_a, &note_b);
 
     let mut map = shielded::NullifierMap::new(Keccak256Commitment);
     let tx_a = client_prove(
-        &inner, &note_a, &sk_a, &paths[0], 0, 900, recipient, root, &mut map, 1,
+        &inner, &note_a, &sk_a, 0, 900, recipient, &mut tree, &mut map, 1,
     )?;
 
     let nf_a = note_a.nullifier(&Sha3_256Shielded, &sk_a);
@@ -227,23 +231,24 @@ fn a_double_spend_across_the_batch_is_rejected_at_admission(
     let mut seq = Sequencer::funded(LOG_MAX_LDE, genesis_notes(&note_a, &note_b))?;
     seq.submit(tx_a)?;
 
-    // A second transfer spending the SAME note, proven against the
-    // *committed* nullifier root rather than the pending one. It is a valid
-    // proof of a real relation — it just isn't the relation the pool is in.
-    // Admission is what must catch it.
+    // A second transfer spending the SAME note, proven against the *pending*
+    // tree (so the commitment-root check passes and the nullifier path is the
+    // one that fails) but a *committed* nullifier root rather than the pending
+    // one. It is a valid proof of a real relation — it just isn't the relation
+    // the pool is in. Admission is what must catch it.
     let mut fresh_map = shielded::NullifierMap::new(Keccak256Commitment);
     // Same value as the honest transfer so the only difference is the
     // replayed nullifier. A different value would fail the balance check
     // first, and the test would pass without ever reaching admission.
+    let mut pending_tree = seq.client_tree();
     let replay = client_prove(
         &inner,
         &note_a,
         &sk_a,
-        &paths[0],
         0,
         900,
         recipient,
-        root,
+        &mut pending_tree,
         &mut fresh_map,
         3,
     )?;

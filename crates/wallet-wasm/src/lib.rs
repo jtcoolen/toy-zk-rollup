@@ -356,7 +356,7 @@ fn imp_pubkey(password: &[u8], vault_bytes: &[u8]) -> Result<String, Fail> {
 }
 
 /// Parse the statement JSON the UI collects from the node:
-/// `{"nullifiers":[hex..],"outputs":[hex..],"root":hex,
+/// `{"nullifiers":[hex..],"outputs":[hex..],"root":hex,"root_after":hex,
 /// "nullifier_root_before":hex,"nullifier_root_after":hex,"fee":u64}`.
 fn stmt_from_json(text: &str) -> Result<TransferPublic, Fail> {
     let v: serde_json::Value =
@@ -398,6 +398,7 @@ fn stmt_from_json(text: &str) -> Result<TransferPublic, Fail> {
         nullifiers,
         outputs,
         root: MerkleRoot::from_digest(field("root")?),
+        root_after: MerkleRoot::from_digest(field("root_after")?),
         nullifier_roots: NullifierRoots {
             before: MerkleRoot::from_digest(field("nullifier_root_before")?),
             after: MerkleRoot::from_digest(field("nullifier_root_after")?),
@@ -461,10 +462,11 @@ fn imp_sign_transfer(
             .join(",")
     };
     Ok(format!(
-        "{{\"nullifiers\":[{}],\"outputs\":[{}],\"root\":\"{}\",\"nullifier_root_before\":\"{}\",\"nullifier_root_after\":\"{}\",\"fee\":{},\"verifying_key\":\"{}\",\"signature\":\"{}\"}}",
+        "{{\"nullifiers\":[{}],\"outputs\":[{}],\"root\":\"{}\",\"root_after\":\"{}\",\"nullifier_root_before\":\"{}\",\"nullifier_root_after\":\"{}\",\"fee\":{},\"verifying_key\":\"{}\",\"signature\":\"{}\"}}",
         arr(&nf),
         arr(&out),
         hex::encode(public.root.as_bytes()),
+        hex::encode(public.root_after.as_bytes()),
         hex::encode(public.nullifier_roots.before.as_bytes()),
         hex::encode(public.nullifier_roots.after.as_bytes()),
         public.fee,
@@ -717,11 +719,12 @@ mod tests {
 
     fn statement_json(fee: u64) -> String {
         format!(
-            "{{\"nullifiers\":[\"{}\",\"{}\"],\"outputs\":[\"{}\"],\"root\":\"{}\",\"nullifier_root_before\":\"{}\",\"nullifier_root_after\":\"{}\",\"fee\":{}}}",
+            "{{\"nullifiers\":[\"{}\",\"{}\"],\"outputs\":[\"{}\"],\"root\":\"{}\",\"root_after\":\"{}\",\"nullifier_root_before\":\"{}\",\"nullifier_root_after\":\"{}\",\"fee\":{}}}",
             "01".repeat(32),
             "02".repeat(32),
             "aa".repeat(32),
             "bb".repeat(32),
+            "bc".repeat(32),
             "cc".repeat(32),
             "dd".repeat(32),
             fee
@@ -772,6 +775,7 @@ mod tests {
             "nullifiers",
             "outputs",
             "root",
+            "root_after",
             "nullifier_root_before",
             "nullifier_root_after",
             "fee",
@@ -830,12 +834,12 @@ mod tests {
         let (code, _) = imp_sign_transfer(
             &pw(),
             &vault,
-            b"{\"nullifiers\":[],\"outputs\":[],\"root\":\"00\",\"nullifier_root_before\":\"00\",\"nullifier_root_after\":\"00\"}",
+            b"{\"nullifiers\":[],\"outputs\":[],\"root\":\"00\",\"root_after\":\"00\",\"nullifier_root_before\":\"00\",\"nullifier_root_after\":\"00\"}",
         )
         .expect_err("must fail");
         assert_eq!(code, ERR_BAD_INPUT);
         // Non-hex digest.
-        let (code, _) = stmt_from_json("{\"nullifiers\":[\"zz\"],\"outputs\":[],\"root\":\"00\",\"nullifier_root_before\":\"00\",\"nullifier_root_after\":\"00\",\"fee\":0}")
+        let (code, _) = stmt_from_json("{\"nullifiers\":[\"zz\"],\"outputs\":[],\"root\":\"00\",\"root_after\":\"00\",\"nullifier_root_before\":\"00\",\"nullifier_root_after\":\"00\",\"fee\":0}")
             .expect_err("must fail");
         assert_eq!(code, ERR_BAD_INPUT);
     }

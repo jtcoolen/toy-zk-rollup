@@ -271,6 +271,16 @@ impl<H: CommitmentHasher> CommitmentTree<H> {
         Some(MembershipPath { siblings, index })
     }
 
+    /// The leaves, in append order.
+    ///
+    /// The prover's frontier witness is derived from these (D-088): the
+    /// in-circuit append gadget needs the tree state at `root_before`, and the
+    /// leaf list is the canonical record of that state.
+    #[must_use]
+    pub fn leaves(&self) -> &[Digest32] {
+        &self.leaves
+    }
+
     /// The hasher in use.
     #[must_use]
     pub const fn hasher(&self) -> &H {

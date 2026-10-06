@@ -412,8 +412,10 @@ fn recombine_le(builder: &mut CircuitBuilder<Challenge>, bits: &[ExprId]) -> Exp
 /// The circuit half of one append: everything the prover must witness.
 #[derive(Debug)]
 pub struct AppendGadget {
-    /// The root after the append, as [`DIGEST_LIMBS`] wire limbs.
-    pub root_after_limbs: Vec<ExprId>,
+    /// The root after the append, as digest expressions — chainable straight
+    /// into the next append; export with [`export_digest_limbs`] for the
+    /// statement.
+    pub root_after: DigestExpr,
     /// Private witness values to append to the runner's private inputs, in
     /// allocation order: 64 frontier extension elements, then 32 bits.
     pub witness: Vec<Challenge>,
@@ -422,16 +424,17 @@ pub struct AppendGadget {
 /// Constrain one commitment append in circuit.
 ///
 /// Given the frontier witness (native side of [`FrontierWitness`]), the leaf's
-/// in-circuit digest, and the pinned `root_before` limbs, this:
+/// in-circuit digest, and the pinned `root_before` digest expressions, this:
 ///
-/// 1. folds the frontier to a root and connects it to `root_before_limbs` --
-///    the witness is *the* frontier of the claimed tree;
+/// 1. folds the frontier to a root and pins it to `root_before` (arithmetic
+///    equality) -- the witness is *the* frontier of the claimed tree;
 /// 2. merges the leaf bottom-up (fixed shape: a `select` per level keeps the
 ///    merge or passes the accumulator through);
 /// 3. binary-increments the count bits, parking the merged accumulator in the
 ///    first unset slot, and constrains the carry-out to zero (the tree cannot
 ///    be full);
-/// 4. folds the updated frontier to `root_after` and returns its limbs.
+/// 4. folds the updated frontier to `root_after` and returns it as digest
+///    expressions, chainable into the next append.
 ///
 /// # Errors
 ///
@@ -442,18 +445,12 @@ pub fn constrain_append(
     params: &AppendParams,
     witness: &FrontierWitness,
     leaf: &DigestExpr,
-    root_before_limbs: &[ExprId],
+    root_before: &DigestExpr,
 ) -> Result<AppendGadget, CircuitBuilderError> {
     if witness.frontier.len() != DEPTH || witness.bits.len() != DEPTH {
         return Err(CircuitBuilderError::InvalidDimension {
             expected: DEPTH,
             actual: witness.frontier.len(),
-        });
-    }
-    if root_before_limbs.len() != DIGEST_LIMBS {
-        return Err(CircuitBuilderError::InvalidDimension {
-            expected: DIGEST_LIMBS,
-            actual: root_before_limbs.len(),
         });
     }
 
@@ -477,11 +474,14 @@ pub fn constrain_append(
     }
 
     // 1. Fold the frontier to a root and pin it to the claimed root_before.
+    // Arithmetic equality, not `connect`: perm outputs are LogUp-tracked, and
+    // aliasing their witness slots desynchronises the multiplicities.
     let zero = builder.define_const(Challenge::ZERO);
-    let root_before = fold_frontier(builder, params, &frontier_exprs, &bit_exprs, [zero, zero])?;
-    let computed_before = export_digest_limbs(builder, &root_before)?;
-    for (got, want) in computed_before.iter().zip(root_before_limbs) {
-        builder.connect(*got, *want);
+    let computed_before =
+        fold_frontier(builder, params, &frontier_exprs, &bit_exprs, [zero, zero])?;
+    for (got, want) in computed_before.iter().zip(root_before) {
+        let diff = builder.sub(*got, *want);
+        builder.assert_zero(diff);
     }
 
     // 2. Merge the leaf bottom-up. `g[h]` is the accumulator after level h:
@@ -523,10 +523,9 @@ pub fn constrain_append(
 
     // 4. Fold the updated frontier to root_after.
     let root_after = fold_frontier(builder, params, &new_frontier, &new_bits, [zero, zero])?;
-    let root_after_limbs = export_digest_limbs(builder, &root_after)?;
 
     Ok(AppendGadget {
-        root_after_limbs,
+        root_after,
         witness: private,
     })
 }
@@ -726,17 +725,18 @@ mod tests {
             let mut builder = CircuitBuilder::<Challenge>::new();
             enable_perm(&mut builder);
             let leaf_ext = builder.alloc_private_inputs(DIGEST_EXT, "leaf");
-            let pinned = builder.alloc_private_inputs(DIGEST_LIMBS, "root_before");
+            let pinned = builder.alloc_private_inputs(DIGEST_EXT, "root_before");
             let gadget = constrain_append(
                 &mut builder,
                 &params,
                 &fw,
                 &[leaf_ext[0], leaf_ext[1]],
-                &pinned,
+                &[pinned[0], pinned[1]],
             )
             .expect("gadget builds");
+            let exported = export_digest_limbs(&mut builder, &gadget.root_after).expect("export");
             let expected_after = const_limbs(&mut builder, root_after.as_bytes());
-            for (got, want) in gadget.root_after_limbs.iter().zip(&expected_after) {
+            for (got, want) in exported.iter().zip(&expected_after) {
                 builder.connect(*got, *want);
             }
 
@@ -745,10 +745,8 @@ mod tests {
             runner.set_public_inputs(&[]).expect("no publics");
             let mut witness = Vec::new();
             witness.extend_from_slice(&digest_to_ext(&new_leaf).expect("canonical leaf"));
-            witness.extend(
-                bytes_to_field_elements(root_before.as_bytes())
-                    .into_iter()
-                    .map(Challenge::from),
+            witness.extend_from_slice(
+                &digest_to_ext(&Digest32::new(*root_before.as_bytes())).expect("canonical root"),
             );
             witness.extend_from_slice(&gadget.witness);
             runner.set_private_inputs(&witness).expect("witness fits");
@@ -770,13 +768,13 @@ mod tests {
         let mut builder = CircuitBuilder::<Challenge>::new();
         enable_perm(&mut builder);
         let leaf_ext = builder.alloc_private_inputs(DIGEST_EXT, "leaf");
-        let pinned = builder.alloc_private_inputs(DIGEST_LIMBS, "root_before");
+        let pinned = builder.alloc_private_inputs(DIGEST_EXT, "root_before");
         let gadget = constrain_append(
             &mut builder,
             &params,
             &fw,
             &[leaf_ext[0], leaf_ext[1]],
-            &pinned,
+            &[pinned[0], pinned[1]],
         )
         .expect("gadget builds");
 
@@ -785,7 +783,7 @@ mod tests {
         runner.set_public_inputs(&[]).expect("no publics");
         let mut witness = Vec::new();
         witness.extend_from_slice(&digest_to_ext(&digest(7)).expect("canonical"));
-        witness.extend_from_slice(&[Challenge::ZERO; DIGEST_LIMBS]);
+        witness.extend_from_slice(&[Challenge::ZERO; DIGEST_EXT]);
         witness.extend_from_slice(&gadget.witness);
         runner.set_private_inputs(&witness).expect("witness fits");
         assert!(

@@ -9,9 +9,11 @@
 //!    this the *sender*, who knows the full commitment preimage but not `sk_d`,
 //!    could pick any random `sk_d'`, compute a matching nullifier, and drain the
 //!    note (D-018).
-//! 2. **Commitment** — the leaf is `H_keccak(DOMAIN_NOTE ‖ value ‖ rho ‖ psi ‖ pk_d)`,
-//!    the exact preimage [`shielded::Note::commit`] produces.
-//! 3. **Membership** — the leaf folds through a sibling path to the published root.
+//! 2. **Commitment** — the leaf is `H_p2(DOMAIN_NOTE ‖ value ‖ rho ‖ psi ‖ pk_d)`,
+//!    the Poseidon2 sponge digest [`shielded::Note::commit`] produces with a
+//!    `pq_hash::Poseidon2Commitment` hasher (D-088).
+//! 3. **Membership** — the leaf folds through a sibling path to the published
+//!    root, one Poseidon2 permutation per level.
 //! 4. **Nullifier** — `nf = H_sha3(DOMAIN_NULLIFIER ‖ sk_d ‖ rho)`, published so
 //!    a second spend of the same note is detectable.
 //!
@@ -19,17 +21,34 @@
 //!
 //! 5. **Value conservation** — `Σ inputs = Σ outputs + fee`, column-wise over
 //!    16-bit limbs with a biased carry chain (D-017).
+//! 6. **Commitment-tree transition** — every output leaf is appended to the
+//!    commitment tree *in circuit* (D-088): the frontier witness is pinned to
+//!    `root`, each output's leaf is merged bottom-up, and the resulting root is
+//!    published as `root_after`. The settlement contract therefore stores the
+//!    root instead of re-deriving it — the proof attests the whole transition.
 //!
-//! ## Why nothing here is Poseidon2
+//! ## Three hashes, each doing one job
 //!
-//! The transfer's own hashes are Keccak-256 (the Merkle tree, replayable by the
-//! native `keccak256` opcode) and SHA3-256 (nullifiers, spend-key derivation).
-//! Poseidon2 appears only in the recursion layer, which re-verifies *this* proof.
+//! * **SHA3-256** — nullifiers and spend-key derivation: never Merkle-folded,
+//!   so its cost is a handful of permutations per spend and nothing more.
+//! * **Poseidon2** — the commitment tree and everything the circuit must *prove
+//!   about* the tree: membership folds and output appends. Arity-16 over
+//!   `KoalaBear`, one permutation per node — cheap in circuit, which is what
+//!   made the in-circuit append of D-088 affordable.
+//! * **Keccak-f[1600]** — the nullifier map only. That tree stays Keccak
+//!   because the *contract* replays nullifier-absence folds with the native
+//!   `keccak256` opcode; the transfer proves each nullifier's absence
+//!   in-circuit and the contract re-checks the fold cheaply.
+//!
+//! The commitment tree moved from Keccak to Poseidon2 in D-088 precisely because
+//! the contract no longer folds it: with the append inside the proof, the
+//! contract stores roots rather than re-deriving them (see `ShieldedPool`).
 //!
 //! ## The public statement
 //!
 //! The statement is exactly [`TransferPublic`]: nullifiers, output commitments,
-//! the commitment root, the nullifier-map root before and after, and the fee. It
+//! the commitment root before and after, the nullifier-map root before and
+//! after, and the fee. It
 //! is exported through the statement table, so
 //! `CircuitVerifier::verify(&proof, statement)` binds the proof to those bytes
 //! and to nothing else.
@@ -46,19 +65,26 @@
 
 use std::fmt;
 
-use p3_circuit::ops::{bytes_to_limbs, KECCAK256_DIGEST_LIMBS};
+use p3_circuit::ops::{bytes_to_limbs, generate_poseidon2_trace, generate_recompose_trace};
 use p3_circuit::{
     Circuit, CircuitBuilder, CircuitBuilderError, ExprId, StatementExport, StatementSchema, Traces,
 };
 use p3_field::PrimeCharacteristicRing;
+use p3_poseidon2_circuit_air::KoalaBearD4Width16;
+use p3_recursion::Poseidon2Config;
 
+use pq_hash::Digest32;
 use shielded::keys::DOMAIN_PK;
 use shielded::note::{DOMAIN_NOTE, DOMAIN_NULLIFIER};
-use shielded::{Transfer, TransferPublic};
+use shielded::{Note, Transfer, TransferPublic};
 
+use crate::commitment_gadget::{
+    self, append_to_frontier, digest_to_ext, export_digest_limbs, p2_compress, p2_sponge_limbs,
+    AppendParams, DigestExpr, DigestExt, FrontierWitness, DIGEST_LIMBS,
+};
 use crate::nullifier_gadget::{constrain_nullifier_non_membership, NullifierWitness};
 use crate::sha3_block::sha3_256_single_block;
-use crate::whir_recursion::{Challenge, F};
+use crate::whir_recursion::{whir_perm, Challenge, F};
 
 /// Default trace height budget for transfer settlement.
 ///
@@ -282,7 +308,7 @@ impl TransferCircuit {
 /// ownership of the builder moves.
 ///
 /// Returns the transfer's statement expressions in the order
-/// `[nullifiers…, output_commitments…, root, nullifier_root_before,
+/// `[nullifiers…, output_commitments…, root, root_after, nullifier_root_before,
 /// nullifier_root_after, fee]`, which the caller places inside its own
 /// statement export list.
 ///
@@ -290,6 +316,13 @@ impl TransferCircuit {
 /// each prepared against the nullifier map as it stands *before* that spend's
 /// nullifier is inserted. The witnesses are what let the circuit prove absence
 /// without holding the map.
+///
+/// `frontier` is the commitment tree's frontier witness at `public.root`
+/// (D-088): the digests and count bits that let the circuit re-derive the
+/// append of each output leaf without holding the tree. It must be the frontier
+/// of the tree whose root is `public.root` -- the gadget pins it there before
+/// appending, so a mismatched frontier makes the transfer unwitnessable.
+/// A transfer with no outputs may pass [`FrontierWitness::empty`].
 ///
 /// # Errors
 ///
@@ -301,6 +334,7 @@ pub fn constrain_transfer(
     transfer: &Transfer<'_>,
     public: &TransferPublic,
     nullifier_witnesses: &[NullifierWitness],
+    frontier: &FrontierWitness,
     private: &mut Vec<Challenge>,
 ) -> Result<Vec<ExprId>, CircuitBuilderError> {
     let parties = transfer.spends.len().max(transfer.outputs.len() + 1);
@@ -329,6 +363,18 @@ pub fn constrain_transfer(
     // ordering of nullifiers inside a transfer binding.
     let mut nf_root = const_limbs(builder, public.nullifier_roots.before.as_bytes());
 
+    // The published commitment root as extension-field constants: both the
+    // spends' membership folds and the outputs' frontier fold are pinned to
+    // this value, so one digest parse serves all of them. A non-canonical root
+    // (an element at or above the modulus) has no field representation at all,
+    // which is an error, not a silent truncation.
+    let root_ext = digest_to_ext(&Digest32::new(*public.root.as_bytes())).ok_or(
+        CircuitBuilderError::InvalidDimension {
+            expected: DIGEST_LIMBS,
+            actual: 0,
+        },
+    )?;
+
     // ---- Inputs: ownership, membership, nullifier -----------------------
     for (spend, nf_witness) in transfer.spends.iter().zip(nullifier_witnesses) {
         let sk = Secret::new(builder, spend.sk_d, "transfer.sk_d")?;
@@ -344,20 +390,25 @@ pub fn constrain_transfer(
         // produce a witness here is to know `sk_d`.
         let pk_d = sha3_framed(builder, DOMAIN_PK, &[&sk.exprs])?;
 
-        // (2) Commitment, over the exact native preimage.
+        // (2) Commitment, over the exact native preimage (D-088: the Poseidon2
+        // sponge digest `Note::commit` produces with a Poseidon2 hasher).
         let mut leaf_msg = const_limbs(builder, DOMAIN_NOTE);
         leaf_msg.extend(amount.exprs.iter().copied());
         leaf_msg.extend(rho.exprs.iter().copied());
         leaf_msg.extend(psi.exprs.iter().copied());
         leaf_msg.extend(pk_d.iter().copied());
-        let leaf = builder.keccak256_limbs::<F>(&leaf_msg)?;
+        let leaf = p2_sponge_limbs(builder, &leaf_msg)?;
 
         // (3) Membership: fold to the root, mirroring
         // `MembershipPath::compute_root`, and bind the fold to the published root.
-        let folded = fold_membership(builder, &leaf, spend.path, spend.index, private)?;
-        let root_limbs = const_limbs(builder, public.root.as_bytes());
-        for (got, want) in folded.iter().zip(&root_limbs) {
-            builder.connect(*got, *want);
+        // Arithmetic equality, not `connect`: the fold's last row is a
+        // permutation output, and aliasing lookup outputs desynchronises the
+        // LogUp multiplicities.
+        let folded = fold_membership_p2(builder, leaf, spend.path, spend.index, private)?;
+        for (idx, got) in folded.iter().enumerate() {
+            let want = builder.define_const(root_ext[idx]);
+            let diff = builder.sub(*got, want);
+            builder.assert_zero(diff);
         }
 
         // (4) Nullifier, and its absence from the nullifier map.
@@ -387,30 +438,35 @@ pub fn constrain_transfer(
         input_amounts.push(amount);
     }
 
-    // ---- Outputs ------------------------------------------------------
-    for note in &transfer.outputs {
-        let rho = Secret::new(builder, note.rho(), "output.rho")?;
-        let psi = Secret::new(builder, note.psi(), "output.psi")?;
-        let amount = Amount::private(builder, note.value())?;
-        private.extend(rho.witness.iter().copied());
-        private.extend(psi.witness.iter().copied());
-        private.extend(amount.limbs.iter().map(|&l| Challenge::from_u16(l)));
-
-        // The recipient's spend key is public to the sender, so it is a
-        // constant: the output commitment is pinned, not chosen.
-        let mut leaf_msg = const_limbs(builder, DOMAIN_NOTE);
-        leaf_msg.extend(amount.exprs.iter().copied());
-        leaf_msg.extend(rho.exprs.iter().copied());
-        leaf_msg.extend(psi.exprs.iter().copied());
-        leaf_msg.extend(const_limbs(builder, note.pk_d().as_bytes()));
-        let commitment = builder.keccak256_limbs::<F>(&leaf_msg)?;
-        statement.extend(commitment);
-
-        output_amounts.push(amount);
-    }
+    // ---- Outputs: hash, append, chain ---------------------------------
+    let tree_root = constrain_outputs(
+        builder,
+        transfer,
+        root_ext,
+        frontier,
+        private,
+        &mut statement,
+        &mut output_amounts,
+    )?;
 
     // ---- The published roots and the fee ------------------------------
+    //
+    // The root *before* is exported as constants: the spends' folds and the
+    // frontier's pin already bind every witness to it, so the statement value
+    // is proven, not supplied.
     statement.extend(const_limbs(builder, public.root.as_bytes()));
+
+    // `root_after` is *computed* above, not supplied: the export lands in the
+    // statement, and the statement is what the verifier checks. The published
+    // value must equal it or the proof simply does not verify - and the pin
+    // below makes a mismatch fail at build time rather than at verify time.
+    let computed_after = export_digest_limbs(builder, &tree_root)?;
+    let want_after = const_limbs(builder, public.root_after.as_bytes());
+    for (got, want) in computed_after.iter().zip(&want_after) {
+        let diff = builder.sub(*got, *want);
+        builder.assert_zero(diff);
+    }
+    statement.extend(computed_after);
 
     // The threaded nullifier root must land on the published `after`. With no
     // spends the thread never moved, so `before == after` is required there —
@@ -437,11 +493,100 @@ pub fn constrain_transfer(
     Ok(statement)
 }
 
+/// Constrain the output side of a transfer (D-088).
+///
+/// Each output's leaf is hashed in-circuit and appended to the frontier
+/// pinned at `root_before`. The appends chain - output *i*'s `root_after` is
+/// output *i+1*'s `root_before` - so the returned root is the tree state
+/// after *all* of this transfer's outputs, which the caller publishes as the
+/// statement's `root_after`; the settlement contract can then store it
+/// without re-deriving anything. Each output's commitment limbs are appended
+/// to `statement` and its amount to `output_amounts`, in output order.
+fn constrain_outputs(
+    builder: &mut CircuitBuilder<Challenge>,
+    transfer: &Transfer<'_>,
+    root_ext: DigestExt,
+    frontier: &FrontierWitness,
+    private: &mut Vec<Challenge>,
+    statement: &mut Vec<ExprId>,
+    output_amounts: &mut Vec<Amount>,
+) -> Result<DigestExpr, CircuitBuilderError> {
+    let params = AppendParams::new(&pq_hash::Poseidon2Commitment::default());
+    // The frontier fold starts at the published root: `constrain_append` pins
+    // the witness`s fold to this value before merging anything, so a frontier
+    // from any other tree state cannot witness.
+    let mut tree_root: DigestExpr = [
+        builder.define_const(root_ext[0]),
+        builder.define_const(root_ext[1]),
+    ];
+    for (i, note) in transfer.outputs.iter().enumerate() {
+        let rho = Secret::new(builder, note.rho(), "output.rho")?;
+        let psi = Secret::new(builder, note.psi(), "output.psi")?;
+        let amount = Amount::private(builder, note.value())?;
+        private.extend(rho.witness.iter().copied());
+        private.extend(psi.witness.iter().copied());
+        private.extend(amount.limbs.iter().map(|&l| Challenge::from_u16(l)));
+
+        // The recipient's spend key is public to the sender, so it is a
+        // constant: the output commitment is pinned, not chosen.
+        let mut leaf_msg = const_limbs(builder, DOMAIN_NOTE);
+        leaf_msg.extend(amount.exprs.iter().copied());
+        leaf_msg.extend(rho.exprs.iter().copied());
+        leaf_msg.extend(psi.exprs.iter().copied());
+        leaf_msg.extend(const_limbs(builder, note.pk_d().as_bytes()));
+        let commitment = p2_sponge_limbs(builder, &leaf_msg)?;
+        statement.extend(export_digest_limbs(builder, &commitment)?);
+
+        // The frontier witness for this append is the tree state after the
+        // first `i` outputs of this transfer were appended to `public.root`.
+        let step = frontier_step(frontier, i, &transfer.outputs).map_err(|_| {
+            CircuitBuilderError::InvalidDimension {
+                expected: DIGEST_LIMBS,
+                actual: 0,
+            }
+        })?;
+        let append =
+            commitment_gadget::constrain_append(builder, &params, &step, &commitment, &tree_root)?;
+        private.extend(append.witness.iter().copied());
+        tree_root = append.root_after;
+
+        output_amounts.push(amount);
+    }
+    Ok(tree_root)
+}
+/// The frontier state after the first `i` outputs of this transfer were appended.
+///
+/// The circuit's appends chain - output `i`'s root is output `i+1`'s starting
+/// point - so each append needs the frontier *at that point*, not the transfer's
+/// starting frontier. Deriving it natively (clone, then one merge per preceding
+/// output) is cheap: a merge is at most 32 permutations and outputs per transfer
+/// are few.
+///
+/// Errors only if the tree is full (2^32 leaves), which the circuit also
+/// refuses: the carry-out of the count increment is constrained to zero.
+fn frontier_step(
+    frontier: &FrontierWitness,
+    i: usize,
+    outputs: &[Note],
+) -> Result<FrontierWitness, String> {
+    let hasher = pq_hash::Poseidon2Commitment::default();
+    let mut step = frontier.clone();
+    for note in outputs.iter().take(i) {
+        let leaf = note.commit(&hasher);
+        append_to_frontier(
+            &hasher,
+            &mut step,
+            &pq_hash::Digest32::new(*leaf.as_bytes()),
+        )?;
+    }
+    Ok(step)
+}
+
 /// Build and witness a transfer circuit against a published [`TransferPublic`].
 ///
-/// A thin wrapper: create the builder, enable Keccak-f, constrain the transfer,
-/// install the statement sink, build, and witness. Every property lives in
-/// [`constrain_transfer`].
+/// A thin wrapper: create the builder, enable Keccak-f, Poseidon2 and
+/// recompose, constrain the transfer, install the statement sink, build, and
+/// witness. Every property lives in [`constrain_transfer`].
 ///
 /// `public` is the single source of truth for the statement *and* for the root
 /// the inputs are proven against: the circuit recomputes the root from the
@@ -457,9 +602,19 @@ pub fn build_transfer_circuit(
     transfer: &Transfer<'_>,
     public: &TransferPublic,
     nullifier_witnesses: &[NullifierWitness],
+    frontier: &FrontierWitness,
 ) -> Result<TransferCircuit, Box<dyn std::error::Error>> {
     let mut builder = CircuitBuilder::<Challenge>::new();
     builder.enable_keccak_f1600::<F>();
+    // D-088: the commitment tree is Poseidon2, so the circuit needs the
+    // permutation table (membership folds, output appends) and the recompose
+    // table (base-coefficient packing the perm rows read). Same shape the
+    // recursion circuit enables - one shared KoalaBear D4 width-16 config.
+    builder.enable_poseidon2_perm::<KoalaBearD4Width16, _>(
+        generate_poseidon2_trace::<Challenge, KoalaBearD4Width16>,
+        whir_perm(),
+    );
+    builder.enable_recompose::<F>(generate_recompose_trace::<F, Challenge>);
 
     let mut private: Vec<Challenge> = Vec::new();
     let statement = constrain_transfer(
@@ -467,6 +622,7 @@ pub fn build_transfer_circuit(
         transfer,
         public,
         nullifier_witnesses,
+        frontier,
         &mut private,
     )?;
 
@@ -500,23 +656,38 @@ pub fn build_transfer_circuit(
     })
 }
 
-/// Fold a leaf through a sibling path to the root, mirroring
-/// [`shielded::MembershipPath::compute_root`]: bit `i` of the index selects
-/// which side `siblings[i]` sits on.
+/// Fold a leaf through a sibling path to the root with Poseidon2 compressions,
+/// mirroring [`shielded::MembershipPath::compute_root`] under a
+/// [`pq_hash::Poseidon2Commitment`] hasher: bit `i` of the index selects which
+/// side `siblings[i]` sits on, and each level is one permutation.
 ///
 /// The index is a *witness*, not a constant, so the side selection is a circuit
 /// select driven by a boolean-constrained bit. Making it a constant would let the
 /// prover pick the fold that suits it.
-fn fold_membership(
+///
+/// The fold runs on *extension* digest expressions - two elements - not the 16
+/// wire limbs the Keccak fold used: Poseidon2 digests are field-native, so each
+/// level is two selects and one perm row instead of sixteen selects and a
+/// 24-round permutation.
+fn fold_membership_p2(
     builder: &mut CircuitBuilder<Challenge>,
-    leaf: &[ExprId],
+    leaf: DigestExpr,
     siblings: &[pq_hash::Digest32],
     index: usize,
     private: &mut Vec<Challenge>,
-) -> Result<Vec<ExprId>, CircuitBuilderError> {
-    let mut current = leaf.to_vec();
+) -> Result<DigestExpr, CircuitBuilderError> {
+    let mut current = leaf;
     for (level, sibling) in siblings.iter().enumerate() {
-        let sibling_limbs = const_limbs(builder, sibling.as_bytes());
+        // A non-canonical sibling has no field representation; that is a witness
+        // bug, reported as a shape error rather than a silent truncation.
+        let sibling_ext = digest_to_ext(sibling).ok_or(CircuitBuilderError::InvalidDimension {
+            expected: DIGEST_LIMBS,
+            actual: 0,
+        })?;
+        let sib: DigestExpr = [
+            builder.define_const(sibling_ext[0]),
+            builder.define_const(sibling_ext[1]),
+        ];
         let go_right = (index >> level) & 1 == 1;
         let bit = builder.alloc_private_input("merkle.bit");
         private.push(if go_right {
@@ -528,13 +699,15 @@ fn fold_membership(
 
         // `bit = 1` puts the sibling on the left, matching the native fold where
         // the node's own index bit selects the side the *sibling* occupies.
-        let mut left = Vec::with_capacity(KECCAK256_DIGEST_LIMBS);
-        let mut right = Vec::with_capacity(KECCAK256_DIGEST_LIMBS);
-        for limb in 0..KECCAK256_DIGEST_LIMBS {
-            left.push(builder.select(bit, sibling_limbs[limb], current[limb]));
-            right.push(builder.select(bit, current[limb], sibling_limbs[limb]));
-        }
-        current = builder.keccak256_compress(&left, &right)?;
+        let left: DigestExpr = [
+            builder.select(bit, sib[0], current[0]),
+            builder.select(bit, sib[1], current[1]),
+        ];
+        let right: DigestExpr = [
+            builder.select(bit, current[0], sib[0]),
+            builder.select(bit, current[1], sib[1]),
+        ];
+        current = p2_compress(builder, &left, &right)?;
     }
     Ok(current)
 }
@@ -639,7 +812,7 @@ fn sum_exprs(
 }
 
 /// The statement limbs of a [`TransferPublic`], in the order the circuit exports
-/// them: nullifiers, output commitments, root, fee.
+/// them: nullifiers, output commitments, root, root after, nullifier roots, fee.
 ///
 /// This is the byte-level contract with the Solidity verifier.
 fn statement_limbs(public: &TransferPublic) -> Vec<F> {
@@ -664,6 +837,11 @@ fn statement_limbs(public: &TransferPublic) -> Vec<F> {
             .map(|&l| F::from_u16(l)),
     );
     out.extend(
+        bytes_to_limbs(public.root_after.as_bytes())
+            .iter()
+            .map(|&l| F::from_u16(l)),
+    );
+    out.extend(
         bytes_to_limbs(public.nullifier_roots.before.as_bytes())
             .iter()
             .map(|&l| F::from_u16(l)),
@@ -679,9 +857,10 @@ fn statement_limbs(public: &TransferPublic) -> Vec<F> {
 
 /// Prove a witnessed transfer circuit under the Keccak WHIR settlement config.
 ///
-/// The circuit's only non-primitive operations are Keccak-f[1600] and the
-/// statement table, so only those two tables are registered — no Poseidon2, no
-/// recompose. The returned verifier binds the statement: `verify(&proof, pis)`
+/// The circuit's non-primitive operations are Keccak-f[1600] (the nullifier
+/// map), Poseidon2 (the commitment tree, D-088), recompose (the base packing
+/// the perm rows read), and the statement table; all four are registered. The
+/// returned verifier binds the statement: `verify(&proof, pis)`
 /// accepts only for the `pis` the circuit was built with.
 ///
 /// # Errors
@@ -741,8 +920,14 @@ pub fn settle_transfer_circuit_with<SC>(
 >
 where
     SC: p3_uni_stark::StarkGenericConfig<Challenge = Challenge> + Send + Sync + Clone + 'static,
-    p3_uni_stark::Val<SC>:
-        p3_field::PrimeField64 + p3_field::Field + p3_circuit_prover::config::StarkField,
+    p3_uni_stark::Val<SC>: p3_field::PrimeField64
+        + p3_field::Field
+        + p3_circuit_prover::config::StarkField
+        // D-088: the Poseidon2 and recompose tables are keyed on the base field
+        // and implemented per field, exactly like the Keccak preprocessor below -
+        // the bound is what lets a caller settle under *either* WHIR config, since
+        // both are KoalaBear-based.
+        + p3_field::extension::BinomiallyExtendable<4>,
     Challenge: p3_field::ExtensionField<p3_uni_stark::Val<SC>>
         + p3_field::BasedVectorSpace<p3_uni_stark::Val<SC>>
         + From<p3_uni_stark::Val<SC>>
@@ -759,26 +944,45 @@ where
         p3_circuit_prover::common::NpoPreprocessor<p3_uni_stark::Val<SC>>,
     p3_circuit_prover::batch_stark_prover::StatementPreprocessor:
         p3_circuit_prover::common::NpoPreprocessor<p3_uni_stark::Val<SC>>,
+    p3_circuit_prover::batch_stark_prover::Poseidon2SharedPreprocessor:
+        p3_circuit_prover::common::NpoPreprocessor<p3_uni_stark::Val<SC>>,
+    p3_circuit_prover::batch_stark_prover::RecomposePreprocessor:
+        p3_circuit_prover::common::NpoPreprocessor<p3_uni_stark::Val<SC>>,
+    p3_circuit_prover::batch_stark_prover::Poseidon2AirBuilderForConfig<4>:
+        p3_circuit_prover::common::NpoAirBuilder<SC, 4>,
+    p3_circuit_prover::batch_stark_prover::RecomposeAirBuilder<4>:
+        p3_circuit_prover::common::NpoAirBuilder<SC, 4>,
 {
     use p3_circuit_prover::batch_stark_prover::{
         BatchStarkProver, KeccakF1600AirBuilder, KeccakF1600Preprocessor, KeccakF1600Prover,
-        StatementAirBuilder, StatementPreprocessor, StatementProver,
+        Poseidon2AirBuilderForConfig, Poseidon2SharedPreprocessor, RecomposeAirBuilder,
+        RecomposePreprocessor, StatementAirBuilder, StatementPreprocessor, StatementProver,
     };
     use p3_circuit_prover::common::{NpoAirBuilder, NpoPreprocessor};
     use p3_circuit_prover::ConstraintProfile;
 
+    // The shared-challenger form of the perm table, matching what the recursion
+    // layer registers for its own Poseidon2 rows: one table serves every
+    // Poseidon2 shape in the circuit.
+    let shared = Poseidon2Config::KOALA_BEAR_D4_W16.for_shared_challenger_table();
     let preprocessors: Vec<Box<dyn NpoPreprocessor<p3_uni_stark::Val<SC>>>> = vec![
         Box::new(KeccakF1600Preprocessor),
+        Box::new(Poseidon2SharedPreprocessor::new(vec![shared])),
+        Box::new(RecomposePreprocessor::new(true)),
         Box::new(StatementPreprocessor::new(tc.schema.clone())),
     ];
     let air_builders: Vec<Box<dyn NpoAirBuilder<SC, 4>>> = vec![
         Box::new(KeccakF1600AirBuilder::<4>),
+        Box::new(Poseidon2AirBuilderForConfig::<4>::new(shared)),
+        Box::new(RecomposeAirBuilder::<4>::new(1, true)),
         Box::new(StatementAirBuilder::<4>::new(tc.schema.clone())),
     ];
 
     let mut prover = BatchStarkProver::new(config)
         .with_table_packing(p3_recursion::ProveNextLayerParams::default().table_packing);
     prover.register_table_prover(Box::new(KeccakF1600Prover::<4>));
+    prover.register_poseidon2_table::<4>(shared);
+    prover.register_recompose_table::<4>(true);
     prover.register_table_prover(Box::new(StatementProver::<4>::new(tc.schema.clone())));
 
     let prepared = prover.prepare_circuit(
@@ -794,8 +998,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::public_and_witnesses;
-    use pq_hash::{Keccak256Commitment, Sha3_256Shielded, ShieldedHasher};
+    use crate::fixtures::{public_and_witnesses, tree_with};
+    use pq_hash::{Poseidon2Commitment, Sha3_256Shielded, ShieldedHasher};
     use shielded::keys::{derive_spend_pk, SpendPublicKey};
     use shielded::transfer::Spend;
     use shielded::tree::{CommitmentTree, DEPTH};
@@ -836,8 +1040,8 @@ mod tests {
     /// The point of the round trip is that the statement survives it unchanged. The
     /// recursion circuit binds its own exported statement to the *inner* proof's
     /// statement table, so the Keccak-settled proof that reaches the chain attests
-    /// to exactly the `[nullifiers, output commitments, root, nullifier roots,
-    /// fee]` the transfer
+    /// to exactly the `[nullifiers, output commitments, root, root_after,
+    /// nullifier roots, fee]` the transfer
     /// was witnessed against — not to "some recursion happened".
     ///
     /// The inner layer must be the Poseidon2 `InSC` because a Keccak wire-cap MMCS
@@ -851,7 +1055,6 @@ mod tests {
 
         let (a, sk_a) = funded_note(1, 1_000);
         let (tree, paths) = tree_with(&[a]);
-        let root = tree.root();
 
         let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
         let outputs = vec![Note::new(900, seed(20), seed(21), recipient)];
@@ -868,8 +1071,8 @@ mod tests {
         };
         transfer.check_balance().expect("fixture balances");
 
-        let (public, nf_witnesses) = public_and_witnesses(&transfer, root);
-        let tc = build_transfer_circuit(&transfer, &public, &nf_witnesses)
+        let (public, nf_witnesses, frontier) = public_and_witnesses(&transfer, &tree);
+        let tc = build_transfer_circuit(&transfer, &public, &nf_witnesses, &frontier)
             .expect("a balanced transfer with a valid path should witness");
 
         // Layer 0: the transfer under the recursion-capable Poseidon2 WHIR config.
@@ -918,28 +1121,6 @@ mod tests {
         (note, sk_d)
     }
 
-    /// A tree holding `notes`, plus a membership path for each.
-    ///
-    /// Every path is captured *after* the tree reaches its final root. A path
-    /// taken mid-append folds to that earlier snapshot's root, so using it
-    /// against the final root is unsatisfiable — a real prover reads the path and
-    /// the root from one tree state for the same reason.
-    fn tree_with(
-        notes: &[Note],
-    ) -> (
-        CommitmentTree<Keccak256Commitment>,
-        Vec<Vec<pq_hash::Digest32>>,
-    ) {
-        let mut tree = CommitmentTree::new(Keccak256Commitment);
-        for note in notes {
-            tree.append(&note.commit(&Keccak256Commitment));
-        }
-        let paths = (0..notes.len())
-            .map(|i| tree.path(i).expect("path exists").siblings)
-            .collect();
-        (tree, paths)
-    }
-
     /// End to end: a balanced 2-in / 2-out transfer builds, proves, and verifies
     /// against its own statement.
     #[test]
@@ -947,7 +1128,6 @@ mod tests {
         let (a, sk_a) = funded_note(1, 1_000);
         let (b, sk_b) = funded_note(2, 2_500);
         let (tree, paths) = tree_with(&[a, b]);
-        let root = tree.root();
 
         let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
         let outputs = vec![
@@ -975,8 +1155,8 @@ mod tests {
         };
         transfer.check_balance().expect("fixture balances");
 
-        let (public, nf_witnesses) = public_and_witnesses(&transfer, root);
-        let tc = build_transfer_circuit(&transfer, &public, &nf_witnesses)
+        let (public, nf_witnesses, frontier) = public_and_witnesses(&transfer, &tree);
+        let tc = build_transfer_circuit(&transfer, &public, &nf_witnesses, &frontier)
             .expect("a balanced transfer with valid paths should witness");
 
         let (proof, verifier) = settle_transfer_circuit(&tc, LOG_MAX_LDE)
@@ -993,7 +1173,6 @@ mod tests {
     fn settlement_rejects_a_different_statement() {
         let (a, sk_a) = funded_note(3, 500);
         let (tree, paths) = tree_with(&[a]);
-        let root = tree.root();
         let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(11));
 
         let transfer = Transfer {
@@ -1006,8 +1185,9 @@ mod tests {
             outputs: vec![Note::new(400, seed(30), seed(31), recipient)],
             fee: 100,
         };
-        let (public, nf_witnesses) = public_and_witnesses(&transfer, root);
-        let tc = build_transfer_circuit(&transfer, &public, &nf_witnesses).expect("should witness");
+        let (public, nf_witnesses, frontier) = public_and_witnesses(&transfer, &tree);
+        let tc = build_transfer_circuit(&transfer, &public, &nf_witnesses, &frontier)
+            .expect("should witness");
         let (proof, verifier) = settle_transfer_circuit(&tc, LOG_MAX_LDE).expect("should prove");
 
         let mut tampered = tc.statement().to_vec();
@@ -1025,7 +1205,6 @@ mod tests {
     fn unbalanced_transfer_cannot_be_witnessed() {
         let (a, sk_a) = funded_note(4, 500);
         let (tree, paths) = tree_with(&[a]);
-        let root = tree.root();
         let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(12));
 
         let transfer = Transfer {
@@ -1039,9 +1218,9 @@ mod tests {
             outputs: vec![Note::new(501, seed(40), seed(41), recipient)],
             fee: 100,
         };
-        let (public, nf_witnesses) = public_and_witnesses(&transfer, root);
+        let (public, nf_witnesses, frontier) = public_and_witnesses(&transfer, &tree);
         assert!(
-            build_transfer_circuit(&transfer, &public, &nf_witnesses).is_err(),
+            build_transfer_circuit(&transfer, &public, &nf_witnesses, &frontier).is_err(),
             "an unbalanced transfer must not witness"
         );
     }
@@ -1057,8 +1236,9 @@ mod tests {
         // Spend a note that is *not* under this root.
         let outsider = funded_note(77, 500).0;
         let wrong_root = {
-            let mut other = CommitmentTree::new(Keccak256Commitment);
-            other.append(&outsider.commit(&Keccak256Commitment));
+            let h = Poseidon2Commitment::default();
+            let mut other = CommitmentTree::new(h.clone());
+            other.append(&outsider.commit(&h));
             other.root()
         };
         assert_ne!(root, wrong_root, "fixtures must differ");
@@ -1075,9 +1255,10 @@ mod tests {
             fee: 100,
         };
         // Public root is the *other* tree's root; the fold cannot reach it.
-        let (public, nf_witnesses) = public_and_witnesses(&transfer, wrong_root);
+        let (mut public, nf_witnesses, frontier) = public_and_witnesses(&transfer, &tree);
+        public.root = wrong_root;
         assert!(
-            build_transfer_circuit(&transfer, &public, &nf_witnesses).is_err(),
+            build_transfer_circuit(&transfer, &public, &nf_witnesses, &frontier).is_err(),
             "a path that folds to a different root must not witness"
         );
     }
@@ -1177,12 +1358,16 @@ mod tests {
         runner.run().expect("circuit pk_d must equal native pk_d");
     }
 
-    /// The Merkle fold must mirror `MembershipPath::compute_root` at the real
-    /// depth, for both index parities.
+    /// The in-circuit Poseidon2 Merkle fold must mirror
+    /// `MembershipPath::compute_root` at the real depth, for both index parities.
+    ///
+    /// This is the D-088 counterpart of the old Keccak fold test: the tree hash
+    /// moved to Poseidon2, so the fold that the spend path uses is now the P2 one.
     #[test]
     fn merkle_fold_matches_native_at_every_depth() {
+        let h = Poseidon2Commitment::default();
         for index in [0usize, 1, 2, 3, DEPTH - 1, 7] {
-            let mut tree = CommitmentTree::new(Keccak256Commitment);
+            let mut tree = CommitmentTree::new(h.clone());
             // Pad so the leaf sits at `index`.
             for i in 0..index {
                 tree.append(
@@ -1192,25 +1377,34 @@ mod tests {
                         seed(0),
                         SpendPublicKey::default(),
                     )
-                    .commit(&Keccak256Commitment),
+                    .commit(&h),
                 );
             }
-            let leaf = Note::new(1, seed(0), seed(0), SpendPublicKey::default())
-                .commit(&Keccak256Commitment);
+            let leaf = Note::new(1, seed(0), seed(0), SpendPublicKey::default()).commit(&h);
             let actual_index = tree.append(&leaf);
             assert_eq!(actual_index, index);
             let path = tree.path(index).expect("path").siblings;
             let root = tree.root();
 
             let mut builder = CircuitBuilder::<Challenge>::new();
-            builder.enable_keccak_f1600::<F>();
+            builder.enable_poseidon2_perm::<KoalaBearD4Width16, _>(
+                generate_poseidon2_trace::<Challenge, KoalaBearD4Width16>,
+                whir_perm(),
+            );
+            builder.enable_recompose::<F>(generate_recompose_trace::<F, Challenge>);
             let mut witness = Vec::new();
-            let leaf_exprs = const_limbs(&mut builder, leaf.as_bytes());
-            let folded = fold_membership(&mut builder, &leaf_exprs, &path, index, &mut witness)
+            let leaf_ext = digest_to_ext(&Digest32::new(*leaf.as_bytes())).expect("canonical");
+            let leaf_exprs: DigestExpr = [
+                builder.define_const(leaf_ext[0]),
+                builder.define_const(leaf_ext[1]),
+            ];
+            let folded = fold_membership_p2(&mut builder, leaf_exprs, &path, index, &mut witness)
                 .expect("fold should build");
-            let expected = const_limbs(&mut builder, root.as_bytes());
+            let expected = digest_to_ext(&Digest32::new(*root.as_bytes())).expect("canonical");
             for (got, want) in folded.iter().zip(&expected) {
-                builder.connect(*got, *want);
+                let want_c = builder.define_const(*want);
+                let diff = builder.sub(*got, want_c);
+                builder.assert_zero(diff);
             }
             let circuit = builder.build().expect("build");
             let mut runner = circuit.runner();

@@ -30,10 +30,12 @@
 
 use std::error::Error;
 
-use pq_hash::{Keccak256Commitment, MerkleRoot, Sha3_256Shielded};
+use pq_hash::{Digest32, Keccak256Commitment, MerkleRoot, Poseidon2Commitment, Sha3_256Shielded};
 use shielded::transfer::Spend;
+use shielded::tree::CommitmentTree;
 use shielded::{Note, NullifierMap, Transfer, TransferPublic};
 
+use crate::commitment_gadget::{append_to_frontier, fold_to_root, frontier_from_leaves};
 use crate::nullifier_gadget::NullifierWitness;
 use crate::transfer::{build_transfer_circuit, settle_transfer_circuit_with};
 use crate::whir_recursion::{InnerWhirConfig, F};
@@ -117,7 +119,7 @@ impl core::fmt::Debug for ClientTransferArtifacts {
 pub fn prove_client_transfer(
     inner: &InnerWhirConfig,
     spec: &ClientSpec<'_>,
-    root: MerkleRoot,
+    tree: &CommitmentTree<Poseidon2Commitment>,
     map: &mut NullifierMap<Keccak256Commitment>,
 ) -> Result<ClientTransferArtifacts, Box<dyn Error>> {
     let spend = Spend {
@@ -138,13 +140,35 @@ pub fn prove_client_transfer(
     // The roots and the witnesses come out of one walk of the shared map, so
     // this client's `before` is whatever the previous client left behind.
     let (nullifier_roots, witnesses) = nullifier_transition(&transfer, map)?;
+    // The commitment-tree roots come from the tree, not the caller: `root` is
+    // its current root and `root_after` is its root with this transfer's output
+    // leaves folded in, computed with the same frontier arithmetic the circuit
+    // re-derives (D-088).
+    let hasher = Poseidon2Commitment::default();
+    let root = tree.root();
+    // The circuit starts from the *pre-append* frontier and re-derives each
+    // step itself; the post-append fold here only computes the claimed
+    // `root_after`, which the circuit then pins against its own walk.
+    let frontier = frontier_from_leaves(&hasher, tree.leaves());
+    let mut frontier_after = frontier.clone();
+    for note in &transfer.outputs {
+        let leaf = note.commit(&hasher);
+        append_to_frontier(
+            &hasher,
+            &mut frontier_after,
+            &Digest32::new(*leaf.as_bytes()),
+        )
+        .map_err(|e| -> Box<dyn Error> { Box::new(std::io::Error::other(e)) })?;
+    }
+    let root_after = fold_to_root(&hasher, &frontier_after);
     let public = transfer.public(
-        &Keccak256Commitment,
+        &hasher,
         &Sha3_256Shielded,
         root,
+        MerkleRoot::from_digest(root_after),
         nullifier_roots,
     );
-    let tc = build_transfer_circuit(&transfer, &public, &witnesses)?;
+    let tc = build_transfer_circuit(&transfer, &public, &witnesses, &frontier)?;
     let (proof, verifier) = settle_transfer_circuit_with(&tc, inner.clone())?;
     verifier.verify(&proof, tc.statement())?;
     Ok(ClientTransferArtifacts {

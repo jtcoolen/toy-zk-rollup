@@ -58,6 +58,7 @@ const statement = {
   nullifiers: [nf],
   outputs: [out1],
   root: 'ab'.repeat(32),
+  root_after: 'ac'.repeat(32),
   nullifier_root_before: 'cd'.repeat(32),
   nullifier_root_after: 'cd'.repeat(32),
   fee: 7,

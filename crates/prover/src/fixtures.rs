@@ -22,8 +22,9 @@ use p3_matrix::dense::RowMajorMatrix;
 
 use crate::whir::F;
 
+use crate::commitment_gadget::{append_to_frontier, frontier_from_leaves, FrontierWitness};
 use crate::nullifier_gadget::NullifierWitness;
-use pq_hash::{Digest32, Keccak256Commitment, MerkleRoot, Sha3_256Shielded};
+use pq_hash::{Digest32, Keccak256Commitment, MerkleRoot, Poseidon2Commitment, Sha3_256Shielded};
 use shielded::keys::derive_spend_pk;
 use shielded::tree::CommitmentTree;
 use shielded::{Note, NullifierMap, NullifierRoots, Transfer, TransferPublic};
@@ -114,20 +115,34 @@ pub fn funded_note(byte: u8, value: u64) -> (Note, [u8; 32]) {
     (note, sk_d)
 }
 
+/// The commitment-tree hasher the fixtures use (D-088: Poseidon2).
+#[must_use]
+pub fn commitment_hasher() -> Poseidon2Commitment {
+    Poseidon2Commitment::default()
+}
+
 /// A tree holding `notes`, with a leaf-to-root sibling path for each.
 ///
 /// All leaves are appended before any path is captured: a path taken mid-append
 /// reflects a different root and every circuit using it would be rejected.
 #[must_use]
-pub fn tree_with(notes: &[Note]) -> (CommitmentTree<Keccak256Commitment>, Vec<Vec<Digest32>>) {
-    let mut tree = CommitmentTree::new(Keccak256Commitment);
+pub fn tree_with(notes: &[Note]) -> (CommitmentTree<Poseidon2Commitment>, Vec<Vec<Digest32>>) {
+    let hasher = commitment_hasher();
+    let mut tree = CommitmentTree::new(hasher.clone());
     for note in notes {
-        tree.append(&note.commit(&Keccak256Commitment));
+        tree.append(&note.commit(&hasher));
     }
     let paths = (0..notes.len())
         .map(|i| tree.path(i).expect("path exists").siblings)
         .collect();
     (tree, paths)
+}
+
+/// The frontier witness of `tree` - the state the in-circuit append gadget
+/// starts from (D-088).
+#[must_use]
+pub fn frontier_of(tree: &CommitmentTree<Poseidon2Commitment>) -> FrontierWitness {
+    frontier_from_leaves(&commitment_hasher(), tree.leaves())
 }
 
 /// The public statement and per-spend nullifier witnesses, from one map walk.
@@ -152,13 +167,18 @@ pub fn nullifier_transition(
 }
 
 /// [`nullifier_transition`] over a fresh empty map, returning the full
-/// [`TransferPublic`] ready for the circuit.
+/// [`TransferPublic`] ready for the circuit, plus the frontier witness the
+/// in-circuit append starts from.
+///
+/// The tree is the source of truth for both roots: `root` is its current root
+/// and `root_after` is its root with the transfer's output leaves appended - the
+/// same derivation a real prover does against the node's tree service.
 #[must_use]
 pub fn public_and_witnesses(
     transfer: &Transfer<'_>,
-    root: MerkleRoot,
-) -> (TransferPublic, Vec<NullifierWitness>) {
-    public_and_witnesses_from(transfer, root, NullifierMap::new(Keccak256Commitment))
+    tree: &CommitmentTree<Poseidon2Commitment>,
+) -> (TransferPublic, Vec<NullifierWitness>, FrontierWitness) {
+    public_and_witnesses_from(transfer, tree, NullifierMap::new(Keccak256Commitment))
 }
 
 /// [`public_and_witnesses`] over a map that already holds prior spends.
@@ -168,10 +188,26 @@ pub fn public_and_witnesses(
 #[must_use]
 pub fn public_and_witnesses_from(
     transfer: &Transfer<'_>,
-    root: MerkleRoot,
+    tree: &CommitmentTree<Poseidon2Commitment>,
     mut map: NullifierMap<Keccak256Commitment>,
-) -> (TransferPublic, Vec<NullifierWitness>) {
+) -> (TransferPublic, Vec<NullifierWitness>, FrontierWitness) {
+    let hasher = commitment_hasher();
     let (roots, witnesses) = nullifier_transition(transfer, &mut map);
-    let public = transfer.public(&Keccak256Commitment, &Sha3_256Shielded, root, roots);
-    (public, witnesses)
+    let root = tree.root();
+    // root_after: fold the frontier after appending every output leaf.
+    let mut frontier = frontier_of(tree);
+    for note in &transfer.outputs {
+        let leaf = note.commit(&hasher);
+        append_to_frontier(&hasher, &mut frontier, &Digest32::new(*leaf.as_bytes()))
+            .expect("fixture tree cannot be full");
+    }
+    let root_after = crate::commitment_gadget::fold_to_root(&hasher, &frontier);
+    let public = transfer.public(
+        &hasher,
+        &Sha3_256Shielded,
+        root,
+        MerkleRoot::from_digest(root_after),
+        roots,
+    );
+    (public, witnesses, frontier_of(tree))
 }

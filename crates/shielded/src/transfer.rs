@@ -155,6 +155,15 @@ pub struct TransferPublic {
     pub outputs: Vec<NoteHash>,
     /// The commitment-tree root the inputs were proven against.
     pub root: MerkleRoot,
+    /// The commitment-tree root after this transfer's outputs are appended.
+    ///
+    /// Supplied like `root` -- the prover learns it from the tree service --
+    /// and the circuit re-derives it: every output's leaf is hashed in-circuit
+    /// and appended to the frontier pinned at `root` (D-088), so a wrong
+    /// `root_after` makes the transfer unwitnessable rather than accepted.
+    /// The settlement contract stores this value instead of re-deriving the
+    /// appends itself.
+    pub root_after: MerkleRoot,
     /// The nullifier-map transition this transfer proves.
     ///
     /// Both roots are in the verified statement: `before` proves each nullifier
@@ -187,6 +196,7 @@ impl Transfer<'_> {
         commitment: &C,
         shielded: &S,
         root: MerkleRoot,
+        root_after: MerkleRoot,
         nullifier_roots: NullifierRoots,
     ) -> TransferPublic
     where
@@ -203,6 +213,7 @@ impl Transfer<'_> {
             nullifiers,
             outputs,
             root,
+            root_after,
             nullifier_roots,
             fee: self.fee,
         }

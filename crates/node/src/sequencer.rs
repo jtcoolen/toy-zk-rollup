@@ -171,28 +171,33 @@ impl From<StateError> for SequencerError {
 /// deployment concern, and modelling it here would suggest the protocol cares,
 /// which it does not: any batch that verifies is a valid block.
 ///
-/// # The pending nullifier projection
+/// # The pending projections
 ///
-/// The two roots a transfer witnesses advance on different schedules within a
-/// batch, and the sequencer has to track both:
+/// Since D-088 *both* roots a transfer witnesses chain forward within a batch,
+/// and the sequencer tracks a projection of each:
 ///
-/// * **Tree root** — every transfer in a batch witnesses the *same* committed
-///   tree root. A transfer's outputs are not spendable until its block lands,
-///   so nothing in the batch moves the tree out from under its siblings.
-/// * **Nullifier root** — chains forward transfer by transfer. A transfer must
+/// * **Commitment root** — chains transfer by transfer. Each transfer proves
+///   its own output appends in-circuit and attests `root_after`, and the block
+///   circuit pins child *i*'s `root` to child *i-1*'s `root_after`, so a queued
+///   transfer must witness the tree its predecessors' outputs left behind.
+///   (Before D-088 the contract re-derived the tree and every transfer in a
+///   batch shared the committed root; the in-circuit append moved the boundary.)
+/// * **Nullifier root** — chains transfer by transfer. A transfer must
 ///   prove its nullifiers were absent from a map that already contains every
 ///   earlier queued transfer's nullifiers, or the batch would admit a
 ///   double-spend that no single committed snapshot shows.
 ///
-/// `pending` is that chained map. Admission checks against `pending.root()`,
-/// not `state.nullifier_root()`, and then advances `pending`. After a block
-/// settles, `pending` is rebuilt from the newly-committed map plus whatever is
-/// still queued — which reproduces the same chain, because the queued
-/// transfers' `before` roots were already pinned by the drained ones.
+/// `pending` and `pending_tree` are those chained structures. Admission checks
+/// against their roots, not the committed ones, and then advances them. After
+/// a block settles both are rebuilt from the newly-committed state plus
+/// whatever is still queued — which reproduces the same chain, because the
+/// drained transfers' `after` roots were exactly what the queued ones
+/// witnessed as `before`.
 pub struct Sequencer {
     state: PoolState,
     mempool: VecDeque<ClientTransferProof>,
     pending: shielded::NullifierMap<pq_hash::Keccak256Commitment>,
+    pending_tree: shielded::tree::CommitmentTree<pq_hash::Poseidon2Commitment>,
     inner: InnerWhirConfig,
     max_transfers_per_block: usize,
 }
@@ -220,8 +225,10 @@ impl Sequencer {
     /// Returns [`SequencerError::Proving`] if the inner WHIR config cannot be
     /// sized for `log_max_lde`.
     pub fn new(log_max_lde: usize) -> Result<Self, SequencerError> {
+        let state = PoolState::genesis();
         Ok(Self {
-            state: PoolState::genesis(),
+            pending_tree: state.commitment_tree(),
+            state,
             mempool: VecDeque::new(),
             pending: PoolState::genesis().nullifier_map(),
             inner: InnerWhirConfig::new(log_max_lde, 0)
@@ -248,8 +255,10 @@ impl Sequencer {
         log_max_lde: usize,
         notes: impl IntoIterator<Item = pq_hash::NoteHash>,
     ) -> Result<Self, SequencerError> {
+        let state = PoolState::funded(notes);
         Ok(Self {
-            state: PoolState::funded(notes),
+            pending_tree: state.commitment_tree(),
+            state,
             mempool: VecDeque::new(),
             pending: PoolState::genesis().nullifier_map(),
             inner: InnerWhirConfig::new(log_max_lde, 0)
@@ -286,6 +295,18 @@ impl Sequencer {
         self.pending.clone()
     }
 
+    /// The commitment-tree projection a client must prove against: committed
+    /// tree plus every output already queued.
+    ///
+    /// The tree-side twin of [`Self::client_map`], and for the same reason:
+    /// since D-088 each transfer attests the root its own appends produce, and
+    /// the block chains the queue, so a client must witness this tree — its
+    /// membership paths included — not the committed one.
+    #[must_use]
+    pub fn client_tree(&self) -> shielded::tree::CommitmentTree<pq_hash::Poseidon2Commitment> {
+        self.pending_tree.clone()
+    }
+
     /// Transfers waiting in the mempool.
     #[must_use]
     pub fn pending(&self) -> usize {
@@ -309,10 +330,15 @@ impl Sequencer {
     /// Returns the first failing check's error.
     pub fn submit(&mut self, transfer: ClientTransferProof) -> Result<(), SequencerError> {
         transfer.envelope.verify_signature()?;
-        // Checked against the *pending* nullifier root: the transfer must be
-        // absent from everything already queued, not just from what settled.
-        self.state
-            .check_admit_against(&transfer.public, self.pending.root())?;
+        // Checked against the *pending* projections: the transfer must be
+        // absent from everything already queued (nullifiers) and must witness
+        // the tree the queue's outputs left behind (commitments), not just
+        // what settled.
+        self.state.check_admit_against(
+            &transfer.public,
+            self.pending_tree.root(),
+            self.pending.root(),
+        )?;
         transfer
             .verifier
             .verify(&transfer.proof, &transfer.statement)
@@ -327,6 +353,13 @@ impl Sequencer {
             if !self.pending.insert(nf) {
                 return Err(StateError::DoubleSpend(*nf).into());
             }
+        }
+        // Advance the tree projection with this transfer's outputs. The proof
+        // verified above attests that `root_after` is what these appends
+        // produce against the `root` just checked, so the projection cannot
+        // drift from what the block circuit will pin.
+        for out in &transfer.public.outputs {
+            self.pending_tree.append(out);
         }
         self.mempool.push_back(transfer);
         Ok(())
@@ -362,11 +395,12 @@ impl Sequencer {
         }
         self.state.commit_block();
 
-        // Re-project the pending map from the newly committed state plus
-        // whatever is still queued. Rebuilding rather than continuing to use
-        // the old projection keeps `pending` anchored to committed state, so
-        // a later rejection cannot leave it drifted ahead of the ledger.
+        // Re-project both pending structures from the newly committed state
+        // plus whatever is still queued. Rebuilding rather than continuing to
+        // use the old projections keeps them anchored to committed state, so
+        // a later rejection cannot leave them drifted ahead of the ledger.
         self.pending = self.state.nullifier_map();
+        self.pending_tree = self.state.commitment_tree();
         for item in &self.mempool {
             for nf in &item.public.nullifiers {
                 // Same reasoning as in `submit`: a repeat here would mean the
@@ -376,6 +410,9 @@ impl Sequencer {
                 if !self.pending.insert(nf) {
                     return Err(StateError::DoubleSpend(*nf).into());
                 }
+            }
+            for out in &item.public.outputs {
+                self.pending_tree.append(out);
             }
         }
         Ok(artifact)

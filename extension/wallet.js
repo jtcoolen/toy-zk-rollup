@@ -153,8 +153,9 @@ return {
     /**
      * Sign a transfer statement. `statement` is the plain object the node's
      * TransferWire expects minus the envelope: {nullifiers, outputs, root,
-     * nullifier_root_before, nullifier_root_after, fee}. Returns the full
-     * POST body as an object (statement fields + verifying_key + signature).
+     * root_after, nullifier_root_before, nullifier_root_after, fee}. Returns
+     * the full POST body as an object (statement fields + verifying_key +
+     * signature).
      */
     signTransfer(password, vaultHex, statement) {
       const json = JSON.stringify(statement);

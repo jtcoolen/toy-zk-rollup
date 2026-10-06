@@ -360,15 +360,15 @@ impl Actor {
         // would make the two notes linkable, so it must never be reused.
         let output =
             shielded::Note::new(out_value, random_bytes()?, random_bytes()?, self.recipient);
-        let path = self
-            .seq
-            .state()
+        // Prove against the *pending* projections: committed state plus every
+        // queued nullifier and output. Since D-088 the commitment root chains
+        // within a batch too - each transfer attests the root its own appends
+        // produce - so membership and root both come from the projected tree.
+        // `submit`'s admission check demands exactly these roots.
+        let tree = self.seq.client_tree();
+        let path = tree
             .path(d.index)
-            .map_err(|e| format!("membership: {e}"))?;
-        let root = self.seq.state().root();
-        // Prove against the *pending* projection: committed state plus every
-        // queued nullifier, so a second queued spend cannot collide with the
-        // first. `submit`'s admission check demands exactly this root.
+            .ok_or_else(|| format!("no membership path for note {}", d.index))?;
         let mut map = self.seq.client_map();
         let spec = ClientSpec {
             note: &d.note,
@@ -379,7 +379,7 @@ impl Actor {
             fee,
         };
         let inner = self.seq.inner().clone();
-        let artifacts = prove_client_transfer(&inner, &spec, root, &mut map)
+        let artifacts = prove_client_transfer(&inner, &spec, &tree, &mut map)
             .map_err(|e| format!("prove: {e}"))?;
         let envelope = d
             .spend_key

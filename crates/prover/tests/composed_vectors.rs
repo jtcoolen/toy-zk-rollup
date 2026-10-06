@@ -167,13 +167,11 @@ fn write_block_genesis(
     // The pool must start at the tree the block was witnessed against (the
     // funded note's leaf), and the expected root after the block's output is
     // appended pins the contract's own accumulator against the prover's tree.
+    let p2 = pq_hash::Poseidon2Commitment::default();
     let mut pool_tree = tree_with(&[note]).0;
-    pool_tree.append(&out_note.commit(&Keccak256Commitment));
+    pool_tree.append(&out_note.commit(&p2));
     let extras = vec![
-        (
-            "genesis_leaves",
-            json!([hex(note.commit(&Keccak256Commitment).as_bytes())]),
-        ),
+        ("genesis_leaves", json!([hex(note.commit(&p2).as_bytes())])),
         (
             "pool_root_after_hex",
             json!(hex(pool_tree.root().as_bytes())),
@@ -214,7 +212,6 @@ fn block_program_equality_and_export() -> Result<(), Box<dyn Error>> {
     // the whole shielded path end to end.
     let (note, sk_d) = funded_note(11, 1_000);
     let (tree, paths) = tree_with(&[note]);
-    let root = tree.root();
     let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
     // The inner (client) config: transfer proofs are Poseidon2 WHIR at the
     // recursion circuit's LDE, exactly as a real client produces them.
@@ -230,7 +227,7 @@ fn block_program_equality_and_export() -> Result<(), Box<dyn Error>> {
         fee: 100,
     };
     let mut map = NullifierMap::new(Keccak256Commitment);
-    let client = prove_client_transfer(&inner, &spec, root, &mut map).expect("client prove");
+    let client = prove_client_transfer(&inner, &spec, &tree, &mut map).expect("client prove");
 
     let shape = TransferShape {
         num_nullifiers: 1,

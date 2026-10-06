@@ -20,7 +20,7 @@
 //!
 //! # Why the roots are in the message
 //!
-//! `root`, `nullifier_root_before` and `nullifier_root_after` pin the
+//! `root`, `root_after`, `nullifier_root_before` and `nullifier_root_after` pin the
 //! signature to a state witness. A transfer re-broadcast against a different
 //! chain state is a different message, so an old signature simply does not
 //! cover the replay - no replay-protection bookkeeping needed at the
@@ -66,7 +66,7 @@ impl std::error::Error for EncodeError {}
 ///   DOMAIN_TX
 ///   || n_nullifiers || nullifier_0 || ... || nullifier_{n-1}
 ///   || n_outputs    || output_0    || ... || output_{m-1}
-///   || root || nullifier_root_before || nullifier_root_after
+///   || root || root_after || nullifier_root_before || nullifier_root_after
 ///   || fee (u64 LE)
 /// ```
 ///
@@ -79,7 +79,7 @@ pub fn encode_statement(public: &TransferPublic) -> Result<Vec<u8>, EncodeError>
         return Err(EncodeError::TooLarge);
     }
     let mut out = Vec::with_capacity(
-        DOMAIN_TX.len() + 8 + public.nullifiers.len() * 32 + public.outputs.len() * 32 + 3 * 32 + 8,
+        DOMAIN_TX.len() + 8 + public.nullifiers.len() * 32 + public.outputs.len() * 32 + 4 * 32 + 8,
     );
     out.extend_from_slice(DOMAIN_TX);
     push_count(&mut out, public.nullifiers.len());
@@ -91,6 +91,7 @@ pub fn encode_statement(public: &TransferPublic) -> Result<Vec<u8>, EncodeError>
         out.extend_from_slice(out_hash.as_bytes());
     }
     out.extend_from_slice(public.root.as_bytes());
+    out.extend_from_slice(public.root_after.as_bytes());
     out.extend_from_slice(public.nullifier_roots.before.as_bytes());
     out.extend_from_slice(public.nullifier_roots.after.as_bytes());
     out.extend_from_slice(&public.fee.to_le_bytes());
@@ -140,6 +141,7 @@ mod tests {
                 })
                 .collect(),
             root: MerkleRoot::from_digest(digest(200)),
+            root_after: MerkleRoot::from_digest(digest(203)),
             nullifier_roots: NullifierRoots {
                 before: MerkleRoot::from_digest(digest(201)),
                 after: MerkleRoot::from_digest(digest(202)),
@@ -154,8 +156,8 @@ mod tests {
         let b = encode_statement(&statement(1, 1, 7)).expect("encode");
         assert_eq!(a, b);
         assert!(a.starts_with(DOMAIN_TX));
-        // domain(24) + 4 + 32 + 4 + 32 + 96 + 8
-        assert_eq!(a.len(), DOMAIN_TX.len() + 4 + 32 + 4 + 32 + 3 * 32 + 8);
+        // domain(24) + 4 + 32 + 4 + 32 + 128 + 8
+        assert_eq!(a.len(), DOMAIN_TX.len() + 4 + 32 + 4 + 32 + 4 * 32 + 8);
     }
 
     #[test]
