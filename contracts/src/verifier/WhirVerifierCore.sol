@@ -682,7 +682,7 @@ library WhirVerifierCore {
         uint256[] memory elems = new uint256[](input.rowElems);
         uint256[] memory flat = input.rowsFlat;
         uint256 rowsCd = input.rowsCdBase;
-        uint256 frame;
+        uint256 frame = 0;
         if (input.prunedNDigests != 0) {
             (frame, out.frameSize) = _frameOpen(
                 input.logFoldedDomainSize, input.numQueries, input.prunedNDigests,

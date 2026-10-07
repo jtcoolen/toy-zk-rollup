@@ -2132,3 +2132,47 @@ queries for 8x grind; pow 24->48 = -33% queries for 256x grind.
 ### Measurement in flight
 WHIR_POW_FLOOR=32 rate 4/4 v8 export -> measure WBND + gas vs 350,772 B /
 60.63M baseline.
+
+
+## Batch 46 - v8-shaped attribution (WhirVerifierV8P probe)
+
+The v5 probe no longer matched the v8 engine, so a byte-fork of the v8 engine
+(test/WhirVerifierV8P.sol) carries gasleft() snapshots at every phase
+boundary and writes them to a public profileData array (non-view on purpose:
+the V6 wrapper staticcalls its engine, so the probe is called directly with
+the CONFIG spliced in exactly as the wrapper splices it: header(16,
+cfgWords stamped) + CONFIG + tail). Run on the real floor-30 v8 vectors.
+
+TOTAL accounted 54.99M of the 58.38M wrapper total (the ~3.4M delta is the
+wrapper: payload build, 182 KB CONFIG extcodecopy, 330 KB calldatacopy).
+
+| bucket | gas | note |
+|---|---|---|
+| constraint identity (batch layer) | 9.29M | _checkIdentity, fixed |
+| verifyRound (5 rounds) | 14.03M | 2.39/2.99/3.04/3.07/2.54 |
+| terminal identity eval (5x) | 14.53M | 1.18/4.83/2.91/2.59/3.02, satellite |
+| initial phase (5x) | 7.61M | 0.35/2.33/2.69/1.05/1.19 |
+| verifyFinal (5x) | 3.56M | 0.69/0.59/0.50/0.50/1.28 |
+| satellite MROOTS (5x) | 3.10M | 0.50/0.70/0.66/0.67/0.56 |
+| constraint weight build | 1.41M | expandFromUnivariate + selVars |
+| round decode | 1.36M | CONFIG+PROOF per-round decode |
+| batch transcript + decode | 0.08M | |
+
+Query/digest-proportional (verifyRound + terminal eval + MROOTS + weight) =
+33.1M; fixed (identity + initial + final + decode) = 21.9M; wrapper 3.4M;
+calldata floor 330 KB x 16 = 5.3M (inside the wrapper/engine reads).
+
+Structural levers ranked by this table:
+1. terminal eval chain 14.5M - already satellite Yul but ~3.4K gas per pruned
+   digest; audit the per-digest path for waste and fuse the MROOTS walk into
+   the same call (one digest walk per round instead of two).
+2. verifyRound 14.0M - ~161K gas per query at 87 queries; the open+fold is
+   Solidity-with-Yul-islands; a full Yul kernel is the GOAT/midfall pattern.
+3. constraint identity 9.3M - Solidity loop over Opened structs; satellite-
+   able like MROOTS (pure field-op program, engine keeps the equality check).
+4. initial phase 7.6M - sumcheck absorbs; Yul absorb loop.
+
+Probe notes: fork lives in test/ (imports remapped ../src/verifier, ../lib);
+events need non-view (the private chain lost view accordingly); the splice
+must read memory bytes at +32 (mload(bnd) is the LENGTH word - first attempt
+wrote the length as the magic and died on BadMagic).
