@@ -1852,3 +1852,23 @@ Measured: constraint identity 10.05M -> 9.03M; recursion-chain v5 verify
 
 Attribution now: terminal 14.79M, open+fold 14.61M, constraint identity
 9.03M, initial phases 7.57M, final STIR 2.81M.
+
+## Batch 39 — v6 re-frame rewrite (3.84M -> 0.99M; v6 verify 68.4M -> 64.7M)
+
+Measured the v6 wrapper overhead precisely with a temporary revert-probe:
+the re-frame cost 3.84M, not the ~6.2M the digest gap suggested (the
+staticcall argument encoding of the 445 KB v5 frame is the other ~1.4M).
+Two changes:
+
+* CONFIG: extcodecopy straight from each chunk runtime into the frame
+  (data start = codesize - 4 - trailer len), replacing chunk.read() calls
+  that allocated + copied every 24 KB twice.
+* Tail: one calldatacopy for the 445 KB PROOF+STATEMENT tail instead of
+  a 32-byte mstore loop.
+
+v6 verify is now 64.71M vs v5 62.23M: the wrapper costs 2.49M total
+(0.99M re-frame + ~1.5M staticcall/encode) and saves 182 KB of calldata
+(~7.2M at 40/16 gas-per-byte). Phase 2's direct-extcodecopy engine erases
+the remaining 2.5M and keeps the calldata win.
+
+Probe instrumentation removed after measuring. 32 suites green.

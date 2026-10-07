@@ -139,29 +139,26 @@ contract WhirVerifierV6 is IWhirVerifier {
             mstore8(add(q, 2), byte(14, src))
             mstore8(add(q, 3), byte(15, src))
         }
-        // CONFIG from the chunk set
+        // CONFIG from the chunk set: extcodecopy straight into the frame.
+        // The chunk runtime ends with [data | uint32 len], so the data start
+        // is codesize - 4 - len; no chunk.read call, no intermediate buffer.
         uint256 dst = 16;
         for (uint256 i; i < _chunks.length; ++i) {
-            // forge-lint: disable-next-line(calls-loop)
-            bytes memory b = _chunks[i].read(0, _lens[i]);
+            address ch = address(_chunks[i]);
+            uint256 len = _lens[i];
             assembly {
-                let n := mload(b)
-                let s := add(b, 32)
-                let d := add(add(v5, 32), dst)
-                for { let o := 0 } lt(o, n) { o := add(o, 32) } {
-                    mstore(add(d, o), mload(add(s, o)))
-                }
+                let cs := extcodesize(ch)
+                extcodecopy(ch, mload(0x40), sub(cs, 4), 4)
+                let dl := shr(224, mload(mload(0x40)))
+                let start := sub(sub(cs, dl), 4)
+                extcodecopy(ch, add(add(v5, 32), dst), start, len)
             }
-            dst += _lens[i];
+            dst += len;
         }
-        // v6 tail: PROOF + stmLen + STATEMENT, verbatim from bundle byte 16
+        // v6 tail: PROOF + stmLen + STATEMENT, verbatim from bundle byte 16.
         uint256 tail = bundle.length - 16;
         assembly {
-            let d := add(add(v5, 32), dst)
-            let s := add(bundle.offset, 16)
-            for { let o := 0 } lt(o, tail) { o := add(o, 32) } {
-                mstore(add(d, o), calldataload(add(s, o)))
-            }
+            calldatacopy(add(add(v5, 32), dst), add(bundle.offset, 16), tail)
         }
 
         (bool ok, bytes memory ret) = address(ENGINE).staticcall(abi.encodeCall(IWhirVerifier.verify, (statement, v5)));
