@@ -1798,3 +1798,28 @@ column - the prover could post the nv-bit selector value... but that is
 DERIVED from transcript challenges, not proof data: cannot post).
 
 Next: Phase 2 engine work per the running plan.
+
+## Batch 37 — selector memo (eval 14.8M -> 12.6M)
+
+The zeta-run insight extended: one opening point fans out across its
+matrix's columns, and the NEXT point of the same matrix reuses the
+IDENTICAL cols[] selector indices - selIndex values repeat across runs
+(round 1: 501 groups, ~250 distinct selIndex values). The backwards
+factored Horner now memoizes eqSelectorValue per (arity, selIndex) inside
+one constraintWeight call: interleaved [seen, value] pairs in one memory
+array (two arrays blew the via-IR stack), keyed by selIndex, reset when
+nv = k - arity changes (the key space changes with arity).
+
+Cap at nv <= 10: at nv = 16 (round 2, 32 mats) the 128 KB zeroing costs
+more than the recompute - cap 13 regressed the block proof by 1.8M, cap
+10 wins everywhere.
+
+Measured: constraint eval 14.78M -> 12.61M; recursion-chain v5 verify
+65.73M -> 63.24M; terminal identity 17.27M -> 14.79M; TOTAL accounted
+55.53M -> 53.05M; block proof 121.86M -> 119.80M. 32 suites green.
+
+Also this batch (36): run-factored Horner + _mulAddExt fused mul-add
+(eval 15.13 -> 14.78M) - committed as a27fbac.
+
+Attribution now (recursion chain): terminal 14.79M, open+fold 14.61M,
+constraint identity 10.05M, initial phases 7.57M, final STIR 2.81M.

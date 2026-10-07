@@ -623,6 +623,15 @@ library WhirGadgets {
             // Walking BACKWARDS keeps the weights exact: sel[u] lands on
             // gamma^(u-i) inside the run and the run lands on gamma^i outside.
             // Virtual groups (no selector) stay singletons of the same walk.
+            // Batch 37: selector memo. One opening point fans out across its
+            // matrix's columns, and the NEXT point of the same matrix reuses
+            // the identical cols[] selector indices - so selIndex values
+            // repeat across runs (round 1: 501 groups, ~250 distinct). Memo
+            // per (arity, selIndex) within this constraint call: nv = k -
+            // arity strictly increases as the backwards walk descends arity,
+            // so a size change means a new key space and the memo resets.
+            uint256[] memory memo;
+            uint256 mNv = 0;
             uint256 t = n;
             while (t > 0) {
                 uint256 b = 3 * (t - 1);
@@ -642,11 +651,35 @@ library WhirGadgets {
                 ) {
                     --i;
                 }
+                uint256 nv = localR.length - arity;
+                if (nv != mNv) {
+                    // Interleaved [seen, value] pairs; empty array = memo off
+                    // (past nv=10 the zeroing costs more than the recompute -
+                    // the block proof regressed 1.8M with the cap at 13).
+                    if (nv <= 10) {
+                        memo = new uint256[](2 << nv);
+                    } else {
+                        memo = new uint256[](0);
+                    }
+                    mNv = nv;
+                }
                 uint256 s = 0;
                 for (uint256 u = t; u > i; --u) {
-                    s = _mulAddExt(
-                        s, gamma, eqSelectorValue(localR, arity, d[3 * (u - 1) + 2])
-                    );
+                    uint256 sel = d[3 * (u - 1) + 2];
+                    uint256 sv;
+                    if (memo.length == 0) {
+                        sv = eqSelectorValue(localR, arity, sel);
+                    } else {
+                        uint256 slot = 2 * sel;
+                        if (memo[slot] == 0) {
+                            sv = eqSelectorValue(localR, arity, sel);
+                            memo[slot] = 1;
+                            memo[slot + 1] = sv;
+                        } else {
+                            sv = memo[slot + 1];
+                        }
+                    }
+                    s = _mulAddExt(s, gamma, sv);
                 }
                 w = _mulAddExt(
                     w, _gammaPow(gamma, t - i), _mulExt(eqBaseValue(localR, arity, zeta), s)
