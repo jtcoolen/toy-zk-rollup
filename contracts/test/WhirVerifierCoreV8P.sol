@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import {KoalaBearExt4} from "../../lib/sol-whir-p3/field/KoalaBearExt4.sol";
-import {KeccakChallenger} from "../../lib/sol-whir-p3/transcript/KeccakChallenger.sol";
-import {StirOpenings} from "./StirOpenings.sol";
-import {WhirGadgets} from "./WhirGadgets.sol";
-import {SumcheckCore} from "./SumcheckCore.sol";
+import {KoalaBearExt4} from "../lib/sol-whir-p3/field/KoalaBearExt4.sol";
+import {KeccakChallenger} from "../lib/sol-whir-p3/transcript/KeccakChallenger.sol";
+import {StirOpenings} from "../src/verifier/StirOpenings.sol";
+import {WhirGadgets} from "../src/verifier/WhirGadgets.sol";
+import {SumcheckCore} from "../src/verifier/SumcheckCore.sol";
 
 /// The WHIR verifier core: the Fiat-Shamir replay of a WHIR opening proof.
 ///
@@ -43,7 +43,7 @@ import {SumcheckCore} from "./SumcheckCore.sol";
 /// transcript absorbs each limb in MONTGOMERY form because that is what p3's
 /// `SerializingChallenger32` writes. `SumcheckCore.observeExt4Canonical` owns
 /// that conversion; nothing here absorbs a field element any other way.
-library WhirVerifierCore {
+library WhirVerifierCoreV8P {
     using KeccakChallenger for KeccakChallenger.State;
 
     /// The sponge plus the config-fixed byte stream.
@@ -58,6 +58,8 @@ library WhirVerifierCore {
         KeccakChallenger.State state;
         bytes constants;
         uint256 constOff;
+        uint256[] acc;
+        uint256 base;
     }
 
     /// Raised when the constant payload runs out, i.e. the proof's shape does
@@ -258,7 +260,8 @@ library WhirVerifierCore {
         Transcript memory t,
         InitialSchedule memory s,
         InitialInput memory input
-    ) internal pure returns (InitialOutput memory out) {
+    ) internal view returns (InitialOutput memory out) {
+        uint256 _gs = gasleft();
         // --- claim registration ------------------------------------------------
         // Virtual claims: framing, then draw the point, then bind the answer.
         // The drawn point is the virtual eq group's univariate point; v5 keeps
@@ -312,6 +315,8 @@ library WhirVerifierCore {
             power = KoalaBearExt4.mul(power, alpha);
         }
 
+        t.acc[t.base + 12] += _gs - gasleft();
+        _gs = gasleft();
         // --- initial sumcheck ----------------------------------------------------
         absorbConstants(t, s.sumcheckConstants);
         //
@@ -324,6 +329,7 @@ library WhirVerifierCore {
 
         out.alpha = alpha;
         out.claimedEval = claimed;
+        t.acc[t.base + 11] += _gs - gasleft();
         out.foldedClaim = folded;
         out.randomness = randomness;
     }
@@ -514,14 +520,6 @@ library WhirVerifierCore {
         // rowElems is implied by rowLimbs and rowsAreBase (checked once per
         // round by the caller); silence the unused-parameter warning.
         rowElems;
-        // Batch 47 hot path: extension rows straight from calldata get a
-        // specialized per-element kernel (microbench: in-loop source/shape
-        // switch dispatch costs ~490 gas/limb; four read-modify-writes per
-        // element cost ~8K/query). Every other shape falls through to the
-        // generic switch loop below.
-        if (rowsCd != 0 && !rowsAreBase) {
-            return _loadRowHot(elems, rowsCd, base, rowLimbs);
-        }
         bytes4 selTag = StirOpenings.LimbOutOfRange.selector;
         assembly ("memory-safe") {
             let dst := add(mload(0x40), 0x20) // leaf scratch above the free pointer
@@ -629,7 +627,7 @@ library WhirVerifierCore {
         RoundSchedule memory s,
         RoundInput memory input,
         uint256 carriedClaim
-    ) internal pure returns (RoundOutput memory out) {
+    ) internal view returns (RoundOutput memory out) {
         // --- shape checks before any sponge work --------------------------------
         //
         // Every rejection below happens before the first absorb so a malformed
@@ -658,6 +656,8 @@ library WhirVerifierCore {
             revert RowBufferMismatch(expectedLimbs, haveLimbs);
         }
 
+        uint256 _gs = gasleft();
+        { uint256 fp; assembly { fp := mload(0x40) } t.acc[t.base + 20] = fp; }
         // --- 1-2: commitment, then OOD point/answer pairs ----------------------
         observeDigest(t, input.commitment);
         out.oodPoints = new uint256[](input.oodAnswers.length);
@@ -685,6 +685,10 @@ library WhirVerifierCore {
         }
         out.queryIndices = indices;
 
+        t.acc[t.base + 8] += _gs - gasleft();
+        t.acc[t.base + 6] = input.numQueries;
+        t.acc[t.base + 7] = input.rowLimbs;
+        _gs = gasleft();
         // --- 5: open and fold every query ------------------------------------------
         out.folds = new uint256[](input.numQueries);
         uint256[] memory elems = new uint256[](input.rowElems);
@@ -702,6 +706,9 @@ library WhirVerifierCore {
             // leaf: the leaf covers the flat wire limbs (Montgomery form),
             // the fold consumes the packed elements, both built from the same
             // decode, so they cannot disagree.
+            uint256 _gq = gasleft();
+            if (q == 0) { uint256 fpa; assembly { fpa := mload(0x40) } t.acc[t.base + 22] = fpa; }
+            if (q == input.numQueries - 1) { uint256 fpb; assembly { fpb := mload(0x40) } t.acc[t.base + 23] = fpb; }
             bytes32 leaf = _loadRowFused(
                 elems,
                 flat,
@@ -711,6 +718,8 @@ library WhirVerifierCore {
                 input.rowElems,
                 input.rowsAreBase
             );
+            t.acc[t.base + 13] += _gq - gasleft();
+            _gq = gasleft();
             if (frame != 0) {
                 // v8: no per-query path walk here. The fold needs only the
                 // row; authentication moves to one amortized walk after the
@@ -718,7 +727,10 @@ library WhirVerifierCore {
                 // frame - index at word 4+q, leaf at word 4+nq+q - so the
                 // loop needs no side arrays and no second pass.
                 _framePut(frame, input.numQueries, q, indices[q], leaf);
+                t.acc[t.base + 14] += _gq - gasleft();
+                _gq = gasleft();
                 out.folds[q] = StirOpenings.foldRow(elems, input.prevRandomness);
+                t.acc[t.base + 15] += _gq - gasleft();
             } else {
                 out.folds[q] = StirOpenings.openAndFoldLeaf(
                     input.prevCommitment,
@@ -733,6 +745,9 @@ library WhirVerifierCore {
                 );
             }
         }
+        t.acc[t.base + 9] += _gs - gasleft();
+        { uint256 fp; assembly { fp := mload(0x40) } t.acc[t.base + 21] = fp; }
+        _gs = gasleft();
         if (frame != 0) {
             // The frame (plus its reserved reply slot) sits at the top of
             // memory; the engine staticcalls the satellite with it through
@@ -763,6 +778,8 @@ library WhirVerifierCore {
         }
         out.claimedEval = claimed;
 
+        t.acc[t.base + 10] += _gs - gasleft();
+        _gs = gasleft();
         // --- 8: round sumcheck -----------------------------------------------------------
         absorbConstants(t, s.sumcheckConstants);
         (uint256 folded, uint256[] memory randomness) = SumcheckCore.verifyRounds(
@@ -987,54 +1004,5 @@ library WhirVerifierCore {
         );
         out.foldedClaim = folded;
         out.randomness = randomness;
-    }
-
-    /// Batch 47 hot path: one row of extension elements from the wire,
-    /// per-element: four LE limbs per element, one packed store per
-    /// element, no per-limb source or shape switches. Same two outputs as
-    /// the generic loop (Montgomery LE leaf scratch + packed element
-    /// lanes) and the same leaf digest.
-    function _loadRowHot(
-        uint256[] memory elems,
-        uint256 rowsCd,
-        uint256 base,
-        uint256 rowLimbs
-    ) private pure returns (bytes32 leaf) {
-        bytes4 selTag = StirOpenings.LimbOutOfRange.selector;
-        assembly ("memory-safe") {
-            let dst := add(mload(0x40), 0x20)
-            let ep := add(elems, 0x20)
-            let p := 0x7f000001
-            let rr := 0x01fffffe
-            function swap32(x) -> y {
-                y := or(
-                    or(and(shl(24, x), 0xff000000), and(shl(8, x), 0xff0000)),
-                    or(and(shr(8, x), 0xff00), shr(24, x))
-                )
-            }
-            let hs := add(rowsCd, mul(base, 4))
-            for { let e := 0 } lt(e, shr(2, rowLimbs)) { e := add(e, 1) } {
-                let eo := shl(4, e)
-                let c0 := swap32(shr(224, calldataload(add(hs, eo))))
-                let c1 := swap32(shr(224, calldataload(add(hs, add(eo, 4)))))
-                let c2 := swap32(shr(224, calldataload(add(hs, add(eo, 8)))))
-                let c3 := swap32(shr(224, calldataload(add(hs, add(eo, 12)))))
-                // One branch for all four limbs: v < p iff v - p wraps (p
-                // < 2^32, so a non-wrapping difference is < 2^32). AND of
-                // four wrapped differences is still > 2^32; any in-range
-                // limb kills it. Revert reports the first offending limb.
-                if iszero(gt(and(and(sub(c0, p), sub(c1, p)), and(sub(c2, p), sub(c3, p))), 0xffffffff)) {
-                    mstore(0, selTag) mstore(4, c0) revert(0, 36)
-                }
-                let dp := add(dst, eo)
-                mstore(dp, shl(224, swap32(mod(mul(c0, rr), p))))
-                mstore(add(dp, 4), shl(224, swap32(mod(mul(c1, rr), p))))
-                mstore(add(dp, 8), shl(224, swap32(mod(mul(c2, rr), p))))
-                mstore(add(dp, 12), shl(224, swap32(mod(mul(c3, rr), p))))
-                mstore(add(ep, shl(5, e)),
-                    or(or(shl(224, c0), shl(192, c1)), or(shl(160, c2), shl(128, c3))))
-            }
-            leaf := keccak256(dst, mul(rowLimbs, 4))
-        }
     }
 }

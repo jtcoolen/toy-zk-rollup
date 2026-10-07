@@ -3,7 +3,7 @@ pragma solidity 0.8.28;
 
 import {KoalaBearExt4} from "../lib/sol-whir-p3/field/KoalaBearExt4.sol";
 import {BatchTranscript} from "../src/verifier/BatchTranscript.sol";
-import {WhirVerifierCore} from "../src/verifier/WhirVerifierCore.sol";
+import {WhirVerifierCoreV8P} from "./WhirVerifierCoreV8P.sol";
 import {WhirGadgets} from "../src/verifier/WhirGadgets.sol";
 import {ConstraintIdentity} from "../src/verifier/ConstraintIdentity.sol";
 
@@ -65,7 +65,7 @@ contract WhirVerifierV8P {
         return string(b);
     }
     uint256[] public profileData;
-    using WhirVerifierCore for WhirVerifierCore.Transcript;
+    using WhirVerifierCoreV8P for WhirVerifierCoreV8P.Transcript;
     using KoalaBearExt4 for uint256;
 
     /// The proof does not start with the WBND magic.
@@ -229,7 +229,7 @@ contract WhirVerifierV8P {
         // copy alone measured 92.4M gas (memory expansion + refill) on the real
         // bundle - the single largest item after the open path.
         _logr("enter gasleft ", gasleft());
-        uint256[] memory acc = new uint256[](90);
+        uint256[] memory acc = new uint256[](130);
         uint256 _g;
         if (proof.length < 16) revert ProofTooShort();
         bytes4 magic;
@@ -313,7 +313,7 @@ contract WhirVerifierV8P {
 
         // Hand the sponge to the WHIR core: the batch layer delegates to the PCS
         // layer on the SAME challenger, so no reseed happens here.
-        WhirVerifierCore.Transcript memory t;
+        WhirVerifierCoreV8P.Transcript memory t;
         t.state = s.sponge;
 
         // --- CONFIG: schedule + per opening round -------------------------------
@@ -347,7 +347,7 @@ contract WhirVerifierV8P {
         bytes calldata proof,
         uint256 co,
         uint256 po,
-        WhirVerifierCore.Transcript memory t,
+        WhirVerifierCoreV8P.Transcript memory t,
         StmRef memory stm,
         uint256[] memory acc
     ) private returns (uint256 no, uint256[][] memory boundEvalsOf) {
@@ -479,27 +479,29 @@ contract WhirVerifierV8P {
     }
 
     function _runRound(
-        WhirVerifierCore.Transcript memory t,
+        WhirVerifierCoreV8P.Transcript memory t,
         RoundCfg memory c,
         RoundPrf memory p,
         StmRef memory stm,
         uint256 roundIdx,
         uint256[] memory acc
     ) private view {
-        uint256 base = 10 + roundIdx * 16;
+        uint256 base = 10 + roundIdx * 24;
+        t.acc = acc;
+        t.base = base;
         // Each round re-binds its framing constants (D-070): the config bytes are
         // consumed by count, and the cursor restarts with the round.
         t.constants = c.framingHex;
         t.constOff = 0;
 
         // --- initial phase ---------------------------------------------------------
-        WhirVerifierCore.InitialSchedule memory s0;
+        WhirVerifierCoreV8P.InitialSchedule memory s0;
         s0.preClaimsConstants = c.framingPre;
         s0.perClaimConstants = c.framingClaim;
         s0.batchingConstants = c.framingBatching;
         s0.sumcheckConstants = c.framingSeps[0];
 
-        WhirVerifierCore.InitialInput memory i0;
+        WhirVerifierCoreV8P.InitialInput memory i0;
         i0.oodAnswers = p.initOodAnswers;
         i0.openingEvals = p.boundEvals;
         i0.claimWidths = c.claimWidths;
@@ -510,7 +512,7 @@ contract WhirVerifierV8P {
         i0.powBits = c.startingPowBits;
 
         uint256 _gi = gasleft();
-        WhirVerifierCore.InitialOutput memory init = WhirVerifierCore.verifyInitial(t, s0, i0);
+        WhirVerifierCoreV8P.InitialOutput memory init = WhirVerifierCoreV8P.verifyInitial(t, s0, i0);
         acc[base + 0] += _gi - gasleft();
 
         // The constraint weights the terminal identity consumes. The initial
@@ -555,10 +557,10 @@ contract WhirVerifierV8P {
     }
 
     function _runIntermediates(
-        WhirVerifierCore.Transcript memory t,
+        WhirVerifierCoreV8P.Transcript memory t,
         RoundCfg memory c,
         RoundPrf memory p,
-        WhirVerifierCore.InitialOutput memory init,
+        WhirVerifierCoreV8P.InitialOutput memory init,
         WhirGadgets.ConstraintWeight[] memory constraints,
         uint256[] memory acc,
         uint256 base
@@ -572,7 +574,7 @@ contract WhirVerifierV8P {
     }
 
     function _runOneIntermediate(
-        WhirVerifierCore.Transcript memory t,
+        WhirVerifierCoreV8P.Transcript memory t,
         RoundCfg memory c,
         RoundPrf memory p,
         uint256 i,
@@ -582,12 +584,12 @@ contract WhirVerifierV8P {
         uint256[] memory acc,
         uint256 base
     ) private view {
-        WhirVerifierCore.RoundSchedule memory s;
+        WhirVerifierCoreV8P.RoundSchedule memory s;
         s.roundIndex = i;
         s.oodSamples = c.schedOodSamples[i];
         s.sumcheckConstants = c.framingSeps[1 + i];
 
-        WhirVerifierCore.RoundInput memory input;
+        WhirVerifierCoreV8P.RoundInput memory input;
         input.commitment = p.roundCommitments[i];
         input.prevCommitment = i == 0 ? p.batchCommitment : p.roundCommitments[i - 1];
         uint256 os = p.oodAnswerLens[i];
@@ -632,8 +634,8 @@ contract WhirVerifierV8P {
         input.sumcheckPowBits = c.schedFoldPowBits[i];
 
         uint256 _gr = gasleft();
-        WhirVerifierCore.RoundOutput memory out =
-            WhirVerifierCore.verifyRound(t, s, input, st.carried);
+        WhirVerifierCoreV8P.RoundOutput memory out =
+            WhirVerifierCoreV8P.verifyRound(t, s, input, st.carried);
         acc[base + 1] += _gr - gasleft();
 
         // v8: the round authenticated its queries with one amortized pruned
@@ -686,7 +688,7 @@ contract WhirVerifierV8P {
     }
 
     function _runFinal(
-        WhirVerifierCore.Transcript memory t,
+        WhirVerifierCoreV8P.Transcript memory t,
         RoundCfg memory c,
         RoundPrf memory p,
         Threading memory th,
@@ -695,14 +697,14 @@ contract WhirVerifierV8P {
         uint256 base
     ) private view {
         uint256 nInter = c.nInter;
-        WhirVerifierCore.FinalSchedule memory sf;
+        WhirVerifierCoreV8P.FinalSchedule memory sf;
         sf.finalPolyConstants = 0;
         sf.roundIndex = nInter;
         // framingSeps[0] framed the initial sumcheck, [1+i] framed round i, so
         // the closing sumcheck's separator sits at 1 + nInter.
         sf.sumcheckConstants = c.framingSeps[1 + nInter];
 
-        WhirVerifierCore.FinalInput memory fi;
+        WhirVerifierCoreV8P.FinalInput memory fi;
         fi.finalPoly = p.finalPoly;
         fi.lastCommitment = nInter == 0 ? p.batchCommitment : p.roundCommitments[nInter - 1];
         fi.powWitness = p.finalPowWitness;
@@ -725,8 +727,8 @@ contract WhirVerifierV8P {
         fi.sumcheckPowBits = c.finalFoldPowBits;
 
         uint256 _gv = gasleft();
-        WhirVerifierCore.FinalOutput memory out =
-            WhirVerifierCore.verifyFinal(t, sf, fi, th.carried);
+        WhirVerifierCoreV8P.FinalOutput memory out =
+            WhirVerifierCoreV8P.verifyFinal(t, sf, fi, th.carried);
         acc[base + 4] += _gv - gasleft();
 
         // The terminal identity, the caller's job since D-086 step A. Its own

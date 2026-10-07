@@ -2176,3 +2176,48 @@ Probe notes: fork lives in test/ (imports remapped ../src/verifier, ../lib);
 events need non-view (the private chain lost view accordingly); the splice
 must read memory bytes at +32 (mload(bnd) is the LENGTH word - first attempt
 wrote the length as the magic and died on BadMagic).
+
+## Batch 47 — per-query anatomy + microbench: where the query loop actually goes
+
+Probe deepened (WhirVerifierCoreV8P fork, round stride 24): verifyRound split
+into phases1-4 / query loop / phases6-7 / sumcheck, and the query loop into
+loadRowFused / framePut / foldRow. Free-pointer trajectory probed per round.
+
+Floor-30 v8 vectors, probe numbers (gasleft overhead inflates ~10-15%):
+
+    per-round (r0..r4, nq = 14/11/11/11/14, rowLimbs 64):
+      query loop      2.10  2.62  2.67  2.70  2.23   M   (12.32M total)
+        loadRowFused  1.26  1.60  1.60  1.60  1.27   M   (7.33M)
+        foldRow       0.79  0.92  0.92  0.92  0.79   M   (4.33M)
+        framePut      ~0.02 each (noise)
+      phases1-4       0.06-0.08 each; phases6-7 0.11-0.14; sumcheck 0.04
+      claim reg (initial) 0.31 2.29 2.65 1.01 1.15  M   (6.42M!)
+      initial sumcheck    0.04 each (40K) - sumcheck is CHEAP, registration is not
+
+    free pointer: flat INSIDE the query loop (no per-query allocation creep);
+    frame alloc ~6.6KB/round; engine heap peaks ~1.2MB.
+
+Microbench (test/QueryMicrobench.t.sol, exact Yul copy, 64-limb ext rows,
+calldata source, 100 iters):
+
+    loop skeleton only (calldataload+swap32+range-check, 2 in-loop switches)  31.2K
+    + Montgomery mod + leaf limb stores                                       +9.1K
+    + elems RMW (4 read-modify-write limbs per element)                       +8.1K
+    + keccak of 256-byte leaf                                                 +0.14K
+    total loadRowFused ~48.5K/query; evaluate_hypercube(16,4) 10.9K/query.
+
+    => the two LOOP-INVARIANT switches (rowsCd, rowsAreBase) inside the limb
+       loop cost ~490 gas/limb in skeleton - solc switch codegen per iteration.
+       The elems path does 4 RMWs per element where 1 store would do.
+
+Levers ranked after batch 47:
+  A. Fused query kernel (GOAT pattern): specialize _loadRowFused loops on
+     rowsCd/rowsAreBase OUTSIDE the loop; per-element single-store elems
+     (4 limbs -> 1 packed word); keep leaf scratch pass. Est -1.5-2M, no wire
+     change. EIP-170 margin 120 B is the constraint: specialization must not
+     grow the engine (satellite absorbs if needed).
+  B. Claim registration 6.42M is the initial phase (not sumcheck!): CONFIG
+     parse per claim. Pre-parsed CONFIG (v9) attacks claim reg + identity
+     9.3M + weight 1.4M + terminal eval 14.5M = the ~31M CONFIG-walk whale.
+     GOAT/midfall both ship pre-compiled program formats for exactly this.
+  C. Terminal eval 14.5M already Yul on satellite; per-digest ~2.3K.
