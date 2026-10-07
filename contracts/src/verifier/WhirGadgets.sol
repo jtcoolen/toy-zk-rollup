@@ -381,6 +381,56 @@ library WhirGadgets {
         }
     }
 
+    /// BTacc * m + aBT in registers: one schoolbook, then the addend folded in
+    /// before the single per-lane mod (batch 36). Both operands are reduced
+    /// words, so u_i < 2**101 and u_i + a_i < 2**101 + P < 2**256: the mod
+    /// erases nothing the packed formulation would have kept.
+    function _mulAddExt(uint256 acc, uint256 m, uint256 a)
+        private
+        pure
+        returns (uint256 out)
+    {
+        assembly ("memory-safe") {
+            let P := 0x7f000001
+            let M := 0xffffffff
+            let W := 3
+            let a0 := shr(224, acc)
+            let a1 := and(shr(192, acc), M)
+            let a2 := and(shr(160, acc), M)
+            let a3 := and(shr(128, acc), M)
+            let b0 := shr(224, m)
+            let b1 := and(shr(192, m), M)
+            let b2 := and(shr(160, m), M)
+            let b3 := and(shr(128, m), M)
+            let u0 := add(mul(a0, b0), mul(W, add(add(mul(a1, b3), mul(a2, b2)), mul(a3, b1))))
+            let u1 := add(add(mul(a0, b1), mul(a1, b0)), mul(W, add(mul(a2, b3), mul(a3, b2))))
+            let u2 := add(add(add(mul(a0, b2), mul(a1, b1)), mul(a2, b0)), mul(W, mul(a3, b3)))
+            let u3 := add(add(add(mul(a0, b3), mul(a1, b2)), mul(a2, b1)), mul(a3, b0))
+            let v0 := add(u0, shr(224, a))
+            let v1 := add(u1, and(shr(192, a), M))
+            let v2 := add(u2, and(shr(160, a), M))
+            let v3 := add(u3, and(shr(128, a), M))
+            out :=
+                or(
+                    or(shl(224, mod(v0, P)), shl(192, mod(v1, P))),
+                    or(shl(160, mod(v2, P)), shl(128, mod(v3, P)))
+                )
+        }
+    }
+
+    /// gamma^e by binary exponentiation (batch 36): the run-length powers in
+    /// the factored Horner. e <= 166 here, so at most 8 ext-squares + 6 muls.
+    function _gammaPow(uint256 gamma, uint256 e) private pure returns (uint256) {
+        uint256 acc = KoalaBearExt4.ONE;
+        uint256 base = gamma;
+        while (e > 0) {
+            if (e & 1 != 0) { acc = KoalaBearExt4.mul(acc, base); }
+            base = KoalaBearExt4.square(base);
+            e >>= 1;
+        }
+        return acc;
+    }
+
     /// `acc * (1 - r - c + 2 r (x) c)` in registers, the virtual-group twin of
     /// `eq_poly_eval` (batch 34). Term biased positive by 4P per lane:
     /// 1 - r - c + 2t + 4P >= 1 - 2(P-1) + 4P > 0, and the +4P is a multiple of
@@ -565,32 +615,43 @@ library WhirGadgets {
             // per group, then run the same backwards Horner over the values.
             // Round 1 of the recursion chain: 501 groups, 10 runs - the
             // dominant constraint drops from 21.6M to a few M.
-            uint256[] memory vals = new uint256[](n);
-            uint256 i = 0;
-            while (i < n) {
-                uint256 b = 3 * i;
+            // Batch 36: the Horner FACTORS over a run. Groups i in a run with
+            // common base B contribute sum gamma^(n-1-t_i) B s_i =
+            // B sum gamma^(n-1-t_i) s_i, so the per-group step collapses to ONE
+            // fused mul-add on a selector-only Horner and the base enters with
+            // one mul-add per run (gamma^run_len via binary pow, ~8 muls).
+            // Walking BACKWARDS keeps the weights exact: sel[u] lands on
+            // gamma^(u-i) inside the run and the run lands on gamma^i outside.
+            // Virtual groups (no selector) stay singletons of the same walk.
+            uint256 t = n;
+            while (t > 0) {
+                uint256 b = 3 * (t - 1);
                 uint256 arity = d[b];
                 uint256 zeta = d[b + 1];
                 if (d[b + 2] == NO_SELECTOR) {
-                    vals[i] = eqGroupValue(localR, arity, zeta, NO_SELECTOR);
-                    ++i;
+                    w = _mulAddExt(
+                        w, gamma, eqGroupValue(localR, arity, zeta, NO_SELECTOR)
+                    );
+                    --t;
                     continue;
                 }
-                uint256 base = eqBaseValue(localR, arity, zeta);
-                uint256 j = i;
+                uint256 i = t;
                 while (
-                    j < n && d[3 * j] == arity && d[3 * j + 1] == zeta
-                        && d[3 * j + 2] != NO_SELECTOR
+                    i > 0 && d[3 * (i - 1)] == arity && d[3 * (i - 1) + 1] == zeta
+                        && d[3 * (i - 1) + 2] != NO_SELECTOR
                 ) {
-                    vals[j] = KoalaBearExt4.mul(
-                        base, eqSelectorValue(localR, arity, d[3 * j + 2])
-                    );
-                    ++j;
+                    --i;
                 }
-                i = j;
-            }
-            for (uint256 t = n; t > 0; --t) {
-                w = KoalaBearExt4.add(KoalaBearExt4.mul(w, gamma), vals[t - 1]);
+                uint256 s = 0;
+                for (uint256 u = t; u > i; --u) {
+                    s = _mulAddExt(
+                        s, gamma, eqSelectorValue(localR, arity, d[3 * (u - 1) + 2])
+                    );
+                }
+                w = _mulAddExt(
+                    w, _gammaPow(gamma, t - i), _mulExt(eqBaseValue(localR, arity, zeta), s)
+                );
+                t = i;
             }
         } else if (c.eqCdBase == 0) {
             for (uint256 i = c.eqPoints.length; i > 0; --i) {
