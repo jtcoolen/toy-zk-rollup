@@ -2221,3 +2221,56 @@ Levers ranked after batch 47:
      9.3M + weight 1.4M + terminal eval 14.5M = the ~31M CONFIG-walk whale.
      GOAT/midfall both ship pre-compiled program formats for exactly this.
   C. Terminal eval 14.5M already Yul on satellite; per-digest ~2.3K.
+
+## Batch 48 (c72f3e3) — base hot kernel, memory-only generic loader, CIDNTY identity offload
+
+Three changes, one commit, 169/169 green.
+
+1. **_loadRowBaseHot** (WhirVerifierCore): round-0 base-field rows read
+   straight from calldata, one limb per element, leaf = keccak(dst, rowLimbs*4).
+2. **Generic row loop memory-only**: the fallback loop no longer branches on
+   calldata-vs-memory per row (rowsFlat is memory after stage A's final-phase
+   change; the hot kernels own the calldata paths).
+3. **CIDNTY offload**: the whole constraint-identity check (CONFIG CONSTRAINTS
+   parse + Opened reconstruction + DAG eval + quotient recompose) moved from
+   the engine into the TerminalWeight satellite behind a magic frame
+   ("CIDNTY" = 0x4349444E5459). Frame = magic, zeta/alpha/lookupAlpha/beta,
+   terminals, statement, CONFIG CONSTRAINTS raw LE bytes, 4 round bound-eval
+   arrays. Satellite parses, evaluates, reverts ConstraintIdentityMismatch
+   (same selector as the engine's, so bubbled reverts are indistinguishable)
+   or returns the 96-B [magic,0,0] ok reply.
+
+**Why**: the engine was 24,946 B — over EIP-170, undeployable. ConstraintIdentity
+is a library, so its DAG interpreter inlined into the engine. After the offload:
+WhirVerifier 17,792 B (+6,784 headroom), TerminalWeight 17,805 B (+6,771).
+
+**Gas**: wrapper test_gas_v8 55.04M -> 55.59M (+0.55M: the 92 KB CONFIG frame
+copy is now paid at the staticcall). Direct v8 path 54.03M. The +0.55M is the
+price of a deployable engine; v9 (CONFIG out of the wire entirely, read from
+code satellites via extcodecopy) pays it back with interest.
+
+**Bug found (worth remembering)**: the frame packer used mcopy for the
+statement and CONFIG copies with CALDATA offsets (statement.offset,
+proof.offset + cfgWord*4). mcopy is memory->memory: it read memory garbage at
+those numeric addresses and the satellite saw zeros at cfg while cfgWords was
+correct (the count word was mstore'd, not mcopy'd — that's why the frame
+length check passed and the parse read n=0). Fix: calldatacopy for both.
+Engine-side dump proved the source calldata was right (cdWordAtProofSrc =
+0x0600000005000000040000000600000002000000000000000000000008000000 = n=6,
+stmInst=5, width=4, preWidth=6, auxWidth=2, skip, skip, numConstraints=8);
+satellite-side scan proved the payload never landed in the frame.
+
+**EIP-170 enforcement nuance**: plain `forge build` exits 0 even when a
+contract exceeds 24,576 B; only `forge build --sizes` errors. Always gate CI
+on --sizes.
+
+**via-IR stub probes infeasible**: extracting the identity body into a stub
+function to measure inline cost hit "Variable expr_mpos_366 is 1 too deep in
+the stack" scheduler errors under via_ir. The satellite IS the stub now.
+
+**Gas ledger (wrapper test_gas_v8)**: 113.8 -> v2 98.75 -> v3 66.82 -> v4 65.73
+-> v6 63.24 -> v7 61.79 -> v8 60.63 -> floor28 58.63 -> floor30 58.38 ->
+cb56da2 59.94 -> hot kernel 57.85 -> stage A 55.19 -> +base kernel 55.04 ->
++CIDNTY 55.59 (deployable). Target 30M: remaining whales (batch 46 attribution,
+inflated ~10-15%): terminal eval 14.5M, rounds 14.0M, identity 9.3M, initial
+7.6M, claim reg 6.4M, foldRow 4.3M, MROOTS 3.1M, calldata floor 5.3M.
