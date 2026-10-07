@@ -121,9 +121,26 @@ pub fn settlement_params_for(
     log_max_lde: usize,
     rate: usize,
 ) -> p3_whir::parameters::ProtocolParameters {
-    let pow_bits =
+    settlement_params_pow(log_max_lde, rate, 0)
+}
+
+/// [`settlement_params_for`] with a grinding FLOOR: the schedule uses
+/// `max(minimum feasible, pow_floor)`. Extra grinding buys fewer STIR
+/// queries (D-092 batch 45 grid: pow 24->32 cuts final-layer queries
+/// 96->85 at rate 4); the prover pays 2^floor hashes per grind point, so
+/// the floor is an explicit prover-time/security dial, never a default.
+#[must_use]
+pub fn settlement_params_pow(
+    log_max_lde: usize,
+    rate: usize,
+    pow_floor: usize,
+) -> p3_whir::parameters::ProtocolParameters {
+    let mut pow_bits =
         crate::whir::required_pow_bits_with(log_max_lde + crate::whir::ZK_ARITY_SLACK, rate)
             .expect("settlement shape reaches the security target");
+    if pow_floor > pow_bits {
+        pow_bits = pow_floor;
+    }
     p3_whir::parameters::ProtocolParameters {
         pow_bits,
         starting_log_inv_rate: rate,

@@ -2092,3 +2092,43 @@ v7 59,773,747 | v8 60,628,306 (+0.85M exec) but -71,428 B calldata
 - statement rebind to D-088 folded root; deeper fusion of foldRow into
   the satellite (leaves+root in one call: saves engine memory traffic,
   not keccaks).
+
+---
+
+## Batch 45 — gas attribution at v8 + the grinding/query grid (D-092)
+
+### Attribution (WhirVerifierP, v5-fork probe, v5 vectors — shape-accurate)
+TOTAL accounted 52.48M of 76.8M probe gas (probe carries extra checks).
+Fixed / non-query-proportional:
+- constraint identity (_checkIdentity): **9.03M** — one shot, independent of queries.
+- constraints decode: 0.35M; batch decode 0.007M; transcript 0.07M.
+Per round (0..4):
+- open+fold queries: 2.61, 3.26, 3.24, 3.24, 2.66M = **15.0M** — scales with numQueries.
+- terminal identity (satellite MROOTS): 1.23, 4.89, 2.97, 2.64, 3.06M = **14.8M** — scales with nDigests (pruned paths).
+- initial phase: 0.35, 2.33, 2.67, 1.05, 1.19M = 7.6M (sumcheck proof reads).
+- final open+STIR: 0.66, 0.56, 0.48, 0.48, 1.22M = 3.4M.
+- sumchecks + gamma/claim fold + closing: ~1.9M total.
+
+So the two query-proportional buckets (open+fold 15M, MROOTS 14.8M) are ~30M of
+the ~60M. Halving queries halves those: floor from query reduction alone is
+~45M -> with 30M fixed cost still there, **30M total is NOT reachable by
+grinding alone**; needs the fixed 9M identity + 7.6M initial-phase work moved
+into satellites (or fused) as well.
+
+### Grinding/query grid (whir_pow_grid.rs, arity 24, folding 4, JohnsonBound)
+rate 4 (current operating point), pow -> total queries (incl terminal):
+pow 24 (min feasible) 96 | 28: 90 | 32: 85 | 40: 76 | 48: 64 | 56: 55 | 64: 44 | 72: 33 | 80: 24 | 88: 14
+rate 3: 24: 116 | 32: 102 | 48: 78 | 64: 53 | 80: 28
+Prover cost: 2^pow hashes per grind point (per query point). pow 24->32 = -11%
+queries for 8x grind; pow 24->48 = -33% queries for 256x grind.
+
+### Plumbing
+- settlement_params_pow(log_max_lde, rate, pow_floor) in settlement_replay.rs:
+  schedule uses max(min feasible, floor). settlement_params_for delegates with 0.
+- composed_export::settlement_bundle_with_blob reads WHIR_POW_FLOOR env.
+- Wire needs NO change: pow_bits per round already flows through CONFIG
+  (sched_pow_bits / final_pow_bits) and the engine reads it from there.
+
+### Measurement in flight
+WHIR_POW_FLOOR=32 rate 4/4 v8 export -> measure WBND + gas vs 350,772 B /
+60.63M baseline.
