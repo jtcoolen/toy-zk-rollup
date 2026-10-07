@@ -1717,3 +1717,51 @@ rewrite is the prize.
 
 Files: test/TerminalWeightP.sol (instrumented satellite), test/FrameSizeProbe.t.sol
 (FrameLogger drives it, dumps the per-constraint table).
+
+## Batch 34 — zeta-run sharing: the eval is 63M -> 16.2M
+
+Two changes on top of batch 33's register fusion, both bit-identical (full
+forge suite green, 32 suites / ~150 tests, including the recursion chain
+E2E v5+v6 and the constraint identity):
+
+**v2 (commit e4e8389)**: _mulBySelectorFactor register fusion + the
+telescoped denominator prod_i(1+zeta^(2^i)) = (zeta^(2^arity)-1)/(zeta-1).
+Constraint eval 63.1M -> 48.35M; recursion-chain v5 verify 113.8M -> 98.75M.
+
+**v3 (this batch) — RUN SHARING**. Parsing the posted statement (bundle
+header is WBND | ver u32 | cfgWords u32 | prfWords u32 — 16 B, not 13)
+shows why the naive loop was absurd: round 1's dominant constraint has 501
+eq groups, but they come from SIX matrices whose points FAN OUT across
+columns — descs are emitted (arity, zeta) per column, so consecutive
+descriptors share (arity, zeta) in long runs (76 and 166 columns per
+point). The zeta-dependent work — the arity loop and the inversion — was
+recomputed 501 times for ~10 distinct answers.
+
+eqGroupValue splits into eqBaseValue (zeta part: arity product + closed-
+form denominator) x eqSelectorValue (selector bits: nv ext-muls). The
+mode-2 walk in constraintWeight groups consecutive descriptors by
+(arity, zeta), computes the base ONCE per run, then per group one ext-mul
+(base x selector). Field mult is associative, every op exact mod p: bit-
+identical values, same Horner order over the value array.
+
+MEASURED (FrameSizeProbe, block proof):
+  constraint eval   48.35M -> 16.23M   (r1 dominant constraint 21.57M -> 6.35M)
+  block-proof verify 154.66M -> 122.96M
+  recursion-chain attribution: terminal identity 50.65M -> 18.37M
+    (r0 1.25M, r1 7.05M, r2 3.11M, r3 3.29M, r4 3.67M)
+    TOTAL accounted 88.8M -> 56.6M
+  recursion-chain v5 verify 98.75M -> 66.82M (v6 73.03M, re-frame ~6.2M)
+
+Cumulative from batch 31's baseline: satellite eval 65.3M -> 18.4M (-72%),
+whole verify 113.8M -> 66.8M (-41%) WITHOUT touching the engine.
+
+WHAT'S LEFT IN THE 16.2M: per-group selector products (nv ext-muls each,
+packed ops ~1.6k) and the per-group Horner mul(w,gamma). Next levers, in
+order: (a) register-fuse eqSelectorValue like eq_poly_eval (~350/factor);
+(b) factor the Horner per run: w' = w*gamma^n + base * horner(sels) turns
+two ext-muls per group into one per group + two per run. Both are local to
+WhirGadgets.
+
+After that the attribution (recursion chain, v5) is: open+fold 14.6M,
+constraint identity 10.0M, initial phases 7.6M, terminal 18.4M, final STIR
+3.4M — the engine items now dominate again, which is Phase 2's job.

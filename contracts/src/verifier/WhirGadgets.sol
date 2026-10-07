@@ -206,7 +206,6 @@ library WhirGadgets {
         uint256 zeta,
         uint256 selIndex
     ) internal pure returns (uint256) {
-        uint256 nv = localR.length - arity;
         // Virtual groups (NO_SELECTOR): the transcript draw IS the expanded
         // point - coords[i] = zeta^(2^(arity-1-i)) with no bridge transform
         // (verified against the v4 ground-truth eq_points). Each eq factor
@@ -228,6 +227,27 @@ library WhirGadgets {
             }
             return raw;
         }
+        return KoalaBearExt4.mul(
+            eqBaseValue(localR, arity, zeta), eqSelectorValue(localR, arity, selIndex)
+        );
+    }
+
+    /// The zeta-only part of `eqGroupValue`: the arity product over the expanded
+    /// coordinates and the closed-form denominator, WITHOUT the selector bits.
+    ///
+    /// Batch 34: one opening point fans out across every column of its matrix -
+    /// round 1 of the recursion chain posts 501 groups but only 10 distinct
+    /// (arity, zeta) pairs, so the arity loop and the inversion are recomputed
+    /// 501 times for 10 distinct answers. Splitting the value into
+    /// `eqBaseValue` * `eqSelectorValue` lets the caller hoist this across a
+    /// run of columns sharing zeta. Field multiplication is associative and
+    /// every op is exact mod p, so the split product is bit-identical to the
+    /// fused one it replaces.
+    function eqBaseValue(uint256[] memory localR, uint256 arity, uint256 zeta)
+        internal
+        pure
+        returns (uint256)
+    {
         uint256 num = KoalaBearExt4.ONE;
         uint256 c = zeta;
         // localR[i] pairs with c_i = zeta^(2^(arity-1-i)): walking i downwards
@@ -239,14 +259,6 @@ library WhirGadgets {
             // the lanes between every step. Same value, deferred reduction.
             num = _mulBySelectorFactor(num, localR[i - 1], c);
             c = KoalaBearExt4.square(c);
-        }
-        // Selector bits, big-endian: bit (nv-1-j) of selIndex pins localR[arity+j].
-        for (uint256 j; j < nv; ++j) {
-            uint256 r = localR[arity + j];
-            uint256 bit = (selIndex >> (nv - 1 - j)) & 1;
-            num = KoalaBearExt4.mul(
-                num, bit == 1 ? r : KoalaBearExt4.sub(KoalaBearExt4.ONE, r)
-            );
         }
         // THE DENOMINATOR IN CLOSED FORM (batch 33). The product telescopes:
         //
@@ -271,6 +283,26 @@ library WhirGadgets {
             KoalaBearExt4.mul(num, KoalaBearExt4.sub(zeta, KoalaBearExt4.ONE)),
             KoalaBearExt4.inv(KoalaBearExt4.sub(c, KoalaBearExt4.ONE))
         );
+    }
+
+    /// The selector-bit part of `eqGroupValue`: bit (nv-1-j) of `selIndex`
+    /// pins localR[arity+j] to r or 1-r (big-endian, nv = localR.length -
+    /// arity). nv ext-multiplies, nothing shared with zeta.
+    function eqSelectorValue(uint256[] memory localR, uint256 arity, uint256 selIndex)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 nv = localR.length - arity;
+        uint256 s = KoalaBearExt4.ONE;
+        for (uint256 j; j < nv; ++j) {
+            uint256 r = localR[arity + j];
+            uint256 bit = (selIndex >> (nv - 1 - j)) & 1;
+            s = KoalaBearExt4.mul(
+                s, bit == 1 ? r : KoalaBearExt4.sub(KoalaBearExt4.ONE, r)
+            );
+        }
+        return s;
     }
 
     /// \`acc * ((1 - r) + r (x) c)\ with the term built in registers and the
@@ -449,12 +481,40 @@ library WhirGadgets {
             // were built once per frame by the satellite's parse; this is the
             // same backwards Horner walk the other sources take.
             uint256[] memory d = c.groupDescs;
-            for (uint256 i = d.length / 3; i > 0; --i) {
-                uint256 b = (i - 1) * 3;
-                w = KoalaBearExt4.add(
-                    KoalaBearExt4.mul(w, gamma),
-                    eqGroupValue(localR, d[b], d[b + 1], d[b + 2])
-                );
+            uint256 n = d.length / 3;
+            // Batch 34: consecutive descriptors share (arity, zeta) - one
+            // opening point fans out across its matrix's columns, and the
+            // zeta-dependent part (arity loop + inversion) is identical for
+            // all of them. Compute the base once per run, the selector bits
+            // per group, then run the same backwards Horner over the values.
+            // Round 1 of the recursion chain: 501 groups, 10 runs - the
+            // dominant constraint drops from 21.6M to a few M.
+            uint256[] memory vals = new uint256[](n);
+            uint256 i = 0;
+            while (i < n) {
+                uint256 b = 3 * i;
+                uint256 arity = d[b];
+                uint256 zeta = d[b + 1];
+                if (d[b + 2] == NO_SELECTOR) {
+                    vals[i] = eqGroupValue(localR, arity, zeta, NO_SELECTOR);
+                    ++i;
+                    continue;
+                }
+                uint256 base = eqBaseValue(localR, arity, zeta);
+                uint256 j = i;
+                while (
+                    j < n && d[3 * j] == arity && d[3 * j + 1] == zeta
+                        && d[3 * j + 2] != NO_SELECTOR
+                ) {
+                    vals[j] = KoalaBearExt4.mul(
+                        base, eqSelectorValue(localR, arity, d[3 * j + 2])
+                    );
+                    ++j;
+                }
+                i = j;
+            }
+            for (uint256 t = n; t > 0; --t) {
+                w = KoalaBearExt4.add(KoalaBearExt4.mul(w, gamma), vals[t - 1]);
             }
         } else if (c.eqCdBase == 0) {
             for (uint256 i = c.eqPoints.length; i > 0; --i) {
