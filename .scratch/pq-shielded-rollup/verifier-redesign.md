@@ -1668,3 +1668,52 @@ Phase-2 field-op levers for the satellite (to study next):
 
 Files: test/FrameSizeProbe.t.sol (FrameLogger + bench), WhirVerifierP.sol
 (call not staticcall; frame size into acc[base+11]).
+
+---
+
+## Batch 33 — the 63M is ONE function: eqGroupValue (mode-2 constraints)
+
+TerminalWeightP (fork of the satellite with storage counters; the verifier
+uses a plain call now so a fallback can write) splits the 65M:
+
+  parse 30K | derive 1.76M | hypercube 99K | constraint eval 63.1M
+
+And the constraint eval is NOT spread out - per-constraint timing shows ONE
+mode-2 constraint per round carries it (the widest stacked table):
+
+| round | dominant constraint gas | k | groups | selVars |
+|---|---|---|---|---|
+| 0 | 1.28M | 20 | 26 | 16 |
+| 1 | **28.98M** | 24 | 501 | 16 |
+| 2 | 6.99M | 23 | 130 | 16 |
+| 3 | 10.79M | 23 | 190 | 16 |
+| 4 | 10.66M | 22 | 202 | 16 |
+| sum | **58.7M** | | | |
+
+Gas per group ~55-58K, and the Horner mul(w,gamma) is only ~3.2K of it - so
+~54K per group is eqGroupValue itself. Round 1 alone is 25% of the whole
+113.8M verify, in a single function.
+
+WHY it is slow: eqGroupValue (WhirGadgets.sol:203) uses the PACKED ext ops
+(KoalaBearExt4.mul/add/sub through the public API). The Ext4 docstring
+(line 126-135) measures the packed formulation at ~1.6k gas/coordinate vs
+~350 for the register-carried form. eq_poly_eval and selectEvalBase were
+ALREADY rewritten to the register form (deferred reduction, c0..c3 in
+registers); eqGroupValue was not. It is the last hot evaluator still on the
+slow path.
+
+THE FIX (highest-value single change found): rewrite eqGroupValue in the
+register form, exactly like eq_poly_eval. Both branches:
+  * virtual (NO_SELECTOR): prod_i (1 - r - c + 2rc), c = zeta^(2^.) - a
+    bare product, no denominator.
+  * selector: num = prod (1-r + r*c), den = prod (1+c), one inv at the end.
+Both are the same shape eq_poly_eval already carries in registers. Estimated
+~4x on the 58.7M -> ~15M, i.e. the whole verify 113.8M -> ~70M from ONE
+function. Parity-tested against the existing eqGroupValue vectors.
+
+Second lever (smaller): the 501 groups share localR and gamma. The Horner
+mul(w,gamma) per group is ~1.6M/round; could batch, but the eqGroupValue
+rewrite is the prize.
+
+Files: test/TerminalWeightP.sol (instrumented satellite), test/FrameSizeProbe.t.sol
+(FrameLogger drives it, dumps the per-constraint table).

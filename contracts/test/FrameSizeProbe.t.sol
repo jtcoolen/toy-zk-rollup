@@ -3,15 +3,12 @@ pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {WhirVerifierP} from "./WhirVerifierP.sol";
-import {TerminalWeight} from "../src/verifier/TerminalWeight.sol";
+import {TerminalWeightP} from "./TerminalWeightP.sol";
 
-/// Records every TWIGHT frame size, then forwards to the real satellite.
-/// WhirVerifierP uses a plain call (fork-only change) so this contract can
-/// write storage; the real TerminalWeight still does all the math.
+/// Forwards to the instrumented satellite and records frame sizes.
 contract FrameLogger {
     address public immutable REAL;
     uint256[] public sizes;
-    uint256[] public satGas;
 
     constructor(address real_) {
         REAL = real_;
@@ -21,15 +18,9 @@ contract FrameLogger {
         return sizes.length;
     }
 
-    function gasAt(uint256 i) external view returns (uint256) {
-        return satGas[i];
-    }
-
     fallback() external {
         sizes.push(msg.data.length);
-        uint256 g = gasleft();
-        (bool ok, bytes memory ret) = REAL.staticcall(msg.data);
-        satGas.push(g - gasleft());
+        (bool ok, bytes memory ret) = REAL.call(msg.data);
         require(ok, "satellite failed");
         assembly {
             return(add(ret, 32), mload(ret))
@@ -39,26 +30,41 @@ contract FrameLogger {
 
 contract FrameSizeProbeTest is Test {
     function test_frame_sizes() public {
-        FrameLogger logger = new FrameLogger(address(new TerminalWeight()));
+        TerminalWeightP sat = new TerminalWeightP();
+        FrameLogger logger = new FrameLogger(address(sat));
         WhirVerifierP p = new WhirVerifierP(address(logger));
         string memory j = vm.readFile("test/vectors/recursion_chain_sidecar.json");
         uint256[] memory statement = vm.parseJsonUintArray(j, ".statement");
         bytes memory bundle = vm.readFileBinary("test/vectors/recursion_chain_bundle.bin");
         (bool ok,) = p.verifyProfiled(statement, bundle);
         assertTrue(ok);
-        uint256 total;
-        for (uint256 i; i < logger.count(); ++i) {
-            uint256 sz = logger.sizes(i);
-            total += sz;
-            emit log_named_uint("frame bytes (round)", sz);
+        emit log_named_uint("parse gas", sat.gParse());
+        emit log_named_uint("derive gas", sat.gDerive());
+        emit log_named_uint("hyper gas", sat.gHyper());
+        uint256 evalTotal;
+        for (uint256 i; i < sat.perConstraintGas_length(); ++i) {
+            evalTotal += sat.perConstraintGas(i);
         }
-        emit log_named_uint("total frame bytes", total);
-        uint256 satTotal;
-        for (uint256 i; i < logger.count(); ++i) {
-            uint256 g = logger.gasAt(i);
-            satTotal += g;
-            emit log_named_uint("satellite gas (round)", g);
+        emit log_named_uint("constraint eval gas", evalTotal);
+        uint256 idx;
+        for (uint256 r; r < sat.perCallCount_length(); ++r) {
+            uint256 n = sat.perCallCount(r);
+            uint256 roundTotal;
+            for (uint256 i; i < n; ++i) {
+                uint256 g = sat.perConstraintGas(idx);
+                roundTotal += g;
+                if (g > 300_000) {
+                    emit log_named_uint("  round", r);
+                    emit log_named_uint("    constraint idx", idx);
+                    emit log_named_uint("      gas", g);
+                    emit log_named_uint("      k", sat.perConstraintK(idx));
+                    emit log_named_uint("      mode", sat.perConstraintMode(idx));
+                    emit log_named_uint("      groups", sat.perConstraintGroups(idx));
+                    emit log_named_uint("      selVars", sat.perConstraintSel(idx));
+                }
+                ++idx;
+            }
+            emit log_named_uint("round total", roundTotal);
         }
-        emit log_named_uint("total satellite gas", satTotal);
     }
 }
