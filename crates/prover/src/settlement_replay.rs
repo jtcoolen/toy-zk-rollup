@@ -121,7 +121,14 @@ pub fn settlement_params_for(
     log_max_lde: usize,
     rate: usize,
 ) -> p3_whir::parameters::ProtocolParameters {
-    settlement_params_pow(log_max_lde, rate, 0)
+    // D-092 batch 45: optional grinding floor, read once here so EVERY
+    // settlement-config path (prover, manual replay, composed export) picks
+    // up the same schedule. Default 0 = minimum feasible, unchanged.
+    let pow_floor = std::env::var("WHIR_POW_FLOOR")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    settlement_params_pow(log_max_lde, rate, pow_floor)
 }
 
 /// [`settlement_params_for`] with a grinding FLOOR: the schedule uses

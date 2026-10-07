@@ -43,6 +43,29 @@ fn schedule_line(cfg: &WhirConfig<Challenge, F, WhirChallenger>) -> String {
 
 #[test]
 #[ignore = "schedule sweep; run with --nocapture"]
+fn pow_per_round() {
+    for pow in [24usize, 26, 28, 30, 32, 40, 48, 56, 64] {
+        match WhirConfig::<Challenge, F, WhirChallenger>::new(24, params(pow, 4, 4)) {
+            Ok(cfg) => {
+                let rp: Vec<String> = cfg
+                    .round_parameters()
+                    .iter()
+                    .map(|r| format!("{}", r.pow_bits))
+                    .collect();
+                println!(
+                    "floor={pow:>3} rounds_pow=[{}] final_pow={} folding_pow={}",
+                    rp.join(","),
+                    cfg.terminal().pow_bits,
+                    cfg.starting_folding_pow_bits()
+                );
+            }
+            Err(e) => println!("floor={pow:>3} infeasible: {e:?}"),
+        }
+    }
+}
+
+#[test]
+#[ignore = "schedule sweep; run with --nocapture"]
 fn pow_grid_rate4_arity24() {
     for rate in [3usize, 4] {
         println!("=== arity 24, folding 4, rate {rate}: grinding budget sweep ===");

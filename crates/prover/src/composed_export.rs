@@ -948,17 +948,9 @@ pub fn settlement_bundle_with_blob(
     statement: &[F],
     rate: usize,
 ) -> Result<SettlementBundle, Box<dyn Error>> {
-    // D-092 batch 45: optional grinding floor, so a sweep can trade prover
-    // time (2^floor hashes per grind point) for fewer STIR queries.
-    let pow_floor = std::env::var("WHIR_POW_FLOOR")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    let params = crate::settlement_replay::settlement_params_pow(
-        crate::block::BLOCK_LOG_MAX_LDE,
-        rate,
-        pow_floor,
-    );
+    // D-092 batch 45: WHIR_POW_FLOOR (if set) is applied inside
+    // settlement_params_for, so prover and replay configs stay identical.
+    let params = settlement_params_for(crate::block::BLOCK_LOG_MAX_LDE, rate);
     let mut rounds_a = Vec::new();
     let mut starts_a = Vec::new();
     let (_doc_a, _out_a, program_a) = composed_run_with(
