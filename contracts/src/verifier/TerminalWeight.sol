@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {KoalaBearExt4} from "../../lib/sol-whir-p3/field/KoalaBearExt4.sol";
 import {WhirGadgets} from "./WhirGadgets.sol";
 import {WhirFixedConfig} from "./WhirFixedConfig.sol";
+import {ConstraintIdentity} from "./ConstraintIdentity.sol";
 
 /// @title TerminalWeight
 /// @notice The terminal-weight satellite (D-086 step A).
@@ -65,6 +66,20 @@ contract TerminalWeight {
     uint256 private constant P = 0x7F00_0001;
     /// @notice Montgomery radix for the wire limbs: 2^31 mod P.
     uint256 private constant MONT = 0x01FF_FFFE;
+
+    /// @notice Third frame magic: ASCII "CIDNTY". The constraint identity
+    /// (D-076) - claim walk, DAG fold, quotient recompose - runs here so the
+    /// engine never inlines the ConstraintIdentity interpreter (batch 48).
+    uint256 public constant CIDNTY_MAGIC = 0x4349_444E_5459;
+
+    /// @notice The identity did not hold for this instance. Same selector as
+    /// the engine's own error, so the bubbled revert is indistinguishable.
+    error ConstraintIdentityMismatch(uint256 instance);
+    /// @notice The CIDNTY frame was malformed, or its CONFIG section did not
+    /// parse exactly to its declared length.
+    error BadIdentityFrame(uint256 site, uint256 a, uint256 b);
+
+    using KoalaBearExt4 for uint256;
 
     /// @notice The frame did not start with the magic.
     error BadFrame();
@@ -385,6 +400,445 @@ contract TerminalWeight {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // CIDNTY: the constraint identity (D-076), offloaded from the engine
+    // ---------------------------------------------------------------------
+    //
+    // Frame (raw BE 32-byte words; the CONFIG section is the wire's raw
+    // little-endian u32 stream, copied verbatim):
+    //
+    //   [0] CIDNTY_MAGIC
+    //   [1] zeta  [2] constraintAlpha  [3] lookupAlpha  [4] beta
+    //   [5] nTerm, then nTerm packed-ext terminal words
+    //   [6] nStm, then nStm canonical-u32 statement words
+    //   [7] cfgWords, then cfgWords*4 raw CONFIG CONSTRAINTS bytes
+    //   then for rounds 1..4: boundLen, then boundLen packed-ext words
+    //
+    // The satellite parses CONSTRAINTS itself (node programs stay in the
+    // frame's calldata, read in place), rebuilds every opened value from the
+    // bound evaluations the engine's walk just verified, and checks
+    // fold(alpha, C(zeta)) * inv_vanishing == Q(zeta) per instance. A
+    // mismatch reverts with the engine's own error selector; the codehash
+    // pin means the engine trusts this code, exactly as for MROOTS.
+
+    /// The subset of the CONSTRAINTS config the claim layout walks.
+    struct IdentityCfg {
+        uint256 n;
+        uint256[] width;
+        uint256[] preWidth;
+        uint256[] auxWidth;
+        bool[] hasMainNext;
+        bool[] hasPreNext;
+        uint256[] numChunks;
+        uint256[][] roundArities;
+    }
+
+    /// The claims of one opening round: widths, owning matrix, arity, point
+    /// index (0 = zeta, 1 = zeta_next of the matrix). Ported verbatim from
+    /// the engine (batch 48) - including the round-2 arity quirk (ar[j]).
+    struct ClaimLayout {
+        uint256 count;
+        uint256[] widths;
+        uint256[] matrix;
+        uint256[] arities;
+        uint256[] point;
+    }
+
+    function _claimLayoutS(IdentityCfg memory c, uint256 round)
+        private
+        pure
+        returns (ClaimLayout memory L)
+    {
+        uint256 n = c.n;
+        uint256[] memory ar = c.roundArities[round];
+        if (round == 1 || round == 3) {
+            uint256 cnt = 0;
+            for (uint256 i; i < n; ++i) {
+                cnt += (round == 1 ? c.hasMainNext[i] : c.hasPreNext[i]) ? 2 : 1;
+            }
+            L.count = cnt;
+            L.widths = new uint256[](cnt);
+            L.matrix = new uint256[](cnt);
+            L.arities = new uint256[](cnt);
+            L.point = new uint256[](cnt);
+            uint256 j = 0;
+            for (uint256 i; i < n; ++i) {
+                uint256 w = round == 1 ? c.width[i] : c.preWidth[i];
+                uint256 reps = (round == 1 ? c.hasMainNext[i] : c.hasPreNext[i]) ? 2 : 1;
+                for (uint256 q; q < reps; ++q) {
+                    L.widths[j] = w;
+                    L.matrix[j] = i;
+                    L.arities[j] = ar[i];
+                    L.point[j] = q;
+                    j++;
+                }
+            }
+        } else if (round == 2) {
+            uint256 cnt = 0;
+            for (uint256 i; i < n; ++i) {
+                cnt += c.numChunks[i];
+            }
+            L.count = cnt;
+            L.widths = new uint256[](cnt);
+            L.matrix = new uint256[](cnt);
+            L.arities = new uint256[](cnt);
+            L.point = new uint256[](cnt);
+            uint256 j = 0;
+            for (uint256 i; i < n; ++i) {
+                for (uint256 q; q < c.numChunks[i]; ++q) {
+                    L.widths[j] = 4;
+                    L.matrix[j] = i;
+                    L.arities[j] = ar[j];
+                    L.point[j] = 0;
+                    j++;
+                }
+            }
+        } else {
+            uint256 cnt = 2 * n;
+            L.count = cnt;
+            L.widths = new uint256[](cnt);
+            L.matrix = new uint256[](cnt);
+            L.arities = new uint256[](cnt);
+            L.point = new uint256[](cnt);
+            uint256 j = 0;
+            for (uint256 i; i < n; ++i) {
+                for (uint256 q; q < 2; ++q) {
+                    L.widths[j] = 4 * c.auxWidth[i];
+                    L.matrix[j] = i;
+                    L.arities[j] = ar[i];
+                    L.point[j] = q;
+                    j++;
+                }
+            }
+        }
+    }
+
+    /// claimed = bound * scale, element-wise, w values from off.
+    function _claimed(uint256[] memory bound, uint256 off, uint256 w, uint256 sc)
+        private
+        pure
+        returns (uint256[] memory out)
+    {
+        out = new uint256[](w);
+        for (uint256 j; j < w; ++j) {
+            out[j] = bound[off + j].mul(sc);
+        }
+    }
+
+    /// fromExt4 over each 4-value group of the w claimed values.
+    function _fromExt4Group(uint256[] memory bound, uint256 off, uint256 w, uint256 sc)
+        private
+        pure
+        returns (uint256[] memory out)
+    {
+        out = new uint256[](w / 4);
+        for (uint256 j; j < w / 4; ++j) {
+            uint256[] memory vals = new uint256[](4);
+            for (uint256 q; q < 4; ++q) {
+                vals[q] = bound[off + 4 * j + q].mul(sc);
+            }
+            out[j] = _fromExt4(vals, 0);
+        }
+    }
+
+    /// Horner evaluation of a quartic at x (the EF4 class of the
+    /// indeterminate) from four consecutive claimed extension values.
+    function _fromExt4(uint256[] memory vals, uint256 off) private pure returns (uint256) {
+        uint256 x = uint256(1) << 192;
+        uint256 acc = vals[off + 3];
+        acc = acc.mul(x).add(vals[off + 2]);
+        acc = acc.mul(x).add(vals[off + 1]);
+        return acc.mul(x).add(vals[off]);
+    }
+
+    /// prod_{i<k}(1 + z^{2^i}): the univariate-eq scale of a claim group.
+    function _claimScale(uint256 z, uint256 k) private pure returns (uint256) {
+        uint256 sc = KoalaBearExt4.ONE;
+        uint256 y = z;
+        for (uint256 i; i < k; ++i) {
+            sc = sc.mul(KoalaBearExt4.ONE.add(y));
+            y = y.square();
+        }
+        return sc;
+    }
+
+    /// A wire LE u32 array at byte offset `at`: count then count LE words.
+    function _leArr(uint256 at) private pure returns (uint256[] memory out, uint256 next) {
+        uint256 n = _leWordAt(at);
+        out = new uint256[](n);
+        for (uint256 i; i < n; ++i) {
+            out[i] = _leWordAt(at + 4 + 4 * i);
+        }
+        next = at + 4 + 4 * n;
+    }
+
+    /// Pack flat u32 extension limbs (4 per value) into packed quartics.
+    function _packQuartics(uint256[] memory flat)
+        private
+        pure
+        returns (uint256[] memory out)
+    {
+        out = new uint256[](flat.length / 4);
+        for (uint256 j; j < out.length; ++j) {
+            out[j] = (flat[4 * j] << 224) | (flat[4 * j + 1] << 192) | (flat[4 * j + 2] << 160)
+                | (flat[4 * j + 3] << 128);
+        }
+    }
+
+    /// Two-adic generators (p3-koala-bear TWO_ADIC_GENERATORS), duplicated
+    /// from the engine so the satellite stands alone.
+    uint256 private constant G0 = 0x1;
+    uint256 private constant G1 = 0x7f00_0000;
+    uint256 private constant G2 = 0x7e01_0002;
+    uint256 private constant G3 = 0x6832_fe4a;
+    uint256 private constant G4 = 0x08db_d69c;
+    uint256 private constant G5 = 0x0a28_f031;
+    uint256 private constant G6 = 0x5c4a_5b99;
+    uint256 private constant G7 = 0x29b7_5a80;
+    uint256 private constant G8 = 0x1766_8b8a;
+    uint256 private constant G9 = 0x27ad_539b;
+    uint256 private constant G10 = 0x334d_48c7;
+    uint256 private constant G11 = 0x7744_959c;
+    uint256 private constant G12 = 0x768f_c6fa;
+    uint256 private constant G13 = 0x3039_64b2;
+    uint256 private constant G14 = 0x3e68_7d4d;
+    uint256 private constant G15 = 0x45a6_0e61;
+    uint256 private constant G16 = 0x6e2f_4d7a;
+    uint256 private constant G17 = 0x163b_d499;
+    uint256 private constant G18 = 0x6c4a_8a45;
+    uint256 private constant G19 = 0x143e_f899;
+    uint256 private constant G20 = 0x514d_dcad;
+    uint256 private constant G21 = 0x484e_f19b;
+    uint256 private constant G22 = 0x205d_63c3;
+    uint256 private constant G23 = 0x68e7_dd49;
+    uint256 private constant G24 = 0x6ac4_9f88;
+
+    function _twoAdic(uint256 k) private pure returns (uint256) {
+        if (k == 0) return G0;
+        if (k == 1) return G1;
+        if (k == 2) return G2;
+        if (k == 3) return G3;
+        if (k == 4) return G4;
+        if (k == 5) return G5;
+        if (k == 6) return G6;
+        if (k == 7) return G7;
+        if (k == 8) return G8;
+        if (k == 9) return G9;
+        if (k == 10) return G10;
+        if (k == 11) return G11;
+        if (k == 12) return G12;
+        if (k == 13) return G13;
+        if (k == 14) return G14;
+        if (k == 15) return G15;
+        if (k == 16) return G16;
+        if (k == 17) return G17;
+        if (k == 18) return G18;
+        if (k == 19) return G19;
+        if (k == 20) return G20;
+        if (k == 21) return G21;
+        if (k == 22) return G22;
+        if (k == 23) return G23;
+        if (k == 24) return G24;
+        revert BadIdentityFrame(4, k, 0);
+    }
+
+    /// The whole constraint identity for every instance, from the frame.
+    function _cidnty() private pure {
+        uint256 c = 32;
+        uint256 zeta = _cdWord(c); c += 32;
+        uint256 alpha = _cdWord(c); c += 32;
+        uint256 lookupAlpha = _cdWord(c); c += 32;
+        uint256 beta = _cdWord(c); c += 32;
+
+        uint256 nTerm = _cdWord(c); c += 32;
+        uint256[] memory terminals = new uint256[](nTerm);
+        assembly ("memory-safe") { calldatacopy(add(terminals, 32), c, mul(nTerm, 32)) }
+        c += nTerm * 32;
+
+        uint256 nStm = _cdWord(c); c += 32;
+        uint256[] memory statement = new uint256[](nStm);
+        assembly ("memory-safe") { calldatacopy(add(statement, 32), c, mul(nStm, 32)) }
+        c += nStm * 32;
+
+        uint256 cfgWords = _cdWord(c); c += 32;
+        uint256 cfg = c;
+        c += cfgWords * 4;
+
+        uint256[][] memory boundEvalsOf = new uint256[][](5);
+        for (uint256 r = 1; r <= 4; ++r) {
+            uint256 bl = _cdWord(c); c += 32;
+            uint256[] memory b = new uint256[](bl);
+            assembly ("memory-safe") { calldatacopy(add(b, 32), c, mul(bl, 32)) }
+            c += bl * 32;
+            boundEvalsOf[r] = b;
+        }
+        if (c != msg.data.length) revert BadIdentityFrame(1, c, msg.data.length);
+
+        uint256 p = cfg;
+        uint256 n = _leWordAt(p); p += 4;
+        uint256 stmInst = _leWordAt(p); p += 4;
+        ConstraintIdentity.Program[] memory programs =
+            new ConstraintIdentity.Program[](n);
+        uint256[] memory width = new uint256[](n);
+        uint256[] memory preWidth = new uint256[](n);
+        uint256[] memory auxWidth = new uint256[](n);
+        bool[] memory hasMainNext = new bool[](n);
+        bool[] memory hasPreNext = new bool[](n);
+        uint256[] memory traceLogSize = new uint256[](n);
+        uint256[] memory traceInvShift = new uint256[](n);
+        uint256[] memory traceHInv = new uint256[](n);
+        uint256[] memory numChunks = new uint256[](n);
+        ConstraintIdentity.ChunkDomain[][] memory chunkDomains =
+            new ConstraintIdentity.ChunkDomain[][](n);
+        uint256[][] memory invD = new uint256[][](n);
+        for (uint256 i; i < n; ++i) {
+            width[i] = _leWordAt(p); p += 4;
+            preWidth[i] = _leWordAt(p); p += 4;
+            auxWidth[i] = _leWordAt(p); p += 4;
+            hasMainNext[i] = _leWordAt(p) != 0; p += 4;
+            hasPreNext[i] = _leWordAt(p) != 0; p += 4;
+            p += 4; // numConstraints: roots.length is authoritative
+            uint256 nNodes = _leWordAt(p); p += 4;
+            programs[i].nodesCdBase = p;
+            programs[i].nodesLen = nNodes;
+            p += nNodes * 4;
+            (programs[i].baseConsts, p) = _leArr(p);
+            uint256[] memory extFlat;
+            (extFlat, p) = _leArr(p);
+            programs[i].extConsts = _packQuartics(extFlat);
+            (programs[i].roots, p) = _leArr(p);
+            traceLogSize[i] = _leWordAt(p); p += 4;
+            p += 4; // trace shift: selectors work in u = zeta * invShift
+            traceInvShift[i] = _leWordAt(p); p += 4;
+            traceHInv[i] = _leWordAt(p); p += 4;
+            uint256 k = _leWordAt(p); p += 4;
+            numChunks[i] = k;
+            ConstraintIdentity.ChunkDomain[] memory cds =
+                new ConstraintIdentity.ChunkDomain[](k);
+            for (uint256 j; j < k; ++j) {
+                cds[j].logSize = _leWordAt(p); p += 4;
+                p += 4; // shift unused
+                cds[j].invShift = _leWordAt(p); p += 4;
+            }
+            chunkDomains[i] = cds;
+            uint256[] memory invDFlat;
+            (invDFlat, p) = _leArr(p);
+            invD[i] = _packQuartics(invDFlat);
+        }
+        uint256 maxMsgW = _leWordAt(p); p += 4;
+        uint256[][] memory busIds = new uint256[][](n);
+        for (uint256 i; i < n; ++i) {
+            (busIds[i], p) = _leArr(p);
+        }
+        bool[] memory hasTerminal = new bool[](n);
+        for (uint256 i; i < n; ++i) {
+            hasTerminal[i] = _leWordAt(p) != 0; p += 4;
+        }
+        uint256 nr = _leWordAt(p); p += 4;
+        if (nr != 5) revert BadIdentityFrame(2, nr, p);
+        uint256[][] memory roundArities = new uint256[][](nr);
+        for (uint256 r; r < nr; ++r) {
+            (roundArities[r], p) = _leArr(p);
+        }
+        if (p != cfg + cfgWords * 4) revert BadIdentityFrame(3, p, cfg + cfgWords * 4);
+
+        // --- opened values, exactly as the engine built them (D-076) ---
+        uint256[] memory zetaNext = new uint256[](n);
+        for (uint256 i; i < n; ++i) {
+            zetaNext[i] = zeta.mulBase(_twoAdic(traceLogSize[i]));
+        }
+        ConstraintIdentity.Opened[] memory opened =
+            new ConstraintIdentity.Opened[](n);
+        for (uint256 i; i < n; ++i) {
+            opened[i].permValues = new uint256[](0);
+            opened[i].periodicValues = new uint256[](0);
+        }
+        uint256[][] memory quotBuf = new uint256[][](n);
+        for (uint256 i; i < n; ++i) {
+            quotBuf[i] = new uint256[](numChunks[i]);
+        }
+        uint256 tIdx = 0;
+        for (uint256 i; i < n; ++i) {
+            if (hasTerminal[i]) {
+                opened[i].permValues = new uint256[](1);
+                opened[i].permValues[0] = terminals[tIdx];
+                tIdx++;
+            }
+        }
+        uint256 betaW = beta;
+        for (uint256 w = 1; w < maxMsgW; ++w) {
+            betaW = betaW.mul(beta);
+        }
+        for (uint256 i; i < n; ++i) {
+            uint256 nb = busIds[i].length;
+            opened[i].permChallenges = new uint256[](2 * nb);
+            for (uint256 k = 0; k < nb; ++k) {
+                uint256 prefix = lookupAlpha.add(betaW.mulBase(busIds[i][k] + 1));
+                opened[i].permChallenges[2 * k] = prefix;
+                opened[i].permChallenges[2 * k + 1] = beta;
+            }
+        }
+        if (stmInst < n) {
+            opened[stmInst].publicValues = statement;
+        }
+
+        for (uint256 round = 1; round <= 4; ++round) {
+            IdentityCfg memory icfg = IdentityCfg(
+                n, width, preWidth, auxWidth, hasMainNext, hasPreNext, numChunks, roundArities);
+            ClaimLayout memory L = _claimLayoutS(icfg, round);
+            uint256[] memory bound = boundEvalsOf[round];
+            uint256 boff = 0;
+            uint256[] memory qIdx = new uint256[](n);
+            for (uint256 j; j < L.count; ++j) {
+                uint256 mi = L.matrix[j];
+                uint256 z = L.point[j] == 0 ? zeta : zetaNext[mi];
+                uint256 sc = _claimScale(z, L.arities[j]);
+                uint256 w = L.widths[j];
+                if (round == 1) {
+                    if (L.point[j] == 0) {
+                        opened[mi].mainLocal = _claimed(bound, boff, w, sc);
+                    } else {
+                        opened[mi].mainNext = _claimed(bound, boff, w, sc);
+                    }
+                } else if (round == 3) {
+                    if (L.point[j] == 0) {
+                        opened[mi].preLocal = _claimed(bound, boff, w, sc);
+                    } else {
+                        opened[mi].preNext = _claimed(bound, boff, w, sc);
+                    }
+                } else if (round == 2) {
+                    quotBuf[mi][qIdx[mi]] = _fromExt4Group(bound, boff, w, sc)[0];
+                    qIdx[mi]++;
+                } else {
+                    if (L.point[j] == 0) {
+                        opened[mi].permLocal = _fromExt4Group(bound, boff, w, sc);
+                    } else {
+                        opened[mi].permNext = _fromExt4Group(bound, boff, w, sc);
+                    }
+                }
+                boff += w;
+            }
+        }
+
+        for (uint256 i; i < n; ++i) {
+            ConstraintIdentity.Selectors memory sels = ConstraintIdentity.selectors(
+                zeta, traceInvShift[i], traceLogSize[i], traceHInv[i]);
+            uint256 fold = ConstraintIdentity.foldConstraints(
+                programs[i], opened[i], sels, alpha);
+            uint256 quotient = ConstraintIdentity.recomposeQuotient(
+                quotBuf[i], chunkDomains[i], invD[i], zeta);
+            if (fold.mul(sels.invVanishing) != quotient) {
+                revert ConstraintIdentityMismatch(i);
+            }
+        }
+        assembly ("memory-safe") {
+            mstore(0, CIDNTY_MAGIC)
+            mstore(32, 0)
+            mstore(64, 0)
+            return(0, 96)
+        }
+    }
+
     /// @notice Parse the frame, evaluate the terminal weight and value, and
     /// reply [magic, weight, value]. No mutability modifier: a fallback may
     /// not be declared pure/view, but this body reads no state and the caller
@@ -393,6 +847,10 @@ contract TerminalWeight {
         if (_head() == MROOTS_MAGIC) {
             // _mroots answers via the return opcode; control never returns.
             _mroots();
+        }
+        if (_head() == CIDNTY_MAGIC) {
+            // _cidnty answers via the return opcode; control never returns.
+            _cidnty();
         }
         uint256[] memory allR;
         WhirGadgets.ConstraintWeight[] memory constraints;

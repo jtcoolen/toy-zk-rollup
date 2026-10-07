@@ -519,8 +519,10 @@ library WhirVerifierCore {
         // switch dispatch costs ~490 gas/limb; four read-modify-writes per
         // element cost ~8K/query). Every other shape falls through to the
         // generic switch loop below.
-        if (rowsCd != 0 && !rowsAreBase) {
-            return _loadRowHot(elems, rowsCd, base, rowLimbs);
+        if (rowsCd != 0) {
+            return rowsAreBase
+                ? _loadRowBaseHot(elems, rowsCd, base, rowLimbs)
+                : _loadRowHot(elems, rowsCd, base, rowLimbs);
         }
         bytes4 selTag = StirOpenings.LimbOutOfRange.selector;
         assembly ("memory-safe") {
@@ -534,11 +536,9 @@ library WhirVerifierCore {
                     or(and(shr(8, x), 0xff00), shr(24, x))
                 )
             }
-            // limb source: absolute calldata byte offset, or memory array data.
-            let src := rowsCd
-            switch rowsCd
-            case 0 { src := add(add(flat, 0x20), mul(base, 0x20)) }
-            default { src := add(rowsCd, mul(base, 4)) }
+            // Memory source only: every calldata shape dispatches to a hot
+            // kernel above (batch 48), so rowsCd is 0 here by construction.
+            let src := add(add(flat, 0x20), mul(base, 0x20))
             // One pass over the rowLimbs wire limbs: each canonical value v
             // (range-checked here) feeds BOTH outputs - the Montgomery LE byte
             // word for the leaf and the packed element lane for the fold.
@@ -555,10 +555,7 @@ library WhirVerifierCore {
             // a literal value operand in shl as a suspected arg swap.
             let m32 := 0xffffffff
             for { let j := 0 } lt(j, rowLimbs) { j := add(j, 1) } {
-                let v := 0
-                switch rowsCd
-                case 0 { v := mload(add(src, shl(5, j))) }
-                default { v := swap32(shr(224, calldataload(add(src, shl(2, j))))) }
+                let v := mload(add(src, shl(5, j)))
                 if iszero(lt(v, p)) { mstore(0, selTag) mstore(4, v) revert(0, 36) }
                 mstore(add(dst, shl(2, j)), shl(224, swap32(mod(mul(v, rr), p))))
                 switch rowsAreBase
@@ -1033,6 +1030,39 @@ library WhirVerifierCore {
                 mstore(add(dp, 12), shl(224, swap32(mod(mul(c3, rr), p))))
                 mstore(add(ep, shl(5, e)),
                     or(or(shl(224, c0), shl(192, c1)), or(shl(160, c2), shl(128, c3))))
+            }
+            leaf := keccak256(dst, mul(rowLimbs, 4))
+        }
+    }
+
+    /// Round 0's shape: base-field rows straight from calldata, one limb per
+    /// element (batch 48). Same wire decode as the extension kernel - swap32
+    /// the LE u32, range-check v < p, store the Montgomery byte word for the
+    /// leaf and the lifted element for the fold - with no 4-limb packing.
+    function _loadRowBaseHot(
+        uint256[] memory elems,
+        uint256 rowsCd,
+        uint256 base,
+        uint256 rowLimbs
+    ) private pure returns (bytes32 leaf) {
+        bytes4 selTag = StirOpenings.LimbOutOfRange.selector;
+        assembly ("memory-safe") {
+            let dst := add(mload(0x40), 0x20)
+            let ep := add(elems, 0x20)
+            let p := 0x7f000001
+            let rr := 0x01fffffe
+            function swap32(x) -> y {
+                y := or(
+                    or(and(shl(24, x), 0xff000000), and(shl(8, x), 0xff0000)),
+                    or(and(shr(8, x), 0xff00), shr(24, x))
+                )
+            }
+            let hs := add(rowsCd, mul(base, 4))
+            for { let e := 0 } lt(e, rowLimbs) { e := add(e, 1) } {
+                let v := swap32(shr(224, calldataload(add(hs, shl(2, e)))))
+                if iszero(lt(v, p)) { mstore(0, selTag) mstore(4, v) revert(0, 36) }
+                mstore(add(dst, shl(2, e)), shl(224, swap32(mod(mul(v, rr), p))))
+                mstore(add(ep, shl(5, e)), shl(224, v))
             }
             leaf := keccak256(dst, mul(rowLimbs, 4))
         }
