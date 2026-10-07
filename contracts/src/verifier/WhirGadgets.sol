@@ -229,21 +229,15 @@ library WhirGadgets {
             return raw;
         }
         uint256 num = KoalaBearExt4.ONE;
-        uint256 den = KoalaBearExt4.ONE;
         uint256 c = zeta;
         // localR[i] pairs with c_i = zeta^(2^(arity-1-i)): walking i downwards
         // from arity-1 starts at zeta^(2^0) and squares, same order as
         // expand_from_univariate fills from the back.
         for (uint256 i = arity; i > 0; --i) {
-            uint256 r = localR[i - 1];
-            // num *= (1 - r) + r*c ; den *= 1 + c
-            num = KoalaBearExt4.mul(
-                num,
-                KoalaBearExt4.add(
-                    KoalaBearExt4.sub(KoalaBearExt4.ONE, r), KoalaBearExt4.mul(r, c)
-                )
-            );
-            den = KoalaBearExt4.mul(den, KoalaBearExt4.add(KoalaBearExt4.ONE, c));
+            // num *= (1 - r) + r*c, fused in registers (batch 33): the packed
+            // formulation (sub, mul, add, mul through the public ops) re-packs
+            // the lanes between every step. Same value, deferred reduction.
+            num = _mulBySelectorFactor(num, localR[i - 1], c);
             c = KoalaBearExt4.square(c);
         }
         // Selector bits, big-endian: bit (nv-1-j) of selIndex pins localR[arity+j].
@@ -254,7 +248,80 @@ library WhirGadgets {
                 num, bit == 1 ? r : KoalaBearExt4.sub(KoalaBearExt4.ONE, r)
             );
         }
-        return KoalaBearExt4.mul(num, KoalaBearExt4.inv(den));
+        // THE DENOMINATOR IN CLOSED FORM (batch 33). The product telescopes:
+        //
+        //     prod_{i<arity} (1 + zeta^(2^i)) = (zeta^(2^arity) - 1) / (zeta - 1)
+        //
+        // so the arity ext-multiplies that accumulated den vanish entirely: c
+        // has already walked to zeta^(2^arity) in the loop above, and the whole
+        // denominator is num * (zeta - 1) / (c - 1) - two muls and an inversion
+        // instead of arity muls. Same zero set: (zeta - 1) * den = c - 1 in the
+        // field, so c == 1 exactly when the product degenerates (zeta = 1, or
+        // some factor 1 + c_i = 0); the fallback keeps that case bit-identical.
+        if (c == KoalaBearExt4.ONE) {
+            uint256 den = KoalaBearExt4.ONE;
+            uint256 d = zeta;
+            for (uint256 i = arity; i > 0; --i) {
+                den = KoalaBearExt4.mul(den, KoalaBearExt4.add(KoalaBearExt4.ONE, d));
+                d = KoalaBearExt4.square(d);
+            }
+            return KoalaBearExt4.mul(num, KoalaBearExt4.inv(den));
+        }
+        return KoalaBearExt4.mul(
+            KoalaBearExt4.mul(num, KoalaBearExt4.sub(zeta, KoalaBearExt4.ONE)),
+            KoalaBearExt4.inv(KoalaBearExt4.sub(c, KoalaBearExt4.ONE))
+        );
+    }
+
+    /// \`acc * ((1 - r) + r (x) c)\ with the term built in registers and the
+    /// reduction deferred to one mod per lane (batch 33). The same fusion
+    /// KoalaBearExt4.eq_poly_eval established for the eq product: unpack once,
+    /// carry lanes in registers, reduce exactly once per stage. Lanes stay far
+    /// below 2**256 (t < 13 P**2, e < 26 P**2 + 5P, u < 2**101), so the result
+    /// is bit-identical to the three-call formulation.
+    function _mulBySelectorFactor(uint256 acc, uint256 r, uint256 c)
+        private
+        pure
+        returns (uint256 out)
+    {
+        assembly ("memory-safe") {
+            let P := 0x7f000001
+            let M := 0xffffffff
+            let W := 3
+            let a0 := shr(224, acc)
+            let a1 := and(shr(192, acc), M)
+            let a2 := and(shr(160, acc), M)
+            let a3 := and(shr(128, acc), M)
+            let r0 := shr(224, r)
+            let r1 := and(shr(192, r), M)
+            let r2 := and(shr(160, r), M)
+            let r3 := and(shr(128, r), M)
+            let c0 := shr(224, c)
+            let c1 := and(shr(192, c), M)
+            let c2 := and(shr(160, c), M)
+            let c3 := and(shr(128, c), M)
+
+            let t0 := add(mul(r0, c0), mul(W, add(add(mul(r1, c3), mul(r2, c2)), mul(r3, c1))))
+            let t1 := add(add(mul(r0, c1), mul(r1, c0)), mul(W, add(mul(r2, c3), mul(r3, c2))))
+            let t2 := add(add(add(mul(r0, c2), mul(r1, c1)), mul(r2, c0)), mul(W, mul(r3, c3)))
+            let t3 := add(add(add(mul(r0, c3), mul(r1, c2)), mul(r2, c1)), mul(r3, c0))
+
+            // term = (1 - r) + t, biased positive; lane 0 carries the +1.
+            let e0 := add(add(t0, mul(3, P)), add(1, sub(P, r0)))
+            let e1 := add(add(t1, mul(3, P)), sub(P, r1))
+            let e2 := add(add(t2, mul(3, P)), sub(P, r2))
+            let e3 := add(add(t3, mul(3, P)), sub(P, r3))
+
+            let u0 := add(mul(a0, e0), mul(W, add(add(mul(a1, e3), mul(a2, e2)), mul(a3, e1))))
+            let u1 := add(add(mul(a0, e1), mul(a1, e0)), mul(W, add(mul(a2, e3), mul(a3, e2))))
+            let u2 := add(add(add(mul(a0, e2), mul(a1, e1)), mul(a2, e0)), mul(W, mul(a3, e3)))
+            let u3 := add(add(add(mul(a0, e3), mul(a1, e2)), mul(a2, e1)), mul(a3, e0))
+            out :=
+                or(
+                    or(shl(224, mod(u0, P)), shl(192, mod(u1, P))),
+                    or(shl(160, mod(u2, P)), shl(128, mod(u3, P)))
+                )
+        }
     }
 
     /// `selectEval` with the base-lifted scalar `v0` (z = lift(v0)).
