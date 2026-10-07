@@ -1902,3 +1902,41 @@ Gotchas hit: Solidity address needs uint256(uint160(...)) to enter Yul; a
 bytes4 var is ALREADY left-aligned in its word (no shl(224) needed).
 
 32 suites, 156 tests green.
+
+## Batch 41 - v7 wire: compact ext limbs (444,936 -> 422,200 B, 59.29M)
+
+The PROOF section's extension arrays carried each ext4 element as a 32-byte
+word with the four <2^31 limbs at bits 224..128 and 16 zero pad bytes -
+pure wire waste (batch 26 itemized it at +29 KB vs postcard). v7 ships the
+four BE limbs only: 16 bytes per element.
+
+* wbnd.rs: Sink::ext_arr16 writes the compact blob; encode_bundle_v7 /
+  encode_bundle_v7_split mirror the v5/v6 paths (v5 stays byte-exact).
+  The blob's byte count carries bit 31 as the compact flag: the decoder
+  learns the element size IN BAND. A bool threaded from the header version
+  through _runRounds/_decodeRoundPrf pushed the via-IR scheduler past the
+  stack limit (var_..._mpos 1 too deep) - the in-band flag costs nothing
+  and keeps every decoder signature unchanged.
+* WhirVerifier.sol: version gate accepts 5 and 7; _extArr reads the flag
+  and lifts 16-byte limbs with shl(128, shr(128, calldataload)) - one
+  shift pair per element, no per-element pad check.
+* WhirVerifierV6.sol: accepts ver 6 or 7 and stamps the frame accordingly
+  (v6 -> 5, v7 -> 7). CONFIG is identical between v6 and v7: same chunks,
+  same digest.
+* export_chain_bundle_v7 (ignored, WHIR_RATE_*=4): writes
+  recursion_chain_bundle_v7.bin (422,200 B), config_v7.bin, 8 chunks,
+  sidecar_v7.json. Recursion is nondeterministic (ZK blinding) so v7 gets
+  its OWN vectors; the v6 vectors stay untouched.
+
+Measured (rate 4/4, own proof run each): v7 bundle 422,200 B (-22,736 =
+1,421 ext elements x 16 B, exactly as predicted), verify 59,287,810 gas.
+Same-run v6-alone comparison: 59.71M -> 59.29M (-0.42M: 22.7 KB calldata
+saving minus the shift-pair decode). v7 through the wrapper: 61.79M vs v6
+62.29M. Reject battery passes (wrong statement, tampered byte).
+
+Cumulative on-chain path: v5 627,136 B / 62.23M -> v6 444,936 B / 62.29M
+(-182 KB CONFIG) -> v7 422,200 B / 61.79M (-22.7 KB limbs). Next wire
+item: pruned Merkle paths (-66 KB est, batch 26) -> ~356 KB, at which
+point the posted proof is essentially the postcard proof + framing.
+
+33 suites, 160 tests green.

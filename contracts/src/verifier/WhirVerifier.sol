@@ -235,7 +235,10 @@ contract WhirVerifier is IWhirVerifier {
         // The u32 LE fields need a byte swap; the version byte does not.
         cfgWords = _swapBytes(cfgWords);
         prfWords = _swapBytes(prfWords);
-        if (version != 5) revert BadVersion(version);
+        // v5: full bundle. v7: same grammar, PROOF ext arrays compacted to
+        // 16-byte limbs with an in-band flag per array (D-092 batch 41). v6
+        // bundles are re-framed by WhirVerifierV6 and never arrive as 6.
+        if (version != 5 && version != 7) revert BadVersion(version);
         if (proof.length < 20 + (cfgWords + prfWords) * 4) revert ProofTooShort();
         // v5 header tail: u32 LE STATEMENT word count right after PROOF.
         StmRef memory stm;
@@ -1188,6 +1191,25 @@ contract WhirVerifier is IWhirVerifier {
     {
         uint256 nBytes;
         (nBytes, no) = _word(d, off);
+        // v7 in-band flag: bit 31 of the byte count selects the compact
+        // 16-byte limb layout (batch 41). Real blobs are far below 2^31 B.
+        bool compact = nBytes > 0x7fff_ffff;
+        nBytes &= 0x7fff_ffff;
+        if (compact) {
+            // v7: four BE limbs per element (16 B), lifted to the packed
+            // word at bits 224..128; the low 128 bits are zero by layout.
+            uint256 n16 = nBytes / 16;
+            out = new uint256[](n16);
+            assembly {
+                let dst := add(out, 32)
+                let srcBase := add(d.offset, mul(no, 4))
+                for { let i := 0 } lt(i, n16) { i := add(i, 1) } {
+                    mstore(add(dst, mul(i, 32)), shl(128, shr(128, calldataload(add(srcBase, mul(i, 16))))))
+                }
+            }
+            no += nBytes / 4;
+            return (out, no);
+        }
         uint256 n = nBytes / 32;
         out = new uint256[](n);
         assembly {

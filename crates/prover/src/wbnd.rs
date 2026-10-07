@@ -99,6 +99,27 @@ impl Sink {
         let bytes: Vec<u8> = hexes.iter().flat_map(|h| hex_to_bytes(h)).collect();
         self.blob(&bytes);
     }
+    /// v7 compact ext elements: the four BE limbs (first 16 bytes of each
+    /// packed 32-byte word) - the 16 pad bytes are wire waste. The blob
+    /// count carries bit 31 as the compact flag: the decoder learns the
+    /// element size in-band, so no wire-wide flag has to reach the decoder
+    /// (a bool parameter there pushed the via-IR scheduler past the stack
+    /// limit - batch 41).
+    fn ext_arr16(&mut self, hexes: &[String]) {
+        let bytes: Vec<u8> = hexes
+            .iter()
+            .flat_map(|h| hex_to_bytes(h)[..16].to_vec())
+            .collect();
+        self.word(bytes.len() as u32 | 0x8000_0000);
+        let mut i = 0;
+        while i < bytes.len() {
+            let mut buf = [0u8; 4];
+            let n = 4usize.min(bytes.len() - i);
+            buf[..n].copy_from_slice(&bytes[i..i + n]);
+            self.word(u32::from_le_bytes(buf));
+            i += 4;
+        }
+    }
     /// Raw hex, no length prefix, packed 4 bytes per LE word.
     fn raw(&mut self, hexstr: &str) {
         let bytes = hex_to_bytes(hexstr);
@@ -613,6 +634,19 @@ fn constraints_section(j: &Value, jj: &Value) -> Vec<u32> {
 /// test proves it against the committed block bundle.
 #[must_use]
 pub fn encode_bundle(j: &Value, jj: &Value, bin: &[u8]) -> Vec<u8> {
+    encode_bundle_impl(j, jj, bin, false)
+}
+
+/// v7: same grammar, version byte 7, and every PROOF-section ext array
+/// compacted to 16-byte limbs (the 16 pad bytes per element are wire
+/// waste - D-092 batch 41). CONFIG and STATEMENT are byte-identical to v5,
+/// so a v7 bundle's CONFIG digest matches its v5 sibling.
+#[must_use]
+pub fn encode_bundle_v7(j: &Value, jj: &Value, bin: &[u8]) -> Vec<u8> {
+    encode_bundle_impl(j, jj, bin, true)
+}
+
+fn encode_bundle_impl(j: &Value, jj: &Value, bin: &[u8], compact: bool) -> Vec<u8> {
     let batch = split_batch(bin, jj);
 
     // CONSTRAINTS (trusted setup, appended to CONFIG in v4).
@@ -695,28 +729,78 @@ pub fn encode_bundle(j: &Value, jj: &Value, bin: &[u8]) -> Vec<u8> {
         for r in 0..num_rounds {
             let rd = &j["rounds"][r];
             m.blob(&hex_to_bytes(rd["commitment"].as_str().unwrap()));
-            m.ext_arr(&hex_strings(&rd["bound_evals"]));
-            m.ext_arr(&hex_strings(&rd["initial_ood_answers"]));
-            m.ext_arr(&hex_strings(&rd["initial_sumcheck_ca"]));
-            m.ext_arr(&hex_strings(&rd["initial_sumcheck_cinf"]));
+            let e = hex_strings(&rd["bound_evals"]);
+            if compact {
+                m.ext_arr16(&e);
+            } else {
+                m.ext_arr(&e);
+            }
+            let e = hex_strings(&rd["initial_ood_answers"]);
+            if compact {
+                m.ext_arr16(&e);
+            } else {
+                m.ext_arr(&e);
+            }
+            let e = hex_strings(&rd["initial_sumcheck_ca"]);
+            if compact {
+                m.ext_arr16(&e);
+            } else {
+                m.ext_arr(&e);
+            }
+            let e = hex_strings(&rd["initial_sumcheck_cinf"]);
+            if compact {
+                m.ext_arr16(&e);
+            } else {
+                m.ext_arr(&e);
+            }
             m.arr(&u32_vec(&rd["initial_sumcheck_pow_witnesses"]));
             m.arr(&u32_vec(&rd["rows_flat"]));
             m.blob(&hex_to_bytes(rd["paths_hex"].as_str().unwrap()));
             m.blob(&hex_to_bytes(rd["round_commitments_hex"].as_str().unwrap()));
-            m.ext_arr(&hex_strings(&rd["ood_answers"]));
+            let e = hex_strings(&rd["ood_answers"]);
+            if compact {
+                m.ext_arr16(&e);
+            } else {
+                m.ext_arr(&e);
+            }
             m.arr(&u32_vec(&rd["ood_answer_lens"]));
             m.arr(&u32_vec(&rd["pow_witnesses"]));
-            m.ext_arr(&hex_strings(&rd["sumcheck_ca"]));
-            m.ext_arr(&hex_strings(&rd["sumcheck_cinf"]));
+            let e = hex_strings(&rd["sumcheck_ca"]);
+            if compact {
+                m.ext_arr16(&e);
+            } else {
+                m.ext_arr(&e);
+            }
+            let e = hex_strings(&rd["sumcheck_cinf"]);
+            if compact {
+                m.ext_arr16(&e);
+            } else {
+                m.ext_arr(&e);
+            }
             m.arr(&u32_vec(&rd["sumcheck_pow_witnesses"]));
             m.arr(&u32_vec(&rd["sumcheck_lens"]));
             m.arr(&u32_vec(&rd["sumcheck_pow_lens"]));
-            m.ext_arr(&hex_strings(&rd["final_poly"]));
+            let e = hex_strings(&rd["final_poly"]);
+            if compact {
+                m.ext_arr16(&e);
+            } else {
+                m.ext_arr(&e);
+            }
             m.word(as_u64(&rd["final_pow_witness"]) as u32);
             m.arr(&u32_vec(&rd["final_rows_ext"]));
             m.blob(&hex_to_bytes(rd["final_paths_hex"].as_str().unwrap()));
-            m.ext_arr(&hex_strings(&rd["final_sumcheck_ca"]));
-            m.ext_arr(&hex_strings(&rd["final_sumcheck_cinf"]));
+            let e = hex_strings(&rd["final_sumcheck_ca"]);
+            if compact {
+                m.ext_arr16(&e);
+            } else {
+                m.ext_arr(&e);
+            }
+            let e = hex_strings(&rd["final_sumcheck_cinf"]);
+            if compact {
+                m.ext_arr16(&e);
+            } else {
+                m.ext_arr(&e);
+            }
             m.arr(&u32_vec(&rd["final_sumcheck_pow_witnesses"]));
             // v5 (D-086 step C): the per-round eq section is GONE. The eq
             // groups are now derived on-chain from the STATEMENT section's
@@ -763,7 +847,7 @@ pub fn encode_bundle(j: &Value, jj: &Value, bin: &[u8]) -> Vec<u8> {
     // ---- header + body ----
     let mut out = vec![0u8; 16];
     out[..4].copy_from_slice(b"WBND");
-    out[4] = 5;
+    out[4] = if compact { 7 } else { 5 };
     out[8..12].copy_from_slice(&(cfg.len() as u32).to_le_bytes());
     out[12..16].copy_from_slice(&(prf.len() as u32).to_le_bytes());
     for w in &cfg {
@@ -803,6 +887,23 @@ pub fn encode_bundle_v6_split(j: &Value, jj: &Value, bin: &[u8]) -> (Vec<u8>, Ve
     let mut out = vec![0u8; 16];
     out[..4].copy_from_slice(b"WBND");
     out[4] = 6;
+    out[8..12].copy_from_slice(&0u32.to_le_bytes());
+    out[12..16].copy_from_slice(&(prfw as u32).to_le_bytes());
+    out.extend_from_slice(&full[16 + cfgw * 4..]);
+    (out, cfg_bytes)
+}
+
+/// The WBND v7 bundle with CONFIG excised: header ver=7, cfgWords=0, then
+/// the compact PROOF + STATEMENT. Same split contract as v6: the caller
+/// ships the returned CONFIG to the chunk satellites and pins its digest.
+#[must_use]
+pub fn encode_bundle_v7_split(j: &Value, jj: &Value, bin: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let full = encode_bundle_v7(j, jj, bin);
+    let (_magic, _ver, cfgw, prfw) = crate::wbnd::header(&full);
+    let cfg_bytes = full[16..16 + cfgw * 4].to_vec();
+    let mut out = vec![0u8; 16];
+    out[..4].copy_from_slice(b"WBND");
+    out[4] = 7;
     out[8..12].copy_from_slice(&0u32.to_le_bytes());
     out[12..16].copy_from_slice(&(prfw as u32).to_le_bytes());
     out.extend_from_slice(&full[16 + cfgw * 4..]);
