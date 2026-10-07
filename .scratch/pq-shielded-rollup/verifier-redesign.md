@@ -1940,3 +1940,155 @@ item: pruned Merkle paths (-66 KB est, batch 26) -> ~356 KB, at which
 point the posted proof is essentially the postcard proof + framing.
 
 33 suites, 160 tests green.
+
+
+---
+
+## Batch 42 — v8 wire: PRUNED round paths (encoder done, export running)
+
+Wire composition measured on v7 (422,200 B): expanded Merkle paths are
+287,776 B (r0 45,728 / r1 63,264 / r2 60,512 / r3 60,512 / r4 50,464 /
+final 7,296) - 68% of the posted bundle. Pruned digest counts (vendor
+PrunedMerklePaths): r0 980, r1 1434, r2 1369, r3 1396, r4 1142 unique
+siblings vs 1480/1720/1720/1720/1480 expanded - saves ~78 KB. v8 lands
+at ~344 KB posted, hitting the ~350 KB ask.
+
+Encoder (wbnd.rs):
+- flat_from_vectors passes through round_pruned_paths -> "pruned_hex"
+  (concatenated per round) + final_pruned_hex.
+- Sink::blob_pruned: same as blob, bit 31 of the byte-count word set
+  (IN-BAND flag pattern again - no bool threading).
+- encode_bundle_impl gains pruned bool; ver byte 8; encode_bundle_v8_split
+  mirrors v7 split (cfgWords=0, CONFIG identical to v6/v7 digest).
+- final paths blob stays expanded (7 KB, no sharing to exploit).
+
+Rust capture (done earlier this batch): whir_walk RoundWalk.pruned_paths +
+TerminalWalk.final_pruned_paths; composed_export emits both.
+
+DECISION - restore strategy: the engine has 425 B margin, so neither the
+frontier walk nor the per-query path check can grow it. GOAT's expand()
+recomputes missing siblings bottom-up - which needs the leaf digests,
+which the engine computes anyway. So instead of expanding to full paths
+and re-verifying per query (double hashing), the satellite does the
+AMORTIZED walk and returns the ROOT: MERKLE_ROOTS entry point.
+  input:  depth, nq, indices[nq], leafDigests[nq], pruned stream
+  output: root (32 B)
+Engine per round: loop 1 extLeaf(row) -> leaf digests in memory; one
+staticcall -> root; compare vs prevCommitment; loop 2 foldRow per query.
+Keccak count drops from sum(nq*depth) = ~8,869 to frontier internal
+nodes ~6,441 (-27%), plus -78 KB calldata (-1.2M) and no per-query path
+decode. Trust: satellite is codehash-pinned, same trust as engine code.
+In-band pruned flag readable at pathsAbs-4 (count word) - no threading.
+
+## Batch 43 - reference verifier research (GOAT / plutus-plonky3 / midfall)
+
+GOATNetwork/bitcoin-stark-verifier (WHIR + Poseidon2 over KoalaBear in
+Bitcoin Script, no OP_CAT) - the closest comp, same protocol family:
+- pruned.rs: ports of p3 walk_frontier/sibling_offset/restore_paths,
+  wire order normative (level 0 first, groups by ascending parent,
+  missing-child positions ascending) - matches our plan exactly.
+- constraint.rs CLOSING SHAPE: Plonky3 evaluates w(R) and f_M(r_fin)
+  separately; constraints ACCUMULATED symbolically, evaluated ONCE at
+  the end against R = concat of all alphas; a constraint from round i
+  reads the LAST n_c coords of R - "no per-round rewriting". Our
+  TerminalWeight already follows this shape.
+- eq_eval identity: prod(1 + 2*z_i*r_i - z_i - r_i) - ONE extension
+  mul per coordinate instead of two. We already use this (WhirGadgets
+  eqEval cites Point::eval_eq).
+- combine_answers: Horner for sigma' (t+1 ext muls vs 2t). We already
+  do factored Horner (v5).
+- budget.rs cost model: "Batching answers into the constraint is not
+  what makes a WHIR verifier expensive; OPENING them is." Confirms our
+  attribution (open+fold 14.6M + terminal 14.8M = 49% of gas).
+- Domain points z_i = domain_gen^index are DERIVED from the squeezed
+  index, not sent (a round costs 1+n ext elements, not n*(1+arity)).
+  We SEND domain_points per round on the wire - candidate to drop
+  (small bytes, but also decode words).
+- Their rate schedule: rate += folding-1 per round from starting 4 -
+  matches our converged 4/4 grid recurrence.
+
+input-output-hk/plutus-plonky3-exploration (Aiken, FRI-based Plonky3):
+- separate proof.ak deserialization module + verify_constraints split;
+  benchmark.md per-op costs. Less transferable (FRI not WHIR, Aiken not
+  EVM); confirms field-op cost tables approach.
+
+midfall proofs/solidity-verifier (Halo2/KZG BLS12-381, codegen):
+- GENERATES the verifier from the VK: all circuit constants become
+  compile-time PUSH immediates - zero runtime CONFIG decode. Our
+  analogue: bake per-deployment constants (schedule, domain points) as
+  immediates in a generated satellite. Decode-side only (~0.5M).
+- separate Halo2QuotientEvaluator satellite contract - same EIP-170
+  pressure, same satellite answer we already use.
+- EIP-2537 precompile smoke tests - irrelevant to hash-based verifiers.
+
+NET for the 30M push: nothing found that beats the amortized-Merkle
+satellite (v8) + query-count reduction. The protocol floor is
+keccak(row->leaf) per query + frontier keccaks + ext4 field arithmetic
+(foldRow, sumcheck, eq evals). To go below ~45M we must cut QUERIES
+(more grinding budget at fixed security level - revisit pow_bits grid,
+GOAT derives queries from the same tradeoff) or fold the per-query
+leaf-hash into the amortized walk (batch rows -> leaves inside the
+satellite, one staticcall per round does leaves+root: saves engine
+memory traffic, not keccaks).
+
+
+
+---
+
+## Batch 44 — v8 pruned Merkle paths + MROOTS satellite; EIP-170 fit (24,456 B)
+
+### v8 wire: pruned per-round Merkle paths
+The expanded per-query paths send every frontier sibling nq times over:
+round r sends nq*depth words where the distinct siblings number only
+~1.4-1.5k. v8 sends each digest ONCE per round (level-major stream,
+same order the p3 walk_frontier consumes) plus the query indices the
+engine already derives. Wire: 422,200 -> **350,772 B** (v7 -> v8, -71,428).
+- Flag: bit 31 of the paths-blob count word (in-band, v6/v7 unchanged).
+- New trailer: pruned_lens u32 array (distinct digest count per round:
+  980/1434/1369/1396/1142) - the engine cannot derive it pre-walk.
+- Final paths blob stays expanded: verifyFinal untouched.
+
+### MROOTS satellite walk (TerminalWeight)
+One staticcall per intermediate round replaces nq Solidity path walks.
+Frame: [MROOTS, depth, nq, nD, indices(nq), leaves(nq), stream(nD),
+expectedRoot] -> reply [MROOTS, root, 0]. Full-Yul walk mirrors
+p3 walk_frontier: insertion-sorted unique seeds, per-level group by
+shr(1,idx), boundary children pull siblings ascending from the stream,
+odd child: right := left; left := stream. Root compared INSIDE the
+satellite (expectedRoot is the engine's own prevCommitment, never proof
+bytes - sound), reverts PrunedRootMismatch (0xaee6dc69) on mismatch;
+the shared _callSatellite bubbles the revert data.
+Yul lessons: revert selectors must be LEFT-aligned (shl(224, sel)) or
+callers see selector 0; unit-test oracle must dedup queries before
+generating the stream and map walk idx -> heap node (n>>lvl)+sibWalk.
+
+### Engine: one call path
+_callSatellite(frame, size) now serves TWIGHT and MROOTS: pin re-check,
+staticcall, revert bubbling. The reply magic/length checks were REMOVED:
+the codehash pin proves the callee is our satellite, which either
+returns 96 B echoing the frame's own magic or reverts - a wrong answer
+is a revert by construction. (Stub tests now assert fail-closed at
+TerminalClaimMismatch instead: a lying satellite still cannot pass.)
+
+### EIP-170 squeeze: 24,941 -> 24,456 (margin 120)
+- frame built incrementally in the query loop (_frameOpen/_framePut,
+  no side arrays): -103
+- shared _callSatellite (was two copies): -88
+- root compare moved into satellite frame: -26
+- reply magic/size checks dropped (pin covers them): -172 <- the big one
+- optimizer_runs 200 -> 100: -96 (gas unchanged within noise; 1000 and
+  25 both WORSE - the size optimum is a plateau at 50-100)
+WhirVerifier runtime now **24,456 B <= 24,576**. forge build --sizes
+still errors on WhirVerifierP (test-only attribution probe, never
+deployed): src-only gate is clean.
+
+### Gas at runs=100 (wrapper, full verify)
+v7 59,773,747 | v8 60,628,306 (+0.85M exec) but -71,428 B calldata
+(~1.14M at 16 gas/B): v8 nets ~0.3M cheaper AND hits the 350 KB ask.
+
+### Next (toward 30M)
+- query-count vs grinding grid (GOAT floor): pow_bits up, queries down.
+- Phase-2 engine reading CONFIG section directly (~57K).
+- statement rebind to D-088 folded root; deeper fusion of foldRow into
+  the satellite (leaves+root in one call: saves engine memory traffic,
+  not keccaks).

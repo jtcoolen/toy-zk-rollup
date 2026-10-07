@@ -87,7 +87,7 @@ contract RecursionChainV6Test is Test {
 
     function test_rejects_bad_header() public view {
         bytes memory b = _bundleV6();
-        b[4] = hex"08"; // version 8 (5/6/7 are the valid wire versions)
+        b[4] = hex"09"; // version 9 (5/6/7/8 are the valid wire versions)
         (bool ok,) = address(verifier).staticcall(abi.encodeCall(WhirVerifierV6.verify, (statement, b)));
         assertFalse(ok, "bad version reverts");
     }

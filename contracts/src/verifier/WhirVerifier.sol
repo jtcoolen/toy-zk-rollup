@@ -236,9 +236,11 @@ contract WhirVerifier is IWhirVerifier {
         cfgWords = _swapBytes(cfgWords);
         prfWords = _swapBytes(prfWords);
         // v5: full bundle. v7: same grammar, PROOF ext arrays compacted to
-        // 16-byte limbs with an in-band flag per array (D-092 batch 41). v6
-        // bundles are re-framed by WhirVerifierV6 and never arrive as 6.
-        if (version != 5 && version != 7) revert BadVersion(version);
+        // 16-byte limbs with an in-band flag per array (D-092 batch 41). v8:
+        // intermediate Merkle paths pruned to the query frontier, digests
+        // amortized across queries (D-092 batch 42). v6 bundles are re-framed
+        // by WhirVerifierV6 and never arrive as 6.
+        if (version != 5 && version != 7 && version != 8) revert BadVersion(version);
         if (proof.length < 20 + (cfgWords + prfWords) * 4) revert ProofTooShort();
         // v5 header tail: u32 LE STATEMENT word count right after PROOF.
         StmRef memory stm;
@@ -525,7 +527,7 @@ contract WhirVerifier is IWhirVerifier {
         RoundPrf memory p,
         WhirVerifierCore.InitialOutput memory init,
         WhirGadgets.ConstraintWeight[] memory constraints
-    ) private pure returns (Threading memory th) {
+    ) private view returns (Threading memory th) {
         Cursors memory cur;
         Step memory st = Step(init.foldedClaim, init.randomness, init.randomness);
         for (uint256 i; i < c.nInter; ++i) {
@@ -542,7 +544,7 @@ contract WhirVerifier is IWhirVerifier {
         Cursors memory cur,
         Step memory st,
         WhirGadgets.ConstraintWeight[] memory constraints
-    ) private pure {
+    ) private view {
         WhirVerifierCore.RoundSchedule memory s;
         s.roundIndex = i;
         s.oodSamples = c.schedOodSamples[i];
@@ -570,10 +572,17 @@ contract WhirVerifier is IWhirVerifier {
         cur.rowOff += nq * input.rowLimbs;
 
         // Every query in round i opens at depth sched_log_folded[i]. The
-        // sibling grid stays in calldata: 750 KB read exactly once.
+        // sibling grid stays in calldata: 750 KB read exactly once. v8
+        // replaces the grid with one pruned stream per round, amortized
+        // across queries and walked once on the satellite.
         uint256 depth = c.schedLogFolded[i];
         input.pathsCdBase = p.pathsAbs + cur.pathOff * 32;
-        cur.pathOff += nq * depth;
+        if (p.prunedLens.length == 0) {
+            cur.pathOff += nq * depth;
+        } else {
+            input.prunedNDigests = p.prunedLens[i];
+            cur.pathOff += input.prunedNDigests;
+        }
 
         input.prevRandomness = st.lastRandomness;
         uint256 scr = p.scLens[i];
@@ -587,6 +596,18 @@ contract WhirVerifier is IWhirVerifier {
 
         WhirVerifierCore.RoundOutput memory out =
             WhirVerifierCore.verifyRound(t, s, input, st.carried);
+
+        // v8: the round authenticated its queries with one amortized pruned
+        // walk instead of per-query paths. The frame is built (top of memory,
+        // reply slot reserved); the satellite walks and returns the root -
+        // compared here against the round's own prevCommitment, so a wrong
+        // or missing stream can only make verification fail, never pass.
+        if (out.frameSize != 0) {
+            // The frame carries the expected root; the pinned satellite
+            // compares and reverts itself, and _callSatellite bubbles its
+            // revert data up unchanged.
+            _callSatellite(out.frameAddr, out.frameSize);
+        }
 
         // This round's constraint: equality groups from its drawn OOD points,
         // selection group from the domain points of its drawn indices.
@@ -710,12 +731,9 @@ contract WhirVerifier is IWhirVerifier {
         uint256[] memory finalPoly,
         uint256[] memory randomness
     ) private view returns (uint256 weight, uint256 value) {
-        // Re-check the pin: the code that runs must be the code that was sized,
-        // reviewed, and deployed alongside this verifier.
-        if (SATELLITE_CODEHASH != SATELLITE.codehash) revert SatelliteUnpinned();
         (uint256 frame, uint256 size) =
             _packTerminalFrame(allR, constraints, finalPoly, randomness);
-        return _callTerminalWeight(frame, size);
+        return _callSatellite(frame, size);
     }
 
     /// Build the TWIGHT frame at the free pointer and return its base and
@@ -854,35 +872,41 @@ contract WhirVerifier is IWhirVerifier {
         }
     }
 
-    /// staticcall the frame and read back [magic, weight, value].
-    function _callTerminalWeight(uint256 frame, uint256 size)
+    /// staticcall the pinned satellite and read back [magic, w, v] (96 B).
+    /// One call path for every frame kind: the terminal weight and the v8
+    /// MROOTS walk both come through here. Because the codehash pin proves
+    /// the callee is OUR satellite - which either returns exactly 96 bytes
+    /// echoing the frame's own magic or reverts - the reply needs no magic
+    /// or length re-check: a wrong answer is a revert, by construction.
+    /// The frame must have 96 bytes of reserved space after it for the reply.
+    function _callSatellite(uint256 frame, uint256 size)
         private
         view
-        returns (uint256 weight, uint256 value)
+        returns (uint256 w, uint256 v)
     {
+        // Re-check the pin: the code that runs must be the code that was
+        // sized, reviewed, and deployed alongside this verifier.
+        if (SATELLITE_CODEHASH != SATELLITE.codehash) revert SatelliteUnpinned();
         // Left-aligned so a 4-byte revert payload carries the selector.
         uint256 failSel = uint256(bytes32(SatelliteCallFailed.selector));
         // Assembly cannot name an immutable; bind them to locals first.
         address satellite = SATELLITE;
-        uint256 magic;
-        uint256 rdSize;
         uint256 reply = frame + size;
         assembly ("memory-safe") {
             let ok := staticcall(gas(), satellite, frame, size, reply, 96)
-            rdSize := returndatasize()
             switch ok
             case 0 {
                 // Bubble the satellite's own revert data when it carried any:
                 // a malformed frame says so instead of vanishing into a bool.
-                switch rdSize
+                let rd := returndatasize()
+                switch rd
                 case 0 { mstore(0, failSel) revert(0, 4) }
-                default { returndatacopy(0, 0, rdSize) revert(0, rdSize) }
+                default { returndatacopy(0, 0, rd) revert(0, rd) }
             }
-            magic := mload(reply)
-            weight := mload(add(reply, 32))
-            value := mload(add(reply, 64))
+            if iszero(ok) { mstore(0, failSel) revert(0, 4) }
+            w := mload(add(reply, 32))
+            v := mload(add(reply, 64))
         }
-        if (rdSize != 96 || magic != TERMINAL_MAGIC) revert SatelliteCallFailed();
     }
 
     // ---------------------------------------------------------------------
@@ -934,6 +958,9 @@ contract WhirVerifier is IWhirVerifier {
         // mediate). _paths reads straight from these offsets.
         uint256 pathsAbs;
         uint256 finalPathsAbs;
+        // v8: per-intermediate digest counts of the pruned stream, in wire
+        // order; empty when the bundle carries expanded paths.
+        uint256[] prunedLens;
         bytes32[] roundCommitments;
         uint256[] oodAnswers;
         uint256[] oodAnswerLens;
@@ -1010,12 +1037,20 @@ contract WhirVerifier is IWhirVerifier {
         {
             uint256 nBytes;
             (nBytes, no) = _word(m, no);
+            // v8: bit 31 of the count word flags a PRUNED stream. Mask it
+            // before advancing the cursor; the flag then selects the
+            // pruned_lens array that follows the blob.
+            bool pruned = nBytes >> 31 == 1;
+            nBytes &= 0x7fff_ffff;
             uint256 abs;
             assembly ("memory-safe") {
                 abs := add(m.offset, mul(no, 4))
             }
             p.pathsAbs = abs;
             no += nBytes / 4;
+            if (pruned) {
+                (p.prunedLens, no) = _arr(m, no);
+            }
         }
         (p.roundCommitments, no) = _blobArr32(m, no);
         (p.oodAnswers, no) = _extArr(m, no);

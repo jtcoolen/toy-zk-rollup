@@ -56,6 +56,16 @@ contract TerminalWeight {
     /// @notice Frame magic: ASCII "TWIGHT".
     uint256 public constant MAGIC = 0x5457_4947_4854;
 
+    /// @notice Second frame magic: ASCII "MROOTS". v8 intermediate rounds
+    /// hand the row decode, fold, and amortized pruned-Merkle walk here in
+    /// one call per round, keeping the engine under its size margin.
+    uint256 public constant MROOTS_MAGIC = 0x4D52_4F4F_5453;
+
+    /// @notice The KoalaBear prime, for row-limb range checks.
+    uint256 private constant P = 0x7F00_0001;
+    /// @notice Montgomery radix for the wire limbs: 2^31 mod P.
+    uint256 private constant MONT = 0x01FF_FFFE;
+
     /// @notice The frame did not start with the magic.
     error BadFrame();
     /// @notice The frame carries trailing or missing words.
@@ -64,6 +74,12 @@ contract TerminalWeight {
     error BadStatement();
     /// @notice A statement matrix claims more variables than the constraint.
     error BadArity(uint256 arity, uint256 numVariables);
+    /// @notice The pruned digest stream ran dry, or carried extra digests:
+    /// the walk's own boundary count (expected) and the wire's count (got)
+    /// disagree. Either direction is fatal - the stream is not this proof's.
+    error SiblingCountMismatch(uint256 expected, uint256 got);
+    /// @notice The frontier walk did not collapse to a single root.
+    error MrootsBadFrontier();
 
     /// Derive the mode-2 group descriptors for one opening round.
     ///
@@ -215,11 +231,169 @@ contract TerminalWeight {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // v8 MROOTS: amortized pruned Merkle root
+    // ---------------------------------------------------------------------
+
+    /// Read the 32-byte frame head (first calldata word) for dispatch.
+    function _head() private pure returns (uint256 h) {
+        assembly ("memory-safe") { h := calldataload(0) }
+    }
+
+    /// One pruned digest from the stream whose first digest sits at absolute
+    /// calldata byte offset base, word k.
+    function _streamDigest(uint256 base, uint256 k) private pure returns (bytes32 d) {
+        assembly ("memory-safe") { d := calldataload(add(base, mul(k, 32))) }
+    }
+
+    /// v8 MROOTS frame:
+    ///   [0] MROOTS_MAGIC
+    ///   [1] depth      path length = log2 folded domain size
+    ///   [2] nq         query count
+    ///   [3] nDigests   pruned stream length for this intermediate
+    ///   [4 .. 4+nq)                 query indices, query order
+    ///   [4+nq .. 4+2nq)             leaf digests, query order
+    ///   [4+2nq .. 4+2nq+nDigests)   pruned digest stream, walk order
+    /// Reply: [MROOTS_MAGIC, root]. The walk mirrors p3-merkle-tree's
+    /// walk_frontier at arity 2: sorted-unique leaves seed one frontier node
+    /// each; per level, nodes sharing a parent hash together and consume
+    /// nothing, lone children pull their sibling from the stream, groups in
+    /// ascending parent order, level-major. The engine compares the returned
+    /// root against its own prevCommitment, so a wrong stream can only make
+    /// verification FAIL - never pass.
+    function _mroots() private pure {
+        assembly ("memory-safe") {
+            let depth := calldataload(32)
+            let nq := calldataload(64)
+            let nD := calldataload(96)
+            if iszero(eq(calldatasize(), mul(add(add(5, mul(2, nq)), nD), 32))) {
+                mstore(0, shl(224, 0x09a205cc)) // BadFrameLength()
+                revert(0, 4)
+            }
+            // The frame's final word is the root the engine expects. The
+            // codehash pin means the engine trusts THIS code, so the
+            // comparison lives here: a mismatch reverts and the shared call
+            // path bubbles it up, costing the engine no second compare.
+            let expectedRoot := calldataload(mul(add(add(4, mul(2, nq)), nD), 32))
+            // Frontier arrays: current + next indices and digests, plus a
+            // 64-byte hash scratch. All sized by nq (frontier never grows).
+            let idxB := mload(0x40)
+            let digB := add(idxB, mul(nq, 32))
+            let nidxB := add(digB, mul(nq, 32))
+            let ndigB := add(nidxB, mul(nq, 32))
+            let scratch := add(ndigB, mul(nq, 32))
+            mstore(0x40, add(scratch, 64))
+            calldatacopy(idxB, 128, mul(nq, 32))
+            calldatacopy(digB, add(128, mul(nq, 32)), mul(nq, 32))
+
+            // Insertion sort by index, carrying digests. nq <= 74.
+            for { let i := 1 } lt(i, nq) { i := add(i, 1) } {
+                let ki := mload(add(idxB, mul(i, 32)))
+                let kd := mload(add(digB, mul(i, 32)))
+                let j := i
+                for { } gt(j, 0) { } {
+                    let pj := mload(add(idxB, mul(sub(j, 1), 32)))
+                    if iszero(gt(pj, ki)) { break }
+                    mstore(add(idxB, mul(j, 32)), pj)
+                    mstore(add(digB, mul(j, 32)), mload(add(digB, mul(sub(j, 1), 32))))
+                    j := sub(j, 1)
+                }
+                mstore(add(idxB, mul(j, 32)), ki)
+                mstore(add(digB, mul(j, 32)), kd)
+            }
+            // Sorted-unique: duplicate query indices share one node.
+            let u := 0
+            for { let i := 0 } lt(i, nq) { i := add(i, 1) } {
+                let ki := mload(add(idxB, mul(i, 32)))
+                if or(iszero(i), iszero(eq(ki, mload(add(idxB, mul(sub(i, 1), 32)))))) {
+                    mstore(add(idxB, mul(u, 32)), ki)
+                    mstore(add(digB, mul(u, 32)), mload(add(digB, mul(i, 32))))
+                    u := add(u, 1)
+                }
+            }
+            if iszero(u) {
+                mstore(0, shl(224, 0x81262fc8)) // MrootsBadFrontier()
+                revert(0, 4)
+            }
+            let streamBase := mul(add(4, mul(2, nq)), 32)
+            let w := 0
+            for { let lvl := 0 } lt(lvl, depth) { lvl := add(lvl, 1) } {
+                let m := 0
+                let i := 0
+                for { } lt(i, u) { } {
+                    let ii := mload(add(idxB, mul(i, 32)))
+                    let p := shr(1, ii)
+                    let left := mload(add(digB, mul(i, 32)))
+                    let right := 0
+                    let paired := 0
+                    if lt(add(i, 1), u) {
+                        if eq(shr(1, mload(add(idxB, mul(add(i, 1), 32)))), p) { paired := 1 }
+                    }
+                    switch paired
+                    case 1 {
+                        right := mload(add(digB, mul(add(i, 1), 32)))
+                        i := add(i, 2)
+                    }
+                    default {
+                        // Boundary child: sibling from the stream. The odd
+                        // child keeps its own digest as the RIGHT input and
+                        // takes the stream digest as LEFT.
+                        switch and(ii, 1)
+                        case 0 { right := calldataload(add(streamBase, mul(w, 32))) }
+                        default {
+                            right := left
+                            left := calldataload(add(streamBase, mul(w, 32)))
+                        }
+                        w := add(w, 1)
+                        i := add(i, 1)
+                    }
+                    mstore(scratch, left)
+                    mstore(add(scratch, 32), right)
+                    mstore(add(nidxB, mul(m, 32)), p)
+                    mstore(add(ndigB, mul(m, 32)), keccak256(scratch, 64))
+                    m := add(m, 1)
+                }
+                // Swap frontiers: current always lives at idxB/digB.
+                let t := idxB
+                idxB := nidxB
+                nidxB := t
+                t := digB
+                digB := ndigB
+                ndigB := t
+                u := m
+            }
+            if iszero(eq(w, nD)) {
+                mstore(0, shl(224, 0xc6de65b0)) // SiblingCountMismatch(uint256,uint256)
+                mstore(4, w)
+                mstore(36, nD)
+                revert(0, 68)
+            }
+            if iszero(eq(u, 1)) {
+                mstore(0, shl(224, 0x81262fc8)) // MrootsBadFrontier()
+                revert(0, 4)
+            }
+            if iszero(eq(mload(digB), expectedRoot)) {
+                mstore(0, shl(224, 0xaee6dc69)) // PrunedRootMismatch()
+                revert(0, 4)
+            }
+            // Reply [magic, root, 0]: the same 96-byte shape as TWIGHT, so
+            // the engine's single satellite-call path reads both.
+            mstore(0, 0x4D524F4F5453) // MROOTS_MAGIC
+            mstore(32, mload(digB))
+            mstore(64, 0)
+            return(0, 96)
+        }
+    }
+
     /// @notice Parse the frame, evaluate the terminal weight and value, and
     /// reply [magic, weight, value]. No mutability modifier: a fallback may
     /// not be declared pure/view, but this body reads no state and the caller
     /// staticcalls it, so ETH can never enter and nothing is written.
     fallback() external {
+        if (_head() == MROOTS_MAGIC) {
+            // _mroots answers via the return opcode; control never returns.
+            _mroots();
+        }
         uint256[] memory allR;
         WhirGadgets.ConstraintWeight[] memory constraints;
         uint256[] memory finalPoly;

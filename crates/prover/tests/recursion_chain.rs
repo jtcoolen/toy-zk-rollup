@@ -258,6 +258,74 @@ fn export_chain_bundle_v7() {
         chunks.len()
     );
 }
+
+/// D-092 v8 export: same chain, compact ext limbs + PRUNED round paths,
+/// (batch 42). Writes its OWN config/chunks/sidecar so the v6 vectors stay
+/// untouched; CONFIG is circuit-derived so the two configs should match.
+#[test]
+#[ignore = "two recursion layers: run with --ignored"]
+fn export_chain_bundle_v8() {
+    let inner = InnerWhirConfig::new_with(CHAIN_LOG_MAX_LDE, CAP_HEIGHT, rate_inner())
+        .expect("inner config");
+    let air = FibonacciAir {};
+    let trace = generate_trace_rows::<F>(0, 1, BASE_TRACE);
+    let pis = vec![F::ZERO, F::ONE, fibonacci_output(BASE_TRACE)];
+
+    let base = p3_uni_stark::prove(&inner, &air, trace, &pis).expect("base prove");
+    let mut rc = build_recursion_circuit(&inner, &air, &base, &pis).expect("rc1");
+    for _ in 1..=2 {
+        let (proof, verifier) =
+            settle_recursion_circuit_with(&rc, inner.clone()).expect("settle InSC");
+        verifier.verify(&proof, &pis).expect("InSC layer verifies");
+        rc = build_batch_recursion_circuit(&inner, &verifier, &proof, &pis)
+            .expect("next recursion circuit");
+    }
+
+    let (bundle, jj, blob) =
+        prover::composed_export::settlement_bundle_with_blob(&rc, &pis, rate_final())
+            .expect("composed bundle for the chain");
+    let _ = &bundle;
+    let flat = prover::wbnd::flat_from_vectors(&jj);
+    let (v7, cfg) = prover::wbnd::encode_bundle_v8_split(&flat, &jj, &blob);
+    let chunks = prover::wbnd::chunk_config(&cfg, 24000);
+    let joined: Vec<u8> = chunks.iter().flatten().copied().collect();
+    let digest: [u8; 32] = p3_keccak::Keccak256Hash.hash_iter(joined.iter().copied());
+    let mut hexs = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        write!(&mut hexs, "{b:02x}").expect("hex");
+    }
+
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contracts/test/vectors");
+    std::fs::write(format!("{dir}/recursion_chain_bundle_v8.bin"), &v7).expect("write v8");
+    std::fs::write(format!("{dir}/recursion_chain_config_v8.bin"), &cfg).expect("write cfg");
+    for (i, c) in chunks.iter().enumerate() {
+        std::fs::write(format!("{dir}/recursion_chain_config_chunk_v8_{i}.bin"), c)
+            .expect("write chunk");
+    }
+    let stmt: Vec<u64> = pis
+        .iter()
+        .map(p3_field::PrimeField64::as_canonical_u64)
+        .collect();
+    let sidecar = serde_json::json!({
+        "statement": stmt,
+        "bundle_v8_len": v7.len(),
+        "config_len": cfg.len(),
+        "config_digest": format!("0x{}", hexs),
+        "chunk_lens": chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+    });
+    std::fs::write(
+        format!("{dir}/recursion_chain_sidecar_v8.json"),
+        sidecar.to_string(),
+    )
+    .expect("write sidecar v8");
+    println!(
+        "v8 bundle {} B, config {} B, {} chunks",
+        v7.len(),
+        cfg.len(),
+        chunks.len()
+    );
+}
 #[test]
 #[ignore = "writes vectors; run with --release when regenerating"]
 fn export_chain_bundle() {

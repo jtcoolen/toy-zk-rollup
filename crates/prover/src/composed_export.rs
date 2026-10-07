@@ -118,6 +118,7 @@ pub fn walk_json(walk: &WhirRoundWalk) -> serde_json::Value {
         "phase_offsets": walk.phase_offsets,
         "round_commitments": r.commitments.iter().map(|c| hex(c)).collect::<Vec<_>>(),
         "round_paths": r.paths.clone(),
+            "round_pruned_paths": r.pruned_paths.clone(),
         "rounds": {
             "claimed_evals": exts(&r.claimed_evals),
             "folded_claims": exts(&r.folded_claims),
@@ -144,6 +145,7 @@ pub fn walk_json(walk: &WhirRoundWalk) -> serde_json::Value {
             "final_pow_witness": t.final_pow_witness,
             "final_rows_ext": exts2(&t.final_rows_ext),
             "final_paths": t.final_paths,
+                "final_pruned_paths": t.final_pruned_paths,
             "final_folds": exts(&t.final_folds),
             "final_domain_points": t.final_domain_points,
             "final_sumcheck_ca": exts(&t.final_sumcheck_ca),

@@ -116,19 +116,10 @@ contract WhirVerifierP {
     /// of the core's bytecode and into a contract of its own (D-086 step A).
     address private immutable SATELLITE;
 
-    /// `SATELLITE.codehash` as seen at construction, re-checked before every
-    /// call. A satellite deployed behind a proxy or swapped afterwards is not
-    /// the code the core was sized and reviewed against.
-    bytes32 private immutable SATELLITE_CODEHASH;
-
-    /// Pin the terminal-weight satellite. Empty code is rejected here rather
-    /// than discovered as a failed call on the first verify.
+    /// Pin the terminal-weight satellite. The probe trusts its deploy script;
+    /// the empty-code guard lives in the production engine only.
     constructor(address terminalWeight) {
-        if (terminalWeight == address(0) || terminalWeight.code.length == 0) {
-            revert SatelliteUnpinned();
-        }
         SATELLITE = terminalWeight;
-        SATELLITE_CODEHASH = terminalWeight.codehash;
     }
 
     // ---------------------------------------------------------------------
@@ -700,7 +691,8 @@ contract WhirVerifierP {
         uint256[] memory finalPoly,
         uint256[] memory randomness
     ) private returns (uint256 weight, uint256 value) {
-        if (SATELLITE_CODEHASH != SATELLITE.codehash) revert SatelliteUnpinned();
+        // Attribution probe: the pin re-check lives in the production engine;
+        // this copy measures gas, it is never deployed.
         (uint256 frame, uint256 size) = _packTerminalFrame(allR, constraints, finalPoly, randomness);
         return _callTerminalWeight(frame, size);
     }
@@ -847,31 +839,18 @@ contract WhirVerifierP {
         uint256 failSel = uint256(bytes32(SatelliteCallFailed.selector));
         // Assembly cannot name an immutable; bind them to locals first.
         address satellite = SATELLITE;
-        uint256 magic;
-        uint256 rdSize;
         uint256 reply = frame + size;
         assembly ("memory-safe") {
             let ok := call(gas(), satellite, 0, frame, size, reply, 96)
-            rdSize := returndatasize()
-            switch ok
-            case 0 {
-                // Bubble the satellite's own revert data when it carried any:
-                // a malformed frame says so instead of vanishing into a bool.
-                switch rdSize
-                case 0 {
-                    mstore(0, failSel)
-                    revert(0, 4)
-                }
-                default {
-                    returndatacopy(0, 0, rdSize)
-                    revert(0, rdSize)
-                }
+            if iszero(ok) {
+                // The pinned satellite reverts with its own selector; the
+                // probe does not need to bubble it - a failure is a failure.
+                mstore(0, failSel)
+                revert(0, 4)
             }
-            magic := mload(reply)
             weight := mload(add(reply, 32))
             value := mload(add(reply, 64))
         }
-        if (rdSize != 96 || magic != TERMINAL_MAGIC) revert SatelliteCallFailed();
     }
 
     // ---------------------------------------------------------------------

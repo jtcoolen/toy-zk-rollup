@@ -117,9 +117,10 @@ contract WhirVerifierV6 is IWhirVerifier {
             revert BadBundle();
         }
         // v6: standard ext limbs. v7: compact 16-byte ext limbs (batch 41).
-        // The frame stamps whichever version arrived; the engine decodes ext
-        // arrays accordingly. CONFIG is identical between the two.
-        if ((version != 6 && version != 7) || cfgWords != 0) revert BadBundle();
+        // v8: pruned intermediate paths (batch 42). The frame stamps
+        // whichever version arrived; the engine decodes accordingly. CONFIG
+        // is identical across all of them.
+        if ((version != 6 && version != 7 && version != 8) || cfgWords != 0) revert BadBundle();
 
         uint256 cLen = CONFIG_LEN;
         uint256 tail = bundle.length - 16;
@@ -150,8 +151,9 @@ contract WhirVerifierV6 is IWhirVerifier {
             mstore8(add(b, 1), 0x42)
             mstore8(add(b, 2), 0x4E)
             mstore8(add(b, 3), 0x44)
-            // v6 frames as v5 (standard ext limbs); v7 frames as v7 (compact).
-            mstore8(add(b, 4), add(5, mul(gt(version, 6), 2)))
+            // v6 frames as v5 (standard ext limbs); v7 and v8 pass their own
+            // version through unchanged.
+            mstore8(add(b, 4), sub(version, eq(version, 6)))
             let cw := div(cLen, 4)
             let q := add(b, 8)
             mstore8(q, and(cw, 0xff))

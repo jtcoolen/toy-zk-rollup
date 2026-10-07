@@ -124,6 +124,11 @@ pub struct RoundWalk {
     /// rebuilt from each round's pruned multiproof with the verifier's own
     /// restore walk. Round 0 opens base rows, later rounds extension rows.
     pub paths: Vec<Vec<Vec<String>>>,
+    /// v8 wire (D-092 batch 42): the PRUNED multiproof digests themselves,
+    /// per round, in frontier wire order (level 0 first, groups by ascending
+    /// parent, missing child positions ascending). The contract's frontier
+    /// walk consumes exactly this stream - no expansion on the wire.
+    pub pruned_paths: Vec<Vec<String>>,
 }
 
 /// Walk the intermediate WHIR rounds of the verifier transcript.
@@ -161,6 +166,7 @@ pub fn replay_rounds(
         params: Vec::new(),
         commitments: Vec::new(),
         paths: Vec::new(),
+        pruned_paths: Vec::new(),
     };
     // The claim the round sumchecks fold, threaded from the initial phase
     // exactly as the native verifier threads it: each round's constraint adds
@@ -291,6 +297,8 @@ pub fn replay_rounds(
                     .map(|p| p.siblings.iter().map(|d| hex(d)).collect())
                     .collect(),
             );
+            walk.pruned_paths
+                .push(proof.sibling_hashes.iter().map(|d| hex(d)).collect());
         }
         if rows.len() != indices.len() {
             return Err(format!(
@@ -398,6 +406,8 @@ pub struct TerminalWalk {
     /// Per-query Merkle paths for the terminal openings (against the last
     /// round's root), rebuilt with the same walk the verifier runs.
     pub final_paths: Vec<Vec<String>>,
+    /// v8 wire: the terminal phase's PRUNED stream, frontier order.
+    pub final_pruned_paths: Vec<String>,
     /// Each terminal query's folded row at the last round's randomness.
     pub final_folds: Vec<Challenge>,
     /// The terminal queries' domain points (univariate base scalars).
@@ -474,6 +484,8 @@ pub fn replay_terminal(
         .iter()
         .map(|p| p.siblings.iter().map(|d| hex(d)).collect())
         .collect();
+    let final_pruned_paths: Vec<String> =
+        opening.proof.sibling_hashes.iter().map(|d| hex(d)).collect();
     let final_folds: Vec<Challenge> = opening
         .rows
         .iter()
@@ -531,6 +543,7 @@ pub fn replay_terminal(
         final_pow_witness: F::as_canonical_u32(&whir.final_pow_witness),
         final_rows_ext: opening.rows.clone(),
         final_paths,
+        final_pruned_paths,
         final_folds,
         final_domain_points,
         final_sumcheck_ca,

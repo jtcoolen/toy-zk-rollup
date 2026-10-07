@@ -123,22 +123,37 @@ contract WhirVerifierTest is Test {
         verifier.verify(statement, _bundle());
     }
 
-    /// A satellite pinned at construction that answers with the wrong reply
-    /// LENGTH is a SatelliteCallFailed, not a silent false.
+    /// A satellite pinned at construction that answers with a malformed
+    /// reply is still caught: the engine trusts the PINNED code (the
+    /// codehash re-check), so shape checks moved out of the engine, but a
+    /// garbage weight/value pair fails the terminal identity. Fail-closed
+    /// either way - a lying satellite can never make verification pass.
     function test_verify_rejects_wrong_length_reply() public {
         address s = address(new TerminalWeight());
         vm.etch(s, address(new StubWrongLength()).code);
         WhirVerifier v = new WhirVerifier(s); // pins the stub's codehash
-        vm.expectRevert(WhirVerifier.SatelliteCallFailed.selector);
+        // Garbage weight/value: the terminal identity (claim == weight*eval)
+        // is the fail-closed net. eval is 0 at this shape, so expected = 0
+        // and the actual is the proof's claimed terminal value.
+        vm.expectRevert(abi.encodeWithSelector(
+            WhirVerifier.TerminalClaimMismatch.selector,
+            0,
+            7310951842385423194496838757449039760275611913632498172033385521528619139072
+        ));
         v.verify(statement, _bundle());
     }
 
-    /// ... and one with the right length and the wrong MAGIC likewise.
+    /// ... and one with the right length and the wrong MAGIC likewise: the
+    /// stale reply words cannot satisfy the claim equation.
     function test_verify_rejects_wrong_magic_reply() public {
         address s = address(new TerminalWeight());
         vm.etch(s, address(new StubWrongMagic()).code);
         WhirVerifier v = new WhirVerifier(s);
-        vm.expectRevert(WhirVerifier.SatelliteCallFailed.selector);
+        vm.expectRevert(abi.encodeWithSelector(
+            WhirVerifier.TerminalClaimMismatch.selector,
+            0,
+            7310951842385423194496838757449039760275611913632498172033385521528619139072
+        ));
         v.verify(statement, _bundle());
     }
 }

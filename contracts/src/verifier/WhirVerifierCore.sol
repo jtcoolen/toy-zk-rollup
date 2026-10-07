@@ -400,6 +400,12 @@ library WhirVerifierCore {
         /// source above. All queries share one depth, so query q's path starts
         /// at `pathsCdBase + q*depth*32`.
         uint256 pathsCdBase;
+        /// v8: digest count of this round's PRUNED digest stream (wire
+        /// pruned_lens[i]), or 0 when the round carries expanded paths. When
+        /// non-zero, pathsCdBase points at the stream instead of the query
+        /// grid and the per-query path decode is replaced by ONE amortized
+        /// frontier walk on the satellite, checked against prevCommitment.
+        uint256 prunedNDigests;
         /// The commitment the queries open against: the previous round's root,
         /// or the batch commitment for round 0.
         bytes32 prevCommitment;
@@ -434,6 +440,14 @@ library WhirVerifierCore {
         /// needs them to rebuild each query's domain point (g^index) for the
         /// constraint weights without trusting proof bytes for it (D-072).
         uint256[] queryIndices;
+        /// v8: MROOTS frame address and byte size this round built (size 0
+        /// when the round carried expanded paths). The frame sits at the top
+        /// of memory with a 96-byte reply slot reserved after it; the caller
+        /// staticcalls the satellite through callSatellite - the same helper
+        /// the terminal weight uses - and checks the root against the round's
+        /// prevCommitment.
+        uint256 frameAddr;
+        uint256 frameSize;
     }
 
     /// A round carries the wrong number of OOD answers for its shape.
@@ -446,6 +460,7 @@ library WhirVerifierCore {
     /// The opened rows do not tile the flattened buffer, or a row's width
     /// disagrees with the fold point that must fold it.
     error RowBufferMismatch(uint256 expected, uint256 actual);
+
 
     /// Replay one intermediate WHIR round.
     ///
@@ -551,6 +566,56 @@ library WhirVerifierCore {
         }
     }
 
+    /// v8: one amortized pruned-Merkle walk per round, on the satellite
+    /// (TerminalWeight, MROOTS entry). The frame is
+    /// [magic, depth, nq, nDigests, indices..., leaves..., stream...];
+    /// _frameOpen allocates it and copies the stream, _framePut drops each
+    /// query's (index, leaf) in as the fold loop produces them - no side
+    /// arrays, no second pass. The frame travels out through RoundOutput
+    /// (.frameSize): the engine staticcalls the satellite - it already owns
+    /// that machinery for the terminal weight - and compares the root, so
+    /// the core carries no second call path.
+    function _frameOpen(
+        uint256 depth,
+        uint256 nq,
+        uint256 nDigests,
+        uint256 streamCdBase,
+        bytes32 expectedRoot
+    ) private pure returns (uint256 frame, uint256 size) {
+        assembly ("memory-safe") {
+            // +1 word: the expected root rides at the frame's tail, so the
+            // pinned satellite compares it itself and reverts on mismatch -
+            // the engine needs no second comparison path.
+            size := mul(add(add(5, mul(2, nq)), nDigests), 32)
+            frame := mload(0x40)
+            // Reserve the frame plus the 96-byte reply slot the shared
+            // satellite call writes into, so later allocations cannot
+            // clobber either.
+            mstore(0x40, add(frame, add(size, 96)))
+            mstore(frame, 0x4D524F4F5453) // "MROOTS"
+            mstore(add(frame, 32), depth)
+            mstore(add(frame, 64), nq)
+            mstore(add(frame, 96), nDigests)
+            calldatacopy(add(frame, mul(add(4, mul(2, nq)), 32)), streamCdBase, mul(nDigests, 32))
+            mstore(add(frame, mul(add(add(4, mul(2, nq)), nDigests), 32)), expectedRoot)
+        }
+    }
+
+
+
+    function _framePut(
+        uint256 frame,
+        uint256 nq,
+        uint256 q,
+        uint256 idx,
+        bytes32 leaf
+    ) private pure {
+        assembly ("memory-safe") {
+            mstore(add(frame, add(128, mul(q, 32))), idx)
+            mstore(add(frame, add(add(128, mul(nq, 32)), mul(q, 32))), leaf)
+        }
+    }
+
     function verifyRound(
         Transcript memory t,
         RoundSchedule memory s,
@@ -617,6 +682,13 @@ library WhirVerifierCore {
         uint256[] memory elems = new uint256[](input.rowElems);
         uint256[] memory flat = input.rowsFlat;
         uint256 rowsCd = input.rowsCdBase;
+        uint256 frame;
+        if (input.prunedNDigests != 0) {
+            (frame, out.frameSize) = _frameOpen(
+                input.logFoldedDomainSize, input.numQueries, input.prunedNDigests,
+                input.pathsCdBase, input.prevCommitment
+            );
+        }
         for (uint256 q; q < input.numQueries; ++q) {
             // One pass produces the packed fold inputs AND the authenticated
             // leaf: the leaf covers the flat wire limbs (Montgomery form),
@@ -631,17 +703,33 @@ library WhirVerifierCore {
                 input.rowElems,
                 input.rowsAreBase
             );
-            out.folds[q] = StirOpenings.openAndFoldLeaf(
-                input.prevCommitment,
-                indices[q],
-                input.logFoldedDomainSize,
-                leaf,
-                elems,
-                input.pathsFlat,
-                q * input.logFoldedDomainSize,
-                input.pathsCdBase == 0 ? 0 : input.pathsCdBase + q * input.logFoldedDomainSize * 32,
-                input.prevRandomness
-            );
+            if (frame != 0) {
+                // v8: no per-query path walk here. The fold needs only the
+                // row; authentication moves to one amortized walk after the
+                // loop. This query's (index, leaf) drops straight into the
+                // frame - index at word 4+q, leaf at word 4+nq+q - so the
+                // loop needs no side arrays and no second pass.
+                _framePut(frame, input.numQueries, q, indices[q], leaf);
+                out.folds[q] = StirOpenings.foldRow(elems, input.prevRandomness);
+            } else {
+                out.folds[q] = StirOpenings.openAndFoldLeaf(
+                    input.prevCommitment,
+                    indices[q],
+                    input.logFoldedDomainSize,
+                    leaf,
+                    elems,
+                    input.pathsFlat,
+                    q * input.logFoldedDomainSize,
+                    input.pathsCdBase == 0 ? 0 : input.pathsCdBase + q * input.logFoldedDomainSize * 32,
+                    input.prevRandomness
+                );
+            }
+        }
+        if (frame != 0) {
+            // The frame (plus its reserved reply slot) sits at the top of
+            // memory; the engine staticcalls the satellite with it through
+            // callSatellite and checks the root against prevCommitment.
+            out.frameAddr = frame;
         }
 
         // --- 6: round batching challenge ----------------------------------------------

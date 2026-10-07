@@ -94,6 +94,22 @@ impl Sink {
             i += 4;
         }
     }
+    /// v8 pruned sibling stream: like `blob`, but bit 31 of the byte count
+    /// is the pruned flag. The contract restores per-query paths from this
+    /// stream with the vendor frontier walk (one sibling per level per
+    /// unique query index), so the count must equal unique_indices * depth
+    /// * 32 - the decoder validates it in-band.
+    fn blob_pruned(&mut self, bytes: &[u8]) {
+        self.word(bytes.len() as u32 | 0x8000_0000);
+        let mut i = 0;
+        while i < bytes.len() {
+            let mut buf = [0u8; 4];
+            let n = 4usize.min(bytes.len() - i);
+            buf[..n].copy_from_slice(&bytes[i..i + n]);
+            self.word(u32::from_le_bytes(buf));
+            i += 4;
+        }
+    }
     /// Packed ext elements (each a 64-hex-char string): byte count + raw bytes.
     fn ext_arr(&mut self, hexes: &[String]) {
         let bytes: Vec<u8> = hexes.iter().flat_map(|h| hex_to_bytes(h)).collect();
@@ -230,6 +246,11 @@ pub fn flat_from_vectors(j: &Value) -> Value {
         // Paths: one hex blob + per-path node counts.
         let mut paths_hex = String::new();
         let mut path_lens: Vec<u32> = Vec::new();
+        // v8: the pruned streams, concatenated in round order (frontier
+        // order within each round). The contract restores per-query paths
+        // from this stream with the same frontier walk the prover ran.
+        let mut pruned_hex = String::new();
+        let mut pruned_lens: Vec<u32> = Vec::new();
         for round_paths in as_arr(&w["round_paths"]) {
             for p in as_arr(round_paths) {
                 for node in as_arr(p) {
@@ -237,6 +258,12 @@ pub fn flat_from_vectors(j: &Value) -> Value {
                 }
                 path_lens.push(as_arr(p).len() as u32);
             }
+        }
+        for round_pruned in as_arr(&w["round_pruned_paths"]) {
+            for node in as_arr(round_pruned) {
+                pruned_hex.push_str(node.as_str().expect("hex node"));
+            }
+            pruned_lens.push(as_arr(round_pruned).len() as u32);
         }
 
         // Claim permutation: proof order -> constraint (placement) order.
@@ -329,6 +356,11 @@ pub fn flat_from_vectors(j: &Value) -> Value {
             "rows_is_base": rows_is_base,
             "paths_hex": paths_hex,
             "path_lens": path_lens,
+            "pruned_hex": pruned_hex,
+            "pruned_lens": pruned_lens,
+            "final_pruned_hex": w["terminal"]["final_pruned_paths"].as_array()
+                .map(|a| a.iter().map(|n| n.as_str().unwrap()).collect::<String>())
+                .unwrap_or_default(),
             "final_poly": flat_ext(&w["terminal"]["final_poly"]),
             "final_pow_witness": mont(as_u64(&w["terminal"]["final_pow_witness"])),
             "final_rows_ext": as_arr(&w["terminal"]["final_rows_ext"]).iter().flat_map(|row| as_arr(row).iter().flat_map(u32s)).collect::<Vec<_>>(),
@@ -634,7 +666,7 @@ fn constraints_section(j: &Value, jj: &Value) -> Vec<u32> {
 /// test proves it against the committed block bundle.
 #[must_use]
 pub fn encode_bundle(j: &Value, jj: &Value, bin: &[u8]) -> Vec<u8> {
-    encode_bundle_impl(j, jj, bin, false)
+    encode_bundle_impl(j, jj, bin, false, false)
 }
 
 /// v7: same grammar, version byte 7, and every PROOF-section ext array
@@ -643,10 +675,26 @@ pub fn encode_bundle(j: &Value, jj: &Value, bin: &[u8]) -> Vec<u8> {
 /// so a v7 bundle's CONFIG digest matches its v5 sibling.
 #[must_use]
 pub fn encode_bundle_v7(j: &Value, jj: &Value, bin: &[u8]) -> Vec<u8> {
-    encode_bundle_impl(j, jj, bin, true)
+    encode_bundle_impl(j, jj, bin, true, false)
 }
 
-fn encode_bundle_impl(j: &Value, jj: &Value, bin: &[u8], compact: bool) -> Vec<u8> {
+/// v8: v7 plus PRUNED per-round Merkle paths. The round paths blob carries
+/// the vendor frontier stream (shared siblings stored once) with bit 31 of
+/// its byte count set; the contract restores one full path per query with
+/// the same walk the prover ran (batch 42). The final-round blob stays
+/// expanded - 7 KB, no sharing to exploit. CONFIG/STATEMENT unchanged.
+#[must_use]
+pub fn encode_bundle_v8(j: &Value, jj: &Value, bin: &[u8]) -> Vec<u8> {
+    encode_bundle_impl(j, jj, bin, true, true)
+}
+
+fn encode_bundle_impl(
+    j: &Value,
+    jj: &Value,
+    bin: &[u8],
+    compact: bool,
+    pruned: bool,
+) -> Vec<u8> {
     let batch = split_batch(bin, jj);
 
     // CONSTRAINTS (trusted setup, appended to CONFIG in v4).
@@ -755,7 +803,16 @@ fn encode_bundle_impl(j: &Value, jj: &Value, bin: &[u8], compact: bool) -> Vec<u
             }
             m.arr(&u32_vec(&rd["initial_sumcheck_pow_witnesses"]));
             m.arr(&u32_vec(&rd["rows_flat"]));
-            m.blob(&hex_to_bytes(rd["paths_hex"].as_str().unwrap()));
+            if pruned {
+                m.blob_pruned(&hex_to_bytes(rd["pruned_hex"].as_str().unwrap()));
+                // Per-intermediate digest counts. The engine cannot know the
+                // unique-query count, so it cannot advance its cursor through
+                // the concatenated stream without this; the satellite
+                // re-validates each count against its own walk.
+                m.arr(&u32_vec(&rd["pruned_lens"]));
+            } else {
+                m.blob(&hex_to_bytes(rd["paths_hex"].as_str().unwrap()));
+            }
             m.blob(&hex_to_bytes(rd["round_commitments_hex"].as_str().unwrap()));
             let e = hex_strings(&rd["ood_answers"]);
             if compact {
@@ -847,7 +904,7 @@ fn encode_bundle_impl(j: &Value, jj: &Value, bin: &[u8], compact: bool) -> Vec<u
     // ---- header + body ----
     let mut out = vec![0u8; 16];
     out[..4].copy_from_slice(b"WBND");
-    out[4] = if compact { 7 } else { 5 };
+    out[4] = if pruned { 8 } else if compact { 7 } else { 5 };
     out[8..12].copy_from_slice(&(cfg.len() as u32).to_le_bytes());
     out[12..16].copy_from_slice(&(prf.len() as u32).to_le_bytes());
     for w in &cfg {
@@ -904,6 +961,24 @@ pub fn encode_bundle_v7_split(j: &Value, jj: &Value, bin: &[u8]) -> (Vec<u8>, Ve
     let mut out = vec![0u8; 16];
     out[..4].copy_from_slice(b"WBND");
     out[4] = 7;
+    out[8..12].copy_from_slice(&0u32.to_le_bytes());
+    out[12..16].copy_from_slice(&(prfw as u32).to_le_bytes());
+    out.extend_from_slice(&full[16 + cfgw * 4..]);
+    (out, cfg_bytes)
+}
+
+/// The WBND v8 bundle with CONFIG excised: header ver=8, cfgWords=0, then
+/// the compact PROOF (pruned round paths) + STATEMENT. Same split contract
+/// as v6/v7: the caller ships the returned CONFIG to the chunk satellites
+/// and pins its digest (identical CONFIG to v6/v7).
+#[must_use]
+pub fn encode_bundle_v8_split(j: &Value, jj: &Value, bin: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let full = encode_bundle_v8(j, jj, bin);
+    let (_magic, _ver, cfgw, prfw) = crate::wbnd::header(&full);
+    let cfg_bytes = full[16..16 + cfgw * 4].to_vec();
+    let mut out = vec![0u8; 16];
+    out[..4].copy_from_slice(b"WBND");
+    out[4] = 8;
     out[8..12].copy_from_slice(&0u32.to_le_bytes());
     out[12..16].copy_from_slice(&(prfw as u32).to_le_bytes());
     out.extend_from_slice(&full[16 + cfgw * 4..]);
