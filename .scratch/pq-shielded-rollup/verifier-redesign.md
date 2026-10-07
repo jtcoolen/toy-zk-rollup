@@ -1765,3 +1765,36 @@ WhirGadgets.
 After that the attribution (recursion chain, v5) is: open+fold 14.6M,
 constraint identity 10.0M, initial phases 7.6M, terminal 18.4M, final STIR
 3.4M — the engine items now dominate again, which is Phase 2's job.
+
+## Batch 35 — selector/virtual register fusion (eval 16.2M -> 15.1M)
+
+Follow-ups on batch 34, all bit-identical (32 suites green):
+
+* _mulByVirtualFactor: the virtual branch's raw *= 1-r-c+2r(x)c fused in
+  registers (4P bias, lane 0 carries +1), twin of _mulBySelectorFactor.
+  (First attempt shipped e1/e2/e3 with mul(2,t0) instead of t1/t2/t3 -
+  caught by the parity tests, TerminalClaimMismatch, fixed.)
+* _mulExt: plain register ext4 product. eqSelectorValue now uses
+  _mulExt(s, r) for set bits and _mulBySelectorFactor(s, r, 0) for clear
+  bits (its factor is exactly (1-r) + r(x)0).
+* FAILED EXPERIMENT, reverted: fusing the mode-2 Horner mul(w, gamma) and
+  base x selector via _mulExt made it 0.1M WORSE (15.129 -> 15.244M) -
+  the packed KoalaBearExt4.mul is already inlined by the optimizer at
+  those sites and the private-assembly call overhead dominates. Lesson:
+  register fusion pays where the packed chain is long (arity loops,
+  selector products); it does not pay on single muls in hot loops.
+
+Measured: constraint eval 16.23M -> 15.13M; recursion-chain v5 verify
+66.82M -> 65.73M; terminal identity 18.37M -> 17.27M; TOTAL accounted
+56.6M -> 55.5M.
+
+Remaining in the 15.1M: eqSelectorValue still walks nv (up to 12) packed
+sub/mul pairs per group for CLEAR bits only via the fused path; set bits
+use _mulExt. The per-group Horner mul+add (~1.6k each x 501 x 5 rounds)
+is ~4M and resists fusion (above). The base per run is now cheap. Further
+satellite gains need the Phase-2 engine (direct extcodecopy CONFIG, no
+re-frame ~6.2M) or a wire change (precomputed selector products per
+column - the prover could post the nv-bit selector value... but that is
+DERIVED from transcript challenges, not proof data: cannot post).
+
+Next: Phase 2 engine work per the running plan.

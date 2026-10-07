@@ -215,14 +215,8 @@ library WhirGadgets {
             uint256 raw = KoalaBearExt4.ONE;
             uint256 cc = zeta;
             for (uint256 i = arity; i > 0; --i) {
-                uint256 rr = localR[i - 1];
-                raw = KoalaBearExt4.mul(
-                    raw,
-                    KoalaBearExt4.add(
-                        KoalaBearExt4.sub(KoalaBearExt4.sub(KoalaBearExt4.ONE, rr), cc),
-                        KoalaBearExt4.mul(KoalaBearExt4.add(rr, rr), cc)
-                    )
-                );
+                // raw *= 1 - r - c + 2 r(x) c, fused in registers (batch 34).
+                raw = _mulByVirtualFactor(raw, localR[i - 1], cc);
                 cc = KoalaBearExt4.square(cc);
             }
             return raw;
@@ -297,10 +291,12 @@ library WhirGadgets {
         uint256 s = KoalaBearExt4.ONE;
         for (uint256 j; j < nv; ++j) {
             uint256 r = localR[arity + j];
-            uint256 bit = (selIndex >> (nv - 1 - j)) & 1;
-            s = KoalaBearExt4.mul(
-                s, bit == 1 ? r : KoalaBearExt4.sub(KoalaBearExt4.ONE, r)
-            );
+            bool one = ((selIndex >> (nv - 1 - j)) & 1) == 1;
+            // Register-fused factors (batch 34): bit set -> s(x)r via _mulExt;
+            // bit clear -> s(x)(1-r) via _mulBySelectorFactor with c = 0, whose
+            // factor is exactly (1-r) + r(x)0. One reduction per lane instead
+            // of the packed mul/sub pair (~1.6k -> ~350 gas).
+            s = one ? _mulExt(s, r) : _mulBySelectorFactor(s, r, 0);
         }
         return s;
     }
@@ -343,6 +339,86 @@ library WhirGadgets {
             let e1 := add(add(t1, mul(3, P)), sub(P, r1))
             let e2 := add(add(t2, mul(3, P)), sub(P, r2))
             let e3 := add(add(t3, mul(3, P)), sub(P, r3))
+
+            let u0 := add(mul(a0, e0), mul(W, add(add(mul(a1, e3), mul(a2, e2)), mul(a3, e1))))
+            let u1 := add(add(mul(a0, e1), mul(a1, e0)), mul(W, add(mul(a2, e3), mul(a3, e2))))
+            let u2 := add(add(add(mul(a0, e2), mul(a1, e1)), mul(a2, e0)), mul(W, mul(a3, e3)))
+            let u3 := add(add(add(mul(a0, e3), mul(a1, e2)), mul(a2, e1)), mul(a3, e0))
+            out :=
+                or(
+                    or(shl(224, mod(u0, P)), shl(192, mod(u1, P))),
+                    or(shl(160, mod(u2, P)), shl(128, mod(u3, P)))
+                )
+        }
+    }
+
+    /// Plain ext4 product in registers: unpack both, schoolbook with the W = 3
+    /// reduction x^4 = W, one mod per lane (batch 34). The packed KoalaBearExt4
+    /// mul re-packs lanes between the partial products; here they never leave
+    /// the registers. Same value, same lane bounds as the twins above.
+    function _mulExt(uint256 a, uint256 b) private pure returns (uint256 out) {
+        assembly ("memory-safe") {
+            let P := 0x7f000001
+            let M := 0xffffffff
+            let W := 3
+            let a0 := shr(224, a)
+            let a1 := and(shr(192, a), M)
+            let a2 := and(shr(160, a), M)
+            let a3 := and(shr(128, a), M)
+            let b0 := shr(224, b)
+            let b1 := and(shr(192, b), M)
+            let b2 := and(shr(160, b), M)
+            let b3 := and(shr(128, b), M)
+            let u0 := add(mul(a0, b0), mul(W, add(add(mul(a1, b3), mul(a2, b2)), mul(a3, b1))))
+            let u1 := add(add(mul(a0, b1), mul(a1, b0)), mul(W, add(mul(a2, b3), mul(a3, b2))))
+            let u2 := add(add(add(mul(a0, b2), mul(a1, b1)), mul(a2, b0)), mul(W, mul(a3, b3)))
+            let u3 := add(add(add(mul(a0, b3), mul(a1, b2)), mul(a2, b1)), mul(a3, b0))
+            out :=
+                or(
+                    or(shl(224, mod(u0, P)), shl(192, mod(u1, P))),
+                    or(shl(160, mod(u2, P)), shl(128, mod(u3, P)))
+                )
+        }
+    }
+
+    /// `acc * (1 - r - c + 2 r (x) c)` in registers, the virtual-group twin of
+    /// `eq_poly_eval` (batch 34). Term biased positive by 4P per lane:
+    /// 1 - r - c + 2t + 4P >= 1 - 2(P-1) + 4P > 0, and the +4P is a multiple of
+    /// P so the deferred mod erases it. Same lane bounds as the selector twin
+    /// (t < 13 P**2, e < 26 P**2 + 5P, u < 2**101): bit-identical to the
+    /// three-call formulation it replaces.
+    function _mulByVirtualFactor(uint256 acc, uint256 r, uint256 c)
+        private
+        pure
+        returns (uint256 out)
+    {
+        assembly ("memory-safe") {
+            let P := 0x7f000001
+            let M := 0xffffffff
+            let W := 3
+            let a0 := shr(224, acc)
+            let a1 := and(shr(192, acc), M)
+            let a2 := and(shr(160, acc), M)
+            let a3 := and(shr(128, acc), M)
+            let r0 := shr(224, r)
+            let r1 := and(shr(192, r), M)
+            let r2 := and(shr(160, r), M)
+            let r3 := and(shr(128, r), M)
+            let c0 := shr(224, c)
+            let c1 := and(shr(192, c), M)
+            let c2 := and(shr(160, c), M)
+            let c3 := and(shr(128, c), M)
+
+            let t0 := add(mul(r0, c0), mul(W, add(add(mul(r1, c3), mul(r2, c2)), mul(r3, c1))))
+            let t1 := add(add(mul(r0, c1), mul(r1, c0)), mul(W, add(mul(r2, c3), mul(r3, c2))))
+            let t2 := add(add(add(mul(r0, c2), mul(r1, c1)), mul(r2, c0)), mul(W, mul(r3, c3)))
+            let t3 := add(add(add(mul(r0, c3), mul(r1, c2)), mul(r2, c1)), mul(r3, c0))
+
+            // term = 1 - r - c + 2t, biased by 4P; lane 0 carries the +1.
+            let e0 := add(add(mul(2, t0), mul(4, P)), add(1, sub(sub(P, r0), c0)))
+            let e1 := add(add(mul(2, t1), mul(4, P)), sub(sub(P, r1), c1))
+            let e2 := add(add(mul(2, t2), mul(4, P)), sub(sub(P, r2), c2))
+            let e3 := add(add(mul(2, t3), mul(4, P)), sub(sub(P, r3), c3))
 
             let u0 := add(mul(a0, e0), mul(W, add(add(mul(a1, e3), mul(a2, e2)), mul(a3, e1))))
             let u1 := add(add(mul(a0, e1), mul(a1, e0)), mul(W, add(mul(a2, e3), mul(a3, e2))))
