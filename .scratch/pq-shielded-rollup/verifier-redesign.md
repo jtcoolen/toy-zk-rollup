@@ -2274,3 +2274,57 @@ cb56da2 59.94 -> hot kernel 57.85 -> stage A 55.19 -> +base kernel 55.04 ->
 +CIDNTY 55.59 (deployable). Target 30M: remaining whales (batch 46 attribution,
 inflated ~10-15%): terminal eval 14.5M, rounds 14.0M, identity 9.3M, initial
 7.6M, claim reg 6.4M, foldRow 4.3M, MROOTS 3.1M, calldata floor 5.3M.
+
+
+## Batch 49 — regenerated V8P attribution probe; fresh phase table (HEAD c72f3e3/d0df2d8)
+
+The probe had drifted (frozen at cb56da2, pre-CIDNTY). Regenerated
+`test/WhirVerifierCoreV8P.sol` + `test/WhirVerifierV8P.sol` from the CURRENT
+engine + core by anchor-patching (imports rewritten to ../, library renamed
+…V8P, Transcript gains acc/base, engine verify() drops view/override and
+threads acc; taps identical slots to before). Build clean, probe verifies the
+real floor-30 v8 bundle (512,204 B spliced wire).
+
+Fresh probe table (gasleft taps, ~1.6x inflated vs wrapper 55.59M — shares
+are the signal; TOTAL accounted 89.46M):
+
+| phase | probe gas | share |
+|---|---|---|
+| terminal identity (TWIGHT satellite) | 14,538,730 | 16.3% |
+| query loop total | 10,501,285 | 11.7% |
+| — _loadRowFused | 5,137,428 | 5.7% |
+| — StirOpenings.foldRow | 4,343,598 | 4.9% |
+| — _framePut | 87,366 | 0.1% |
+| constraint identity (CIDNTY satellite) | 8,583,433 | 9.6% |
+| verifyInitial claim registration | 7,356,689 | 8.2% |
+| verifyInitial sumcheck | 199,962 | 0.2% |
+| verifyFinal | 3,381,439 | 3.8% |
+| MROOTS satellite | 3,100,576 | 3.5% |
+| constraint weight (expand/powConst) | 1,385,057 | 1.5% |
+| phases 6-7 (round claim fold) | 624,422 | 0.7% |
+| round decode (all 5) | 676,333 | 0.8% |
+| phases 1-4 (transcript draws) | 347,889 | 0.4% |
+| batch transcript | 71,599 | 0.1% |
+| decode + statement | 7,580 | 0.0% |
+
+Per-round (initial claim reg / verifyRound loop / MROOTS / terminal):
+r0 309k / 1.81M / 499k / 1.18M · r1 2.27M / 2.22M / 705k / 4.83M ·
+r2 2.63M / 2.26M / 662k / 2.91M · r3 1.01M / 2.29M / 673k / 2.59M ·
+r4 1.14M / 1.92M / 561k / 3.02M.
+
+Readings:
+- The CONFIG-walk family (terminal 14.5 + CIDNTY 8.6 + claim reg 7.4 + weight
+  1.4 = 31.9M probe ≈ 36%) is confirmed as the whale cluster; r1's terminal
+  identity (4.83M) is the single hottest per-round item.
+- foldRow ≈ 78k probe per query (nq 11-14, rowElems 16): ~5k per ext fold
+  step — StirOpenings.foldRow is generic Solidity; a hot assembly kernel like
+  the loader's is the obvious next cut (est. −1.5M real).
+- claim reg varies with each round's bound-eval count (r2 2.63M): pure
+  observeExt absorbs; KeccakChallenger per-absorb overhead is the lever.
+- fp markers show the query loop allocates nothing per query (fp q0 == fp qn)
+  — the loader hot kernels are allocation-free as designed.
+- 0x40 slots (acc 16/17) unused in the regen (harmless zeros).
+
+Next (batch 50): hot assembly foldRow in WhirVerifierCore (rowsAreBase-aware
+fold of rowElems ext elems against prevRandomness), then KeccakChallenger
+absorb-path audit for the claim-reg loop.
