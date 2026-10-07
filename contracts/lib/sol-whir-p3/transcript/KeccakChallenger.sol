@@ -102,6 +102,48 @@ library KeccakChallenger {
         self.inputLen = newLen;
     }
 
+    /// Append nWords little-endian base words verbatim - NO range check.
+    ///
+    /// Byte-identical to observeBasesLE for in-range words: the stored
+    /// bytes are appended in file order either way (the checked path's
+    /// shr/mask dance only validates, it never rewrites). The caller must
+    /// vouch for the data: this is for AUTHENTICATED blobs (the CONFIG
+    /// framing section, digest-pinned at deployment), where a word >= p
+    /// cannot occur without breaking the pin first.
+    function observeBasesLERaw(
+        State memory self,
+        bytes memory data,
+        uint256 off,
+        uint256 nWords
+    ) internal pure {
+        if (off + nWords * 4 > data.length) {
+            revert BasesRange();
+        }
+        if (nWords == 0) {
+            return;
+        }
+        self.outputIndex = 0;
+        uint256 oldLen = self.inputLen;
+        uint256 newLen = oldLen + nWords * 4;
+        _ensureCapacity(self, newLen);
+        bytes memory buffer = self.inputBuffer;
+        assembly ("memory-safe") {
+            let src := add(add(data, 0x20), off)
+            let dst := add(buffer, add(0x20, oldLen))
+            let end := add(src, shl(2, nWords))
+            for { } lt(src, end) { } {
+                // Straight 32-byte word copy: the file-order bytes ARE the
+                // sponge input (little-endian words appended verbatim). The
+                // final partial word overwrites up to 28 bytes past newLen
+                // with garbage - inside the rounded allocation and beyond
+                // inputLen, so never read.
+                mstore(dst, mload(src))
+                src := add(src, 32)
+                dst := add(dst, 32)
+            }
+        }
+        self.inputLen = newLen;
+    }
     /// Absorb one packed extension element - four canonical limbs at bits
     /// 224/192/160/128 - as four Montgomery-converted base words in one pass.
     ///

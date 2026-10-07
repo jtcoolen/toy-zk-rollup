@@ -630,6 +630,8 @@ contract WhirVerifierV8P {
         }
 
         input.prevRandomness = st.lastRandomness;
+        input.satellite = SATELLITE;
+        input.satelliteCodehash = SATELLITE_CODEHASH;
         uint256 scr = p.scLens[i];
         input.sumcheckCA = _slice(p.scA, cur.scOff, scr);
         input.sumcheckCInf = _slice(p.scInf, cur.scOff, scr);
@@ -643,20 +645,6 @@ contract WhirVerifierV8P {
         WhirVerifierCoreV8P.RoundOutput memory out =
             WhirVerifierCoreV8P.verifyRound(t, s, input, st.carried);
         acc[base + 1] += _gr - gasleft();
-
-        // v8: the round authenticated its queries with one amortized pruned
-        // walk instead of per-query paths. The frame is built (top of memory,
-        // reply slot reserved); the satellite walks and returns the root -
-        // compared here against the round's own prevCommitment, so a wrong
-        // or missing stream can only make verification fail, never pass.
-        if (out.frameSize != 0) {
-            // The frame carries the expected root; the pinned satellite
-            // compares and reverts itself, and _callSatellite bubbles its
-            // revert data up unchanged.
-            uint256 _gs = gasleft();
-            _callSatellite(out.frameAddr, out.frameSize);
-            acc[base + 2] += _gs - gasleft();
-        }
 
         // This round's constraint: equality groups from its drawn OOD points,
         // selection group from the domain points of its drawn indices.

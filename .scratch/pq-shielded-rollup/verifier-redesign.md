@@ -2447,3 +2447,62 @@ query kernel is still ~1.8M above bench floor - TerminalWeight is itself a
 constants blob - verify the digest pin first) ~1-2M; (b) split _qfold's per-query
 kernel into a standalone function to help register fusion; (c) the v9 CONFIG
 restructure (TWIGHT 9.1 + CIDNTY 5.4 + framing 3.1 real = the whale cluster).
+
+
+## Batch 52 — fresh probe attribution with QFOLD taps; ranked plan
+
+Regenerated the V8P probe forks from the QFOLD-era src (regen procedure now:
+copy src core -> test/WhirVerifierCoreV8P.sol, rewrite imports to ../src/...,
+add Transcript acc/base, taps: +8 phases1-4 (verifyRound entry), +20 qfold
+pack, +21 qfold satellite, +19 round sumcheck, +12 claim reg, +11 initial
+sumcheck, +24/25/26/27 shape facts; probe engine: fill input.satellite/
+satelliteCodehash, delete the dead MROOTS call block). Probe fork runs ~13%
+hotter than the real build (gasleft taps + acc adds), so treat probe numbers
+as SHARES, not absolutes. Real wrapper today: 55.49M, inner 53.94M.
+
+### Probe table (floor-30 v8 proof, TOTAL accounted 60.99M probe-gas)
+- constraint identity (CIDNTY):        8.60M  (14%)
+- qfold satellite, 5 rounds:  2.227+2.803+2.751+2.765+2.299 = 12.84M (21%)
+- claim reg, 5 rounds:        0.212+1.223+2.235+0.576+0.681 =  4.93M (8%)
+- initial sumcheck:           0.139+1.096+0.446+0.476(+0.505) = ~2.7M
+- verifyFinal:                0.652+0.556+0.468+0.470+1.237 =  3.38M
+- constraint weight (TWIGHT): 0.217+0.309+0.302+0.306+0.257 =  1.39M
+- round sumcheck:             ~0.72M;  phases1-4: ~0.35M
+- round decode (all): 0.69M; batch transcript 0.07M; decode+stmt 0.008M
+- qfold pack: 0.053+0.115+0.168+0.200+0.188 = 0.72M (frame building)
+
+### QFOLD satellite internals (round 0, real-build revert points)
+- r0 satellite call total: 2.227M (probe) — pack 52.7k separate.
+- P2 revert INSIDE _qfold right after the query loop: real-build cumulative
+  3.858M; P1 (before first satellite call) was 3.29M => query loop + entry
+  + pack ≈ 566k => 40.5k per query (nq=14). Bench floor for the same shape
+  (foldRow 11,099 + decode + leaf) ≈ 17k/query => ~2.4x spill tax.
+- P3 (after phase-7 dot, before Merkle walk): 3.900M => dot ≈ 42k (cheap).
+- => pruned Merkle walk r0 ≈ 2.23M - 0.57M - 0.04M ≈ 1.6M — the whale INSIDE
+  the satellite. (Walk does one keccak per internal node + frontier churn.)
+
+### Ranked levers (est. real-gas impact, cheapest first)
+1. FRAMING RAW-APPEND (~1.5-2M): claim reg absorbs 18,072 CONFIG framing
+   words through observeBasesLE (171 gas/word: per-word <p range check +
+   flush). CONFIG is digest-pinned by V6 (constructor pins CONFIG_DIGEST,
+   verify() checks _digest() != configDigest -> ConfigMismatch BEFORE the
+   engine call), so the range check is redundant for framing words. Raw
+   append ~57 gas/word => -1.5-2M. Small, safe, today.
+2. MERKLE WALK OPTIMIZATION (~1-2M): r0 walk 1.6M real for ~nq*depth node
+   hashes. Ideas: avoid frontier array churn (in-place level compaction),
+   skip keccak when both parents identical (dedup already), hoist constant
+   swaps. Medium effort, inside _qfold's Yul.
+3. QFOLD QUERY-LOOP SPLIT (~1-1.5M): 40.5k/query vs ~17k bench floor =
+   spill tax from nested loops in one giant Yul block. Split per-query
+   kernel into its own Yul function (or two-pass structure) to help
+   register allocation. Medium effort.
+4. CIDNTY (8.6M probe): needs pre-parsed constraint tables (v9 CONFIG
+   restructure) — biggest single whale but big effort.
+5. Claim-reg remainder + initial sumcheck: framing absorb is the bulk of
+   claim reg (lever 1 covers it); sumcheck is algebra, hard.
+
+### Actions this batch
+- Executing lever 1: observeBasesLERaw (no range check) for framing absorb
+  path only (t.constants source), gated on the V6 digest pin.
+- Probe forks regenerated and committed (they track src now; regen script
+  embedded above).

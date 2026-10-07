@@ -77,11 +77,13 @@ library WhirVerifierCore {
             revert ConstantsExhausted(4 * n, t.constants.length - t.constOff);
         }
         uint256 end = t.constOff + 4 * n;
-        // One bulk pass: the payload is already in the transcript's byte order
-        // (little-endian words), so the absorber appends it verbatim after a
-        // per-word range check. Byte-identical to the previous per-word
-        // observeBase(swapBytes(..)) loop - pinned by the transcript vectors.
-        t.state.observeBasesLE(t.constants, t.constOff, n);
+        // One bulk pass, NO per-word range check: t.constants is always the
+        // CONFIG framing section (trusted setup, digest-pinned at deployment
+        // - WhirVerifierV6 rejects a chunk set whose keccak != CONFIG_DIGEST
+        // at construction), so a word >= p cannot reach here without breaking
+        // the pin first. The appended bytes are identical to the checked
+        // path - pinned by the transcript vectors.
+        t.state.observeBasesLERaw(t.constants, t.constOff, n);
         t.constOff = end;
     }
 

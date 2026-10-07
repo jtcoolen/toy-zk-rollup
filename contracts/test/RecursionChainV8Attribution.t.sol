@@ -77,7 +77,8 @@ contract RecursionChainV8AttributionTest is Test {
             uint256 base = 10 + r * 32;
             emit log_named_uint("-- initial", p.profileData(base + 0));
             emit log_named_uint("   verifyRound", p.profileData(base + 1));
-            emit log_named_uint("   satellite MROOTS", p.profileData(base + 2));
+            emit log_named_uint("   qfold pack", p.profileData(base + 20));
+        emit log_named_uint("   qfold satellite", p.profileData(base + 21));
             emit log_named_uint("   constraint weight", p.profileData(base + 3));
             emit log_named_uint("   verifyFinal", p.profileData(base + 4));
             emit log_named_uint("   terminal identity", p.profileData(base + 5));

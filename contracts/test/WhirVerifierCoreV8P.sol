@@ -262,6 +262,14 @@ library WhirVerifierCoreV8P {
         InitialInput memory input
     ) internal view returns (InitialOutput memory out) {
         uint256 _gs = gasleft();
+        {
+            uint256 fsum;
+            for (uint256 c; c < s.perClaimConstants.length; ++c) fsum += s.perClaimConstants[c];
+            t.acc[t.base + 27] = fsum;
+        }
+        t.acc[t.base + 24] = input.openingEvals.length;
+        t.acc[t.base + 25] = input.oodAnswers.length;
+        t.acc[t.base + 26] = input.claimWidths.length;
         // --- claim registration ------------------------------------------------
         // Virtual claims: framing, then draw the point, then bind the answer.
         // The drawn point is the virtual eq group's univariate point; v5 keeps
@@ -288,15 +296,9 @@ library WhirVerifierCoreV8P {
             cursor += width;
         }
 
+        t.acc[t.base + 12] += _gs - gasleft();
+        _gs = gasleft();
         // --- batching challenge -------------------------------------------------
-        {
-            uint256 fsum;
-            for (uint256 c; c < s.perClaimConstants.length; ++c) fsum += s.perClaimConstants[c];
-            t.acc[t.base + 27] = fsum;
-        }
-        t.acc[t.base + 24] = input.openingEvals.length;
-        t.acc[t.base + 25] = input.oodAnswers.length;
-        t.acc[t.base + 26] = input.claimWidths.length;
         absorbConstants(t, s.batchingConstants);
         uint256 alpha = drawExt(t);
 
@@ -322,8 +324,6 @@ library WhirVerifierCoreV8P {
             claimed = KoalaBearExt4.add(claimed, KoalaBearExt4.mul(input.oodAnswers[i], power));
             power = KoalaBearExt4.mul(power, alpha);
         }
-        t.acc[t.base + 12] += _gs - gasleft();
-        _gs = gasleft();
 
         // --- initial sumcheck ----------------------------------------------------
         absorbConstants(t, s.sumcheckConstants);
@@ -334,10 +334,10 @@ library WhirVerifierCoreV8P {
         (uint256 folded, uint256[] memory randomness) = SumcheckCore.verifyRounds(
             t.state, claimed, input.roundCA, input.roundCInf, input.powWitnesses, input.powBits
         );
+        t.acc[t.base + 11] += _gs - gasleft();
 
         out.alpha = alpha;
         out.claimedEval = claimed;
-        t.acc[t.base + 11] += _gs - gasleft();
         out.foldedClaim = folded;
         out.randomness = randomness;
     }
@@ -426,6 +426,12 @@ library WhirVerifierCoreV8P {
         /// The previous fold point, packed: the initial sumcheck's randomness
         /// for round 0, the previous round sumcheck's randomness after that.
         uint256[] prevRandomness;
+        /// v9: the pinned satellite the QFOLD frame calls into, and the
+        /// codehash it must present. The engine fills both from its own
+        /// immutables; the core re-checks before every call, so the pin is
+        /// enforced on the path that actually uses it.
+        address satellite;
+        bytes32 satelliteCodehash;
         /// The round sumcheck's round polynomials and witnesses.
         uint256[] sumcheckCA;
         uint256[] sumcheckCInf;
@@ -454,14 +460,6 @@ library WhirVerifierCoreV8P {
         /// needs them to rebuild each query's domain point (g^index) for the
         /// constraint weights without trusting proof bytes for it (D-072).
         uint256[] queryIndices;
-        /// v8: MROOTS frame address and byte size this round built (size 0
-        /// when the round carried expanded paths). The frame sits at the top
-        /// of memory with a 96-byte reply slot reserved after it; the caller
-        /// staticcalls the satellite through callSatellite - the same helper
-        /// the terminal weight uses - and checks the root against the round's
-        /// prevCommitment.
-        uint256 frameAddr;
-        uint256 frameSize;
     }
 
     /// A round carries the wrong number of OOD answers for its shape.
@@ -474,6 +472,10 @@ library WhirVerifierCoreV8P {
     /// The opened rows do not tile the flattened buffer, or a row's width
     /// disagrees with the fold point that must fold it.
     error RowBufferMismatch(uint256 expected, uint256 actual);
+    /// The pinned satellite's runtime code changed after construction.
+    error SatelliteUnpinned();
+    /// The satellite call failed without revert data of its own.
+    error SatelliteCallFailed();
 
 
     /// Replay one intermediate WHIR round.
@@ -594,44 +596,91 @@ library WhirVerifierCoreV8P {
     /// (.frameSize): the engine staticcalls the satellite - it already owns
     /// that machinery for the terminal weight - and compares the root, so
     /// the core carries no second call path.
-    function _frameOpen(
-        uint256 depth,
-        uint256 nq,
-        uint256 nDigests,
-        uint256 streamCdBase,
-        bytes32 expectedRoot
+    /// Pack one round's QFOLD frame at the top of memory (v9). Layout and
+    /// the satellite's contract with it are documented on TerminalWeight._qfold:
+    /// the rows ride INSIDE the frame (the satellite's calldata is the frame,
+    /// not the outer transaction), and the reply is the standard 96-byte
+    /// [magic, root, claimedEval] triple the shared call path reads.
+    function _frameQFold(
+        RoundInput memory input,
+        uint256[] memory indices,
+        uint256 gamma,
+        uint256 carriedClaim
     ) private pure returns (uint256 frame, uint256 size) {
+        uint256 nq = input.numQueries;
+        uint256 nOod = input.oodAnswers.length;
+        uint256 nD = input.prunedNDigests;
+        uint256 rowLimbs = input.rowLimbs;
+        uint256[] memory pr = input.prevRandomness;
+        uint256[] memory ood = input.oodAnswers;
+        // Header words (documented on TerminalWeight._qfold), written by
+        // ordinary Solidity: the compiler emits the same mstores without the
+        // stack pressure of one giant assembly block.
+        uint256 words = 15 + nOod + nq;
+        uint256[] memory w = new uint256[](words);
+        w[0] = 0x5146_4F4C_4400; // "QFOLD"
+        w[1] = input.logFoldedDomainSize;
+        w[2] = nq;
+        w[3] = nD;
+        w[4] = rowLimbs;
+        w[5] = input.rowsAreBase ? 1 : 0;
+        w[6] = 4; // fold dims
+        w[7] = uint256(input.prevCommitment);
+        w[8] = pr[0];
+        w[9] = pr[1];
+        w[10] = pr[2];
+        w[11] = pr[3];
+        w[12] = gamma;
+        w[13] = carriedClaim;
+        w[14] = nOod;
+        for (uint256 i; i < nOod; ++i) {
+            w[15 + i] = ood[i];
+        }
+        for (uint256 q; q < nq; ++q) {
+            w[15 + nOod + q] = indices[q];
+        }
+        // Rows and stream ride INSIDE the frame: the satellite's calldata is
+        // the frame, not the outer transaction. They extend past the header
+        // array into heap the allocator has not handed out yet - the free
+        // pointer bump below claims the whole region, header + rows + stream
+        // + the 96-byte reply slot, in one step.
+        uint256 rowBytes = nq * rowLimbs * 4;
+        uint256 rowsCd = input.rowsCdBase;
+        uint256 streamCd = input.pathsCdBase;
         assembly ("memory-safe") {
-            // +1 word: the expected root rides at the frame's tail, so the
-            // pinned satellite compares it itself and reverts on mismatch -
-            // the engine needs no second comparison path.
-            size := mul(add(add(5, mul(2, nq)), nDigests), 32)
-            frame := mload(0x40)
-            // Reserve the frame plus the 96-byte reply slot the shared
-            // satellite call writes into, so later allocations cannot
-            // clobber either.
+            frame := add(w, 32)
+            size := add(mul(words, 32), add(rowBytes, mul(nD, 32)))
             mstore(0x40, add(frame, add(size, 96)))
-            mstore(frame, 0x4D524F4F5453) // "MROOTS"
-            mstore(add(frame, 32), depth)
-            mstore(add(frame, 64), nq)
-            mstore(add(frame, 96), nDigests)
-            calldatacopy(add(frame, mul(add(4, mul(2, nq)), 32)), streamCdBase, mul(nDigests, 32))
-            mstore(add(frame, mul(add(add(4, mul(2, nq)), nDigests), 32)), expectedRoot)
+            let p := add(frame, mul(words, 32))
+            calldatacopy(p, rowsCd, rowBytes)
+            calldatacopy(add(p, rowBytes), streamCd, mul(nD, 32))
         }
     }
 
-
-
-    function _framePut(
+    /// staticcall the pinned satellite with a QFOLD frame and read the
+    /// 96-byte reply. Same contract as the engine's own satellite path:
+    /// the codehash pin proves the callee, so the reply needs no magic or
+    /// length re-check; a wrong answer is a revert by construction.
+    function _callSatellite(
+        address satellite,
+        bytes32 pin,
         uint256 frame,
-        uint256 nq,
-        uint256 q,
-        uint256 idx,
-        bytes32 leaf
-    ) private pure {
+        uint256 size
+    ) private view returns (uint256 w, uint256 v) {
+        if (satellite.codehash != pin) revert SatelliteUnpinned();
+        uint256 failSel = uint256(bytes32(SatelliteCallFailed.selector));
+        uint256 reply = frame + size;
         assembly ("memory-safe") {
-            mstore(add(frame, add(128, mul(q, 32))), idx)
-            mstore(add(frame, add(add(128, mul(nq, 32)), mul(q, 32))), leaf)
+            let ok := staticcall(gas(), satellite, frame, size, reply, 96)
+            switch ok
+            case 0 {
+                let rd := returndatasize()
+                switch rd
+                case 0 { mstore(0, failSel) revert(0, 4) }
+                default { returndatacopy(0, 0, rd) revert(0, rd) }
+            }
+            w := mload(add(reply, 32))
+            v := mload(add(reply, 64))
         }
     }
 
@@ -641,6 +690,7 @@ library WhirVerifierCoreV8P {
         RoundInput memory input,
         uint256 carriedClaim
     ) internal view returns (RoundOutput memory out) {
+        uint256 _gr = gasleft();
         // --- shape checks before any sponge work --------------------------------
         //
         // Every rejection below happens before the first absorb so a malformed
@@ -668,8 +718,6 @@ library WhirVerifierCoreV8P {
         if (haveLimbs != expectedLimbs) {
             revert RowBufferMismatch(expectedLimbs, haveLimbs);
         }
-        uint256 _gs = gasleft();
-        { uint256 fp; assembly { fp := mload(0x40) } t.acc[t.base + 20] = fp; }
 
         // --- 1-2: commitment, then OOD point/answer pairs ----------------------
         observeDigest(t, input.commitment);
@@ -697,55 +745,56 @@ library WhirVerifierCoreV8P {
             indices[q] = t.state.sampleBits(input.logFoldedDomainSize);
         }
         out.queryIndices = indices;
-        t.acc[t.base + 8] += _gs - gasleft();
-        t.acc[t.base + 6] = input.numQueries;
-        t.acc[t.base + 7] = input.rowLimbs;
-        t.acc[t.base + 16] = input.rowElems;
-        t.acc[t.base + 17] = input.prevRandomness.length;
-        t.acc[t.base + 18] = input.rowsAreBase ? 1 : 0;
-        _gs = gasleft();
 
-        // --- 5: open and fold every query ------------------------------------------
-        out.folds = new uint256[](input.numQueries);
-        uint256[] memory elems = new uint256[](input.rowElems);
-        uint256[] memory flat = input.rowsFlat;
-        uint256 rowsCd = input.rowsCdBase;
-        uint256 frame = 0;
+        t.acc[t.base + 8] += _gr - gasleft();
+        // --- 5-7: open, fold, batch, and combine ---------------------------------
+        //
+        // v9: when the round carries a pruned digest stream and a pinned
+        // satellite handle, the ENTIRE query loop (row decode, leaf hash,
+        // fold), the round batching draw, and the phase-7 dot product run on
+        // the satellite in one staticcall (TerminalWeight._qfold). The query
+        // loop touches no transcript state, so drawing gamma before it -
+        // which the frame needs - is transcript-identical to drawing it
+        // after. The satellite authenticates every (index, leaf) pair with
+        // the amortized pruned walk and reverts unless the root matches
+        // prevCommitment, then computes the combined claim the dot product
+        // produces. The engine reads [root, claimedEval] back; the root rode
+        // only for debug - the compare already pinned it inside the satellite.
         if (input.prunedNDigests != 0) {
-            (frame, out.frameSize) = _frameOpen(
-                input.logFoldedDomainSize, input.numQueries, input.prunedNDigests,
-                input.pathsCdBase, input.prevCommitment
-            );
-        }
-        for (uint256 q; q < input.numQueries; ++q) {
-            // One pass produces the packed fold inputs AND the authenticated
-            // leaf: the leaf covers the flat wire limbs (Montgomery form),
-            // the fold consumes the packed elements, both built from the same
-            // decode, so they cannot disagree.
+            // The QFOLD kernel is the folding-factor-4 shape: 16 elements
+            // per row, 4-dim fold point, rows in calldata. Anything else is
+            // a shape the vectors never exercise; fail closed.
+            if (input.rowElems != 16 || input.prevRandomness.length != 4 || input.rowsCdBase == 0) {
+                revert RowBufferMismatch(16, input.rowElems);
+            }
+            uint256 gamma = drawExt(t);
+            out.gamma = gamma;
+            uint256 _gp = gasleft();
+            (uint256 frame, uint256 size) = _frameQFold(input, indices, gamma, carriedClaim);
+            t.acc[t.base + 20] += _gp - gasleft();
+            _gp = gasleft();
+            (, uint256 claimed) =
+                _callSatellite(input.satellite, input.satelliteCodehash, frame, size);
+            t.acc[t.base + 21] += _gp - gasleft();
+            out.claimedEval = claimed;
+        } else {
+            // Legacy path (memory rows, per-query expanded paths): the JSON
+            // harnesses and every non-v8 shape. Unchanged semantics.
             uint256 _gq = gasleft();
-            if (q == 0) { uint256 fpa; assembly { fpa := mload(0x40) } t.acc[t.base + 22] = fpa; }
-            if (q == input.numQueries - 1) { uint256 fpb; assembly { fpb := mload(0x40) } t.acc[t.base + 23] = fpb; }
-            bytes32 leaf = _loadRowFused(
-                elems,
-                flat,
-                rowsCd,
-                q * input.rowLimbs,
-                input.rowLimbs,
-                input.rowElems,
-                input.rowsAreBase
-            );
-            if (t.acc[t.base + 28] != 0) { t.acc[t.base + 13] += _gq - gasleft(); _gq = gasleft(); }
-            if (frame != 0) {
-                // v8: no per-query path walk here. The fold needs only the
-                // row; authentication moves to one amortized walk after the
-                // loop. This query's (index, leaf) drops straight into the
-                // frame - index at word 4+q, leaf at word 4+nq+q - so the
-                // loop needs no side arrays and no second pass.
-                _framePut(frame, input.numQueries, q, indices[q], leaf);
-                if (t.acc[t.base + 28] != 0) { t.acc[t.base + 14] += _gq - gasleft(); _gq = gasleft(); }
-                out.folds[q] = StirOpenings.foldRow(elems, input.prevRandomness);
-                if (t.acc[t.base + 28] != 0) { t.acc[t.base + 15] += _gq - gasleft(); }
-            } else {
+            out.folds = new uint256[](input.numQueries);
+            uint256[] memory elems = new uint256[](input.rowElems);
+            uint256[] memory flat = input.rowsFlat;
+            uint256 rowsCd = input.rowsCdBase;
+            for (uint256 q; q < input.numQueries; ++q) {
+                bytes32 leaf = _loadRowFused(
+                    elems,
+                    flat,
+                    rowsCd,
+                    q * input.rowLimbs,
+                    input.rowLimbs,
+                    input.rowElems,
+                    input.rowsAreBase
+                );
                 out.folds[q] = StirOpenings.openAndFoldLeaf(
                     input.prevCommitment,
                     indices[q],
@@ -758,47 +807,38 @@ library WhirVerifierCoreV8P {
                     input.prevRandomness
                 );
             }
-        }
-        t.acc[t.base + 9] += _gs - gasleft();
-        { uint256 fp; assembly { fp := mload(0x40) } t.acc[t.base + 21] = fp; }
-        _gs = gasleft();
-        if (frame != 0) {
-            // The frame (plus its reserved reply slot) sits at the top of
-            // memory; the engine staticcalls the satellite with it through
-            // callSatellite and checks the root against prevCommitment.
-            out.frameAddr = frame;
-        }
 
-        // --- 6: round batching challenge ----------------------------------------------
-        uint256 gamma = drawExt(t);
-        out.gamma = gamma;
+            t.acc[t.base + 9] += _gq - gasleft();
+            // --- 6: round batching challenge ---
+            uint256 gamma = drawExt(t);
+            out.gamma = gamma;
 
-        // --- 7: fold this round's claims onto the carried claim ------------------------
-        //
-        // `Constraint::new_with_existing_claim(gamma, nv, [Eq(ood), Select(folds)])
-        // then `combine_evals`: the carried claim holds gamma^0, the equality group
-        // takes gamma^1..gamma^ood_samples, the selection group follows at the
-        // next powers up. The running exponent is exactly what `combine_evals`'s
-        // `shift` does.
-        uint256 claimed = carriedClaim;
-        uint256 power = gamma; // gamma^1: the carried claim owns gamma^0
-        for (uint256 i; i < input.oodAnswers.length; ++i) {
-            claimed = KoalaBearExt4.add(claimed, KoalaBearExt4.mul(input.oodAnswers[i], power));
-            power = KoalaBearExt4.mul(power, gamma);
+            // --- 7: fold this round's claims onto the carried claim ---
+            //
+            // `Constraint::new_with_existing_claim(gamma, nv, [Eq(ood), Select(folds)])
+            // then `combine_evals`: the carried claim holds gamma^0, the equality group
+            // takes gamma^1..gamma^ood_samples, the selection group follows at the
+            // next powers up. The running exponent is exactly what `combine_evals`'s
+            // `shift` does.
+            uint256 claimed = carriedClaim;
+            uint256 power = gamma; // gamma^1: the carried claim owns gamma^0
+            for (uint256 i; i < input.oodAnswers.length; ++i) {
+                claimed = KoalaBearExt4.add(claimed, KoalaBearExt4.mul(input.oodAnswers[i], power));
+                power = KoalaBearExt4.mul(power, gamma);
+            }
+            for (uint256 q; q < input.numQueries; ++q) {
+                claimed = KoalaBearExt4.add(claimed, KoalaBearExt4.mul(out.folds[q], power));
+                power = KoalaBearExt4.mul(power, gamma);
+            }
+            out.claimedEval = claimed;
         }
-        for (uint256 q; q < input.numQueries; ++q) {
-            claimed = KoalaBearExt4.add(claimed, KoalaBearExt4.mul(out.folds[q], power));
-            power = KoalaBearExt4.mul(power, gamma);
-        }
-        out.claimedEval = claimed;
-        t.acc[t.base + 10] += _gs - gasleft();
 
         // --- 8: round sumcheck -----------------------------------------------------------
-        absorbConstants(t, s.sumcheckConstants);
         uint256 _gsc = gasleft();
+        absorbConstants(t, s.sumcheckConstants);
         (uint256 folded, uint256[] memory randomness) = SumcheckCore.verifyRounds(
             t.state,
-            claimed,
+            out.claimedEval,
             input.sumcheckCA,
             input.sumcheckCInf,
             input.sumcheckPowWitnesses,
