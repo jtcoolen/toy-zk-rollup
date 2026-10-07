@@ -1417,3 +1417,85 @@ the expanded form skips: ~1,871 x 2 Poseidon2-ish hashes... no - the
 walk hashes siblings per level either way; pruned saves the DUPLICATE
 hashes too: expanded 8,765 sibling-hashes vs pruned 6,894 node-hashes
 + restore overhead ~neutral). Net gas: expect 113.8M -> ~108M.
+
+---
+
+## Batch 27 — v6 wire implemented (Rust export + Solidity wrapper)
+
+Pieces landed, all beside the existing verifier:
+
+* `wbnd.rs`: `encode_bundle_v6_split(flat, jj, bin) -> (bundle, config)`
+  - v5 bundle with the CONFIG section excised, header ver=6, cfgWords=0.
+  `header()` and `chunk_config(cfg, max)` helpers. v5 path byte-identical.
+* `recursion_chain.rs::export_chain_bundle_v6` (ignored): writes
+  `recursion_chain_bundle_v6.bin`, `recursion_chain_config.bin`, 8 x
+  `recursion_chain_config_chunk_{i}.bin` (24,471 B each), and
+  `recursion_chain_sidecar_v6.json` with the keccak256 CONFIG digest.
+  Rate 4/4: **v6 bundle 444,936 B** (v5 627,136; -29%), config 182,200 B.
+  Rate 2/2 sanity: config 182,444 B - CONFIG is rate-independent as
+  predicted (it is the AIR + schedules, not the proof).
+* `ConfigChunk.sol`: two-contract design. A contract cannot reference its
+  own runtimeCode (E0 circular reference) and runtimeCode is unavailable
+  with immutables - so `ConfigChunk` constructor deploys
+  `ConfigChunkBody.runtimeCode ++ data ++ uint32(len)`; the body exposes
+  dataLen()/read() via extcodecopy of self. Chunk holds ~24.4 KB of
+  CONFIG in CODE: no storage, no SLOAD, deposit paid once at deploy.
+* `WhirVerifierV6.sol`: constructor(engine, chunks, configDigest) pins
+  keccak256(concat chunks) == digest (the v5 header comment finally
+  enforced). verify() checks ver==6 && cfgWords==0, re-frames a v5 bundle
+  in memory (header + CONFIG from chunks + verbatim v6 tail) and
+  staticcalls the frozen v5 ENGINE. v5 stays ground truth; v6 is a
+  wrapper, not a fork.
+
+Expected gas: -182,200 B calldata = -3,644,000 gas (16/byte zero-cost
+excluded: these are nonzero bytes: 4 B/byte = -728,800 tx-level) plus
+the engine no longer decodes CONFIG from calldata... but the wrapper
+pays: chunk reads (8 x ~24 KB extcodecopy+abi) + 627 KB memory re-frame
+(~1M) + staticcall of a 627 KB payload (abi encode ~1M). Net on-chain
+tx saving is the calldata; internal gas roughly cancels. Phase 2 (direct
+extcodecopy CONFIG reads inside the engine) removes the re-frame.
+
+Numbers from RecursionChainV6.t.sol land in the next batch.
+
+---
+
+## Batch 28 — v6 wire green: measured numbers
+
+RecursionChainV6.t.sol (rate 4/4 artifacts):
+
+| | v5 (today) | v6 (wrapper) |
+|---|---|---|
+| calldata bytes | 627,136 | **444,936** (-29%) |
+| EVM gas | 113,753,786 | 119,964,953 |
+| tx calldata gas (nonzero 16/byte) | 10,034,176 | 7,118,976 |
+| total on-chain cost | ~123.8M | ~127.1M |
+
+The wrapper re-frame (8 chunk reads + 627 KB memory copy + staticcall
+abi-encode) costs ~6.2M EVM gas - MORE than the 2.9M calldata saving.
+That is expected and is exactly the Phase-2 argument: the re-frame is
+wasteful scaffolding. Phase 2 moves CONFIG reads INTO the engine
+(extcodecopy per CONFIG field, no re-frame, no double read):
+113.8M - 2.9M calldata - ~1M CONFIG decode from calldata + ~0.5M
+extcodecopy reads = ~110M, and the same change makes the PROOF-only
+compaction (varint ext limbs -29 KB, pruned paths -66 KB) stack on top
+without any re-frame penalty: ~350 KB calldata target stays alive.
+
+Bugs fixed on the way (all mine, none in v5):
+* version byte read: shr(248) of word 0 reads byte 0; correct is
+  shr(248, calldataload(+4)).
+* prfWords must be copied VERBATIM (already LE on the wire); re-encoding
+  a shr(224) big-endian read as LE double-swaps and yields 3.2 billion.
+* ConfigChunk: a contract cannot reference its own runtimeCode, and
+  runtimeCode is unavailable with immutables - two-contract design
+  (ConfigChunk deploys ConfigChunkBody code ++ data ++ uint32 len).
+  Body runtime = 561 B, so chunk payload <= 24,011 B; export chunks at
+  24,000 and the test re-chunks config.bin at runtime (digest is over
+  the concatenation, so the split is free).
+* The prover is NON-deterministic across runs (ZK blinding): a fresh
+  export never byte-matches a committed bundle. Differential tests must
+  compare a bundle against the vectors from the SAME export run.
+
+Files: ConfigChunk.sol, WhirVerifierV6.sol (src/verifier),
+RecursionChainV6.t.sol (test), wbnd.rs encode_bundle_v6_split +
+chunk_config + header, recursion_chain.rs export_chain_bundle_v6.
+v5 artifacts untouched and still the ground truth.

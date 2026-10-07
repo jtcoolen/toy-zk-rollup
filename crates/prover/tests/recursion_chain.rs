@@ -4,10 +4,11 @@
 //! Intermediate layers settle under the Poseidon2 `InSC` so the next
 //! [`build_batch_recursion_circuit`] can consume them; the final layer settles
 //! under the Keccak `OutSC`, which is what the Solidity verifier replays.
-//! Run: `cargo test --release -p prover --test `recursion_chain` -- --ignored --nocapture --test-threads=1`
+//! Run: `cargo test --release -p prover --test recursion_chain -- --ignored --nocapture --test-threads=1`
 
 use p3_circuit::test_utils::{generate_trace_rows, FibonacciAir};
 use p3_field::PrimeCharacteristicRing;
+use p3_symmetric::CryptographicHasher;
 use prover::config::F;
 use prover::whir_recursion::{
     build_batch_recursion_circuit, build_recursion_circuit, settle_recursion_circuit,
@@ -118,6 +119,77 @@ fn layer_chain_convergence() {
 /// bundle path so the EXISTING Solidity verifier can be measured against a
 /// real multi-layer recursion proof. Writes the WBND bundle + a small
 /// sidecar (statement) into contracts/test/vectors/.
+/// D-092 v6 export: the same chain, split into (bundle-without-CONFIG,
+/// CONFIG chunks). The Solidity side (`WhirVerifierV6` + `ConfigChunk`) pins
+/// the CONFIG digest at deploy and receives only PROOF + STATEMENT per
+/// proof: 627 KB -> ~445 KB calldata at the rate-4 shape (batch 25).
+#[test]
+#[ignore = "two recursion layers: run with --ignored"]
+fn export_chain_bundle_v6() {
+    let inner = InnerWhirConfig::new_with(CHAIN_LOG_MAX_LDE, CAP_HEIGHT, rate_inner())
+        .expect("inner config");
+    let air = FibonacciAir {};
+    let trace = generate_trace_rows::<F>(0, 1, BASE_TRACE);
+    let pis = vec![F::ZERO, F::ONE, fibonacci_output(BASE_TRACE)];
+
+    let base = p3_uni_stark::prove(&inner, &air, trace, &pis).expect("base prove");
+    let mut rc = build_recursion_circuit(&inner, &air, &base, &pis).expect("rc1");
+    for _ in 1..=2 {
+        let (proof, verifier) =
+            settle_recursion_circuit_with(&rc, inner.clone()).expect("settle InSC");
+        verifier.verify(&proof, &pis).expect("InSC layer verifies");
+        rc = build_batch_recursion_circuit(&inner, &verifier, &proof, &pis)
+            .expect("next recursion circuit");
+    }
+
+    let (bundle, jj, blob) =
+        prover::composed_export::settlement_bundle_with_blob(&rc, &pis, rate_final())
+            .expect("composed bundle for the chain");
+    let _ = &bundle;
+    let flat = prover::wbnd::flat_from_vectors(&jj);
+    let (v6, cfg) = prover::wbnd::encode_bundle_v6_split(&flat, &jj, &blob);
+    // 24,000 B per chunk: the ConfigChunkBody runtime is ~561 B and the
+    // blob carries a uint32 trailer; 24,576 - 561 - 4 = 24,011, rounded
+    // down. The Solidity test re-chunks at the same size.
+    let chunks = prover::wbnd::chunk_config(&cfg, 24000);
+    let joined: Vec<u8> = chunks.iter().flatten().copied().collect();
+    let digest: [u8; 32] = p3_keccak::Keccak256Hash.hash_iter(joined.iter().copied());
+    let mut hexs = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        write!(&mut hexs, "{b:02x}").expect("hex");
+    }
+
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contracts/test/vectors");
+    std::fs::write(format!("{dir}/recursion_chain_bundle_v6.bin"), &v6).expect("write v6");
+    std::fs::write(format!("{dir}/recursion_chain_config.bin"), &cfg).expect("write cfg");
+    for (i, c) in chunks.iter().enumerate() {
+        std::fs::write(format!("{dir}/recursion_chain_config_chunk_{i}.bin"), c)
+            .expect("write chunk");
+    }
+    let stmt: Vec<u64> = pis
+        .iter()
+        .map(p3_field::PrimeField64::as_canonical_u64)
+        .collect();
+    let sidecar = serde_json::json!({
+        "statement": stmt,
+        "bundle_v6_len": v6.len(),
+        "config_len": cfg.len(),
+        "config_digest": format!("0x{}", hexs),
+        "chunk_lens": chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+    });
+    std::fs::write(
+        format!("{dir}/recursion_chain_sidecar_v6.json"),
+        sidecar.to_string(),
+    )
+    .expect("write sidecar v6");
+    println!(
+        "v6 bundle {} B, config {} B, {} chunks",
+        v6.len(),
+        cfg.len(),
+        chunks.len()
+    );
+}
 #[test]
 #[ignore = "writes vectors; run with --release when regenerating"]
 fn export_chain_bundle() {

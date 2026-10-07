@@ -778,3 +778,50 @@ pub fn encode_bundle(j: &Value, jj: &Value, bin: &[u8]) -> Vec<u8> {
     }
     out
 }
+
+/// The WBND v6 bundle: identical grammar, but the CONFIG section is EMPTY
+/// (cfgWords = 0) and returned separately so a deployment can pin it at
+/// deploy time (chunked code satellites - EIP-170 caps one contract at
+/// 24,576 B, so 182 KB needs 8 chunks). The on-chain tx then carries only
+/// PROOF + STATEMENT: 627 KB -> ~445 KB at the rate-4 shape (D-092 batch
+/// 25). The v5 path is untouched; `encode_bundle` stays byte-exact.
+#[must_use]
+pub fn encode_bundle_v6(j: &Value, jj: &Value, bin: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let (mut out, cfg) = encode_bundle_v6_split(j, jj, bin);
+    // v6 inlines nothing of CONFIG: the caller ships `cfg` to the satellites.
+    out.shrink_to_fit();
+    (out, cfg)
+}
+
+/// v6 split: (header+PROOF+STATEMENT bundle, CONFIG section bytes). The
+/// header keeps the v5 layout with version byte 6 and cfgWords = 0.
+#[must_use]
+pub fn encode_bundle_v6_split(j: &Value, jj: &Value, bin: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let full = encode_bundle(j, jj, bin);
+    let (_magic, _ver, cfgw, prfw) = crate::wbnd::header(&full);
+    let cfg_bytes = full[16..16 + cfgw * 4].to_vec();
+    let mut out = vec![0u8; 16];
+    out[..4].copy_from_slice(b"WBND");
+    out[4] = 6;
+    out[8..12].copy_from_slice(&0u32.to_le_bytes());
+    out[12..16].copy_from_slice(&(prfw as u32).to_le_bytes());
+    out.extend_from_slice(&full[16 + cfgw * 4..]);
+    (out, cfg_bytes)
+}
+
+/// The WBND header: (magic ok, version, cfg words, prf words).
+#[must_use]
+pub fn header(b: &[u8]) -> (bool, u8, usize, usize) {
+    let magic = &b[..4] == b"WBND";
+    let ver = b[4];
+    let cfgw = u32::from_le_bytes(b[8..12].try_into().unwrap()) as usize;
+    let prfw = u32::from_le_bytes(b[12..16].try_into().unwrap()) as usize;
+    (magic, ver, cfgw, prfw)
+}
+
+/// Split CONFIG bytes into code-satellite chunks of at most `max` bytes
+/// (EIP-170: 24,576 runtime code; leave headroom for the accessor shell).
+#[must_use]
+pub fn chunk_config(cfg: &[u8], max: usize) -> Vec<Vec<u8>> {
+    cfg.chunks(max).map(<[u8]>::to_vec).collect()
+}
