@@ -3,14 +3,14 @@
 //! Same chain as `recursion_chain::layer_chain_convergence` but every knob
 //! comes from the environment so a grid can run without recompiling:
 //!
-//!   WHIR_BASE_TRACE   base fib trace rows        (default 1024)
-//!   WHIR_LDE          chain log-max-LDE budget   (default 24)
-//!   WHIR_RATE_INNER   starting inverse rate, inner layers (default 1)
-//!   WHIR_RATE_FINAL   starting inverse rate, final layer  (default 1)
+//!   `WHIR_BASE_TRACE`   base fib trace rows        (default 1024)
+//!   `WHIR_LDE`          chain log-max-LDE budget   (default 24)
+//!   `WHIR_RATE_INNER`   starting inverse rate, inner layers (default 1)
+//!   `WHIR_RATE_FINAL`   starting inverse rate, final layer  (default 1)
 //!
 //! Prints every layer size, the final postcard size, and the final flat
-//! (WBND) size when WHIR_EMIT_FLAT=1. Run:
-//!   WHIR_RATE_INNER=2 cargo test --release -p prover --test chain_sweep -- --ignored --nocapture --test-threads=1
+//! (WBND) size when `WHIR_EMIT_FLAT`=1. Run:
+//!   `WHIR_RATE_INNER`=2 cargo test --release -p prover --test `chain_sweep` -- --ignored --nocapture --test-threads=1
 
 use p3_circuit::test_utils::{generate_trace_rows, FibonacciAir};
 use p3_field::PrimeCharacteristicRing;

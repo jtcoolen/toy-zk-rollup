@@ -4,14 +4,14 @@
 //!
 //! Pure schedule solving - no proving - so a full sweep is instant. The
 //! `proof_proxy` column estimates the paths bytes of one STARK at that arity:
-//! sum over rounds of num_queries x log_folded_domain x 32.
+//! sum over rounds of `num_queries` x `log_folded_domain` x 32.
 
 use p3_whir::parameters::{FoldingFactor, ProtocolParameters, SecurityAssumption, WhirConfig};
 use prover::whir_recursion::{Challenge, WhirChallenger, F};
 
 const SECURITY_LEVEL: usize = 96;
 
-fn params(pow_bits: usize, log_inv_rate: usize, folding: usize) -> ProtocolParameters {
+const fn params(pow_bits: usize, log_inv_rate: usize, folding: usize) -> ProtocolParameters {
     ProtocolParameters {
         security_level: SECURITY_LEVEL,
         pow_bits,
@@ -23,7 +23,7 @@ fn params(pow_bits: usize, log_inv_rate: usize, folding: usize) -> ProtocolParam
 }
 
 /// Estimated paths bytes: per round queries x depth x 32, plus the terminal
-/// round at its own depth. Depth of a round is its log_folded_domain_size.
+/// round at its own depth. Depth of a round is its `log_folded_domain_size`.
 fn proof_proxy(cfg: &WhirConfig<Challenge, F, WhirChallenger>) -> usize {
     let mut bytes = 0usize;
     for r in cfg.round_parameters() {
@@ -40,7 +40,7 @@ fn proof_proxy(cfg: &WhirConfig<Challenge, F, WhirChallenger>) -> usize {
 #[test]
 #[ignore = "parameter sweep; run with --nocapture"]
 fn sweep_grinding() {
-    // The chain settles at arity 24 (CHAIN_LOG_MAX_LDE); probe that plus 21
+    // The chain settles at arity 24 (`CHAIN_LOG_MAX_LDE`); probe that plus 21
     // (the base fib layer) for context.
     for arity in [21usize, 24] {
         println!("=== arity {arity}, folding 4, rate 1/2: grinding budget sweep ===");

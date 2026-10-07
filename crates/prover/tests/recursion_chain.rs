@@ -4,7 +4,7 @@
 //! Intermediate layers settle under the Poseidon2 `InSC` so the next
 //! [`build_batch_recursion_circuit`] can consume them; the final layer settles
 //! under the Keccak `OutSC`, which is what the Solidity verifier replays.
-//! Run: `cargo test --release -p prover --test recursion_chain -- --ignored --nocapture --test-threads=1`
+//! Run: `cargo test --release -p prover --test `recursion_chain` -- --ignored --nocapture --test-threads=1`
 
 use p3_circuit::test_utils::{generate_trace_rows, FibonacciAir};
 use p3_field::PrimeCharacteristicRing;
@@ -18,8 +18,8 @@ const BASE_TRACE: usize = 1024;
 
 /// Starting inverse rate for the final (Keccak) settlement of the exported
 /// chain bundle. Rate 2 halves the STIR query budget - the dominant term of
-/// the on-chain wire - and the final circuit fits it under TWO_ADICITY 24
-/// (D-092 batch 20). Set WHIR_RATE_FINAL=1 to reproduce the rate-1 baseline.
+/// the on-chain wire - and the final circuit fits it under `TWO_ADICITY` 24
+/// (D-092 batch 20). Set `WHIR_RATE_FINAL`=1 to reproduce the rate-1 baseline.
 fn rate_final() -> usize {
     std::env::var("WHIR_RATE_FINAL")
         .ok()
@@ -143,8 +143,8 @@ fn export_chain_bundle() {
         prover::composed_export::settlement_bundle_with_blob(&rc, &pis, rate_final())
             .expect("composed bundle for the chain");
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contracts/test/vectors");
-    // The vectors doc too: gen_composed_flat.mjs turns it into the flat form
-    // the WhirComposed harness drives (WHIR_FLAT env, batch 19).
+    // The vectors doc too: `gen_composed_flat`.mjs turns it into the flat form
+    // the WhirComposed harness drives (`WHIR_FLAT` env, batch 19).
     std::fs::write(
         format!("{dir}/recursion_chain_vectors.json"),
         jj.to_string(),

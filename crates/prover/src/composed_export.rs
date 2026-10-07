@@ -935,14 +935,17 @@ pub fn settlement_bundle(
     Ok((bundle, jj))
 }
 
-/// [settlement_bundle] plus the semantic blob, so a test can seed the
+/// The composed bundle triple: (WBND bundle, vectors doc, semantic blob).
+pub type SettlementBundle = (Vec<u8>, serde_json::Value, Vec<u8>);
+
+/// [`settlement_bundle`] plus the semantic blob, so a test can seed the
 /// Solidity transcript the way the composed harness does (the blob is the
 /// third bundle input and otherwise only lives inside the WBND frame).
 pub fn settlement_bundle_with_blob(
     rc: &RecursionCircuit,
     statement: &[F],
     rate: usize,
-) -> Result<(Vec<u8>, serde_json::Value, Vec<u8>), Box<dyn Error>> {
+) -> Result<SettlementBundle, Box<dyn Error>> {
     let params = settlement_params_for(crate::block::BLOCK_LOG_MAX_LDE, rate);
     let mut rounds_a = Vec::new();
     let mut starts_a = Vec::new();

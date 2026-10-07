@@ -215,6 +215,11 @@ pub fn required_pow_bits(num_variables: usize) -> Result<usize, WhirConfigError>
 }
 
 /// [`required_pow_bits`] at an explicit starting inverse rate.
+///
+/// # Errors
+///
+/// Returns the last WHIR configuration error if no arity yields a feasible
+/// schedule at this rate.
 pub fn required_pow_bits_with(
     num_variables: usize,
     starting_log_inv_rate: usize,
@@ -269,11 +274,17 @@ pub fn config(cap_height: usize, num_variables: usize) -> Result<Config, WhirCon
     config_with(cap_height, num_variables, 1)
 }
 
-/// [`config`] at an explicit starting inverse rate. Rate 2 (quarter-rate)
-/// roughly halves the STIR query budget - the dominant term of the on-chain
-/// proof - at the cost of one more arity of committed domain; the final
-/// layer's arity budget is what decides whether it fits. Soundness stays
-/// `JohnsonBound` (the proven regime) at every rate.
+/// [`config`] at an explicit starting inverse rate.
+///
+/// Rate 2 (quarter-rate) roughly halves the STIR query budget - the dominant
+/// term of the on-chain proof - at the cost of one more arity of committed
+/// domain; the arity budget of the final layer decides whether it fits.
+/// Soundness stays `JohnsonBound` (the proven regime) at every rate.
+///
+/// # Errors
+///
+/// Returns the WHIR configuration error if this rate cannot reach
+/// [`SECURITY_LEVEL`] at `num_variables`.
 pub fn config_with(
     cap_height: usize,
     num_variables: usize,

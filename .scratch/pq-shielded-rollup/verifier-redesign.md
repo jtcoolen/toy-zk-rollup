@@ -1294,3 +1294,126 @@ orthogonal and belong to the redesigned verifier.
 4. rate 5/5: probing
 5. layers 0-2 at best rate: no further change (plateau) -> STOP
    parameter iteration after this one; move to wire-format work.
+
+---
+
+## Batch 24 — parameter phase CONVERGED at rate 4/4: 627 KB bundle, 113.8M gas
+
+| metric | rate 1/1 (M1) | rate 4/4 | delta |
+|---|---|---|---|
+| WBND bundle | 1,228,244 B | **627,136 B** | **−49%** |
+| PROOF section | 1,042,708 B | 441,844 B | −58% |
+| paths_hex | 795,675 B | 280,475 B | −65% |
+| CONFIG | 182,444 B | 182,200 B | 0% |
+| gas (existing verifier) | 175,396,812 | **113,754,344** | **−35%** |
+| rejects | 26.6/43.2/166.6M | 7.1/8.3/78.6M | all reject |
+
+**Iteration ledger (5 done, last 2 non-improving -> STOP per user rule):**
+1. rate 2/2: bundle −31%, gas −23%
+2. rate 3/3: bundle −41.5%
+3. rate 4/4: bundle −49%, gas −35% (356 KB postcard plateau)
+4. rate 5/5: PANIC in vendor p3-recursion whir/uni/pcs.rs:443 — dead
+5. layers {0,1,2} at rate 4: 356-358 KB, no change — plateau confirmed
+
+**Rate-4 wire anatomy (627 KB):** paths 280 KB (45%), eq_points 97 KB
+(16%), framing_hex 87 KB (14%), rows_flat 67 KB (11%), final_paths 32 KB,
+final_rows 14 KB, rest ~50 KB. CONFIG is now 29% of the wire.
+
+**Step D re-measured at rate 4** (/tmp/dedup_r4.py): expanded 8,765
+siblings vs pruned 6,894 = −21% = −60 KB (was −250 KB at rate 1: fewer
+queries, less sharing to exploit). Still worth it, but the CONFIG
+regeneration levers are bigger: framing_hex (87 KB) + eq_points (97 KB)
+= 184 KB (29%) of schedule-derived constants the redesigned verifier can
+compute instead of read. Together with Step D: 627 − 60 − 184 ≈ 383 KB.
+The last stretch to 300 KB needs rows compression (67 KB rows_flat is
+already raw field elements; the STATEMENT 3 KB is minimal) or one more
+rate notch if the vendor ever fixes rate 5. Honest assessment: ~380 KB
+is the realistic v6 floor; 300 KB needs the vendor path or a smaller
+terminal schedule.
+
+**Moving to the next task (per user rule): the redesigned verifier**
+(D-092 Phase 2) sitting BESIDE the existing one, consuming a v6 wire:
+- contracts/src/verifier2/ (new library, existing one untouched)
+- v6 wire: framing + eq_points regenerated from schedule (prover emits
+  schedule params only), Step D pruned paths (per-depth node lists)
+- P2b compute: assembly Merkle walk, sumcheck absorb batching
+- statement rebind to the D-088 folded root
+
+---
+
+## Batch 25 — why 356 KB postcard becomes 627 KB on chain; v6 wire plan
+
+User question: the sweep says the final proof is 356 KB, why does the
+bundle submitted on chain weigh 627 KB? Full accounting (rate 4/4):
+
+| part | bytes | what it is |
+|---|---|---|
+| postcard proof | 356,545 | the WHIR proof itself |
+| PROOF section | 441,844 | postcard + 85 KB flat-encoding overhead (fixed u32 words vs varints, length prefixes) |
+| CONFIG section | 182,200 | framing_hex ~87 KB + CONSTRAINTS node programs ~88 KB + schedules/batch cfg ~7 KB |
+| header + STATEMENT | ~3.1 KB | |
+| **bundle** | **627,136** | |
+
+**The CONFIG is the bug.** WhirVerifier.sol:24-26 says it outright: "CONFIG
+is deploy-time data... A deployment should pin keccak256(configSection)".
+Yet every proof carries it: 182 KB x 16 gas/B = ~2.9M gas of calldata +
+decode per verify, for bytes that are FIXED per circuit shape (framing
+labels, AIR node programs, schedule tables). Nothing in CONFIG depends
+on the proof: eq_points are zeta-derived and live in PROOF (D-072), the
+framing is AIR+schedule derived, the CONSTRAINTS programs are the AIR.
+
+**v6 wire (fix):** CONFIG moves to the verifier constructor (storage,
+keccak-pinned immutable). Bundle v6 = header (ver 6, cfgWords=0) + PROOF
++ stmLen + STATEMENT - identical grammar otherwise, so the parser diff is
+tiny: version check + CONFIG source (storage -> memory copy once at verify
+start, ~63k gas) + the three CONFIG decoders switch from calldata readers
+to memory readers. ConstraintIdentity.Program already supports memory
+node words (the JSON test path); v6 uses it. v5 stays supported.
+
+Expected: on-chain proof 627 KB -> ~445 KB (-29%), gas -~2.5M.
+To actually reach 300 KB on chain the PROOF section must also shrink:
+85 KB flat-encoding overhead (varint packing) + Step D pruned paths
+(-60 KB) -> ~300-325 KB. That is the redesigned verifier job (next task).
+
+Vendor note: CONFIG-in-proof was inherited from the v3 wire design; the
+node settlement path (composed_export::settlement_bundle) emits v5 and
+keeps working; the v6 export is additive.
+
+---
+
+## Batch 26 — the +85 KB flat expansion, itemized (rate 4/4 bundle)
+
+PROOF section 441,844 B vs postcard 356,545 B = +85,299 B. Measured
+(/tmp/flat_gap.py, sums to +82,078 of the +85,299; remainder is batch
+block framing):
+
+| item | flat wire | postcard | delta | why |
+|---|---|---|---|---|
+| Merkle paths | 312,864 | 246,944 | **+65,920** | flat carries one EXPANDED path per query (shared siblings repeated); postcard stores a PRUNED multiproof (each shared node once) |
+| extension arrays | 45,472 | 16,281 | **+29,191** | flat packs each ext4 element as a 32-byte word (limbs at bits 224/192/160/128); postcard varints each <2^31 limb (1-4 B) |
+| u32 arrays | 88,472 | ~102,325 | −13,853 | flat is already lean here (4 B/elem; my postcard estimate over-counts - real postcard uses fixed u32 for field elements) |
+| length prefixes | ~820 | 0 | +820 | every flat array carries a u32 count |
+
+**Yes, the redesign can address all of it.** v6 wire = three changes:
+1. CONFIG -> constructor (batch 25): −182,200 B
+2. pruned paths (Step D): −65,920 B; the Solidity walk already restores
+   paths in Rust (restore_and_recompute_paths); the contract walk takes
+   one root + per-query paths, so the pruned form needs a per-depth node
+   list + a restore pass on chain (the same node set, deduped)
+3. varint ext limbs: −29,191 B; 4 limbs of <2^31 each, varint-packed
+   (the decoder is a 10-line loop; limbs are canonical field elements)
+
+Arithmetic: 441,844 − 65,920 − 29,191 = 346,733 PROOF + 16 header +
+3,072 STATEMENT = **~350 KB calldata** - exactly the user target: post
+the 350 KB proof and nothing else. The remaining gap to the 300 KB
+aspiration is the u32-array floor (rows_flat 67 KB is raw field data,
+already minimal) and would need a rate-5 vendor fix or smaller terminal
+schedule - not wire work.
+
+Gas effect: −182 KB CONFIG (−2.9M calldata − decode) − 95 KB proof bytes
+(−1.5M calldata) ≈ −4.5M before the restore-walk cost of pruned paths
+(the on-chain restore recomputes ~1,871 internal nodes per proof that
+the expanded form skips: ~1,871 x 2 Poseidon2-ish hashes... no - the
+walk hashes siblings per level either way; pruned saves the DUPLICATE
+hashes too: expanded 8,765 sibling-hashes vs pruned 6,894 node-hashes
++ restore overhead ~neutral). Net gas: expect 113.8M -> ~108M.

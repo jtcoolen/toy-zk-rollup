@@ -183,11 +183,12 @@ pub const fn protocol_params(pow_bits: usize) -> ProtocolParameters {
     protocol_params_with(pow_bits, 1)
 }
 
-/// [`protocol_params`] with an explicit starting inverse rate. Rate 2 (a
-/// quarter-rate code) roughly halves the STIR query budget - and with it the
-/// Merkle-path bytes, the dominant term of the on-chain proof - at the cost
-/// of doubling every committed domain, one arity higher. The soundness
-/// assumption stays `JohnsonBound` (the proven regime) at every rate.
+/// [`protocol_params`] with an explicit starting inverse rate.
+///
+/// Rate 2 (a quarter-rate code) roughly halves the STIR query budget - and
+/// with it the Merkle-path bytes, the dominant term of the on-chain proof -
+/// at the cost of doubling every committed domain, one arity higher. The
+/// soundness assumption stays `JohnsonBound` (the proven regime) at every rate.
 #[must_use]
 pub const fn protocol_params_with(
     pow_bits: usize,
@@ -227,6 +228,11 @@ pub fn required_pow_bits(num_variables: usize) -> Result<usize, WhirConfigError>
 }
 
 /// [`required_pow_bits`] at an explicit starting inverse rate.
+///
+/// # Errors
+///
+/// Returns the last WHIR configuration error if no arity yields a feasible
+/// schedule at this rate.
 pub fn required_pow_bits_with(
     num_variables: usize,
     starting_log_inv_rate: usize,
@@ -291,6 +297,11 @@ impl InnerWhirConfig {
 
     /// [`InnerWhirConfig::new`] at an explicit starting inverse rate (see
     /// [`protocol_params_with`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns the verifier-parameters error if this rate cannot reach
+    /// [`SECURITY_LEVEL`] at `log_max_lde_height`.
     pub fn new_with(
         log_max_lde_height: usize,
         cap_height: usize,
