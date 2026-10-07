@@ -208,7 +208,6 @@ contract WhirVerifierP {
     /// reads nothing but the arguments.
     function verifyProfiled(uint256[] calldata statement, bytes calldata proof)
         external
-        view
         returns (bool, uint256[] memory)
     {
         // The proof is read straight from CALLODATA: every reader below is a
@@ -326,7 +325,7 @@ contract WhirVerifierP {
         uint256 po,
         WhirVerifierCoreP.Transcript memory t,
         StmRef memory stm
-    ) private view returns (uint256 no, uint256[][] memory boundEvalsOf) {
+    ) private returns (uint256 no, uint256[][] memory boundEvalsOf) {
         uint256 numRounds;
         (numRounds, no) = _word(proof, co);
         boundEvalsOf = new uint256[][](numRounds);
@@ -448,7 +447,7 @@ contract WhirVerifierP {
         RoundPrf memory p,
         StmRef memory stm,
         uint256 roundIdx
-    ) private view {
+    ) private {
         // Each round re-binds its framing constants (D-070): the config bytes are
         // consumed by count, and the cursor restarts with the round.
         t.base = 10 + roundIdx * 16;
@@ -622,7 +621,7 @@ contract WhirVerifierP {
         RoundPrf memory p,
         Threading memory th,
         WhirGadgets.ConstraintWeight[] memory constraints
-    ) private view {
+    ) private {
         uint256 nInter = c.nInter;
         WhirVerifierCoreP.FinalSchedule memory sf;
         sf.finalPolyConstants = 0;
@@ -680,7 +679,7 @@ contract WhirVerifierP {
         WhirGadgets.ConstraintWeight[] memory constraints,
         uint256[] memory finalPoly,
         uint256 foldedClaim
-    ) private view {
+    ) private {
         uint256[] memory allR = _concat(allRandomness, closing);
         (uint256 weight, uint256 value) = _terminalWeight(allR, constraints, finalPoly, closing);
         uint256 expected = KoalaBearExt4.mul(weight, value);
@@ -700,7 +699,7 @@ contract WhirVerifierP {
         WhirGadgets.ConstraintWeight[] memory constraints,
         uint256[] memory finalPoly,
         uint256[] memory randomness
-    ) private view returns (uint256 weight, uint256 value) {
+    ) private returns (uint256 weight, uint256 value) {
         if (SATELLITE_CODEHASH != SATELLITE.codehash) revert SatelliteUnpinned();
         (uint256 frame, uint256 size) = _packTerminalFrame(allR, constraints, finalPoly, randomness);
         return _callTerminalWeight(frame, size);
@@ -843,7 +842,7 @@ contract WhirVerifierP {
     }
 
     /// staticcall the frame and read back [magic, weight, value].
-    function _callTerminalWeight(uint256 frame, uint256 size) private view returns (uint256 weight, uint256 value) {
+    function _callTerminalWeight(uint256 frame, uint256 size) private returns (uint256 weight, uint256 value) {
         // Left-aligned so a 4-byte revert payload carries the selector.
         uint256 failSel = uint256(bytes32(SatelliteCallFailed.selector));
         // Assembly cannot name an immutable; bind them to locals first.
@@ -852,7 +851,7 @@ contract WhirVerifierP {
         uint256 rdSize;
         uint256 reply = frame + size;
         assembly ("memory-safe") {
-            let ok := staticcall(gas(), satellite, frame, size, reply, 96)
+            let ok := call(gas(), satellite, 0, frame, size, reply, 96)
             rdSize := returndatasize()
             switch ok
             case 0 {
