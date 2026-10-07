@@ -2402,3 +2402,48 @@ v9 plan (mainline, beside the existing verifier):
 2. Hot kernels (loadRowFused+foldRow fused per query; claim-reg absorb loop)
    as satellite entry points, not engine-inlined code.
 3. Keep the engine as a thin dispatcher: parse header, drive rounds, call out.
+
+
+## Batch 51 — QFOLD satellite: query loop + fold + dot product leave the engine (55.59 -> 53.94M)
+
+TerminalWeight gains a fourth magic frame, QFOLD (0x51464F4C44): one staticcall
+per round carries the whole query workload - row decode, leaf hash, dims-4 fold
+tree, the amortized pruned Merkle walk (was a separate MROOTS call), and the
+phase-7 dot product - and replies the standard 96-B [magic, root, claimedEval].
+Frame (BE words): magic, depth, nq, nD, rowLimbs, rowsAreBase, foldDims(=4),
+expectedRoot, prevRandomness x4, gamma, carriedClaim, nOod, oodAnswers,
+indices, then ROWS and pruned STREAM copied inline (the satellite's calldata is
+the frame, not the outer tx). Gamma is drawn BEFORE the query loop - legal
+because the loop touches no transcript state; WhirComposed's gamma assertion
+pins it.
+
+Core changes: RoundInput gains satellite + satelliteCodehash (engine fills from
+its immutables; core re-checks the pin per call); verifyRound is now view;
+phases 5-7 split - pruned rounds (rowsCdBase != 0 && prunedNDigests != 0) pack
+_frameQFold + _callSatellite in-core, memory-path harnesses keep the old loop.
+RoundOutput.frameAddr/frameSize deleted; the engine's MROOTS call site is gone.
+
+Gotchas hit: Yul functions don't capture outer variables (declare p inside each
+helper) and forbid shadowing outer names (rename to pm); one giant assembly
+block for the frame packer hit stack-too-deep - write the header in ordinary
+Solidity (new uint256[](words) + indexed stores), keep only the calldatacopy
+tail in assembly; the free-pointer bump then claims header+rows+stream+reply in
+one step (the rows extend past the header array - legal because nothing else
+allocates between).
+
+Sizes: TerminalWeight 19,660 B (margin 4,916), WhirVerifier 18,354 B (margin
+6,222). All 173 tests pass. test_gas_v8: 53,935,293 direct / 55,490,251 wrapper
+(-1.65M real vs batch 50's 55.59M).
+
+Decomposition attempts: revert-point probes only measure to round 0 (P1: 3.29M
+before the first satellite call - decode + initial + claim reg dominate r0).
+Events can't fire under the V6 wrapper's staticcall (view). The V8P probe is
+frozen on the old path; regen deferred.
+
+Reading: QFOLD landed less than the codegen-gap estimate (~3.5M). The satellite
+query kernel is still ~1.8M above bench floor - TerminalWeight is itself a
+19.6 KB via-IR contract and _qfold's nested loops likely spill too. Next probes:
+(a) raw-append framing absorb (drop the per-word range check on the AUTHENTICATED
+constants blob - verify the digest pin first) ~1-2M; (b) split _qfold's per-query
+kernel into a standalone function to help register fusion; (c) the v9 CONFIG
+restructure (TWIGHT 9.1 + CIDNTY 5.4 + framing 3.1 real = the whale cluster).
