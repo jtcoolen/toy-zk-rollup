@@ -31,7 +31,7 @@ contract RoundHarness {
         WhirVerifierCore.RoundSchedule memory s,
         WhirVerifierCore.RoundInput memory input,
         uint256 carried
-    ) external pure returns (WhirVerifierCore.RoundOutput memory) {
+    ) external view returns (WhirVerifierCore.RoundOutput memory) {
         return WhirVerifierCore.verifyRound(t, s, input, carried);
     }
 }

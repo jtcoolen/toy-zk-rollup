@@ -350,7 +350,7 @@ contract WhirComposedTest is Test {
         uint256 carried,
         uint256[] memory lastRandomness,
         uint256[] memory allRandomness
-    ) private pure returns (Threading memory th) {
+    ) private view returns (Threading memory th) {
         for (uint256 i; i < nInter; ++i) {
             WhirVerifierCore.RoundSchedule memory s;
             s.roundIndex = i;

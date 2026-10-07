@@ -72,6 +72,15 @@ contract TerminalWeight {
     /// engine never inlines the ConstraintIdentity interpreter (batch 48).
     uint256 public constant CIDNTY_MAGIC = 0x4349_444E_5459;
 
+    /// @notice Fourth frame magic: ASCII "QFOLD". v9: the whole per-query loop
+    /// (row decode, leaf hash, fold) plus the amortized pruned-Merkle walk runs
+    /// here in ONE call per round. The engine keeps only the transcript, the
+    /// fold dot-product, and the sumcheck. This is the codegen lever: the same
+    /// kernels cost 7-15x less when compiled in this small contract than when
+    /// inlined into the monolithic engine (via-IR spills the engine's hot loops
+    /// to memory; here they stay in registers).
+    uint256 public constant QFOLD_MAGIC = 0x5146_4F4C_4400;
+
     /// @notice The identity did not hold for this instance. Same selector as
     /// the engine's own error, so the bubbled revert is indistinguishable.
     error ConstraintIdentityMismatch(uint256 instance);
@@ -396,6 +405,331 @@ contract TerminalWeight {
             mstore(0, 0x4D524F4F5453) // MROOTS_MAGIC
             mstore(32, mload(digB))
             mstore(64, 0)
+            return(0, 96)
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // QFOLD: the whole per-query loop (v9), offloaded from the engine
+    // ---------------------------------------------------------------------
+    //
+    // Frame (raw BE 32-byte words):
+    //
+    //   word 0        magic "QFOLD"
+    //   word 1        depth (log folded-domain size)
+    //   word 2        nq (query count)
+    //   word 3        nD  (pruned digest count)
+    //   word 4        rowLimbs (16 base or 64 extension limbs per row)
+    //   word 5        rowsAreBase (0/1)
+    //   word 6        foldDims (must be 4)
+    //   word 7        expectedRoot
+    //   words 8..11   prevRandomness (4 packed ext elements)
+    //   word 12       gamma (the round batching challenge, drawn by the
+    //                 engine BEFORE the frame: the query loop touches no
+    //                 transcript state, so drawing it early is identical)
+    //   word 13       carriedClaim (packed ext)
+    //   word 14       nOod
+    //   words 15..    oodAnswers (nOod packed ext words)
+    //   then          indices (nq words, sampled by the engine transcript)
+    //   then          rows: nq*rowLimbs wire limbs, 4 bytes each, copied
+    //                 verbatim from the proof calldata (the satellite's own
+    //                 calldata is the frame - the outer tx calldata is not
+    //                 visible here, so the rows ride inside the frame)
+    //   then          nD digest words (the pruned stream)
+    //
+    // The satellite decodes each row (wire LE u32 limbs -> Mont byte words
+    // for the leaf, packed lanes for the fold), hashes the leaf, folds the
+    // row against the randomness with the same 15-fold tree as
+    // KoalaBearExt4.evaluate_hypercube (dims-4 unrolled), forms this round's
+    // combined claim (carried + gamma-powers over the OOD answers and the
+    // folds - the whole phase-7 dot product), then runs the amortized
+    // pruned-Merkle walk over the (index, leaf) pairs and checks the root.
+    // Reply [magic, root, claimedEval] - the same 96-byte shape as TWIGHT
+    // and MROOTS, so the engine's single satellite-call path reads it.
+    //
+    // Why here and not in the engine: identical kernels cost 7-15x less
+    // compiled in this small contract than inlined into the monolithic
+    // engine (via-IR stack pressure spills the engine's hot loops). The
+    // fold dot-product and everything transcript-bound stays in the engine.
+    function _qfold() private pure {
+        assembly ("memory-safe") {
+            let depth := calldataload(32)
+            let nq := calldataload(64)
+            let nD := calldataload(96)
+            let rowLimbs := calldataload(128)
+            let rowsAreBase := calldataload(160)
+            if iszero(eq(calldataload(192), 4)) {
+                mstore(0, shl(224, 0x09a205cc)) // BadFrameLength()
+                revert(0, 4)
+            }
+            let expectedRoot := calldataload(224)
+            let r0 := calldataload(256)
+            let r1 := calldataload(288)
+            let r2 := calldataload(320)
+            let r3 := calldataload(352)
+            let gamma := calldataload(384)
+            let carried := calldataload(416)
+            let nOod := calldataload(448)
+            let oodBase := 480 // word 15: the round's OOD answers
+            let idxBase := add(oodBase, mul(nOod, 32))
+            let rowsAbs := add(idxBase, mul(nq, 32))
+            let streamAbs := add(rowsAbs, mul(mul(nq, rowLimbs), 4))
+            if iszero(eq(calldatasize(), add(streamAbs, mul(nD, 32)))) {
+                mstore(0, shl(224, 0x09a205cc)) // BadFrameLength()
+                revert(0, 4)
+            }
+            let p := 0x7f000001
+            let rr := 0x01fffffe
+            function swap32(x) -> y {
+                y := or(
+                    or(and(shl(24, x), 0xff000000), and(shl(8, x), 0xff0000)),
+                    or(and(shr(8, x), 0xff00), shr(24, x))
+                )
+            }
+            // One fused extension fold: a0 + r*(a1-a0), the exact lane
+            // discipline of KoalaBearExt4._fold_once (deferred reductions).
+            function fold(a0, a1, r) -> o {
+                let pm := 0x7f000001
+                let M := 0xffffffff
+                let W := 3
+                let x0 := shr(224, a0)
+                let x1 := and(shr(192, a0), M)
+                let x2 := and(shr(160, a0), M)
+                let x3 := and(shr(128, a0), M)
+                let d0 := add(sub(shr(224, a1), x0), pm)
+                let d1 := add(sub(and(shr(192, a1), M), x1), pm)
+                let d2 := add(sub(and(shr(160, a1), M), x2), pm)
+                let d3 := add(sub(and(shr(128, a1), M), x3), pm)
+                let c0 := shr(224, r)
+                let c1 := and(shr(192, r), M)
+                let c2 := and(shr(160, r), M)
+                let c3 := and(shr(128, r), M)
+                let t0 := add(mul(c0, d0), mul(W, add(add(mul(c1, d3), mul(c2, d2)), mul(c3, d1))))
+                let t1 := add(add(mul(c0, d1), mul(c1, d0)), mul(W, add(mul(c2, d3), mul(c3, d2))))
+                let t2 := add(add(add(mul(c0, d2), mul(c1, d1)), mul(c2, d0)), mul(W, mul(c3, d3)))
+                let t3 := add(add(add(mul(c0, d3), mul(c1, d2)), mul(c2, d1)), mul(c3, d0))
+                o := or(
+                    or(shl(224, mod(add(x0, t0), pm)), shl(192, mod(add(x1, t1), pm))),
+                    or(shl(160, mod(add(x2, t2), pm)), shl(128, mod(add(x3, t3), pm)))
+                )
+            }
+            // Extension add/mul with the same lane discipline as
+            // KoalaBearExt4.add / _mul_packed (the fold dot product).
+            function eadd(a, b) -> o {
+                let pm := 0x7f000001
+                let M := 0xffffffff
+                let sum := add(a, b)
+                o := or(
+                    or(shl(224, mod(shr(224, sum), pm)), shl(192, mod(and(shr(192, sum), M), pm))),
+                    or(shl(160, mod(and(shr(160, sum), M), pm)), shl(128, mod(and(shr(128, sum), M), pm)))
+                )
+            }
+            function emul(a, b) -> o {
+                let pm := 0x7f000001
+                let M := 0xffffffff
+                let W := 3
+                let x0 := shr(224, a)
+                let x1 := and(shr(192, a), M)
+                let x2 := and(shr(160, a), M)
+                let x3 := and(shr(128, a), M)
+                let y0 := shr(224, b)
+                let y1 := and(shr(192, b), M)
+                let y2 := and(shr(160, b), M)
+                let y3 := and(shr(128, b), M)
+                let t0 := add(mul(x0, y0), mul(W, add(add(mul(x1, y3), mul(x2, y2)), mul(x3, y1))))
+                let t1 := add(add(mul(x0, y1), mul(x1, y0)), mul(W, add(mul(x2, y3), mul(x3, y2))))
+                let t2 := add(add(add(mul(x0, y2), mul(x1, y1)), mul(x2, y0)), mul(W, mul(x3, y3)))
+                let t3 := add(add(add(mul(x0, y3), mul(x1, y2)), mul(x2, y1)), mul(x3, y0))
+                o := or(
+                    or(shl(224, mod(t0, pm)), shl(192, mod(t1, pm))),
+                    or(shl(160, mod(t2, pm)), shl(128, mod(t3, pm)))
+                )
+            }
+            // Work arrays: fold inputs (16 words), leaf scratch (64 B),
+            // Merkle frontiers (nq-sized), fold outputs (nq words).
+            let eB := mload(0x40)
+            let scratch := add(eB, 512)
+            // Leaf scratch: one 4-byte Mont word per wire limb, up to 64
+            // limbs (256 B) for extension rows; 64 B suffices for base rows.
+            let idxB := add(scratch, 256)
+            let digB := add(idxB, mul(nq, 32))
+            let nidxB := add(digB, mul(nq, 32))
+            let ndigB := add(nidxB, mul(nq, 32))
+            let foldB := add(ndigB, mul(nq, 32))
+            let mscratch := add(foldB, mul(nq, 32))
+            mstore(0x40, add(mscratch, 64))
+            for { let q := 0 } lt(q, nq) { q := add(q, 1) } {
+                let idx := calldataload(add(idxBase, mul(q, 32)))
+                let leaf := 0
+                switch rowsAreBase
+                case 1 {
+                    // 16 base limbs: wire LE u32 -> Mont byte word + lane 0.
+                    let hs := add(rowsAbs, mul(mul(q, rowLimbs), 4))
+                    for { let j := 0 } lt(j, rowLimbs) { j := add(j, 1) } {
+                        let v := swap32(shr(224, calldataload(add(hs, shl(2, j)))))
+                        if iszero(lt(v, p)) {
+                            mstore(0, shl(224, 0x97a1e05e)) // LimbOutOfRange()
+                            mstore(4, v)
+                            revert(0, 36)
+                        }
+                        mstore(add(scratch, shl(2, j)), shl(224, swap32(mod(mul(v, rr), p))))
+                        mstore(add(eB, shl(5, j)), shl(224, v))
+                    }
+                    leaf := keccak256(scratch, 64)
+                }
+                default {
+                    // 64 wire limbs = 16 packed ext elements, 4 limbs per
+                    // element, top lane first. One 4-byte load per limb.
+                    let hs := add(rowsAbs, mul(mul(q, rowLimbs), 4))
+                    for { let e := 0 } lt(e, shr(2, rowLimbs)) { e := add(e, 1) } {
+                        let eo := shl(4, e)
+                        let c0 := swap32(shr(224, calldataload(add(hs, eo))))
+                        let c1 := swap32(shr(224, calldataload(add(hs, add(eo, 4)))))
+                        let c2 := swap32(shr(224, calldataload(add(hs, add(eo, 8)))))
+                        let c3 := swap32(shr(224, calldataload(add(hs, add(eo, 12)))))
+                        if iszero(gt(and(and(sub(c0, p), sub(c1, p)), and(sub(c2, p), sub(c3, p))), 0xffffffff)) {
+                            mstore(0, shl(224, 0x97a1e05e)) // LimbOutOfRange()
+                            mstore(4, c0)
+                            revert(0, 36)
+                        }
+                        let dp := add(scratch, eo)
+                        mstore(dp, shl(224, swap32(mod(mul(c0, rr), p))))
+                        mstore(add(dp, 4), shl(224, swap32(mod(mul(c1, rr), p))))
+                        mstore(add(dp, 8), shl(224, swap32(mod(mul(c2, rr), p))))
+                        mstore(add(dp, 12), shl(224, swap32(mod(mul(c3, rr), p))))
+                        mstore(add(eB, shl(5, e)),
+                            or(or(shl(224, c0), shl(192, c1)), or(shl(160, c2), shl(128, c3))))
+                    }
+                    leaf := keccak256(scratch, 256)
+                }
+                // dims-4 fold tree: 16 elements at eB -> 1 value.
+                let l0 := fold(mload(add(eB, 0)),   mload(add(eB, 256)), r0)
+                let l1 := fold(mload(add(eB, 32)),  mload(add(eB, 288)), r0)
+                let l2 := fold(mload(add(eB, 64)),  mload(add(eB, 320)), r0)
+                let l3 := fold(mload(add(eB, 96)),  mload(add(eB, 352)), r0)
+                let l4 := fold(mload(add(eB, 128)), mload(add(eB, 384)), r0)
+                let l5 := fold(mload(add(eB, 160)), mload(add(eB, 416)), r0)
+                let l6 := fold(mload(add(eB, 192)), mload(add(eB, 448)), r0)
+                let l7 := fold(mload(add(eB, 224)), mload(add(eB, 480)), r0)
+                let m0 := fold(l0, l4, r1)
+                let m1 := fold(l1, l5, r1)
+                let m2 := fold(l2, l6, r1)
+                let m3 := fold(l3, l7, r1)
+                let n0 := fold(m0, m2, r2)
+                let n1 := fold(m1, m3, r2)
+                let fv := fold(n0, n1, r3)
+                mstore(add(idxB, mul(q, 32)), idx)
+                mstore(add(digB, mul(q, 32)), leaf)
+                mstore(add(foldB, mul(q, 32)), fv)
+            }
+            // --- phase-7 dot product: carried + gamma-powers over OOD, folds ---
+            let claimed := carried
+            let power := gamma // gamma^1: the carried claim owns gamma^0
+            for { let i := 0 } lt(i, nOod) { i := add(i, 1) } {
+                claimed := eadd(claimed, emul(calldataload(add(oodBase, mul(i, 32))), power))
+                power := emul(power, gamma)
+            }
+            for { let q := 0 } lt(q, nq) { q := add(q, 1) } {
+                claimed := eadd(claimed, emul(mload(add(foldB, mul(q, 32))), power))
+                power := emul(power, gamma)
+            }
+            // --- amortized pruned Merkle walk (identical to _mroots) ---
+            // Insertion sort by index, carrying leaves.
+            for { let i := 1 } lt(i, nq) { i := add(i, 1) } {
+                let ki := mload(add(idxB, mul(i, 32)))
+                let kd := mload(add(digB, mul(i, 32)))
+                let j := i
+                for { } gt(j, 0) { } {
+                    let pj := mload(add(idxB, mul(sub(j, 1), 32)))
+                    if iszero(gt(pj, ki)) { break }
+                    mstore(add(idxB, mul(j, 32)), pj)
+                    mstore(add(digB, mul(j, 32)), mload(add(digB, mul(sub(j, 1), 32))))
+                    j := sub(j, 1)
+                }
+                mstore(add(idxB, mul(j, 32)), ki)
+                mstore(add(digB, mul(j, 32)), kd)
+            }
+            // Sorted-unique: duplicate query indices share one node.
+            let u := 0
+            for { let i := 0 } lt(i, nq) { i := add(i, 1) } {
+                let ki := mload(add(idxB, mul(i, 32)))
+                if or(iszero(i), iszero(eq(ki, mload(add(idxB, mul(sub(i, 1), 32)))))) {
+                    mstore(add(idxB, mul(u, 32)), ki)
+                    mstore(add(digB, mul(u, 32)), mload(add(digB, mul(i, 32))))
+                    u := add(u, 1)
+                }
+            }
+            if iszero(u) {
+                mstore(0, shl(224, 0x81262fc8)) // MrootsBadFrontier()
+                revert(0, 4)
+            }
+            let w := 0
+            for { let lvl := 0 } lt(lvl, depth) { lvl := add(lvl, 1) } {
+                let m := 0
+                let i := 0
+                for { } lt(i, u) { } {
+                    let ii := mload(add(idxB, mul(i, 32)))
+                    let par := shr(1, ii)
+                    let left := mload(add(digB, mul(i, 32)))
+                    let right := 0
+                    let paired := 0
+                    if lt(add(i, 1), u) {
+                        if eq(shr(1, mload(add(idxB, mul(add(i, 1), 32)))), par) { paired := 1 }
+                    }
+                    switch paired
+                    case 1 {
+                        right := mload(add(digB, mul(add(i, 1), 32)))
+                        i := add(i, 2)
+                    }
+                    default {
+                        // Boundary child: sibling from the stream. The odd
+                        // child keeps its own digest as the RIGHT input and
+                        // takes the stream digest as LEFT.
+                        switch and(ii, 1)
+                        case 0 { right := calldataload(add(streamAbs, mul(w, 32))) }
+                        default {
+                            right := left
+                            left := calldataload(add(streamAbs, mul(w, 32)))
+                        }
+                        w := add(w, 1)
+                        i := add(i, 1)
+                    }
+                    mstore(mscratch, left)
+                    mstore(add(mscratch, 32), right)
+                    mstore(add(nidxB, mul(m, 32)), par)
+                    mstore(add(ndigB, mul(m, 32)), keccak256(mscratch, 64))
+                    m := add(m, 1)
+                }
+                // Swap frontiers: current always lives at idxB/digB.
+                let t := idxB
+                idxB := nidxB
+                nidxB := t
+                t := digB
+                digB := ndigB
+                ndigB := t
+                u := m
+            }
+            if iszero(eq(w, nD)) {
+                mstore(0, shl(224, 0xc6de65b0)) // SiblingCountMismatch(uint256,uint256)
+                mstore(4, w)
+                mstore(36, nD)
+                revert(0, 68)
+            }
+            if iszero(eq(u, 1)) {
+                mstore(0, shl(224, 0x81262fc8)) // MrootsBadFrontier()
+                revert(0, 4)
+            }
+            if iszero(eq(mload(digB), expectedRoot)) {
+                mstore(0, shl(224, 0xaee6dc69)) // PrunedRootMismatch()
+                revert(0, 4)
+            }
+            // Reply [magic, root, claimedEval]: the same 96-byte shape as
+            // TWIGHT and MROOTS, so the engine's single satellite path reads
+            // it. The root rode back only for debug - the compare above
+            // already pinned it against the frame's expectedRoot.
+            mstore(0, 0x51464F4C4400) // QFOLD_MAGIC
+            mstore(32, mload(digB))
+            mstore(64, claimed)
             return(0, 96)
         }
     }
@@ -844,6 +1178,10 @@ contract TerminalWeight {
     /// not be declared pure/view, but this body reads no state and the caller
     /// staticcalls it, so ETH can never enter and nothing is written.
     fallback() external {
+        if (_head() == QFOLD_MAGIC) {
+            // _qfold answers via the return opcode; control never returns.
+            _qfold();
+        }
         if (_head() == MROOTS_MAGIC) {
             // _mroots answers via the return opcode; control never returns.
             _mroots();

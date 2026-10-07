@@ -73,7 +73,7 @@ contract WhirFinalPhaseTest is Test {
     /// Run the initial phase and every intermediate round, returning the
     /// transcript parked after the last round sumcheck, the carried claim,
     /// the last fold point, and every folding randomness in protocol order.
-    function _beforeFinal(string memory j) private pure returns (
+    function _beforeFinal(string memory j) private view returns (
         WhirVerifierCore.Transcript memory t,
         uint256 carried,
         uint256[] memory lastRandomness,

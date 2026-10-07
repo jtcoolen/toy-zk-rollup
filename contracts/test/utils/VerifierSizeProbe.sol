@@ -79,7 +79,7 @@ contract VerifierSizeProbe {
 
     /// The heavy phase entry points. Empty schedules/inputs are fine: the linker
     /// pulls the code regardless, and this contract is never executed.
-    function phases(WhirVerifierCore.Transcript memory t) external pure {
+    function phases(WhirVerifierCore.Transcript memory t) external view {
         WhirVerifierCore.InitialSchedule memory isch;
         WhirVerifierCore.InitialInput memory iin;
         WhirVerifierCore.verifyInitial(t, isch, iin);

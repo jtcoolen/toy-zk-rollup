@@ -590,6 +590,10 @@ contract WhirVerifier is IWhirVerifier {
         }
 
         input.prevRandomness = st.lastRandomness;
+        // v9: the QFOLD frame calls the pinned satellite from inside the
+        // core; hand it the handle and the pin so the core can re-check.
+        input.satellite = SATELLITE;
+        input.satelliteCodehash = SATELLITE_CODEHASH;
         uint256 scr = p.scLens[i];
         input.sumcheckCA = _slice(p.scA, cur.scOff, scr);
         input.sumcheckCInf = _slice(p.scInf, cur.scOff, scr);
@@ -601,18 +605,6 @@ contract WhirVerifier is IWhirVerifier {
 
         WhirVerifierCore.RoundOutput memory out =
             WhirVerifierCore.verifyRound(t, s, input, st.carried);
-
-        // v8: the round authenticated its queries with one amortized pruned
-        // walk instead of per-query paths. The frame is built (top of memory,
-        // reply slot reserved); the satellite walks and returns the root -
-        // compared here against the round's own prevCommitment, so a wrong
-        // or missing stream can only make verification fail, never pass.
-        if (out.frameSize != 0) {
-            // The frame carries the expected root; the pinned satellite
-            // compares and reverts itself, and _callSatellite bubbles its
-            // revert data up unchanged.
-            _callSatellite(out.frameAddr, out.frameSize);
-        }
 
         // This round's constraint: equality groups from its drawn OOD points,
         // selection group from the domain points of its drawn indices.
