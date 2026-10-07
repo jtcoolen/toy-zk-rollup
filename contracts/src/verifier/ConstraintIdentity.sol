@@ -141,77 +141,126 @@ library ConstraintIdentity {
         Selectors memory sels,
         uint256 alpha
     ) internal pure returns (uint256) {
-        uint256 isFirst = sels.isFirst;
-        uint256 isLast = sels.isLast;
-        uint256 s2 = sels.isTransition;
-
         uint256 n = prog.nodesCdBase == 0 ? prog.nodes.length / 3 : prog.nodesLen / 3;
         uint256[] memory stack = new uint256[](n);
-        uint256 cdBase = prog.nodesCdBase;
-        for (uint256 i = 0; i < n; ++i) {
-            uint256 op;
-            uint256 a;
-            uint256 b;
-            if (cdBase == 0) {
-                uint256 base = 3 * i;
-                op = prog.nodes[base];
-                a = prog.nodes[base + 1];
-                b = prog.nodes[base + 2];
-            } else {
-                // Three LE u32 words per node, one calldataload: the node is
-                // 12 bytes, fully inside one word. LE decode = byte-swap of
-                // the big-endian slice (same recipe as _arr).
-                assembly ("memory-safe") {
-                    let w := calldataload(add(cdBase, mul(i, 12)))
-                    op := shr(248, w)
-                    let x := and(shr(192, w), 0xffffffff)
-                    x := or(and(shr(8, x), 0x00ff00ff), and(shl(8, x), 0xff00ff00))
-                    a := or(and(shr(16, x), 0x0000ffff), and(shl(16, x), 0xffff0000))
-                    let y := and(shr(160, w), 0xffffffff)
-                    y := or(and(shr(8, y), 0x00ff00ff), and(shl(8, y), 0xff00ff00))
-                    b := or(and(shr(16, y), 0x0000ffff), and(shl(16, y), 0xffff0000))
+        // Batch 38: the whole node loop in one Yul block. The Solidity
+        // if/else-if chain cost ~10 compares per node over 19 op codes; the
+        // Yul switch compiles to a jump table, and the arithmetic arms are
+        // register-fused (unpack once, one mod per lane, no call frame).
+        // The leaf arms exploit the layout: Opened's ten arrays sit at
+        // (op-2)*32 for ops 2..11 and Selectors' first three fields at
+        // (op-12)*32 for ops 12..14, so one indexed mload covers all of
+        // them. Program: nodes@0 baseConsts@96 extConsts@128.
+        assembly ("memory-safe") {
+            let P := 0x7f000001
+            let M := 0xffffffff
+            let W := 3
+            let sp := add(stack, 32)
+            let cdb := mload(add(prog, 32))
+            for { let idx := 0 } lt(idx, n) { idx := add(idx, 1) } {
+                let op := 0
+                let x := 0
+                let y := 0
+                switch cdb
+                case 0 {
+                    let np := add(add(mload(prog), 32), mul(idx, 96))
+                    op := mload(np)
+                    x := mload(add(np, 32))
+                    y := mload(add(np, 64))
                 }
-            }
-            if (op == OP_ADD) {
-                stack[i] = stack[a].add(stack[b]);
-            } else if (op == OP_SUB) {
-                stack[i] = stack[a].sub(stack[b]);
-            } else if (op == OP_MUL) {
-                stack[i] = stack[a].mul(stack[b]);
-            } else if (op == OP_NEG) {
-                stack[i] = uint256(0).sub(stack[a]);
-            } else if (op == OP_CONST_BASE) {
-                stack[i] = lift(prog.baseConsts[a]);
-            } else if (op == OP_CONST_EXT) {
-                stack[i] = prog.extConsts[a];
-            } else if (op == OP_MAIN_LOCAL) {
-                stack[i] = opened.mainLocal[a];
-            } else if (op == OP_MAIN_NEXT) {
-                stack[i] = opened.mainNext[a];
-            } else if (op == OP_PRE_LOCAL) {
-                stack[i] = opened.preLocal[a];
-            } else if (op == OP_PRE_NEXT) {
-                stack[i] = opened.preNext[a];
-            } else if (op == OP_PERM_LOCAL) {
-                stack[i] = opened.permLocal[a];
-            } else if (op == OP_PERM_NEXT) {
-                stack[i] = opened.permNext[a];
-            } else if (op == OP_PERM_CHALLENGE) {
-                stack[i] = opened.permChallenges[a];
-            } else if (op == OP_PERM_VALUE) {
-                stack[i] = opened.permValues[a];
-            } else if (op == OP_PUBLIC) {
-                stack[i] = lift(opened.publicValues[a]);
-            } else if (op == OP_PERIODIC) {
-                stack[i] = opened.periodicValues[a];
-            } else if (op == OP_IS_FIRST) {
-                stack[i] = isFirst;
-            } else if (op == OP_IS_LAST) {
-                stack[i] = isLast;
-            } else if (op == OP_IS_TRANSITION) {
-                stack[i] = s2;
-            } else {
-                revert("bad op");
+                default {
+                    // Three LE u32 words per node, one calldataload: the node
+                    // is 12 bytes, fully inside one word. LE decode = byte
+                    // swap of the big-endian slice (same recipe as _arr).
+                    let w := calldataload(add(cdb, mul(idx, 12)))
+                    op := shr(248, w)
+                    x := and(shr(192, w), 0xffffffff)
+                    x := or(and(shr(8, x), 0x00ff00ff), and(shl(8, x), 0xff00ff00))
+                    x := or(and(shr(16, x), 0x0000ffff), and(shl(16, x), 0xffff0000))
+                    y := and(shr(160, w), 0xffffffff)
+                    y := or(and(shr(8, y), 0x00ff00ff), and(shl(8, y), 0xff00ff00))
+                    y := or(and(shr(16, y), 0x0000ffff), and(shl(16, y), 0xffff0000))
+                }
+                let v := 0
+                switch op
+                case 15 {
+                    if or(iszero(lt(x, n)), iszero(lt(y, n))) { mstore(0, 0x48ef0e01) revert(0, 4) }
+                    let va := mload(add(sp, mul(x, 32)))
+                    let vb := mload(add(sp, mul(y, 32)))
+                    let x0 := mod(add(shr(224, va), shr(224, vb)), P)
+                    let x1 := mod(add(and(shr(192, va), M), and(shr(192, vb), M)), P)
+                    let x2 := mod(add(and(shr(160, va), M), and(shr(160, vb), M)), P)
+                    let x3 := mod(add(and(shr(128, va), M), and(shr(128, vb), M)), P)
+                    v := or(or(shl(224, x0), shl(192, x1)), or(shl(160, x2), shl(128, x3)))
+                }
+                case 16 {
+                    if or(iszero(lt(x, n)), iszero(lt(y, n))) { mstore(0, 0x48ef0e01) revert(0, 4) }
+                    let va := mload(add(sp, mul(x, 32)))
+                    let vb := mload(add(sp, mul(y, 32)))
+                    let x0 := mod(add(shr(224, va), sub(P, shr(224, vb))), P)
+                    let x1 := mod(add(and(shr(192, va), M), sub(P, and(shr(192, vb), M))), P)
+                    let x2 := mod(add(and(shr(160, va), M), sub(P, and(shr(160, vb), M))), P)
+                    let x3 := mod(add(and(shr(128, va), M), sub(P, and(shr(128, vb), M))), P)
+                    v := or(or(shl(224, x0), shl(192, x1)), or(shl(160, x2), shl(128, x3)))
+                }
+                case 17 {
+                    if or(iszero(lt(x, n)), iszero(lt(y, n))) { mstore(0, 0x48ef0e01) revert(0, 4) }
+                    let va := mload(add(sp, mul(x, 32)))
+                    let vb := mload(add(sp, mul(y, 32)))
+                    let a0 := shr(224, va)
+                    let a1 := and(shr(192, va), M)
+                    let a2 := and(shr(160, va), M)
+                    let a3 := and(shr(128, va), M)
+                    let b0 := shr(224, vb)
+                    let b1 := and(shr(192, vb), M)
+                    let b2 := and(shr(160, vb), M)
+                    let b3 := and(shr(128, vb), M)
+                    let u0 := add(mul(a0, b0), mul(W, add(add(mul(a1, b3), mul(a2, b2)), mul(a3, b1))))
+                    let u1 := add(add(mul(a0, b1), mul(a1, b0)), mul(W, add(mul(a2, b3), mul(a3, b2))))
+                    let u2 := add(add(add(mul(a0, b2), mul(a1, b1)), mul(a2, b0)), mul(W, mul(a3, b3)))
+                    let u3 := add(add(add(mul(a0, b3), mul(a1, b2)), mul(a2, b1)), mul(a3, b0))
+                    v := or(or(shl(224, mod(u0, P)), shl(192, mod(u1, P))), or(shl(160, mod(u2, P)), shl(128, mod(u3, P))))
+                }
+                case 18 {
+                    if iszero(lt(x, n)) { mstore(0, 0x48ef0e01) revert(0, 4) }
+                    let va := mload(add(sp, mul(x, 32)))
+                    let x0 := mod(sub(P, shr(224, va)), P)
+                    let x1 := mod(sub(P, and(shr(192, va), M)), P)
+                    let x2 := mod(sub(P, and(shr(160, va), M)), P)
+                    let x3 := mod(sub(P, and(shr(128, va), M)), P)
+                    v := or(or(shl(224, x0), shl(192, x1)), or(shl(160, x2), shl(128, x3)))
+                }
+                case 0 {
+                    let arr := mload(add(prog, 96))
+                    if iszero(lt(x, mload(arr))) { mstore(0, 0x48ef0e01) revert(0, 4) }
+                    v := shl(224, mload(add(add(arr, 32), mul(x, 32))))
+                }
+                case 1 {
+                    let arr := mload(add(prog, 128))
+                    if iszero(lt(x, mload(arr))) { mstore(0, 0x48ef0e01) revert(0, 4) }
+                    v := mload(add(add(arr, 32), mul(x, 32)))
+                }
+                default {
+                    switch op
+                    case 12 { v := mload(sels) }
+                    case 13 { v := mload(add(sels, 32)) }
+                    case 14 { v := mload(add(sels, 64)) }
+                    default {
+                        switch op
+                        case 10 {
+                            let arr := mload(add(opened, 256))
+                            if iszero(lt(x, mload(arr))) { mstore(0, 0x48ef0e01) revert(0, 4) }
+                            v := shl(224, mload(add(add(arr, 32), mul(x, 32))))
+                        }
+                        default {
+                            if or(lt(op, 2), gt(op, 11)) { mstore(0, 0x48ef0e01) revert(0, 4) }
+                            let arr := mload(add(opened, mul(sub(op, 2), 32)))
+                            if iszero(lt(x, mload(arr))) { mstore(0, 0x48ef0e01) revert(0, 4) }
+                            v := mload(add(add(arr, 32), mul(x, 32)))
+                        }
+                    }
+                }
+                mstore(add(sp, mul(idx, 32)), v)
             }
         }
 

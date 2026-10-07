@@ -1823,3 +1823,32 @@ Also this batch (36): run-factored Horner + _mulAddExt fused mul-add
 
 Attribution now (recursion chain): terminal 14.79M, open+fold 14.61M,
 constraint identity 10.05M, initial phases 7.57M, final STIR 2.81M.
+
+## Batch 38 — Yul jump-table dispatch in the constraint-identity DAG (identity 10.0M -> 9.0M)
+
+_checkIdentity runs a post-order DAG interpreter over ~21k nodes per
+recursion-chain verify (instances 2-3 carry 5.9k + 15.3k nodes). The
+Solidity if/else-if chain over 19 op codes cost ~10 compares per node.
+The whole node loop now lives in ONE Yul block:
+
+* switch -> jump table (solc emits one jump for the whole dispatch);
+* ADD/SUB/MUL/NEG register-fused (unpack once, one mod per lane);
+* leaf ops exploit the struct layout: Opened's ten arrays sit at
+  (op-2)*32 for ops 2..11, so one indexed mload covers eight of them;
+  Selectors' first three fields cover ops 12..14 the same way;
+* PUBLIC (op 10) is the only lifted leaf needing a special case.
+
+Soundness parity: the Solidity version bounds-checked every array read
+automatically. In v5 the CONFIG - the node program itself - rides inside
+the bundle, so a tampered bundle is attacker-controlled program data:
+without checks a garbage node index expands memory to MemoryOOG (the
+tamper-profile test caught exactly this). Per-case bounds checks
+(x<n, y<n for arithmetic; x<len for leaves) restore the clean revert at
+0.3M cost - cheaper than the 0.7M hoisted variant, and the redundant
+op<19 check died to the via-IR stack limit anyway.
+
+Measured: constraint identity 10.05M -> 9.03M; recursion-chain v5 verify
+63.24M -> 62.23M; TOTAL accounted 53.05M -> 52.03M. 32 suites green.
+
+Attribution now: terminal 14.79M, open+fold 14.61M, constraint identity
+9.03M, initial phases 7.57M, final STIR 2.81M.
