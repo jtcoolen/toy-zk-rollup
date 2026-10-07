@@ -671,7 +671,8 @@ contract WhirVerifier is IWhirVerifier {
         uint256 rowElems = uint256(1) << th.lastRandomness.length;
         fi.rowElems = rowElems;
         fi.rowLimbs = rowElems * 4;
-        fi.rowsFlat = p.finalRowsExt;
+        fi.rowsCdBase = p.finalRowsAbs;
+        fi.rowsLen = p.finalRowsLen;
         fi.pathsCdBase = p.finalPathsAbs;
         fi.prevRandomness = th.lastRandomness;
         // D-072 phase 2: the domain points are computed in-circuit from the
@@ -972,7 +973,9 @@ contract WhirVerifier is IWhirVerifier {
         uint256[] scPowLens;
         uint256[] finalPoly;
         uint256 finalPowWitness;
-        uint256[] finalRowsExt;
+        /// v8: final-phase rows stay in calldata (zero-copy), like rounds.
+        uint256 finalRowsAbs;
+        uint256 finalRowsLen;
         uint256[] finalScA;
         uint256[] finalScInf;
         uint256[] finalScPow;
@@ -1063,7 +1066,20 @@ contract WhirVerifier is IWhirVerifier {
         (p.scPowLens, no) = _arr(m, no);
         (p.finalPoly, no) = _extArr(m, no);
         (p.finalPowWitness, no) = _word(m, no);
-        (p.finalRowsExt, no) = _arr(m, no);
+        {
+            // v8: the final rows are the same wire shape as the round rows
+            // (u32 LE limbs), so keep them in calldata: the hot row loader
+            // reads them zero-copy and the memory copy disappears.
+            uint256 nLimbs;
+            (nLimbs, no) = _word(m, no);
+            uint256 abs;
+            assembly ("memory-safe") {
+                abs := add(m.offset, mul(no, 4))
+            }
+            p.finalRowsAbs = abs;
+            p.finalRowsLen = nLimbs;
+            no += nLimbs;
+        }
         {
             uint256 nBytes;
             (nBytes, no) = _word(m, no);
