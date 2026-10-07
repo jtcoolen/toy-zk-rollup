@@ -74,7 +74,7 @@ contract RecursionChainV8AttributionTest is Test {
         emit log_named_uint("constraint identity", p.profileData(6));
         emit log_named_uint("round decode (all)", p.profileData(7));
         for (uint256 r; r < 5; ++r) {
-            uint256 base = 10 + r * 24;
+            uint256 base = 10 + r * 32;
             emit log_named_uint("-- initial", p.profileData(base + 0));
             emit log_named_uint("   verifyRound", p.profileData(base + 1));
             emit log_named_uint("   satellite MROOTS", p.profileData(base + 2));
@@ -84,13 +84,21 @@ contract RecursionChainV8AttributionTest is Test {
             emit log_named_uint("     r: phases1-4", p.profileData(base + 8));
             emit log_named_uint("     r: query loop", p.profileData(base + 9));
             emit log_named_uint("     r: phases6-7", p.profileData(base + 10));
+            emit log_named_uint("     r: round sumcheck", p.profileData(base + 19));
             emit log_named_uint("     i: claim reg", p.profileData(base + 12));
             emit log_named_uint("     i: sumcheck", p.profileData(base + 11));
+            emit log_named_uint("     i: #openingEvals", p.profileData(base + 24));
+            emit log_named_uint("     i: #oodAnswers", p.profileData(base + 25));
+            emit log_named_uint("     i: #claims", p.profileData(base + 26));
+            emit log_named_uint("     i: framing sum", p.profileData(base + 27));
             emit log_named_uint("       q: loadRowFused", p.profileData(base + 13));
             emit log_named_uint("       q: framePut", p.profileData(base + 14));
             emit log_named_uint("       q: foldRow", p.profileData(base + 15));
             emit log_named_uint("       nq", p.profileData(base + 6));
             emit log_named_uint("       rowLimbs", p.profileData(base + 7));
+            emit log_named_uint("       rowElems", p.profileData(base + 16));
+            emit log_named_uint("       |randomness|", p.profileData(base + 17));
+            emit log_named_uint("       rowsAreBase", p.profileData(base + 18));
             emit log_named_uint("       0x40 before loop", p.profileData(base + 16));
             emit log_named_uint("       0x40 after loop", p.profileData(base + 17));
             emit log_named_uint("       fp entry", p.profileData(base + 20));

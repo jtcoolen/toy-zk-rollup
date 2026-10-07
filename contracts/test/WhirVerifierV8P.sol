@@ -224,7 +224,7 @@ contract WhirVerifierV8P {
         returns (bool)
     {
         _logr("enter gasleft ", gasleft());
-        uint256[] memory acc = new uint256[](130);
+        uint256[] memory acc = new uint256[](200);
         uint256 _g;
         // The proof is read straight from CALLODATA: every reader below is a
         // calldataload, so the 2.8 MB bundle is never copied into memory. The
@@ -492,7 +492,7 @@ contract WhirVerifierV8P {
         uint256 roundIdx,
         uint256[] memory acc
     ) private view {
-        uint256 base = 10 + roundIdx * 24;
+        uint256 base = 10 + roundIdx * 32;
         t.acc = acc;
         t.base = base;
         // Each round re-binds its framing constants (D-070): the config bytes are

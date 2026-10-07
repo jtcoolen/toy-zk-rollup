@@ -2328,3 +2328,45 @@ Readings:
 Next (batch 50): hot assembly foldRow in WhirVerifierCore (rowsAreBase-aware
 fold of rowElems ext elems against prevRandomness), then KeccakChallenger
 absorb-path audit for the claim-reg loop.
+
+
+## Batch 50 — foldRow exonerated; claim-reg decoded; real-gas budget
+
+Microbenches (FoldRowBench.t.sol, tight loops):
+- `StirOpenings.foldRow` 16 elems / 4 randomness (the in-situ shape: every round
+  has rowElems=16, |randomness|=4, rowsAreBase=false): **11,099 gas**, 739/fold.
+  61 queries total ⇒ foldRow ≤ **0.68M real** across the whole proof. The probe's
+  4.34M was nested-tap inflation (~6×), NOT a whale. The hot fold-kernel idea is
+  DEAD — 15 fused assembly folds are already near-floor.
+- 64-elem/6-dim shape (unused here): 62k, 985/fold.
+- `observeExt4Mont`: **1,044 gas** per ext element (4 limbs: mod p + Mont + bswap).
+- `observeBasesLE`: **171 gas/word** bulk (10,688-word call), 194 split 8×1336.
+  The keccak flush dominates: ~57 gas loop + ~90-110 amortized f1600 per word.
+
+Probe shapes (new taps, stride fixed 24→32 — slots 24..27 were silently
+overwritten by round 1's block; caught by #openingEvals printing gas values):
+- claim-reg per round (probe): 311k / 2,274k / 2,636k / 1,010k / 1,143k = 7.37M.
+- openingEvals: 24 / 499 / 128 / 188 / 200 = **1,039 ext evals** ⇒ 1.08M real.
+- perClaimConstants framing sums: 756 / 2,876 / 10,688 / 1,632 / 2,120 =
+  **18,072 CONFIG words** ⇒ ~3.1M real — the claim-reg whale is framing absorb,
+  already bulk; floor ≈ keccak flush.
+- round sumcheck (new tap acc[base+19]): 97k/130k/130k/130k/130k ≈ 0.6M probe —
+  negligible.
+
+Real-gas budget (probe ÷1.6, wrapper 55.59M truth):
+| item | real M | note |
+|---|---|---|
+| terminal identity (TWIGHT) | ~9.1 | CONFIG constraint walk, biggest single item |
+| query loop | ~6.6 | loadRowFused ~3.2 (52k/q — read it), foldRow 0.68, rest |
+| CIDNTY | ~5.4 | +0.55M frame copy of CONFIG |
+| claim reg | ~4.6 | framing 3.1 + evals 1.1 + dot 0.4 |
+| verifyFinal | ~2.1 | |
+| MROOTS | ~1.9 | |
+| weight | ~0.9 | |
+| calldata floor | ~5-8 | 512 KB wire × 16/4 gas |
+| rest | ~2 | decode, sumchecks, phases |
+
+Floor with today's protocol shape ≈ 45-50M. **30M needs protocol-shape cuts, not
+more kernel tuning**: v9 pre-compiled CONFIG (GOAT/midfall model) — pre-swapped
+framing (raw append), pre-flattened constraint tables, CONFIG out of the wire via
+extcodecopy code-satellites (saves ~2.9M calldata + ~1.5M re-frame/frame-copy).

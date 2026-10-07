@@ -289,6 +289,14 @@ library WhirVerifierCoreV8P {
         }
 
         // --- batching challenge -------------------------------------------------
+        {
+            uint256 fsum;
+            for (uint256 c; c < s.perClaimConstants.length; ++c) fsum += s.perClaimConstants[c];
+            t.acc[t.base + 27] = fsum;
+        }
+        t.acc[t.base + 24] = input.openingEvals.length;
+        t.acc[t.base + 25] = input.oodAnswers.length;
+        t.acc[t.base + 26] = input.claimWidths.length;
         absorbConstants(t, s.batchingConstants);
         uint256 alpha = drawExt(t);
 
@@ -692,6 +700,9 @@ library WhirVerifierCoreV8P {
         t.acc[t.base + 8] += _gs - gasleft();
         t.acc[t.base + 6] = input.numQueries;
         t.acc[t.base + 7] = input.rowLimbs;
+        t.acc[t.base + 16] = input.rowElems;
+        t.acc[t.base + 17] = input.prevRandomness.length;
+        t.acc[t.base + 18] = input.rowsAreBase ? 1 : 0;
         _gs = gasleft();
 
         // --- 5: open and fold every query ------------------------------------------
@@ -786,6 +797,7 @@ library WhirVerifierCoreV8P {
 
         // --- 8: round sumcheck -----------------------------------------------------------
         absorbConstants(t, s.sumcheckConstants);
+        uint256 _gsc = gasleft();
         (uint256 folded, uint256[] memory randomness) = SumcheckCore.verifyRounds(
             t.state,
             claimed,
@@ -794,6 +806,7 @@ library WhirVerifierCoreV8P {
             input.sumcheckPowWitnesses,
             input.sumcheckPowBits
         );
+        t.acc[t.base + 19] += _gsc - gasleft();
         out.foldedClaim = folded;
         out.randomness = randomness;
     }
