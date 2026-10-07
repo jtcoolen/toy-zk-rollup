@@ -1872,3 +1872,33 @@ v6 verify is now 64.71M vs v5 62.23M: the wrapper costs 2.49M total
 the remaining 2.5M and keeps the calldata win.
 
 Probe instrumentation removed after measuring. 32 suites green.
+
+## Batch 40 - v6 wrapper: build the engine payload directly (64.71M -> 62.29M)
+
+The v6 wrapper's remaining 2.49M was almost entirely the handoff: build a
+445 KB v5 frame, then abi.encodeCall it - which allocates a SECOND 445 KB
+buffer and copies the frame into it. Two quadratic memory expansions, one
+zeroing pass, one full copy, for bytes that were already contiguous.
+
+Fix: WhirVerifierV6.verify now writes the engine's call payload DIRECTLY in
+final ABI layout in one buffer - selector, heads, statement (calldatacopy),
+bundle length word, then the v5 bundle: header bytes, CONFIG via
+extcodecopy from each chunk, tail via one calldatacopy - and staticcalls it
+from that pointer with the reply landing in 64 bytes of slack. One
+allocation, one expansion, zero redundant copies.
+
+Result: v6 verify 64.71M -> 62.29M. The wrapper now costs 57K gas TOTAL
+over the frozen v5 engine (62.23M) while posting 444,936 B instead of
+627,136 B - 182 KB less calldata (~7.2M gas at 40/16 per byte). Net v6 win
+vs v5: ~7.15M gas and 182 KB of block space.
+
+Phase-2 note: the planned "direct extcodecopy CONFIG reads inside the
+engine" now only saves the 57K wrapper delta - the re-frame it existed to
+kill is gone. Phase 2's real work is the compact PROOF (varint limbs,
+pruned paths) and the engine attribution items (terminal 14.79M, open+fold
+14.61M, constraint identity 9.03M).
+
+Gotchas hit: Solidity address needs uint256(uint160(...)) to enter Yul; a
+bytes4 var is ALREADY left-aligned in its word (no shl(224) needed).
+
+32 suites, 156 tests green.

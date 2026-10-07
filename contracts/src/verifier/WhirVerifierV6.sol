@@ -97,7 +97,14 @@ contract WhirVerifierV6 is IWhirVerifier {
     }
 
     /// Verify a v6 bundle: header(ver 6, cfgWords 0) + PROOF + stmLen +
-    /// STATEMENT. Re-frames to v5 in memory and delegates to ENGINE.
+    /// STATEMENT. Builds the engine's call payload DIRECTLY in final ABI
+    /// layout - selector, heads, statement, then the v5 bundle (header +
+    /// CONFIG from the chunks + the untouched v6 tail) - in ONE memory
+    /// buffer, and staticcalls it. The old path built a 445 KB v5 frame and
+    /// then encodeCall-copied it into a second 445 KB buffer: two quadratic
+    /// memory expansions (~1.6M gas), a zeroing pass, and a full copy, for
+    /// bytes that were already contiguous. One buffer, one expansion, zero
+    /// copies beyond the extcodecopy/calldatacopy that must happen anyway.
     function verify(uint256[] calldata statement, bytes calldata bundle) external view returns (bool) {
         if (bundle.length < 20) revert BundleTooShort();
         uint256 version;
@@ -111,38 +118,53 @@ contract WhirVerifierV6 is IWhirVerifier {
         }
         if (version != 6 || cfgWords != 0) revert BadBundle();
 
-        // v5 frame: [16B header(ver 5, cfgWords=C)] [CONFIG C bytes] [v6 tail from byte 16]
         uint256 cLen = CONFIG_LEN;
-        bytes memory v5 = new bytes(16 + cLen + (bundle.length - 16));
+        uint256 tail = bundle.length - 16;
+        uint256 stmtN = statement.length;
+        uint256 bundleLen = 16 + cLen + tail;
+        // Engine calldata layout (absolute, selector included): heads at 4
+        // and 36; statement length word at 68, data at 100; bundle length
+        // word at 100 + 32*stmtN, data at 132 + 32*stmtN.
+        uint256 bundleOff = 132 + 32 * stmtN;
+        uint256 payload = bundleOff + bundleLen;
+        bytes4 sel = IWhirVerifier.verify.selector;
+        uint256 engine = uint256(uint160(address(ENGINE)));
+        uint256 ptr;
         assembly {
-            let m := add(v5, 32)
-            mstore8(m, 0x57)
-            mstore8(add(m, 1), 0x42)
-            mstore8(add(m, 2), 0x4E)
-            mstore8(add(m, 3), 0x44)
-            mstore8(add(m, 4), 5)
+            ptr := mload(0x40)
+            mstore(0x40, add(add(ptr, payload), 64))
+            let p := ptr
+            mstore(p, sel) // bytes4 is already left-aligned in its word
+            mstore(add(p, 4), 64)
+            mstore(add(p, 36), add(96, mul(stmtN, 32)))
+            mstore(add(p, 68), stmtN)
+            calldatacopy(add(p, 100), statement.offset, mul(stmtN, 32))
+            mstore(add(p, add(100, mul(stmtN, 32))), bundleLen)
+            // v5 header: WBND, ver 5, cfgWords LE at +8, prfWords LE at +12
+            // (prfWords copied verbatim from the v6 header).
+            let b := add(p, bundleOff)
+            mstore8(b, 0x57)
+            mstore8(add(b, 1), 0x42)
+            mstore8(add(b, 2), 0x4E)
+            mstore8(add(b, 3), 0x44)
+            mstore8(add(b, 4), 5)
+            let cw := div(cLen, 4)
+            let q := add(b, 8)
+            mstore8(q, and(cw, 0xff))
+            mstore8(add(q, 1), and(shr(8, cw), 0xff))
+            mstore8(add(q, 2), and(shr(16, cw), 0xff))
+            mstore8(add(q, 3), and(shr(24, cw), 0xff))
+            let hw := calldataload(bundle.offset)
+            q := add(b, 12)
+            mstore8(q, byte(12, hw))
+            mstore8(add(q, 1), byte(13, hw))
+            mstore8(add(q, 2), byte(14, hw))
+            mstore8(add(q, 3), byte(15, hw))
         }
-        // cfgWords u32 LE at byte 8; prfWords u32 LE at byte 12 copied from
-        // the v6 header (the v6 header carries the real prfWords).
-        uint256 cw = cLen / 4;
-        assembly {
-            let p := add(add(v5, 32), 8)
-            mstore8(p, and(cw, 0xff))
-            mstore8(add(p, 1), and(shr(8, cw), 0xff))
-            mstore8(add(p, 2), and(shr(16, cw), 0xff))
-            mstore8(add(p, 3), and(shr(24, cw), 0xff))
-            // verbatim copy of bundle bytes 12..16 (already u32 LE on the wire)
-            let q := add(add(v5, 32), 12)
-            let src := calldataload(bundle.offset)
-            mstore8(q, byte(12, src))
-            mstore8(add(q, 1), byte(13, src))
-            mstore8(add(q, 2), byte(14, src))
-            mstore8(add(q, 3), byte(15, src))
-        }
-        // CONFIG from the chunk set: extcodecopy straight into the frame.
+        // CONFIG from the chunk set: extcodecopy straight into the payload.
         // The chunk runtime ends with [data | uint32 len], so the data start
         // is codesize - 4 - len; no chunk.read call, no intermediate buffer.
-        uint256 dst = 16;
+        uint256 dst = bundleOff + 16;
         for (uint256 i; i < _chunks.length; ++i) {
             address ch = address(_chunks[i]);
             uint256 len = _lens[i];
@@ -151,23 +173,23 @@ contract WhirVerifierV6 is IWhirVerifier {
                 extcodecopy(ch, mload(0x40), sub(cs, 4), 4)
                 let dl := shr(224, mload(mload(0x40)))
                 let start := sub(sub(cs, dl), 4)
-                extcodecopy(ch, add(add(v5, 32), dst), start, len)
+                extcodecopy(ch, add(ptr, dst), start, len)
             }
             dst += len;
         }
-        // v6 tail: PROOF + stmLen + STATEMENT, verbatim from bundle byte 16.
-        uint256 tail = bundle.length - 16;
+        // v6 tail: PROOF + stmLen + STATEMENT, verbatim from bundle byte 16,
+        // then the staticcall itself - reply lands in the 64-byte slack.
         assembly {
-            calldatacopy(add(add(v5, 32), dst), add(bundle.offset, 16), tail)
-        }
-
-        (bool ok, bytes memory ret) = address(ENGINE).staticcall(abi.encodeCall(IWhirVerifier.verify, (statement, v5)));
-        if (!ok) {
-            // Bubble the engine's revert data for debuggability.
-            assembly {
-                revert(add(ret, 32), mload(ret))
+            calldatacopy(add(ptr, dst), add(bundle.offset, 16), tail)
+            let out := and(add(add(ptr, payload), 63), not(31))
+            let ok := staticcall(gas(), engine, ptr, payload, out, 96)
+            switch ok
+            case 1 { return(out, 32) }
+            default {
+                let rd := returndatasize()
+                if gt(rd, 96) { rd := 96 }
+                revert(out, rd)
             }
         }
-        return abi.decode(ret, (bool));
     }
 }
