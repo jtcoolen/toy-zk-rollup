@@ -58,11 +58,14 @@ contract FoldRowBenchTest is Test {
         }
         uint256 g0 = gasleft();
         uint256 acc;
-        for (uint256 k; k < 1000; ++k) {
-            acc += StirOpenings.foldRow(row, r);
+        unchecked {
+            for (uint256 k; k < 1000; ++k) {
+                row[0] = ((k + 1) << 224) | ((k + 2) << 192) | ((k + 3) << 160) | ((k + 4) << 128);
+                acc += StirOpenings.foldRow(row, r);
+            }
         }
         uint256 per = (g0 - gasleft()) / 1000;
-        emit log_named_uint("gas per foldRow (16 elems, 15 folds)", per);
+        emit log_named_uint("gas per foldRow (16 elems, 15 folds, varying)", per);
         emit log_named_uint("gas per _fold_once", per / 15);
         emit log_named_uint("sink", acc);
     }

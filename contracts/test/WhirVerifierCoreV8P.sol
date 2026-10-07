@@ -734,8 +734,7 @@ library WhirVerifierCoreV8P {
                 input.rowElems,
                 input.rowsAreBase
             );
-            t.acc[t.base + 13] += _gq - gasleft();
-            _gq = gasleft();
+            if (t.acc[t.base + 28] != 0) { t.acc[t.base + 13] += _gq - gasleft(); _gq = gasleft(); }
             if (frame != 0) {
                 // v8: no per-query path walk here. The fold needs only the
                 // row; authentication moves to one amortized walk after the
@@ -743,10 +742,9 @@ library WhirVerifierCoreV8P {
                 // frame - index at word 4+q, leaf at word 4+nq+q - so the
                 // loop needs no side arrays and no second pass.
                 _framePut(frame, input.numQueries, q, indices[q], leaf);
-                t.acc[t.base + 14] += _gq - gasleft();
-                _gq = gasleft();
+                if (t.acc[t.base + 28] != 0) { t.acc[t.base + 14] += _gq - gasleft(); _gq = gasleft(); }
                 out.folds[q] = StirOpenings.foldRow(elems, input.prevRandomness);
-                t.acc[t.base + 15] += _gq - gasleft();
+                if (t.acc[t.base + 28] != 0) { t.acc[t.base + 15] += _gq - gasleft(); }
             } else {
                 out.folds[q] = StirOpenings.openAndFoldLeaf(
                     input.prevCommitment,

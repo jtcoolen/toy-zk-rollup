@@ -2370,3 +2370,35 @@ Floor with today's protocol shape ≈ 45-50M. **30M needs protocol-shape cuts, n
 more kernel tuning**: v9 pre-compiled CONFIG (GOAT/midfall model) — pre-swapped
 framing (raw append), pre-flattened constraint tables, CONFIG out of the wire via
 extcodecopy code-satellites (saves ~2.9M calldata + ~1.5M re-frame/frame-copy).
+
+### Batch 50b — clean taps + codegen gap
+
+Clean-tap pass (per-query taps guarded off by runtime-false flag): TOTAL accounted
+65.29M probe. Per-query taps were NOT lying about totals (loop sum ≈ loop tap).
+
+Calldata census: bundle 330,004 B has 4,517 zeros; CONFIG 182,200 B has 104,854
+zeros (57%!). Wire calldata cost ≈ **6.9M** total (bundle 5.23M + cfg 1.66M).
+
+THE CODEGEN GAP: microbench floors vs in-situ per-query taps:
+- foldRow: bench 11.1k vs in-situ 84k/query (7.6×)
+- loadRowFused: kernel floor ~6k vs in-situ 101k/query (15×)
+Same shapes, same data widths. The big via-IR contract (WhirVerifierCore inlined
+into WhirVerifier) spills these loops to memory; the tiny bench contract fuses
+them in registers. fp markers show only ~780 B/query of allocation in the loop —
+consistent with stack-materialization spills, not data copies.
+
+Implication: the 30M target is NOT reachable by more protocol math — the same
+proof verifies at ~15M of "real work" but pays ~40M in spill/loop overhead in
+the monolithic engine. The fix is structural: run the hot loops in SMALL
+standalone code units (satellites) where via-IR fuses them, exactly what
+TerminalWeight already proves out (its MROOTS walk costs ~1/3 of the same walk
+inlined in the engine).
+
+v9 plan (mainline, beside the existing verifier):
+1. CONFIG out of the wire → code satellites (extcodecopy), pre-transformed:
+   pre-swapped framing words (raw append, no bswap/range-check: trusted code),
+   pre-parsed constraint tables for TWIGHT/CIDNTY. Kills ~1.7M calldata,
+   ~2M framing bswap, ~0.55M CIDNTY frame copy, big TWIGHT/CIDNTY cuts.
+2. Hot kernels (loadRowFused+foldRow fused per query; claim-reg absorb loop)
+   as satellite entry points, not engine-inlined code.
+3. Keep the engine as a thin dispatcher: parse header, drive rounds, call out.
