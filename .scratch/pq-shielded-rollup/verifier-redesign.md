@@ -1499,3 +1499,71 @@ Files: ConfigChunk.sol, WhirVerifierV6.sol (src/verifier),
 RecursionChainV6.t.sol (test), wbnd.rs encode_bundle_v6_split +
 chunk_config + header, recursion_chain.rs export_chain_bundle_v6.
 v5 artifacts untouched and still the ground truth.
+
+---
+
+## Batch 29 — v6 committed; PROOF compaction belongs to the Phase-2 engine
+
+v6 wire landed (3dd3eac). The remaining +85 KB PROOF expansion cannot go
+through the wrapper: any PROOF-encoding change makes the bundle unreadable
+to the v5 engine, so the wrapper would have to decode-and-re-encode the
+whole PROOF - more re-frame waste. Both compactions belong in the
+redesigned engine (D-092 Phase 2), which reads CONFIG from the satellites
+via extcodecopy and the compact PROOF from calldata directly:
+
+* varint ext limbs (-29,191 B): ext_arr becomes a varint stream of the
+  four <2^31 limbs per ext element; _extArr grows a 10-line varint loop.
+* pruned paths (-65,920 B): one shared node once per depth instead of one
+  expanded path per query; StirOpenings.verifyMix walks per-query paths
+  today, so the pruned form needs a restore pass (the Rust side already
+  does exactly this: restore_and_recompute_paths).
+* both together: 444,936 -> ~350 KB calldata, the user target.
+
+Gas reality check for the 30M goal: v6 engine path = 113.8M - 2.9M
+calldata - ~1M CONFIG decode + ~0.5M extcodecopy = ~110M; PROOF
+compaction adds -1.5M calldata -2.8M duplicate hashes +1M restore =
+~107M. The 30M target therefore lives ENTIRELY in the compute side (P2b):
+constraint folding, sumcheck evals, and the Merkle walk are ~95% of the
+remaining gas. Attribution harness (RecursionChainGasProfile) next.
+
+---
+
+## Batch 30 — gas attribution: the truncation curve is not enough
+
+RecursionChainGasProfile ran: gas-at-revert vs truncated bundle is
+NON-MONOTONIC (114M at 20% bytes, 18M at 30%). Reason: calldataload
+past the end returns zeros, so the engine does not revert at the cut -
+it keeps computing on garbage until some later check fails. The curve
+measures "when does garbage fail", not "which phase costs what".
+
+What we DO know about the 113.8M:
+* CONFIG decode + calldata: ~3.9M (batches 25/28)
+* rows_flat/paths_hex raw reads: ~1.5M (calldata copy is free; reads
+  are calldataload)
+* Merkle walk: 8,765 sibling hashes (expanded paths). StarkMerkle
+  verifyMix hashes per level; at keccak-class cost (~200-300 gas incl.
+  loop) that is ~2.5M; at Poseidon2-class (~2,500) ~22M. UNMEASURED.
+* ConstraintIdentity fold + SumcheckCore evals + transcript: the rest,
+  ~85-105M. UNMEASURED.
+
+The 30M target (4x cut) cannot be planned on guesses. Next step is the
+attribution instrument: WhirVerifierProfile.sol BESIDE the verifier -
+a copy of verify() with gasleft() snapshots at phase boundaries (batch
+decode, per-round decode, per-round StirOpenings walk, per-round
+ConstraintIdentity fold, per-round SumcheckCore, terminal satellite
+call). Same wire, same vectors, emits the table. That table IS the
+Phase-2 optimization plan: every remaining optimization (P2b assembly
+Merkle walk, sumcheck batching, folding restructure, pruned-path
+restore) gets sized against it before any of it gets written.
+
+Phase-2 consolidated plan (beside-sitting redesign, target <=30M):
+1. WhirEngine.sol: reads CONFIG from ConfigChunk satellites via
+   extcodecopy (no re-frame, no CONFIG calldata): -3.9M.
+2. Compact PROOF: varint ext limbs (-29 KB), pruned paths (-66 KB):
+   -1.5M calldata, -2.8M duplicate hashes, +1M restore: ~-3.3M net.
+   Bundle: ~350 KB (user target).
+3. P2b compute (the 4x): sized by the attribution table from step 0.
+4. Statement rebind to the D-088 folded root (removes per-proof
+   statement hashing).
+5. v5 stays byte-exact ground truth; v6 wrapper stays as the migration
+   path; WhirEngine replaces the wrapper when it beats 119.96M.
