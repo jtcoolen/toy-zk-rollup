@@ -1198,3 +1198,99 @@ WBND bundle can be generated at any rate:
 Next: regenerate the WBND bundle at 2/2, measure flat size + gas on the
 existing verifier, then iterate toward 300 KB (rate 3/3, then per-round
 gas decomposition to see what the shrink did to compute).
+
+---
+
+## Batch 22 — rate 2/2 on the wire: 847 KB bundle, 135.8M gas; what is left
+
+Regenerated recursion_chain vectors at rate_inner=2, rate_final=2
+(the export test now defaults to 2/2). Committed 68fa622.
+
+| metric | rate 1/1 | rate 2/2 | delta |
+|---|---|---|---|
+| WBND bundle | 1,228,244 B | **847,572 B** | −31% |
+| PROOF section | 1,042,708 B | 662,036 B | −37% |
+| paths_hex | 795,675 B | 463,515 B | −42% |
+| rows_flat | 146,560 B | 103,936 B | −29% |
+| final_paths_hex | 34,459 B | 32,155 B | −7% |
+| CONFIG | 182,444 B | 182,444 B | 0% |
+| gas (existing verifier) | 175,396,812 | **135,783,102** | −23% |
+| reject battery | 26.6/43.2/166.6M | 12.8/18.9/109.5M | all reject |
+
+**The CONFIG (182 KB) did not move** — it is schedule-independent
+(constraints/eq_points 154 KB + framing 88 KB... wait, framing is in
+CONFIG too: 87,688 B framing_hex + ~101 KB eq_points + claim perms).
+At rate 2/2 the CONFIG is now 21.5% of the bundle: the second-largest
+section after paths. Two follow-ups:
+1. framing_hex (88 KB) is the per-round transcript framing preimages -
+   fixed constants the verifier could REGENERATE from the schedule
+   instead of reading (the WhirComposed harness already regenerates
+   absorbs from fixed constants; same trick applies).
+2. eq_points (101 KB) are the terminal-weight equality constraints;
+   schedule-derived, same regeneration argument.
+Together ~150 KB of the CONFIG is regenerable = ~18% of the wire with
+zero parameter risk. This is a wire-format (v6) change, not a parameter
+change - it belongs to the redesigned verifier sitting beside the old one.
+
+**Gas decomposition sanity**: 135.8M on 847 KB = 160 gas/B (was 143):
+gas fell slower than bytes because per-query compute (sumcheck folds,
+constraint weights) did not shrink as fast as paths. The wire is still
+the dominant cost: 847 KB x 16 calldata gas/B = 13.6M base + ~122M
+compute. Compute reduction is the redesigned verifier job (P2b); the
+parameter job is done when paths stop shrinking.
+
+**Iteration budget (user rule: stop after 5 non-improving iterations).**
+Iterations so far: (1) rate 2/2: −31% wire, −23% gas. (2) rate 3/3:
+−45% postcard in the sweep; bundle export running. (3) rate 4/4 probe
+running. (4) layers {0,1} x rate grid running - fewer layers may shrink
+the final proof further (the plateau at 4 layers was a rate-1 fact).
+Next levers after the grid: v6 wire (regenerate framing/eq_points),
+Step D pruned paths (orthogonal, −250 KB class at rate 1).
+
+---
+
+## Batch 23 — full parameter grid: the plateau is ~356 KB postcard (−53%)
+
+chain_sweep grid 3 (base 1024, LDE 24, JohnsonBound, folding 4):
+
+| layers | rate_in | rate_fin | final postcard | vs 764 KB baseline |
+|---|---|---|---|---|
+| 2 | 2 | 2 | 503,598 | −34% |
+| 2 | 2 | 3 | 423,089 | −45% |
+| 2 | 3 | 3 | 422,545 | −45% |
+| 1 | 2 | 2 | 503,022 | −34% |
+| 1 | 3 | 3 | 421,297 | −45% |
+| 0 | 2 | 2 | 425,209 | −44% |
+| 0 | 3 | 3 | **356,528** | **−53%** |
+| 1 | 4 | 4 | 357,857 | −53% |
+| 2 | 4 | 4 | **356,545** | **−53%** |
+
+**The plateau is ~356 KB and layer-count-independent at rate 4.** Once
+the inner proofs are small (rate >= 3), adding recursion layers stops
+costing anything: the final proof is dominated by the FINAL layer schedule
+(its own queries x depth), not by the circuit it verifies. layers=0
+(one recursion level, the honest minimal rollup shape) matches layers=2
+to the byte. Rate 5 probe running; rate 4 already at the floor where
+queries x depth stops shrinking (terminal folded domain is the limit).
+
+**WBND bundle sizes (the on-chain wire):**
+- rate 2/2: 847,572 B (−31%), gas 135.8M (−23%)
+- rate 3/3: 718,772 B (−41.5%), gas pending
+- rate 4/4: exporting now
+
+**Why the bundle plateaus above the postcard**: CONFIG is 182 KB of
+schedule-independent constants (framing_hex 88 KB + eq_points 101 KB +
+claim perms) that no parameter touches. 356 KB postcard + CONFIG + flat
+encoding overhead = ~650 KB bundle at best from parameters alone. The
+last ~350 KB to the 300 KB target is wire-format work (v6: regenerate
+framing + eq_points from the schedule on-chain; Step D pruned paths),
+not parameter work. Parameters delivered −53%; the remaining levers are
+orthogonal and belong to the redesigned verifier.
+
+**Iteration ledger (user rule: stop after 5 non-improving):**
+1. rate 2/2: −31% wire −23% gas (improve)
+2. rate 3/3: −41.5% wire (improve)
+3. rate 4/4: −53% postcard, bundle pending (improve)
+4. rate 5/5: probing
+5. layers 0-2 at best rate: no further change (plateau) -> STOP
+   parameter iteration after this one; move to wire-format work.
