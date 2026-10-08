@@ -3100,3 +3100,53 @@ Implication: shrinking the recursion circuit (fewer Poseidon2 rows per path
 node = smaller hash arity in the in-circuit verifier, or fewer inner queries)
 cuts inst2+inst3 directly. The inner-LDE knob did not shrink the CIRCUIT (it
 shrinks the inner proof's domain, not the verifier circuit's constraint count).
+
+## Batch 68 — V9 REDESIGN PLAN: the path to 30M (recorded decision document)
+
+Evidence base: batch 63 map + batch 64-66 shape sweep + batch 67 CIDNTY split.
+Canonical v8: 50,682,535 gas, 330,004 B calldata. Target: 30,000,000. Gap: 20.68M.
+
+### What is exhausted (measured, do not retry)
+- Verifier code: floor ~45M for this proof shape (every block within ~2x of its
+  algorithmic floor; selector product, hot kernel, framing, staging all done).
+- Proof-shape knobs: best -1.6M (trace/layers/inner-LDE all hit the same wall:
+  the final settlement's own 87-query work at LDE 25 is fixed by the security
+  target). pow 32 / final LDE 24 PANIC; rate 8 unsupported; folding factor 4
+  fixed; ZK blinding slack is a security property.
+
+### The whale anatomy (batch 67)
+CIDNTY 10.15M = parse 0.88 + rebuild 1.86 + foldConstraints inst0-3 (0.12+0.11+1.58+3.63)
++ recompose inst2-3 (~1.97). The recursion-circuit instances (2,3) = 7.19M:
+cost ∝ recursion-circuit constraint-node count, NOT queries or calldata.
+
+### V9 options, quantified
+(A) BATCH WIDTH 4 -> 2 (settle 2 inner proofs per on-chain verify instead of 4).
+    Links: 4 -> 2 (~-20M: links 1-2 = 17.9M remain); CIDNTY instances halve
+    (drop inst3: -5.6M); calldata ~halves (-2.6M). ESTIMATE: 50.7 -> ~25-28M.
+    MEETS 30M. Cost: 2 verifies per 4 proofs = same total gas per proof
+    (~13-14M/proof vs 12.7M now), one extra verify tx. PRODUCT DECISION.
+(B) COMMIT C(zeta) (open the folded constraint polynomial at zeta in the proof):
+    replaces CIDNTY's foldConstraints re-derivation (-3.6M inst2-3 fold) but
+    keeps rebuild; needs an opening check against the same Merkle roots.
+    Soundness argument required (the opened value must bind to the constraint
+    program the same way). ESTIMATE: -4..6M. Does NOT reach 30M alone.
+(C) SHRINK THE RECURSION CIRCUIT (framework work in p3_recursion: fewer
+    constraint rows per Poseidon2 / smaller in-circuit verifier). Cuts inst2-3
+    (7.19M) and the final circuit proportionally. Largest ceiling but deepest
+    change; upstream crate territory.
+(D) KEEP 4 WIDTH + all v9 code ideas (CONFIG off wire via code satellites,
+    pre-swapped framing, pre-parsed tables): ~-2..3M from 49M floor. Cannot
+    reach 30M.
+
+### RECOMMENDATION
+V9 = (A) as the primary lever, with (B) as a follow-up once the opening-binding
+argument is written down. (A) is a prover/export change (batch width), the
+Solidity verifier is width-agnostic (loops over instances) — verify empirically
+by regenerating with width 2 and re-measuring. If the estimate holds, V9 ships
+at ~26M with the SAME verifier code, and the remaining v9 code ideas (D) buy
+headroom to ~24M.
+
+### Next actions
+1. Locate batch-width plumbing in build_batch_recursion_circuit / composed_export.
+2. Regenerate v8 vectors at width 2, measure test_gas_v8 (no verifier change).
+3. If ~28M: record V9 acceptance; else iterate with (B).
