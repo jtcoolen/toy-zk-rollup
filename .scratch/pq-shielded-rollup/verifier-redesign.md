@@ -3345,3 +3345,22 @@ Remaining code-only levers (D): fuse claim-rebuild (1.86M) + recompose (1.97M)
 Solidity loops in CIDNTY -> est -1..1.5M => ~46M. Protocol lever (B): commit
 C(zeta) -> -4..6M => ~41-43M, needs soundness argument. Neither reaches 30M;
 the wall is the 87-query security floor (batch 75).
+
+## Batch 77 — NEW CANONICAL: 287,972 B / 47,564,029 gas at 96 bits (300 KB target MET)
+
+Shape: RC_LAYERS=0 (settle rc1 directly under OutSC), WHIR_POW_FLOOR=28 (safe
+grind: floor 30 was FLAKY - the 0-layer export failed once at floor 30 with the
+known grind-witness miss, floor 28 exports cleanly), rate 4/4, security 96.
+  bundle 287,972 B  <- UNDER the 300 KB target, at 96-bit security
+  gas    47,564,029 (was 50,682,535: -3.12M)
+  174/174 tests green.
+Also fused _fromExt4Group in TerminalWeight (batch 77): per-group 4-elem array
+allocation removed, Horner runs on scaled limbs directly. Measured delta on
+identical vectors: 47,701,509 -> 47,564,029 = -137,480 gas.
+Gate anatomy refined: claim-rebuild-inclusive prefix = 43.27M (gate), post-
+recompose = 43.39M => fold+recompose loop = 7.4M total (foldConstraints ~5.2M
+fused Yul, recompose ~2.1M); claim rebuild + parse = 2.75M. Rounds walk 40.53M
+= security-bound 87-query work (untouchable at 96 bits).
+NOTE: gate technique now uses assembly("memory-safe"){ if iszero(calldataload(0x10000000)){revert(0,0)} }
++ staticcall-delta test patch (deny=warnings rejects unconditional revert; plain
+assembly hits stack-too-deep in viaIR).

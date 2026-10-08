@@ -871,19 +871,24 @@ contract TerminalWeight {
         }
     }
 
-    /// fromExt4 over each 4-value group of the w claimed values.
+    /// fromExt4 over each 4-value group of the w claimed values. Fused (batch
+    /// 77): the per-group 4-element array allocation is gone - the Horner runs
+    /// directly on the four scaled limbs, saving one memory allocation and one
+    /// inner loop per group (~4,700 groups per CIDNTY call at canonical shape).
     function _fromExt4Group(uint256[] memory bound, uint256 off, uint256 w, uint256 sc)
         private
         pure
         returns (uint256[] memory out)
     {
         out = new uint256[](w / 4);
+        uint256 x = uint256(1) << 192;
         for (uint256 j; j < w / 4; ++j) {
-            uint256[] memory vals = new uint256[](4);
-            for (uint256 q; q < 4; ++q) {
-                vals[q] = bound[off + 4 * j + q].mul(sc);
-            }
-            out[j] = _fromExt4(vals, 0);
+            uint256 b = off + 4 * j;
+            uint256 acc = bound[b + 3].mul(sc);
+            acc = acc.mul(x).add(bound[b + 2].mul(sc));
+            acc = acc.mul(x).add(bound[b + 1].mul(sc));
+            acc = acc.mul(x).add(bound[b].mul(sc));
+            out[j] = acc;
         }
     }
 
