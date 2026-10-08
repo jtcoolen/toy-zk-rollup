@@ -2943,3 +2943,52 @@ Micro-optimisation has hit diminishing returns by construction.
 
 Realistic ceiling for verifier-code-only work: ~45M. The 30M target requires
 path 1 or 2 — proof-shape or protocol-level changes, not more Yul fusion.
+
+
+## Batch 63 — COMPLETE per-link map (the definitive answer to "why modest / how to 30M")
+
+Revert-gate sweep on the batch-61b build (total 50,682,535). The chain is 4 links;
+each link ends at its TWIGHT call (keyed on allR length 20/24/23/22 — non-monotonic
+because each link's allR is its own prefix). Cumulative gas at each link's end:
+
+| block | cumulative | delta | share |
+|---|---|---|---|
+| link 1 (verifyInitial + 3 rounds + verifyFinal + TWIGHT) | 7,537,255 | 7.54M | 15% |
+| link 2 | 17,877,070 | 10.34M | 20% |
+| link 3 | 25,473,360 | 7.60M | 15% |
+| link 4 | 40,529,107 | 15.05M | 30% |
+| **CIDNTY (constraint identity, WhirVerifier.sol:314)** | 50,682,535 | **10.15M** | **20%** |
+
+Link-4 TWIGHT internal split (allR=22): parse ends 37.98M, deriveGroupDescs +0.29M,
+evalConstraintsPoly +2.21M, evaluate_hypercube +0.06M. So TWIGHT per link = 1.1–3.7M,
+NOT the whale. evaluate_hypercube is cheap (0.06M).
+
+### The three biggest blocks, ranked
+1. **CIDNTY 10.15M (20%)** — the STARK constraint identity: recompute every opened
+   value from bound evals, fold(alpha, C(zeta)), check *inv_vanishing == quotient(zeta).
+   This is the single largest block. It is fundamental STARK work (constraints MUST be
+   evaluated at the OOD point) — the only reduction is fewer/cheaper constraints
+   (foldConstraints node count, prover-side) or committing C(zeta) and opening it.
+2. **Link 4 = 15.05M (30%)** — the heaviest link. Its rounds + verifyFinal dominate
+   (TWIGHT only 2.27M). Later links cost more because the folded claim / randomness
+   arrays grow and the final round's sumcheck is largest.
+3. **Calldata floor 5.23M (10%)** — 330,004 B at 16/4 gas. Irreducible without
+   shrinking the proof.
+
+### Why micro-opts are exhausted (definitive)
+No block exceeds 10.15M and each is near its algorithmic floor for THIS proof shape:
+- CIDNTY = STARK constraint eval (inherent).
+- Per-link rounds = WHIR sumcheck + Merkle + QFOLD (inherent to proof size).
+- TWIGHT = eq-poly Horner over ~501 groups (already hoisted/cached, batches 34/36/37/60).
+- Calldata = proof size.
+Batches 55–61 shaved 1–2% each because they optimized a FIXED computation. The
+verifier code floor for this proof is ~45M. **30M is unreachable by verifier code alone.**
+
+### The only paths to 30M (all need proof-shape / protocol change)
+- **Fewer links** (4→2): removes ~2 links ≈ 15–20M. Biggest single lever.
+- **Fewer queries/round** (11→6): cuts QFOLD + Merkle + row decode ~40% ≈ 8–10M.
+- **Smaller foldConstraints** (node count): cuts CIDNTY proportionally.
+- **Commit C(zeta)** instead of re-deriving in CIDNTY: moves ~6–8M off-chain-side
+  into a consistency check. Needs soundness argument.
+Any ONE of these roughly halves the gap. None is a verifier-code edit — they are
+prover/config changes. The verifier is done optimizing; the proof shape is the lever.
