@@ -3169,3 +3169,34 @@ ext muls + chunkVanishings pow2).
 => The 30M gap is structural: 7.19M of CIDNTY is evaluating the RECURSION
 CIRCUIT's own constraint programs on-chain. Options A (batch width), B (commit
 C(zeta)), C (shrink recursion circuit) stand as recorded in batch 68.
+
+## Batch 70 — SECURITY LEVEL is the real proof-size knob (user: "optimise the proving: tweak parameters to make recursive circuits/proofs smaller")
+
+Bundle anatomy (instrumented encode_bundle_impl, canonical 330,004 B):
+  pruned_paths 261,108 B (79%) | rows_flat 63,188 B (19%) | bound_evals 33,268+16,644 |
+  fsc_ca 29,396+29,396 | final_pow_wit 3,604+1,812 | everything else < 13K.
+  => Merkle paths + query rows ARE the proof; both scale with QUERY COUNT.
+
+Two new env knobs (defaults = canonical behaviour, zero drift):
+  WHIR_POW_FLOOR now also applies to InnerWhirConfig (clamped to 30: KoalaBear
+  order 2^31-1 makes pow_bits>=31 impossible — the floor-32 PANIC explained).
+  WHIR_SECURITY_LEVEL overrides SECURITY_LEVEL (96 canonical) at both
+  ProtocolParameters sites (whir.rs protocol_params, whir_recursion
+  protocol_params_with; both demoted from const fn).
+
+Measured grid (rate 4/4, floor as noted):
+  sec 96 floor 30 (canonical)  330,004 B  50,682,535 gas
+  sec 96 floor 30 + inner-floor  328,084 B  50,572,130 gas  (inner floor same as min: no-op)
+  sec 88 floor 24               314,980 B  49,111,192 gas  (-15.0 KB, -1.57M)
+  sec 80 floor 24               286,484 B  45,672,795 gas  (-43.5 KB, -5.01M)  ** UNDER 300 KB **
+  sec 80/88 floor 30            PANIC (grinding_challenger: schedule pushes a
+                                  grind site past 30 bits -> mask >= field order)
+  sec 72 floor 24               running...
+
+SECURITY DECISION REQUIRED: 96 -> 80 bits is a protocol-level choice (conjectured
+proximity gap + Johnson bound + grinding; 80 bits still exceeds most production
+SNARK targets' conservative floors but is below the 96-bit house style). The
+verifier needs NO changes: all three bundles verify on the existing v8 verifier
+(config digest changes only). At sec 80 the proof is 286 KB (target 300K met)
+and gas 45.7M; the remaining gap to 30M is the structural CIDNTY/link work
+(batch 68 options A/B).

@@ -774,35 +774,48 @@ fn encode_bundle_impl(
         let mut m = Sink::default();
         let num_rounds = as_u64(&j["num_rounds"]) as usize;
         m.word(num_rounds as u32);
+        let mut sz: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut prev = m.words.len();
+        let mut mark = |m: &Sink, name: &str, sz: &mut std::collections::BTreeMap<String, usize>, prev: &mut usize| {
+            *sz.entry(name.to_string()).or_insert(0) += (m.words.len() - *prev) * 4;
+            *prev = m.words.len();
+        };
         for r in 0..num_rounds {
             let rd = &j["rounds"][r];
             m.blob(&hex_to_bytes(rd["commitment"].as_str().unwrap()));
+            mark(&m, "commitment", &mut sz, &mut prev);
             let e = hex_strings(&rd["bound_evals"]);
             if compact {
                 m.ext_arr16(&e);
             } else {
                 m.ext_arr(&e);
             }
+            mark(&m, "bound_evals", &mut sz, &mut prev);
             let e = hex_strings(&rd["initial_ood_answers"]);
             if compact {
                 m.ext_arr16(&e);
             } else {
                 m.ext_arr(&e);
             }
+            mark(&m, "initial_ood", &mut sz, &mut prev);
             let e = hex_strings(&rd["initial_sumcheck_ca"]);
             if compact {
                 m.ext_arr16(&e);
             } else {
                 m.ext_arr(&e);
             }
+            mark(&m, "init_sc_ca", &mut sz, &mut prev);
             let e = hex_strings(&rd["initial_sumcheck_cinf"]);
             if compact {
                 m.ext_arr16(&e);
             } else {
                 m.ext_arr(&e);
             }
+            mark(&m, "init_sc_cinf", &mut sz, &mut prev);
             m.arr(&u32_vec(&rd["initial_sumcheck_pow_witnesses"]));
+            mark(&m, "init_pow", &mut sz, &mut prev);
             m.arr(&u32_vec(&rd["rows_flat"]));
+            mark(&m, "rows_flat", &mut sz, &mut prev);
             if pruned {
                 m.blob_pruned(&hex_to_bytes(rd["pruned_hex"].as_str().unwrap()));
                 // Per-intermediate digest counts. The engine cannot know the
@@ -813,45 +826,60 @@ fn encode_bundle_impl(
             } else {
                 m.blob(&hex_to_bytes(rd["paths_hex"].as_str().unwrap()));
             }
+            mark(&m, "pruned_paths", &mut sz, &mut prev);
             m.blob(&hex_to_bytes(rd["round_commitments_hex"].as_str().unwrap()));
+            mark(&m, "round_commitments", &mut sz, &mut prev);
             let e = hex_strings(&rd["ood_answers"]);
             if compact {
                 m.ext_arr16(&e);
             } else {
                 m.ext_arr(&e);
             }
+            mark(&m, "ood_answers", &mut sz, &mut prev);
             m.arr(&u32_vec(&rd["ood_answer_lens"]));
+            mark(&m, "ood_lens", &mut sz, &mut prev);
             m.arr(&u32_vec(&rd["pow_witnesses"]));
+            mark(&m, "pow_wits", &mut sz, &mut prev);
             let e = hex_strings(&rd["sumcheck_ca"]);
             if compact {
                 m.ext_arr16(&e);
             } else {
                 m.ext_arr(&e);
             }
+            mark(&m, "sc_ca", &mut sz, &mut prev);
             let e = hex_strings(&rd["sumcheck_cinf"]);
             if compact {
                 m.ext_arr16(&e);
             } else {
                 m.ext_arr(&e);
             }
+            mark(&m, "sc_cinf", &mut sz, &mut prev);
             m.arr(&u32_vec(&rd["sumcheck_pow_witnesses"]));
+            mark(&m, "sc_pow", &mut sz, &mut prev);
             m.arr(&u32_vec(&rd["sumcheck_lens"]));
+            mark(&m, "sc_lens", &mut sz, &mut prev);
             m.arr(&u32_vec(&rd["sumcheck_pow_lens"]));
+            mark(&m, "final_poly", &mut sz, &mut prev);
             let e = hex_strings(&rd["final_poly"]);
             if compact {
                 m.ext_arr16(&e);
             } else {
                 m.ext_arr(&e);
             }
+            mark(&m, "final_pow_wit", &mut sz, &mut prev);
             m.word(as_u64(&rd["final_pow_witness"]) as u32);
+            mark(&m, "final_rows", &mut sz, &mut prev);
             m.arr(&u32_vec(&rd["final_rows_ext"]));
+            mark(&m, "final_paths", &mut sz, &mut prev);
             m.blob(&hex_to_bytes(rd["final_paths_hex"].as_str().unwrap()));
+            mark(&m, "fsc_ca", &mut sz, &mut prev);
             let e = hex_strings(&rd["final_sumcheck_ca"]);
             if compact {
                 m.ext_arr16(&e);
             } else {
                 m.ext_arr(&e);
             }
+            mark(&m, "fsc_cinf", &mut sz, &mut prev);
             let e = hex_strings(&rd["final_sumcheck_cinf"]);
             if compact {
                 m.ext_arr16(&e);
@@ -859,6 +887,7 @@ fn encode_bundle_impl(
                 m.ext_arr(&e);
             }
             m.arr(&u32_vec(&rd["final_sumcheck_pow_witnesses"]));
+            mark(&m, "fsc_pow", &mut sz, &mut prev);
             // v5 (D-086 step C): the per-round eq section is GONE. The eq
             // groups are now derived on-chain from the STATEMENT section's
             // opening points plus the transcript-drawn virtual claim points
@@ -867,6 +896,7 @@ fn encode_bundle_impl(
             // domain_points DROPPED (v3): the verifier recomputes g^index from
             // the indices its own transcript samples.
         }
+        for (k, v) in &sz { println!("PRF-FIELD {k}: {v} B"); }
         prf.extend_from_slice(&m.take());
     }
 

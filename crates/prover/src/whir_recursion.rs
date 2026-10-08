@@ -179,7 +179,7 @@ pub fn whir_mmcs(cap_height: usize) -> WhirMmcs {
 /// regime — Reed-Solomon correlated agreement is established at that radius — so
 /// this is the less conjectural choice, not merely the one that fits.
 #[must_use]
-pub const fn protocol_params(pow_bits: usize) -> ProtocolParameters {
+pub fn protocol_params(pow_bits: usize) -> ProtocolParameters {
     protocol_params_with(pow_bits, 1)
 }
 
@@ -190,12 +190,12 @@ pub const fn protocol_params(pow_bits: usize) -> ProtocolParameters {
 /// at the cost of doubling every committed domain, one arity higher. The
 /// soundness assumption stays `JohnsonBound` (the proven regime) at every rate.
 #[must_use]
-pub const fn protocol_params_with(
+pub fn protocol_params_with(
     pow_bits: usize,
     starting_log_inv_rate: usize,
 ) -> ProtocolParameters {
     ProtocolParameters {
-        security_level: SECURITY_LEVEL,
+        security_level: crate::whir::security_level(),
         pow_bits,
         round_log_inv_rates: Vec::new(),
         folding_factor: FoldingFactor::Constant(FOLDING_FACTOR),
@@ -309,10 +309,20 @@ impl InnerWhirConfig {
     ) -> Result<Self, WhirVerifierParamsError> {
         // Blinding doubles the committed height, so the schedule must be sized
         // one arity above the trace bound. See `crate::whir::ZK_ARITY_SLACK`.
-        let pow_bits = required_pow_bits_with(
+        let mut pow_bits = required_pow_bits_with(
             log_max_lde_height + crate::whir::ZK_ARITY_SLACK,
             starting_log_inv_rate,
         )?;
+        // D-092 batch 70: WHIR_POW_FLOOR also applies to the INNER config.
+        // More grinding bits -> fewer STIR queries in every inner proof ->
+        // smaller inner proofs AND a smaller recursion circuit (the in-circuit
+        // verifier's Poseidon2 work scales with inner queries). KoalaBear caps
+        // pow_bits at 30 (field order 2^31-1); the floor is clamped there.
+        if let Some(floor) = std::env::var("WHIR_POW_FLOOR").ok().and_then(|v| v.parse::<usize>().ok()) {
+            if floor > pow_bits {
+                pow_bits = floor.min(30);
+            }
+        }
         let params = protocol_params_with(pow_bits, starting_log_inv_rate);
         let challenger = WhirChallenger::new(whir_perm());
         let pcs = WhirPcs::new(

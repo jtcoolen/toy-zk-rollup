@@ -119,6 +119,17 @@ pub type Config = StarkConfig<Pcs, Challenge, Challenger>;
 /// WHIR today.
 pub const SECURITY_LEVEL: usize = 96;
 
+/// D-092 batch 70: env-overridable security level for the proof-size study.
+/// Default 96 (canonical). WHIR_SECURITY_LEVEL lowers the algebraic target,
+/// which drops STIR queries in EVERY schedule (inner + final). EXPERIMENT
+/// ONLY: shipping below 96 bits is a protocol decision, never a default.
+pub fn security_level() -> usize {
+    std::env::var("WHIR_SECURITY_LEVEL")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(SECURITY_LEVEL)
+}
+
 /// Folding factor per WHIR round.
 ///
 /// `WhirUniPcs` requires a constant folding factor; 4 matches the recursion
@@ -162,9 +173,9 @@ pub const ZK_ARITY_SLACK: usize = 2;
 /// [`crate::whir_recursion::protocol_params`] for the same reasoning on the
 /// recursion side.
 #[must_use]
-pub const fn protocol_params() -> ProtocolParameters {
+pub fn protocol_params() -> ProtocolParameters {
     ProtocolParameters {
-        security_level: SECURITY_LEVEL,
+        security_level: security_level(),
         pow_bits: 0,
         round_log_inv_rates: Vec::new(),
         folding_factor: FoldingFactor::Constant(FOLDING_FACTOR),
