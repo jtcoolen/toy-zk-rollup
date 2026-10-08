@@ -3078,3 +3078,25 @@ Best honest proof-shape gas: 49.05M. Gap to 30M: 19.05M.
    (c) verifier-code floor ~45M for THIS shape (batch 63 map) — code alone
        cannot reach 30M.
 Next: probe batch width plumbing (build_batch_recursion_circuit) for (a).
+
+## Batch 67 — CIDNTY internal breakdown (the 10.15M whale dissected)
+
+Revert gates inside _cidnty (TerminalWeight.sol), canonical build:
+  entry (link-4 end)          40,529,107
+  after frame parse            41,407,060   parse  =   877,953
+  after claim rebuild (4 rounds) 43,271,380  rebuild = 1,864,320
+  after instance 0             43,389,023    inst0  =     117,643
+  after instance 1             43,495,807    inst1  =     106,784
+  after instance 2             45,078,405    inst2  =   1,582,598
+  reply                        50,682,535    inst3  =   5,604,130
+
+=> foldConstraints/recomposeQuotient on the RECURSION-CIRCUIT instances (2,3)
+   = 7.19M of the 10.15M. The fib instances are trivial (0.22M).
+   The recursion circuit's AIR has thousands of constraint nodes (Poseidon2
+   rows); evaluating + folding them at zeta is the whale. It scales with the
+   RECURSION CIRCUIT SIZE, not with queries or calldata.
+
+Implication: shrinking the recursion circuit (fewer Poseidon2 rows per path
+node = smaller hash arity in the in-circuit verifier, or fewer inner queries)
+cuts inst2+inst3 directly. The inner-LDE knob did not shrink the CIRCUIT (it
+shrinks the inner proof's domain, not the verifier circuit's constraint count).
