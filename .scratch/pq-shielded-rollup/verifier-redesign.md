@@ -3050,3 +3050,31 @@ RECURSION CIRCUIT itself — its size is set by the in-circuit WHIR verification
 (Poseidon2 per path node x inner queries). The inner query count is the next
 knob to probe: fewer inner queries -> smaller recursion circuit -> fewer final
 constraints (CIDNTY 10.15M) AND smaller final proof.
+
+## Batch 66 — inner LDE 24->23: -1.6M (same wall). Sweep CLOSED at -1.6M.
+
+CHAIN_LOG_MAX_LDE 24 -> 23 (inner proofs + recursion circuits half size):
+bundle 328,980 B, gas 49,058,765 (-1.62M). Verifies PASS on the existing
+verifier (config digest changes, shape unchanged). Same -1.6M as trace and
+layers: it is the CALDATA delta (330.0 -> 329.0 KB) plus a hair. The final
+settlement's own query work (87 queries x depth-21 paths at LDE 25) is the
+floor and does not move with what it proves.
+
+FINAL TABLE (all honest shape knobs, canonical 330,004 B / 50,682,535):
+  trace 1024->256      49,067,090  (-1.62M)
+  layers 2->1          49,050,804  (-1.63M)
+  inner LDE 24->23     49,058,765  (-1.62M)
+  pow floor 32         PANIC (inner layers reject floor 32)
+  final LDE 24         PANIC (PoW budget at smaller final domain)
+  rate 8               unsupported (rate > folding factor 4)
+Best honest proof-shape gas: 49.05M. Gap to 30M: 19.05M.
+
+=> The ONLY remaining path to 30M is structural (batch 63 list):
+   (a) fewer batch instances per settlement (links 4->2): ~-20M, halves both
+       per-link work AND the final circuit (CIDNTY shrinks too) — PRODUCT
+       decision: fewer proofs settled per on-chain verify;
+   (b) commit C(zeta) instead of re-deriving in CIDNTY: -6..8M, needs a
+       soundness argument (opening check replaces identity check);
+   (c) verifier-code floor ~45M for THIS shape (batch 63 map) — code alone
+       cannot reach 30M.
+Next: probe batch width plumbing (build_batch_recursion_circuit) for (a).
