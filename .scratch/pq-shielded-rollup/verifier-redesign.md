@@ -3276,3 +3276,25 @@ REVISED PATH TO 30M (gap now 17.45M from 47.45M best-case shape):
    extension degree 8 (halves required queries at same security:
    log2|F|=31, deg 8 -> 248 bits field capacity; framework supports
    for_extension_degree::<8>? TO INVESTIGATE - this is the last big lever).
+
+## Batch 74 — EXTENSION DEGREE 8 is DEAD (dump_schedule_curve re-run)
+
+EF4 vs EF8 total_queries at nv=25, 96 bits: IDENTICAL wherever the schedule binds
+(lir=2 pow=24: 152=152; pow=32: 135=135; pow=48: 101=101; lir=3 pow=32: 102=102).
+The query budget is set by the Johnson-bound list size + folding schedule, NOT
+field capacity, at this operating point. EF8 would also double wire limbs and
+Solidity ext-mul cost. Lever CLOSED (was the last big proof-shape idea).
+
+DEFINITIVE WALL (96-bit floor, this proof shape): every measured lever now closed
+- security reduction (user floor 96; 128 mathematically impossible)
+- shape knobs (trace/layers/inner-LDE/rate/pow/folding/cap-height): best -1.6M, don't stack
+- link count (RC_LAYERS=0): -3.2M, links are cheap
+- extension degree: 0
+- midfall full-Yul rewrite: floor says <=5.7M, weeks of risk
+Remaining tractable levers, by size: (B) commit C(zeta) -4..6M [protocol change,
+soundness argument needed]; (C) shrink recursion circuit (inst2+3 = 7M CIDNTY +
+final rows) [deep framework work]; (D) verifier polish <=5.7M [code only].
+Sum of ALL three ~= 33-40M. 30M at 96 bits likely requires the final settlement
+to verify fewer queries, which the field caps. NEXT MEASUREMENT: split the
+per-link 7-15M into MROOTS (path verify) vs QFOLD (row fold) vs sumcheck to
+decide whether matrices (->C) or fold width is the target.
