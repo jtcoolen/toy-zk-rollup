@@ -2690,3 +2690,42 @@ constraints because derivation happens in the satellite.
 Next (impact order): QFOLD 12.2M decomposition (early-return gates in the
 fallback QFOLD path; qfold frame sizes 9956/11332/12004 incl. selector are
 unique per round), then CIDNTY 9.71M.
+
+## Batch 57 — CIDNTY decomposed: foldConstraints is the whale (5.9M)
+
+Sentinel-gate decomposition of the single CIDNTY call (9.71M), cumulative
+gas via test_gas_v8 gates (opaque-true guard: assembly if gt(calldatasize(),1)
+revert — plain always-true reverts hit the unreachable-code deny; gates inside
+loops compile fine):
+
+- frame parse (calldatacopy of terminals/statement/bounds): 10k
+- config parse (programs, chunkDomains, invD, busIds): 370k
+- opened setup (permChallenges, betaW): 48k
+- claim walk (4 rounds of _claimScale/_claimed/_fromExt4Group): 1.90M
+- fold loop total: 7.29M, of which
+  - selectors(i): 96k total
+  - foldConstraints: i0 42k, i2 1.44M, i3 3.59M, i4 90k  => ~5.9M
+  - recomposeQuotient: ~1.1M total (k<=8, O(k^2) muls)
+  - final check + reply: ~100k
+
+Instance shapes (dumped via extended 608-B CIDNTY reply — the cross-context
+counter route that works): nodes = [52, 40, 1963, 5085, 116, 105],
+chunks = [4, 4, 8, 8, 4, 4]. Six instances.
+
+foldConstraints runs at ~700 gas/node: the per-node cost is dominated by the
+emul (16 base-muls + 4 mods ~= 400-500 gas floor) for MUL nodes; the Yul jump
+table + bounds checks add ~200. Already near kernel floor — the lever is NODE
+COUNT (DAG size), an AIR/prover-side concern, or v9 pre-parsed node tables
+(skip the LE-decode per node: ~100 gas/node = ~590k total).
+
+Selector-memo conclusion (batch 56) + this: TWIGHT mode-2 walk and CIDNTY fold
+are both at their data-layout floor; the memo already captures all within-nv
+reuse (sel indices are disjoint across matrices of equal arity). Remaining
+22M-over-30M gap is framing/parse/alloc overhead + these floors => v9 wire
+redesign (config->code satellites, pre-parsed tables) is the mainline.
+
+Measurement lessons: (a) always-true Solidity revert = unreachable-code deny
+error; use assembly gt(calldatasize(),1) guard; (b) satellite counters cross
+the staticcall boundary ONLY via the reply (extend return(0, N), probe core
+staticcalls with bigger outsize, copies to fixed slots, publishes to acc);
+(c) prog/opened pointers are NOT small ints — index dumps by loop var.
