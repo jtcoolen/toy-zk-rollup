@@ -630,8 +630,16 @@ library WhirGadgets {
             // per (arity, selIndex) within this constraint call: nv = k -
             // arity strictly increases as the backwards walk descends arity,
             // so a size change means a new key space and the memo resets.
-            uint256[] memory memo;
-            uint256 mNv = 0;
+            // Batch 60: direct-mapped selector cache replaces the capped
+            // exact memo. The old memo keyed on sel alone and RESET whenever nv
+            // changed (and switched off entirely past nv=10 - the recursion
+            // chain's dominant constraint has k=24 with small arities, so nv
+            // > 10 and the memo never engaged: 501 full selector evals). The
+            // cache keys on (nv, sel) with a tag word, so one table serves the
+            // whole walk across every arity/nv segment; xor-fold spreads sel
+            // bits over 1024 slots (perfect for nv<=10, ~few collisions at
+            // ~250 distinct sels for nv=20). Tag+1 encoding: 0 = empty slot.
+            uint256[] memory cache;
             uint256 t = n;
             while (t > 0) {
                 uint256 b = 3 * (t - 1);
@@ -652,32 +660,26 @@ library WhirGadgets {
                     --i;
                 }
                 uint256 nv = localR.length - arity;
-                if (nv != mNv) {
-                    // Interleaved [seen, value] pairs; empty array = memo off
-                    // (past nv=10 the zeroing costs more than the recompute -
-                    // the block proof regressed 1.8M with the cap at 13).
-                    if (nv <= 10) {
-                        memo = new uint256[](2 << nv);
-                    } else {
-                        memo = new uint256[](0);
-                    }
-                    mNv = nv;
+                if (cache.length == 0) {
+                    cache = new uint256[](2048);
                 }
+                uint256 keyBase = (nv + 1) << 24;
                 uint256 s = 0;
                 for (uint256 u = t; u > i; --u) {
                     uint256 sel = d[3 * (u - 1) + 2];
                     uint256 sv;
-                    if (memo.length == 0) {
-                        sv = eqSelectorValue(localR, arity, sel);
-                    } else {
-                        uint256 slot = 2 * sel;
-                        if (memo[slot] == 0) {
-                            sv = eqSelectorValue(localR, arity, sel);
-                            memo[slot] = 1;
-                            memo[slot + 1] = sv;
+                    if (sel < 0xFFFFFF) {
+                        uint256 key = keyBase | (sel + 1);
+                        uint256 slot = ((sel ^ (sel >> 12)) & 1023) * 2;
+                        if (cache[slot] == key) {
+                            sv = cache[slot + 1];
                         } else {
-                            sv = memo[slot + 1];
+                            sv = eqSelectorValue(localR, arity, sel);
+                            cache[slot] = key;
+                            cache[slot + 1] = sv;
                         }
+                    } else {
+                        sv = eqSelectorValue(localR, arity, sel);
                     }
                     s = _mulAddExt(s, gamma, sv);
                 }
