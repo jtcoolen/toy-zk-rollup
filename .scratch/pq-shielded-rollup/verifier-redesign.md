@@ -3200,3 +3200,26 @@ verifier needs NO changes: all three bundles verify on the existing v8 verifier
 (config digest changes only). At sec 80 the proof is 286 KB (target 300K met)
 and gas 45.7M; the remaining gap to 30M is the structural CIDNTY/link work
 (batch 68 options A/B).
+
+## Batch 71 — SECURITY CEILING: 128 bits is mathematically impossible on KoalaBear (user: "target 128 bits of provable security" -> "do as best as you can")
+
+Definitive limits of the WHIR_SECURITY_LEVEL knob at KoalaBear (p = 2^31-1), rate 4, this statement shape:
+- **Algebraic ceiling 113.36 bits**: schedule builder rejects 128 outright
+  (InitialClaimsBelowTarget { num_claims: 6, bits: 113.356 }). No grind can cover
+  the gap above the field's algebraic contribution.
+- **Grind ceiling 30 bits**: grinding_challenger asserts (1<<bits) < p, so bits <= 30.
+  Worse, a 30-bit grind is FLAKY (~13% failure per site: only ~2 field elements in
+  2^31 satisfy sample & mask == 0, scan covers ~2p candidates -> e^-2 miss rate).
+  28 bits is safe (~3e-4). This is why floor 30 sometimes panics at
+  grinding_challenger.rs:304 "failed to find proof-of-work witness".
+- Measured: 104 PANIC (needs >=31 grind bits), 100 PANIC after 124 s full-field scan
+  (needs 30 -> flaky), 112 PANIC (>=31). **Practical ceiling ~96-98 bits at floor 24.**
+- Grid (floor 24 unless noted): 96 canonical 330,004 B / 50.68M | 88: 314,980 B / 49.11M |
+  80: 286,484 B / 45.67M | 72: 248,852 B / 41.94M | 64: 218,900 B / 39.26M | 56: 172,812 B.
+  All verify on the existing v8 verifier (config digest changes only).
+
+CONCLUSION: security reduction is CLOSED as a lever (user floor >= 96, house target
+128 unreachable on this field). 30M gas must come from STRUCTURE: V9 option A
+(batch width 4->2, est -20M, the CIDNTY whale is per-instance recursion circuits),
+option B (commit C(zeta), -4..6M), option D code ideas. Canonical vectors restored;
+HEAD stays at 96-bit canonical 50,682,535 gas.
