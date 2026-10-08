@@ -3452,3 +3452,76 @@ it without surgery). Fibonacci harness tests to be retired as vectors move.
 Gas on the shielded wire is UNMEASURED until the first shielded v8 export lands
 - expect ~2-3x the fib 47.5M (i.e. ~90-140M) before any new optimisation; the
 whole gas frontier (batches 63-79) must be re-derived on shielded vectors.
+
+## Batch 82 - POSEIDON2-ONLY MIGRATION: SHA3/Keccak deleted from the shielded circuits. First honest post-migration census.
+
+User directive: "for example, no sha3, only poseidon2" + "identify the
+bottlenecks in the circuits/circuit relations, and optimise them". The batch-81
+census named them: SHA3 note derivation (290 wide keccak_f1600 rows/spend) and
+the Keccak nullifier fold. Both are now Poseidon2.
+
+Changes (all consensus-critical, pinned in-circuit vs native by
+circuit_p2_matches_native_shielded + gadget fold tests + regenerated golden
+vectors):
+* pq-hash: Poseidon2Shielded (ShieldedHasher over the Poseidon2 sponge;
+  framing = plain concat domain || parts, no length prefixes - every
+  preimage is fixed-length).
+* nullifier tree: Keccak -> Poseidon2, depth 256 -> 96. Address = low 96 bits
+  of the nullifier digest (masked compare in highest_differing_bit). 96-bit
+  address regime, user-accepted.
+* nullifier_gadget: 288 wide keccak rows/spend -> 128 narrow Poseidon2 perm
+  rows/spend (fold of 96-bit addresses, 6 limbs, FOLD_START=64).
+* transfer: pk_d + nullifier via p2_framed sponge; enable_keccak_f1600 GONE -
+  the client circuit now contains zero keccak rows.
+* ShieldedPool.sol: _emptyNullifierRoot() keccak loop deleted; EMPTY_NULLIFIER_
+  ROOT constant (Poseidon2 depth-96 empty root 0x83265b7a...7329) pinned.
+
+CENSUS (rate 2, default inner grind):
+  client circuit:   29,624 -> 10,668 ops (-64%); poseidon2 282 rows, keccak 0
+  client proof:     822,343 -> 496,683 B (-40%)
+  rc circuit:      569,699 -> 360,311 ops (-37%); witnesses 710K -> 415K
+      npo: recompose/coeff 33,019 + poseidon2 22,374 + challenger 4,077
+  rc padded rows:  414,676 -> 2^19 (524,288). 276K alu rows is the binding
+      constraint: JUST over 2^18 = 262,144. Under 2^18 halves the settlement
+      trace -> biggest single remaining lever.
+  final proof:     935,908 B raw at rate 2 (fib-era shielded: 903,268).
+
+WHY final proof didn't shrink yet: it is dominated by the rc trace padding
+(2^19) and query paths, and 2^19 didn't move. The client proof shrank 40% but
+the rc circuit shrank 37% and still rounds up to the same power of two. The
+pruned_paths field alone is 477 KB of the 936 KB bundle.
+
+RATE 3/4: still closed at this witness size (2^19 padded + blinding arity
+slack + grinding headroom). census at rate 3 reached the client proof stage
+(302 s) before a grind-witness flake (grinding_challenger.rs:304 - known
+flake, retry is the fix; two consecutive flakes at inner_pow_floor=30 suggest
+30-bit grind is tight for this transcript, not a wall).
+
+NEXT (priority order by estimated impact):
+1. rc circuit below 2^18 alu rows: -63K alu needed. Levers: fewer WHIR
+   verifier queries in-circuit (inner grind already at 30-bit cap), fold
+   depth 96 -> 64 (nullifier address 64-bit: -32 perm rows/spend in client,
+   -~2K in rc), statement width 100 -> fewer limbs (root_after is derivable,
+   could be recomputed in-circuit instead of public: -16 public limbs),
+   recompose/coeff 33K rows (p3_recursion internals).
+2. Re-run census with WHIR_INNER_POW_FLOOR=30 (canonical): fewer client
+   queries -> smaller rc circuit -> may cross under 2^18 by itself.
+3. Rate 3 retry once rc pads 2^18: 2^22 domain fits with grinding room.
+4. Wire export + gas measurement on shielded v8 (exportv8 running).
+
+## Batch 83 - FIRST HONEST SHIELDED GAS BASELINE: 85.2M gas / 477,640 B wire (rate 2).
+
+export_shielded_bundle_v8 on the Poseidon2 circuits (rate 2, inner grind 28):
+  raw bundle 935,908 B -> v8 wire 477,640 B (config 227,468 B, 10 chunks)
+  test_gas_v8: 85,205,024 gas (88.4M incl. deploy)
+
+This REPLACES the fib-proxy frontier as the canonical curve. The fib proxy
+(47.5M / 286,852 B) understated gas 1.8x, size 1.7x - direction was right,
+magnitude was not. Distance to the 30M target: 2.84x.
+
+Composition of the wire (from the census field dump): pruned_paths 477 KB of
+936 KB raw = Merkle query paths over the 2^19-padded rc trace. The whole game
+is (a) rc trace under 2^18, (b) rate 3+, (c) fewer queries. Each of the three
+halves its own slice: 2^19->2^18 removes ~1 path level per query AND halves
+every per-row cost in the settlement trace; rate 2->3 removes half the
+remaining opened rows; inner grind 30 (when it doesn't flake) cuts queries.
