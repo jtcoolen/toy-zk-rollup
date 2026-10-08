@@ -273,7 +273,9 @@ fn export_chain_bundle_v8() {
 
     let base = p3_uni_stark::prove(&inner, &air, trace, &pis).expect("base prove");
     let mut rc = build_recursion_circuit(&inner, &air, &base, &pis).expect("rc1");
-    for _ in 1..=2 {
+    // D-092 batch 73: env-controlled InSC layer count (canonical 2).
+    let layers: usize = std::env::var("RC_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    for _ in 1..=layers {
         let (proof, verifier) =
             settle_recursion_circuit_with(&rc, inner.clone()).expect("settle InSC");
         verifier.verify(&proof, &pis).expect("InSC layer verifies");

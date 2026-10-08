@@ -3249,3 +3249,30 @@ NOTE from re-reading batch 64: InSC layers 2->1 measured only -1.6M, which
 CONTRADICTS option A's -20M estimate if links == chain layers. The 4 "links"
 (prf.terminals.length == 4) are NOT simply chain layers - must establish what
 actually sets terminals.length before betting on A.
+
+## Batch 73 — LINK COUNT IS NOT THE WHALE: option A is DEAD (RC_LAYERS=0 experiment)
+
+Settled rc1 DIRECTLY under OutSC (0 InSC layers => 2 links, not 4):
+  bundle 284,932 B (-45 KB), gas 47,451,241 (-3.23M). NOT -20M.
+Combined with batch 64 (2->1 layers: -1.6M): the chain layers cost ~1.6M each;
+the FINAL settlement's own work (87 queries at LDE 25: QFOLD + Merkle + row
+decode + the recursion-circuit CIDNTY inst2/3) is ~45M and does not shrink with
+fewer links. The batch-68 option-A estimate (-20M) was wrong: links 1-3 were
+never 33M of the cost; the per-link map (batch 63) attributed gas to links
+because each link ENDS at a TWIGHT, but the dominant per-link cost is the
+FINAL round's work, which stays in the last link regardless of layer count.
+
+REVISED PATH TO 30M (gap now 17.45M from 47.45M best-case shape):
+1. (B) COMMIT C(zeta): -4..6M, needs opening-binding soundness argument.
+2. (C) SHRINK RECURSION CIRCUIT: inst2+inst3 = 7.04M of CIDNTY; the recursion
+   circuit's 5,085-node constraint program is Poseidon2 rounds + WHIR walk.
+   Fewer in-circuit Poseidon2 rows (smaller DIGEST_ELEMS? fewer grind checks?
+   batch-width 2 INSIDE the recursion circuit) cuts inst3 directly.
+3. (D) final polish: monolith inlining of satellite dispatch (~1-3M).
+4. Query-count floor: 87 queries at 96 bits is fixed (security lever closed).
+   => (B)+(C)+(D) ~= 8-12M: gets to ~36-40M, NOT 30M. The last 6-10M requires
+   the final settlement itself to do less: fewer queries at 96 bits means
+   STRONGER per-query algebra: rate 8 (needs folding 8 - framework limit) or
+   extension degree 8 (halves required queries at same security:
+   log2|F|=31, deg 8 -> 248 bits field capacity; framework supports
+   for_extension_degree::<8>? TO INVESTIGATE - this is the last big lever).
