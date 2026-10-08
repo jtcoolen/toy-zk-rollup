@@ -3150,3 +3150,22 @@ headroom to ~24M.
 1. Locate batch-width plumbing in build_batch_recursion_circuit / composed_export.
 2. Regenerate v8 vectors at width 2, measure test_gas_v8 (no verifier change).
 3. If ~28M: record V9 acceptance; else iterate with (B).
+
+## Batch 69 — shape knobs DO NOT STACK + CIDNTY node anatomy
+
+trace 256 + inner LDE 23 combined: 329,140 B / 49,088,277 gas — identical to
+either knob alone (49.07/49.06M). The -1.6M is ONE wall (final-settlement
+calldata+query floor), not three additive savings. Sweep definitively CLOSED.
+
+CIDNTY inst node counts (recursion_chain_vectors.json):
+  inst 0: 52 nodes (fib main)      inst 3: 5,085 nodes (recursion circuit)
+  inst 1: 40 nodes (fib perm)      inst 4: 116 nodes
+  inst 2: 1,963 nodes (rc circuit) inst 5: 105 nodes
+inst 3 op histogram: op15 (ext-add) 2,765 | op17 816 | op16 (ext-mul) 563 |
+leaves 758 | rest ~150. foldConstraints inst3 = 3.63M / 5,085 = 714 gas/node
+(already fused Yul since batch 38); recompose inst3 = 1.97M (8 chunks, O(k^2)
+ext muls + chunkVanishings pow2).
+
+=> The 30M gap is structural: 7.19M of CIDNTY is evaluating the RECURSION
+CIRCUIT's own constraint programs on-chain. Options A (batch width), B (commit
+C(zeta)), C (shrink recursion circuit) stand as recorded in batch 68.
