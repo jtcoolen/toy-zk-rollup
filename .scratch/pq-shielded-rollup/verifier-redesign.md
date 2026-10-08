@@ -3562,3 +3562,32 @@ KEY READINGS:
 * rate 3 settlement: census keeps flaking at inner pow 30 (grinding_challenger
   304, 4 consecutive); retry at pow 29 running. Rate 3 at 2^18 rc fits
   (2^22 domain) - expect ~550-600 KB raw, wire ~300-330 KB.
+
+## Batches 85-87 - INNER-RATE SWEEP: 477,640 B -> 346,052 B wire, 85.2M -> 70.1M gas.
+
+New knob: WHIR_INNER_RATE (client-proof starting inverse rate, default 1).
+Sweep at WHIR_RATE_FINAL=3, pow 28, inner pow 29:
+
+| inner rate | client proof | rc ops (alu) | rc pad | final raw |
+|---|---|---|---|---|
+| 1 | 466,215 B | 338,016 (256,289) | 2^18 | 761,988 B |
+| 2 | 353,668 B | 234,182 (162,276) | 2^18 | 761,988 B (same pad) |
+| 3 | 307,100 B | 196,815 (128,501) | **2^17** | 740,112 B |
+
+Rate-4 settlement became feasible once rc pads 2^17 (rate 4 at 2^18 had
+panicked the WHIR schedule): raw 675,312 B. Final grind 30 adds ~0.6% only.
+
+Committed canonical (batch 87, WHIR_INNER_RATE=3 WHIR_RATE_FINAL=4 pow 28
+inner 29): wire **346,052 B**, gas **70,119,870** (-27.5% size, -17.7% gas vs
+batch 84). Grind flake rate at pow 29-30 is high (6 flakes this batch; the
+SIMD grind scan has no retry - fixed lane count, expect("witness") panics).
+
+NEXT LEVER (user-proposed, in progress): ZK blinding OFF for the rc/settlement
+layer, ON for the client transfer proof. The rc witness is fully derived from
+the client proof (itself ZK) + public statement - blinding it hides nothing.
+Removes: trace doubling (commit height halves: 2^18 -> 2^17 committed),
+ZK_ARITY_SLACK 2->1 (fewer grind bits -> fewer queries), the randomization
+commitment round (one less cap + transcript round in Solidity), one WHIR fold
+round. Blocker: WhirUniPcs::ZK is an associated const (vendor pcs.rs:949)
+read at compile time by batch-stark - needs a type-level const-generic flag
+through vendor + settlement_replay + Solidity ProofCodec.
