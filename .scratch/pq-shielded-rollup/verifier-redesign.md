@@ -3525,3 +3525,40 @@ is (a) rc trace under 2^18, (b) rate 3+, (c) fewer queries. Each of the three
 halves its own slice: 2^19->2^18 removes ~1 path level per query AND halves
 every per-row cost in the settlement trace; rate 2->3 removes half the
 remaining opened rows; inner grind 30 (when it doesn't flake) cuts queries.
+
+## Batch 84 - FULL SHAPE CENSUS (shielded_shape_report): every circuit, per op kind.
+
+Canonical env (rate_final=2, WHIR_POW_FLOOR=28, WHIR_INNER_POW_FLOOR=30):
+
+CLIENT TRANSFER CIRCUIT (1 spend / 1 output):
+  ops=10,668  witnesses=10,779  alu_rows=9,888 -> pads 2^14
+    alu: MulAdd 4,657 | BoolCheck 2,890 | Add 2,030 | Mul 311
+    npo: poseidon2_perm 282 | statement 1
+  client proof: 463,645 B raw postcard, statement 100 limbs
+    RowCounts([public 346, statement 1, alu 9,888]), ext_degree 4,
+    alu_lanes 4, horner_packed_steps 2
+
+BLOCK RECURSION CIRCUIT (in-circuit WHIR verifier of 1 client proof):
+  ops=335,634  witnesses=389,706  alu_rows=254,196 -> pads 2^18 (was 2^19 at inner pow 28)
+    alu: MulAdd 93,098 | Add 63,947 | Mul 61,451 | BoolCheck 35,700
+    npo: recompose/coeff 32,579 | poseidon2 20,368 | challenger 4,062 | statement 1
+
+SETTLEMENT (rc proven under Keccak OutSC WHIR, rate 2):
+  final proof 872,164 B raw (inner pow 30) vs 935,908 (pow 28) - the inner
+  grind cut one padding power off the rc trace and ~64 KB off the bundle.
+
+KEY READINGS:
+* rc alu 254,196 is 3.2% under 2^18 - the padding power is NOT robust; any
+  circuit growth flips it back to 2^19. Buffer is ~8K rows.
+* rc = 25.7x the client's op count: the in-circuit verifier's per-query work
+  (recompose 32.6K = query openings; alu 254K = STIR folding + OOD eval).
+  rc size is driven by client-proof query count x client trace width, NOT by
+  the transfer logic (10.7K ops).
+* client proof 463 KB for a 2^14-row circuit: WHIR proof = queries x
+  (path + opened width). The opened width (alu table 9,888 rows x 4 lanes,
+  ext4) is the driver. Narrowing the client trace is the lever on rc size.
+* BoolCheck 2,890 in client = bit decompositions (96 nullifier address bits
+  + 16-bit limb splits + value range checks).
+* rate 3 settlement: census keeps flaking at inner pow 30 (grinding_challenger
+  304, 4 consecutive); retry at pow 29 running. Rate 3 at 2^18 rc fits
+  (2^22 domain) - expect ~550-600 KB raw, wire ~300-330 KB.
