@@ -3030,3 +3030,23 @@ Verifier-code floor for THIS proof: ~45M (batch 63 map).
     node = smaller hash arity, or batch fewer instances per layer);
   - or commit C(zeta) to move CIDNTY's 10.15M into an opening check.
 Next experiment: CHAIN_LOG_MAX_LDE 24 -> 23 (halves the final query work if it fits).
+
+## Batch 65 — final settlement LDE knob: WHIR_FINAL_LDE (infeasible below 25)
+
+Added env override WHIR_FINAL_LDE in settlement_bundle_with_blob (defaults to
+BLOCK_LOG_MAX_LDE=25, canonical behaviour unchanged). Test LDE 24: PANIC in
+serializing_challenger (PoW budget) — same structural wall as the documented
+PowBitsExceedBudget at arity 24: at a smaller final domain the required grinding
+bits exceed what the prover budget allows at rate 4 / floor 30. LDE 25 stands.
+
+PROOF-SHAPE SWEEP CLOSED (batches 64-65, 6 knobs): trace -1.6M, layers -1.6M,
+pow floor 32 infeasible, rate 8 unsupported, LDE 24 infeasible, cap height
+already minimal. Best honest proof-shape win: -1.6M (50.7 -> 49.1M). The wire
+and gas are dominated by the FINAL settlement's own query work (87 queries x
+depth-21 paths), fixed by the security target at LDE 25.
+
+Remaining path to 30M (protocol-level, recorded in batch 63): shrink the
+RECURSION CIRCUIT itself — its size is set by the in-circuit WHIR verification
+(Poseidon2 per path node x inner queries). The inner query count is the next
+knob to probe: fewer inner queries -> smaller recursion circuit -> fewer final
+constraints (CIDNTY 10.15M) AND smaller final proof.

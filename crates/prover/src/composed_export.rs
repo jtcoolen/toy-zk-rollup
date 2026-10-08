@@ -950,14 +950,19 @@ pub fn settlement_bundle_with_blob(
 ) -> Result<SettlementBundle, Box<dyn Error>> {
     // D-092 batch 45: WHIR_POW_FLOOR (if set) is applied inside
     // settlement_params_for, so prover and replay configs stay identical.
-    let params = settlement_params_for(crate::block::BLOCK_LOG_MAX_LDE, rate);
+    // Batch 64 experiment: WHIR_FINAL_LDE overrides the settlement LDE.
+    let lde: usize = std::env::var("WHIR_FINAL_LDE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(crate::block::BLOCK_LOG_MAX_LDE);
+    let params = settlement_params_for(lde, rate);
     let mut rounds_a = Vec::new();
     let mut starts_a = Vec::new();
     let (_doc_a, _out_a, program_a) = composed_run_with(
         statement,
         rc,
         &params,
-        crate::block::BLOCK_LOG_MAX_LDE,
+        lde,
         rate,
         &mut rounds_a,
         &mut starts_a,
@@ -968,7 +973,7 @@ pub fn settlement_bundle_with_blob(
         statement,
         rc,
         &params,
-        crate::block::BLOCK_LOG_MAX_LDE,
+        lde,
         rate,
         &mut rounds_b,
         &mut starts_b,
