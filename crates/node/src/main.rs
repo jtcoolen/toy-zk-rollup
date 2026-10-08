@@ -55,7 +55,7 @@ use axum::{Json, Router};
 use governor::{Quota, RateLimiter};
 use nonzero_ext::nonzero;
 use p3_field::PrimeField32;
-use pq_hash::{Poseidon2Commitment, Sha3_256Shielded};
+use pq_hash::{Poseidon2Commitment, Poseidon2Shielded};
 use prover::client::{prove_client_transfer, ClientSpec};
 use prover::fixtures::{funded_note, seed};
 use rand::rngs::SysRng;
@@ -298,7 +298,7 @@ impl Actor {
         Ok(Self {
             seq,
             demo,
-            recipient: derive_spend_pk(&Sha3_256Shielded, &seed(9)),
+            recipient: derive_spend_pk(&Poseidon2Shielded, &seed(9)),
             sender,
             pending_settlement: None,
             snapshot,

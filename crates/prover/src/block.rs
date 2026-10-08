@@ -817,7 +817,7 @@ mod tests {
     use crate::fixtures::{funded_note, seed, tree_with};
     use crate::transfer::LOG_MAX_LDE;
     use p3_field::PrimeCharacteristicRing;
-    use pq_hash::{Keccak256Commitment, Poseidon2Commitment, Sha3_256Shielded};
+    use pq_hash::{Poseidon2Commitment, Poseidon2Shielded};
     use shielded::keys::derive_spend_pk;
     use shielded::tree::CommitmentTree;
     use shielded::{Note, NullifierMap};
@@ -839,7 +839,7 @@ mod tests {
     ///
     /// One map across the whole block, not one per client: the chain constraint
     /// only means something if the children are transitions of the *same* map.
-    type NullifierStore = NullifierMap<Keccak256Commitment>;
+    type NullifierStore = NullifierMap<Poseidon2Commitment>;
 
     /// One client's transfer witness, as it would exist on the spender's machine.
     ///
@@ -895,7 +895,7 @@ mod tests {
     fn block_rejects_children_from_different_tree_states() -> Result<(), Box<dyn Error>> {
         let (n1, sk1) = funded_note(11, 1_000);
         let (n2, sk2) = funded_note(22, 2_000);
-        let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
+        let recipient = derive_spend_pk(&Poseidon2Shielded, &seed(9));
         let inner = InnerWhirConfig::new(LOG_MAX_LDE, 0).expect("inner config");
 
         // Two *separate* trees, so the two transfers carry different roots.
@@ -919,7 +919,7 @@ mod tests {
             index: 0,
             out_value: 1_900,
         };
-        let mut map = NullifierMap::new(Keccak256Commitment);
+        let mut map = NullifierMap::new(Poseidon2Commitment::default());
         let client_a = prove_client_transfer(&inner, &spec_a, &mut tree_a, recipient, &mut map)?;
         let client_b = prove_client_transfer(&inner, &spec_b, &mut tree_b, recipient, &mut map)?;
 
@@ -958,7 +958,7 @@ mod tests {
         let (n1, sk1) = funded_note(11, 1_000);
         let (n2, sk2) = funded_note(22, 2_000);
         let (mut tree, _) = tree_with(&[n1, n2]);
-        let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
+        let recipient = derive_spend_pk(&Poseidon2Shielded, &seed(9));
         let inner = InnerWhirConfig::new(LOG_MAX_LDE, 0).expect("inner config");
 
         let spec_a = ClientSpec {
@@ -978,8 +978,8 @@ mod tests {
         // commitment chain is intact - but client B was witnessed against its
         // own fresh map, so its `before` is the empty-map root rather than
         // client A's `after`.
-        let mut map_a = NullifierMap::new(Keccak256Commitment);
-        let mut map_b = NullifierMap::new(Keccak256Commitment);
+        let mut map_a = NullifierMap::new(Poseidon2Commitment::default());
+        let mut map_b = NullifierMap::new(Poseidon2Commitment::default());
         let client_a = prove_client_transfer(&inner, &spec_a, &mut tree, recipient, &mut map_a)?;
         let client_b = prove_client_transfer(&inner, &spec_b, &mut tree, recipient, &mut map_b)?;
         assert_ne!(
@@ -1020,7 +1020,7 @@ mod tests {
         let (n1, sk1) = funded_note(11, 1_000);
         let (n2, sk2) = funded_note(22, 2_000);
         let (mut tree, _) = tree_with(&[n1, n2]);
-        let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
+        let recipient = derive_spend_pk(&Poseidon2Shielded, &seed(9));
         let inner = InnerWhirConfig::new(LOG_MAX_LDE, 0).expect("inner config");
 
         let spec_a = ClientSpec {
@@ -1035,7 +1035,7 @@ mod tests {
             index: 1,
             out_value: 1_900,
         };
-        let mut map = NullifierMap::new(Keccak256Commitment);
+        let mut map = NullifierMap::new(Poseidon2Commitment::default());
         let client_a = prove_client_transfer(&inner, &spec_a, &mut tree, recipient, &mut map)?;
         let client_b = prove_client_transfer(&inner, &spec_b, &mut tree, recipient, &mut map)?;
 
@@ -1081,7 +1081,7 @@ mod tests {
         let (n1, sk1) = funded_note(11, 1_000);
         let (n2, sk2) = funded_note(22, 2_000);
         let (mut tree, _) = tree_with(&[n1, n2]);
-        let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
+        let recipient = derive_spend_pk(&Poseidon2Shielded, &seed(9));
 
         let inner = InnerWhirConfig::new(LOG_MAX_LDE, 0).expect("inner config");
 
@@ -1100,7 +1100,7 @@ mod tests {
             index: 1,
             out_value: 1_900,
         };
-        let mut map = NullifierMap::new(Keccak256Commitment);
+        let mut map = NullifierMap::new(Poseidon2Commitment::default());
         let client_a = prove_client_transfer(&inner, &spec_a, &mut tree, recipient, &mut map)?;
         let client_b = prove_client_transfer(&inner, &spec_b, &mut tree, recipient, &mut map)?;
 
@@ -1166,7 +1166,7 @@ mod tests {
         let (n1, sk1) = funded_note(11, 1_000);
         let (n2, sk2) = funded_note(22, 2_000);
         let (mut tree, _) = tree_with(&[n1, n2]);
-        let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
+        let recipient = derive_spend_pk(&Poseidon2Shielded, &seed(9));
         let inner = InnerWhirConfig::new(LOG_MAX_LDE, 0).expect("inner config");
 
         let spec_a = ClientSpec {
@@ -1181,7 +1181,7 @@ mod tests {
             index: 1,
             out_value: 1_900,
         };
-        let mut map = NullifierMap::new(Keccak256Commitment);
+        let mut map = NullifierMap::new(Poseidon2Commitment::default());
         let client_a = prove_client_transfer(&inner, &spec_a, &mut tree, recipient, &mut map)?;
         let client_b = prove_client_transfer(&inner, &spec_b, &mut tree, recipient, &mut map)?;
         let children = children_of(std::iter::once(&client_a).chain(std::iter::once(&client_b)));
@@ -1259,13 +1259,13 @@ mod tests {
     #[test]
     #[ignore = "scaling probe; run with --nocapture when choosing the aggregation fan-in"]
     fn measure_proof_size_vs_fan_in() -> Result<(), Box<dyn Error>> {
-        let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
+        let recipient = derive_spend_pk(&Poseidon2Shielded, &seed(9));
         let inner = InnerWhirConfig::new(LOG_MAX_LDE, 0).expect("inner config");
 
         println!("fan_in | block_bytes | bytes_per_transfer | total_queries");
         println!("-------+-------------+--------------------+--------------");
         for fan in [1usize, 2, 4, 8] {
-            let mut map = NullifierMap::new(Keccak256Commitment);
+            let mut map = NullifierMap::new(Poseidon2Commitment::default());
             let mut clients = Vec::new();
             let mut notes = Vec::new();
             for i in 0..fan {

@@ -221,15 +221,15 @@ pub struct SubmitOk {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pq_hash::{Digest32, Keccak256Commitment, Sha3_256Shielded};
+    use pq_hash::{Digest32, Poseidon2Commitment, Poseidon2Shielded};
     use shielded::keys::derive_spend_pk;
 
     fn sample_wire() -> TransferWire {
         let sk_d = [3u8; 32];
-        let pk_d = derive_spend_pk(&Sha3_256Shielded, &sk_d);
+        let pk_d = derive_spend_pk(&Poseidon2Shielded, &sk_d);
         let note = shielded::Note::new(900, [1u8; 32], [2u8; 32], pk_d);
-        let nf = note.nullifier(&Sha3_256Shielded, &sk_d);
-        let out = note.commit(&Keccak256Commitment);
+        let nf = note.nullifier(&Poseidon2Shielded, &sk_d);
+        let out = note.commit(&Poseidon2Commitment::default());
         let public = TransferPublic {
             nullifiers: vec![nf],
             outputs: vec![out],

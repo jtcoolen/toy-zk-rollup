@@ -31,7 +31,7 @@ import {BlockStatement} from "./BlockStatement.sol";
 /// duplicate. That made the contract a second source of truth for a fact the
 /// proof already establishes. The transfer circuit now proves nullifier
 /// *non-membership* in-circuit (D-032, D-035): each spend folds
-/// `keccak256` from an empty-subtree constant up to the nullifier root it
+/// Poseidon2 from an empty-subtree constant up to the nullifier root it
 /// inherited, then folds the nullifier itself up to the root after insertion.
 /// Both endpoints are in the verified statement, and the block circuit chains
 /// one transfer's `after` to the next transfer's `before`.
@@ -75,6 +75,15 @@ contract ShieldedPool {
 
     /// The nullifier-map root the next block must build on.
     bytes32 public currentNullifierRoot;
+
+    /// The root of an empty nullifier map: the Poseidon2 empty-subtree chain
+    /// at `NULLIFIER_TREE_DEPTH = 96` (`crates/shielded/src/nullifier_tree.rs`).
+    /// Pinned here rather than computed: the fold is Poseidon2 now (D-092
+    /// batch 82), which Solidity cannot replay cheaply - the whole point of
+    /// the move was that the contract never folds this tree, it only chains
+    /// the roots the proof publishes.
+    bytes32 public constant EMPTY_NULLIFIER_ROOT =
+        0x83265b7a2c40cc6eca237b6016b764606335cd0c6ff0732470e20a484d5a7329;
 
     /// Collected fees, withdrawable by `feeRecipient`.
     address public feeRecipient;
@@ -123,7 +132,7 @@ contract ShieldedPool {
         feeRecipient = feeRecipient_;
         currentRoot = genesisRoot_;
         currentNullifierRoot =
-            genesisNullifierRoot_ == bytes32(0) ? _emptyNullifierRoot() : genesisNullifierRoot_;
+            genesisNullifierRoot_ == bytes32(0) ? EMPTY_NULLIFIER_ROOT : genesisNullifierRoot_;
     }
     /// Apply a verified block.
     ///
@@ -167,15 +176,6 @@ contract ShieldedPool {
             block_.nullifierAfter,
             block_.totalFee
         );
-    }
-
-    /// The root of an empty nullifier map: the prover's depth-256 empty-subtree
-    /// chain (`NULLIFIER_TREE_DEPTH` in `crates/shielded/src/nullifier_tree.rs`).
-    /// Deploy-time only; the value is a constant of the scheme.
-    function _emptyNullifierRoot() private pure returns (bytes32 cur) {
-        for (uint256 h; h < 256; ++h) {
-            cur = keccak256(abi.encodePacked(cur, cur));
-        }
     }
 
     /// Withdraw collected fees. Only the fee recipient.

@@ -25,7 +25,7 @@
 //! structure. A bug that "fixes" a root by writing it would have nowhere to
 //! live here.
 
-use pq_hash::{Keccak256Commitment, MerkleRoot, NoteHash, Nullifier, Poseidon2Commitment};
+use pq_hash::{MerkleRoot, NoteHash, Nullifier, Poseidon2Commitment};
 use shielded::nullifier_tree::NullifierMap;
 use shielded::tree::CommitmentTree;
 
@@ -47,7 +47,7 @@ pub struct PoolState {
     /// The append-only note commitment tree (Poseidon2, D-088).
     tree: CommitmentTree<Poseidon2Commitment>,
     /// The nullifier map: which nullifiers have been spent.
-    nullifiers: NullifierMap<Keccak256Commitment>,
+    nullifiers: NullifierMap<Poseidon2Commitment>,
     /// Number of blocks applied to reach this state.
     block_number: u64,
 }
@@ -108,7 +108,7 @@ impl PoolState {
     pub fn genesis() -> Self {
         Self {
             tree: CommitmentTree::new(Poseidon2Commitment::default()),
-            nullifiers: NullifierMap::new(Keccak256Commitment),
+            nullifiers: NullifierMap::new(Poseidon2Commitment::default()),
             block_number: 0,
         }
     }
@@ -177,7 +177,7 @@ impl PoolState {
     /// while giving the sequencer a structure it can insert into and recompute
     /// roots from.
     #[must_use]
-    pub fn nullifier_map(&self) -> NullifierMap<Keccak256Commitment> {
+    pub fn nullifier_map(&self) -> NullifierMap<Poseidon2Commitment> {
         self.nullifiers.clone()
     }
 

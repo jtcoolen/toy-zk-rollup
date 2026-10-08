@@ -24,7 +24,7 @@ use crate::whir::F;
 
 use crate::commitment_gadget::{append_to_frontier, frontier_from_leaves, FrontierWitness};
 use crate::nullifier_gadget::NullifierWitness;
-use pq_hash::{Digest32, Keccak256Commitment, MerkleRoot, Poseidon2Commitment, Sha3_256Shielded};
+use pq_hash::{Digest32, MerkleRoot, Poseidon2Commitment, Poseidon2Shielded};
 use shielded::keys::derive_spend_pk;
 use shielded::tree::CommitmentTree;
 use shielded::{Note, NullifierMap, NullifierRoots, Transfer, TransferPublic};
@@ -105,7 +105,7 @@ pub fn seed(byte: u8) -> [u8; 32] {
 #[must_use]
 pub fn funded_note(byte: u8, value: u64) -> (Note, [u8; 32]) {
     let sk_d = seed(byte);
-    let pk_d = derive_spend_pk(&Sha3_256Shielded, &sk_d);
+    let pk_d = derive_spend_pk(&Poseidon2Shielded, &sk_d);
     let note = Note::new(
         value,
         seed(byte.wrapping_add(100)),
@@ -160,7 +160,7 @@ pub fn frontier_of(tree: &CommitmentTree<Poseidon2Commitment>) -> FrontierWitnes
 #[must_use]
 pub fn nullifier_transition(
     transfer: &Transfer<'_>,
-    map: &mut NullifierMap<Keccak256Commitment>,
+    map: &mut NullifierMap<Poseidon2Commitment>,
 ) -> (NullifierRoots, Vec<NullifierWitness>) {
     crate::client::nullifier_transition(transfer, map)
         .expect("fixture must produce a valid nullifier transition")
@@ -178,7 +178,7 @@ pub fn public_and_witnesses(
     transfer: &Transfer<'_>,
     tree: &CommitmentTree<Poseidon2Commitment>,
 ) -> (TransferPublic, Vec<NullifierWitness>, FrontierWitness) {
-    public_and_witnesses_from(transfer, tree, NullifierMap::new(Keccak256Commitment))
+    public_and_witnesses_from(transfer, tree, NullifierMap::new(Poseidon2Commitment::default()))
 }
 
 /// [`public_and_witnesses`] over a map that already holds prior spends.
@@ -189,7 +189,7 @@ pub fn public_and_witnesses(
 pub fn public_and_witnesses_from(
     transfer: &Transfer<'_>,
     tree: &CommitmentTree<Poseidon2Commitment>,
-    mut map: NullifierMap<Keccak256Commitment>,
+    mut map: NullifierMap<Poseidon2Commitment>,
 ) -> (TransferPublic, Vec<NullifierWitness>, FrontierWitness) {
     let hasher = commitment_hasher();
     let (roots, witnesses) = nullifier_transition(transfer, &mut map);
@@ -204,7 +204,7 @@ pub fn public_and_witnesses_from(
     let root_after = crate::commitment_gadget::fold_to_root(&hasher, &frontier);
     let public = transfer.public(
         &hasher,
-        &Sha3_256Shielded,
+        &Poseidon2Shielded,
         root,
         MerkleRoot::from_digest(root_after),
         roots,

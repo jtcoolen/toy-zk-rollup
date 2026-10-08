@@ -43,7 +43,7 @@ use prover::composed_export::{
 };
 use prover::settlement_replay::{hex, settlement_params_for, Challenge, SemPcs};
 
-use pq_hash::{Keccak256Commitment, Sha3_256Shielded};
+use pq_hash::{Poseidon2Commitment, Poseidon2Shielded};
 use prover::block::{block_statement, build_multi_transfer_circuit, ChildProof, TransferShape};
 use prover::client::{prove_client_transfer, ClientSpec};
 use prover::fixtures::{funded_note, seed, tree_with};
@@ -218,7 +218,7 @@ fn block_program_equality_and_export() -> Result<(), Box<dyn Error>> {
     // the whole shielded path end to end.
     let (note, sk_d) = funded_note(11, 1_000);
     let (tree, paths) = tree_with(&[note]);
-    let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
+    let recipient = derive_spend_pk(&Poseidon2Shielded, &seed(9));
     // The inner (client) config: transfer proofs are Poseidon2 WHIR at the
     // recursion circuit's LDE, exactly as a real client produces them.
     let inner = InnerWhirConfig::new(prover::transfer::LOG_MAX_LDE, 0).expect("inner config");
@@ -232,7 +232,7 @@ fn block_program_equality_and_export() -> Result<(), Box<dyn Error>> {
         output: &out_note,
         fee: 100,
     };
-    let mut map = NullifierMap::new(Keccak256Commitment);
+    let mut map = NullifierMap::new(Poseidon2Commitment::default());
     let client = prove_client_transfer(&inner, &spec, &tree, &mut map).expect("client prove");
 
     let shape = TransferShape {
@@ -311,7 +311,7 @@ fn shielded_size_census() -> Result<(), Box<dyn Error>> {
     use p3_circuit::Op;
     let (note, sk_d) = funded_note(11, 1_000);
     let (tree, paths) = tree_with(&[note]);
-    let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
+    let recipient = derive_spend_pk(&Poseidon2Shielded, &seed(9));
     let inner = InnerWhirConfig::new(prover::transfer::LOG_MAX_LDE, 0).expect("inner config");
     let out_note = Note::new(900, seed(200), seed(201), recipient);
 
@@ -332,7 +332,7 @@ fn shielded_size_census() -> Result<(), Box<dyn Error>> {
     println!("CENSUS client circuit padded rows: alu->{}", pad(tc.census_alu_rows()));
 
     // --- client proof (InSC/Poseidon2) --------------------------------------
-    let mut map = NullifierMap::new(Keccak256Commitment);
+    let mut map = NullifierMap::new(Poseidon2Commitment::default());
     let spec = ClientSpec {
         note: &note, sk_d: &sk_d, path: &paths[0], index: 0, output: &out_note, fee: 100,
     };
@@ -392,10 +392,10 @@ fn export_shielded_bundle_v8() -> Result<(), Box<dyn Error>> {
     use p3_symmetric::CryptographicHasher;
     let (note, sk_d) = funded_note(11, 1_000);
     let (tree, paths) = tree_with(&[note]);
-    let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
+    let recipient = derive_spend_pk(&Poseidon2Shielded, &seed(9));
     let inner = InnerWhirConfig::new(prover::transfer::LOG_MAX_LDE, 0).expect("inner config");
     let out_note = Note::new(900, seed(200), seed(201), recipient);
-    let mut map = NullifierMap::new(Keccak256Commitment);
+    let mut map = NullifierMap::new(Poseidon2Commitment::default());
     let spec = ClientSpec {
         note: &note, sk_d: &sk_d, path: &paths[0], index: 0, output: &out_note, fee: 100,
     };

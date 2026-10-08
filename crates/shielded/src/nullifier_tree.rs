@@ -52,9 +52,19 @@ use pq_hash::{CommitmentHasher, Digest32, MerkleRoot, Nullifier};
 use std::collections::HashSet;
 
 /// Depth of the nullifier map: one level per bit of the nullifier digest.
-pub const NULLIFIER_TREE_DEPTH: usize = 256;
+/// Address/path bits, and so the tree's depth.
+///
+/// D-092 batch 82: 256 -> 96. The tree is Poseidon2 now (see the prover's
+/// nullifier gadget), and the insert fold runs one permutation per level, so
+/// the depth is a direct circuit cost: 96 levels instead of 256 removes 160
+/// permutation rows per nullifier. The address is the low 96 bits of the
+/// nullifier digest; two nullifiers agreeing on those 96 bits are treated as
+/// duplicates (the insert refuses), which bounds the collision assumption at
+/// the sponge's own margin - the same 96-bit regime the proof system targets.
+pub const NULLIFIER_TREE_DEPTH: usize = 96;
 
-/// Bit `i` of a 256-bit address, little-endian within each byte.
+/// Bit `i` of the address, little-endian within each byte. Bits at or above
+/// [`NULLIFIER_TREE_DEPTH`] never reach this function.
 const fn addr_bit(addr: &[u8; 32], i: usize) -> bool {
     (addr[i / 8] >> (i % 8)) & 1 == 1
 }
@@ -66,7 +76,12 @@ const fn addr_bit(addr: &[u8; 32], i: usize) -> bool {
 /// highest differing bit is below `h`. So bucketing occupied addresses by this
 /// value sorts them into exactly the sibling subtrees along our path.
 fn highest_differing_bit(a: &[u8; 32], b: &[u8; 32]) -> Option<usize> {
-    (0..32).rev().find_map(|byte| {
+    // Only the low NULLIFIER_TREE_DEPTH bits are the address; higher bits are
+    // ignored, so two digests agreeing on the address path are indistinguishable
+    // here and the insert treats them as duplicates rather than silently
+    // stacking two leaves at one path.
+    let bytes = NULLIFIER_TREE_DEPTH / 8;
+    (0..bytes).rev().find_map(|byte| {
         let x = a[byte] ^ b[byte];
         if x == 0 {
             return None;
@@ -392,10 +407,11 @@ mod tests {
 
         let root_before = map.root();
         let w = map.non_inclusion_witness(&b).expect("b absent");
-        // [1;32] vs [2;32] differ in every byte; the topmost differing byte is
-        // 31 with xor 0x03, so the highest differing bit is 248 + 1 = 249.
-        assert_eq!(w.start_height, 249);
-        assert_eq!(w.siblings.len(), NULLIFIER_TREE_DEPTH - 249);
+        // [1;32] vs [2;32] differ in every byte, but only the low
+        // NULLIFIER_TREE_DEPTH bits are the address: the topmost masked byte is
+        // 11 with xor 0x03, so the highest differing bit is 8*11 + 1 = 89.
+        assert_eq!(w.start_height, 89);
+        assert_eq!(w.siblings.len(), NULLIFIER_TREE_DEPTH - 89);
         assert_eq!(map.root_before(&w, &b), root_before);
 
         // Folding the insert must land on the root of the map we would get by
@@ -415,15 +431,16 @@ mod tests {
         // differs from us.
         let mut map = NullifierMap::new(Keccak256Commitment);
         let ours = [0u8; 32];
-        // Differs from ours only in the top bit of the top byte -> bit 255.
+        // Differs from ours only in the top bit of the address -> bit 95.
+        // (Byte 31 is outside the masked address; byte 11 is its top byte.)
         let far = {
             let mut b = [0u8; 32];
-            b[31] = 0x80;
+            b[NULLIFIER_TREE_DEPTH / 8 - 1] = 0x80;
             b
         };
         assert!(map.insert(&nf(far)));
         let w = map.non_inclusion_witness(&nf(ours)).expect("absent");
-        assert_eq!(w.start_height, 255);
+        assert_eq!(w.start_height, NULLIFIER_TREE_DEPTH - 1);
         assert_eq!(w.siblings.len(), 1, "only the top-level sibling is needed");
         assert_eq!(map.root_before(&w, &nf(ours)), map.root());
     }
@@ -448,7 +465,7 @@ mod tests {
 
     #[test]
     fn witness_size_tracks_occupied_spread_not_tree_depth() {
-        // With k occupants spread over 2^256, the closest highest-differing bit
+        // With k occupants spread over 2^NULLIFIER_TREE_DEPTH, the closest highest-differing bit
         // sits near log2(k), so the witness stays small as k grows.
         let mut map = NullifierMap::new(Keccak256Commitment);
         let probe = nf([0u8; 32]);

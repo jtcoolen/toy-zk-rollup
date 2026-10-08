@@ -9,10 +9,18 @@
 //!   fold(nf,       siblings') == nullifier_root_after     (inserted)
 //! ```
 //!
+//! # Hasher
+//!
+//! The fold is Poseidon2 - the same permutation, and the same table, the note
+//! Merkle tree uses. It used to be Keccak-f[1600], which cost 24 wide rows per
+//! level and made the nullifier fold the widest instance in the client proof;
+//! D-092 batch 82 moved it here. The collision margin is the sponge's, not
+//! SHA3's - a reduction the operator accepted (D-092).
+//!
 //! # Why the shape is fixed
 //!
 //! A circuit cannot have a data-dependent number of rows, so the variable part
-//! of the native witness — how far down the tree the empty subtree starts — is
+//! of the native witness - how far down the tree the empty subtree starts - is
 //! replaced by a compile-time budget. `FOLD_DEPTH` is the number of levels the
 //! absence fold runs. The prover must supply a witness whose empty subtree
 //! reaches at least `NULLIFIER_TREE_DEPTH - FOLD_DEPTH`, i.e. the map must be
@@ -20,7 +28,7 @@
 //! as `LOG_MAX_LDE`: too small and proving fails loudly, never silently.
 //!
 //! Emptiness is downward-closed inside a containing subtree, so if the subtree
-//! at height `h` is empty then so is the one at any lower `h0 ≤ h`. That is
+//! at height `h` is empty then so is the one at any lower `h0 <= h`. That is
 //! what lets a fixed `h0 = NULLIFIER_TREE_DEPTH - FOLD_DEPTH` stand in for a
 //! larger true `h`, padding the bottom of the fold with empty-subtree
 //! constants.
@@ -29,26 +37,28 @@
 //!
 //! The address is the nullifier, and the nullifier is already computed in this
 //! circuit as `H(DOMAIN_NULLIFIER || sk_d || rho)`. The direction bits are
-//! decomposed from those digest limbs, so the prover never chooses an address —
-//! it is derived from the witness that produced the nullifier. A prover who
-//! could pick the address could route a spend around the empty-subtree check.
+//! decomposed from that digest's exported limbs, so the prover never chooses an
+//! address - it is derived from the witness that produced the nullifier. A
+//! prover who could pick the address could route a spend around the
+//! empty-subtree check. Only the low [`NULLIFIER_TREE_DEPTH`] bits are the
+//! address, matching the native map's masked address.
 //!
 //! # Cost, stated plainly
 //!
-//! The absence fold is `FOLD_DEPTH` Keccak-f. The insert fold runs from the
-//! leaf all the way to the root — `NULLIFIER_TREE_DEPTH` Keccak-f — because the
-//! empty-collapse that makes absence cheap only applies when *both* children
-//! are empty, and the inserted leaf is not. Sparsity does not help the insert
-//! direction. At 24 rows per Keccak-f that is roughly
-//! `24 · (FOLD_DEPTH + 256)` rows per nullifier.
+//! The absence fold is `FOLD_DEPTH` Poseidon2 permutations. The insert fold
+//! runs from the leaf all the way to the root - `NULLIFIER_TREE_DEPTH`
+//! permutations - because the empty-collapse that makes absence cheap only
+//! applies when *both* children are empty, and the inserted leaf is not.
+//! Sparsity does not help the insert direction. At one permutation row per
+//! level that is `FOLD_DEPTH + NULLIFIER_TREE_DEPTH` permutation rows per
+//! nullifier, on the same narrow table the note tree already pays for.
 
-use p3_circuit::ops::KECCAK256_DIGEST_LIMBS;
 use p3_circuit::{CircuitBuilder, CircuitBuilderError, ExprId};
 use pq_hash::CommitmentHasher;
 use pq_hash::Digest32;
 use shielded::nullifier_tree::{NonInclusionWitness, NullifierMap, NULLIFIER_TREE_DEPTH};
 
-use crate::transfer::const_limbs;
+use crate::commitment_gadget::{DigestExpr, digest_to_ext, export_digest_limbs, p2_compress};
 use crate::whir_recursion::{Challenge, F};
 
 /// Levels the absence fold covers.
@@ -62,6 +72,10 @@ pub const FOLD_DEPTH: usize = 32;
 
 /// The height the absence fold starts at.
 const FOLD_START: usize = NULLIFIER_TREE_DEPTH - FOLD_DEPTH;
+
+/// The number of 16-bit digest limbs the address bits are read from: the low
+/// `NULLIFIER_TREE_DEPTH` bits of the digest, one limb per 16 bits.
+const ADDR_LIMBS: usize = NULLIFIER_TREE_DEPTH / 16;
 
 /// A nullifier's non-membership witness, in circuit-ready form.
 ///
@@ -117,7 +131,9 @@ pub fn prepare_witness<H: CommitmentHasher>(
 ) -> Result<NullifierWitness, String> {
     if witness.start_height < FOLD_START {
         return Err(format!(
-            "nullifier map too dense for this circuit: the empty subtree containing              the address starts at height {}, below the circuit floor of {FOLD_START}              (FOLD_DEPTH = {FOLD_DEPTH})",
+            "nullifier map too dense for this circuit: the empty subtree containing \
+             the address starts at height {}, below the circuit floor of {FOLD_START} \
+             (FOLD_DEPTH = {FOLD_DEPTH})",
             witness.start_height
         ));
     }
@@ -138,18 +154,21 @@ pub fn prepare_witness<H: CommitmentHasher>(
     })
 }
 
-/// Decompose 16 digest limbs into 256 little-endian bits.
+/// Decompose the low [`NULLIFIER_TREE_DEPTH`] address bits from a digest's
+/// exported limbs.
 ///
-/// Limb `i` holds bits `16i .. 16i+16`, so bit `b` of the digest is bit
-/// `b % 16` of limb `b / 16`. This matches the native `addr_bit`, which reads
-/// bit `i` from byte `i / 8` little-endian within the byte, because each 16-bit
-/// limb is two little-endian bytes.
+/// Limb `i` holds digest bits `16i .. 16i+16` little-endian (each limb is two
+/// little-endian bytes), which matches the native `addr_bit`: bit `i` of the
+/// address is bit `i % 16` of limb `i / 16`. Bits at or above
+/// `NULLIFIER_TREE_DEPTH` are not the address and are never read - the native
+/// map masks them out the same way, so the two sides agree on which digests
+/// collide.
 fn digest_bits(
     builder: &mut CircuitBuilder<Challenge>,
     limbs: &[ExprId],
 ) -> Result<Vec<ExprId>, CircuitBuilderError> {
     let mut bits = Vec::with_capacity(NULLIFIER_TREE_DEPTH);
-    for limb in limbs.iter().take(KECCAK256_DIGEST_LIMBS) {
+    for limb in limbs.iter().take(ADDR_LIMBS) {
         let mut part = builder.decompose_to_bits::<F>(*limb, 16)?;
         bits.append(&mut part);
     }
@@ -162,54 +181,71 @@ fn digest_bits(
     Ok(bits)
 }
 
-/// Fold `start` upward through `siblings`, one level per sibling.
+/// A digest constant as circuit expressions.
+///
+/// # Errors
+///
+/// [`CircuitBuilderError::MissingOutput`] if the digest is not a canonical
+/// field-element encoding - which for a witness digest means corruption, since
+/// every honest digest is a Poseidon2 output.
+fn const_digest(
+    builder: &mut CircuitBuilder<Challenge>,
+    digest: &Digest32,
+) -> Result<DigestExpr, CircuitBuilderError> {
+    let ext = digest_to_ext(digest).ok_or(CircuitBuilderError::MissingOutput)?;
+    Ok([builder.define_const(ext[0]), builder.define_const(ext[1])])
+}
+
+/// Fold `start` upward through `siblings`, one Poseidon2 permutation per level.
 ///
 /// Direction at each level is taken from `bits`, so the caller controls how the
 /// path is chosen and the prover cannot steer it.
 fn fold_up(
     builder: &mut CircuitBuilder<Challenge>,
-    start: Vec<ExprId>,
+    start: DigestExpr,
     start_height: usize,
     siblings: &[Digest32],
     bits: &[ExprId],
-) -> Result<Vec<ExprId>, CircuitBuilderError> {
+) -> Result<DigestExpr, CircuitBuilderError> {
     let mut current = start;
     for (offset, sibling) in siblings.iter().enumerate() {
         let level = start_height + offset;
-        let sibling_limbs = const_limbs(builder, sibling.as_bytes());
+        let sibling_expr = const_digest(builder, sibling)?;
         let go_right = bits[level];
         builder.assert_bool(go_right);
 
         // `go_right = 1` puts the sibling on the left, matching the native
         // fold where the node's own address bit selects the side the sibling
         // occupies.
-        let mut left = Vec::with_capacity(KECCAK256_DIGEST_LIMBS);
-        let mut right = Vec::with_capacity(KECCAK256_DIGEST_LIMBS);
-        for limb in 0..KECCAK256_DIGEST_LIMBS {
-            left.push(builder.select(go_right, sibling_limbs[limb], current[limb]));
-            right.push(builder.select(go_right, current[limb], sibling_limbs[limb]));
-        }
-        current = builder.keccak256_compress(&left, &right)?;
+        let left = [
+            builder.select(go_right, sibling_expr[0], current[0]),
+            builder.select(go_right, sibling_expr[1], current[1]),
+        ];
+        let right = [
+            builder.select(go_right, current[0], sibling_expr[0]),
+            builder.select(go_right, current[1], sibling_expr[1]),
+        ];
+        current = p2_compress(builder, &left, &right)?;
     }
     Ok(current)
 }
 
 /// Constrain a nullifier's absence and its insertion, returning the two roots.
 ///
-/// `nullifier_limbs` must be the in-circuit digest of the nullifier, so the
-/// address bits are derived rather than declared. The returned limb vectors are
-/// the roots the transfer's statement must export; the settlement contract
-/// checks each against the root it holds.
+/// `nullifier` must be the in-circuit digest of the nullifier, so the address
+/// bits are derived rather than declared. The returned digests are the roots
+/// the transfer's statement must export; the settlement contract checks each
+/// against the root it holds.
 ///
 /// # Errors
 ///
-/// Returns [`CircuitBuilderError`] if the witness is short, or if a digest limb
-/// cannot be decomposed.
+/// Returns [`CircuitBuilderError`] if the witness is short, if a digest is not
+/// canonical, or if a limb cannot be decomposed.
 pub fn constrain_nullifier_non_membership(
     builder: &mut CircuitBuilder<Challenge>,
-    nullifier_limbs: &[ExprId],
+    nullifier: &DigestExpr,
     witness: &NullifierWitness,
-) -> Result<(Vec<ExprId>, Vec<ExprId>), CircuitBuilderError> {
+) -> Result<(DigestExpr, DigestExpr), CircuitBuilderError> {
     if witness.siblings.len() != FOLD_DEPTH {
         return Err(CircuitBuilderError::InvalidDimension {
             expected: FOLD_DEPTH,
@@ -223,19 +259,20 @@ pub fn constrain_nullifier_non_membership(
         });
     }
 
-    let bits = digest_bits(builder, nullifier_limbs)?;
+    let limbs = export_digest_limbs(builder, nullifier)?;
+    let bits = digest_bits(builder, &limbs)?;
 
     // Absence: start from the empty-subtree constant at FOLD_START. The
-    // constant is not a witness, so nothing is being trusted about it — the
+    // constant is not a witness, so nothing is being trusted about it - the
     // fold either reaches the root or the nullifier was not absent.
     // `lower_empties` is indexed by height and its length is checked above, so
     // this index cannot fail. A silent default would substitute a zero digest
     // and weaken the fold, so the failure is explicit instead.
-    let start_digest = witness
+    let start = witness
         .lower_empties
         .get(FOLD_START)
         .ok_or(CircuitBuilderError::MissingOutput)?;
-    let start = const_limbs(builder, start_digest.as_bytes());
+    let start = const_digest(builder, start)?;
     let root_before = fold_up(builder, start, FOLD_START, &witness.siblings, &bits)?;
 
     // Insertion: the same sibling path, but starting from the nullifier's own
@@ -243,18 +280,12 @@ pub fn constrain_nullifier_non_membership(
     // FOLD_START.
     // Only the first FOLD_START entries are siblings here. `lower_empties`
     // carries heights `0..=FOLD_START`, and the top one is the absence fold's
-    // *starting node*, not a level the insert fold consumes — including it
+    // *starting node*, not a level the insert fold consumes - including it
     // would push the insert fold one level past the root.
     let mut insert_siblings = Vec::with_capacity(NULLIFIER_TREE_DEPTH);
     insert_siblings.extend_from_slice(&witness.lower_empties[..FOLD_START]);
     insert_siblings.extend_from_slice(&witness.siblings);
-    let root_after = fold_up(
-        builder,
-        nullifier_limbs.to_vec(),
-        0,
-        &insert_siblings,
-        &bits,
-    )?;
+    let root_after = fold_up(builder, *nullifier, 0, &insert_siblings, &bits)?;
 
     Ok((root_before, root_after))
 }
@@ -262,12 +293,19 @@ pub fn constrain_nullifier_non_membership(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commitment_gadget::DIGEST_LIMBS;
     use crate::transfer::const_limbs;
-    use p3_circuit::ops::{KeccakF1600Trace, NpoTypeId};
-    use pq_hash::{Digest32, Keccak256Commitment, Nullifier};
+    use crate::whir_recursion::{Challenge, F};
+    use p3_circuit::ops::{generate_poseidon2_trace, generate_recompose_trace};
+    use p3_poseidon2_circuit_air::KoalaBearD4Width16;
+    use crate::whir_recursion::whir_perm;
+    use pq_hash::{Digest32, Nullifier, Poseidon2Commitment};
 
-    fn nf(bytes: [u8; 32]) -> Nullifier {
-        Nullifier::from_digest(Digest32::new(bytes))
+    /// A nullifier whose digest is a canonical field encoding: every digest
+    /// the real system holds is a Poseidon2 output, and the fold parses digests
+    /// as field elements, so test probes must be too.
+    fn nf(tag: &[u8]) -> Nullifier {
+        Nullifier::from_digest(Poseidon2Commitment::default().hash(&[b"probe", tag]))
     }
 
     /// Build a circuit that folds `probe`'s witness and asserts the two roots
@@ -275,7 +313,7 @@ mod tests {
     ///
     /// A successful run means the in-circuit fold produced exactly those roots;
     /// a constraint violation means it did not. This is the native/circuit
-    /// equivalence check — the circuit is never trusted to agree with the map,
+    /// equivalence check - the circuit is never trusted to agree with the map,
     /// only tested against it.
     fn fold_and_check(
         probe: &Nullifier,
@@ -284,19 +322,28 @@ mod tests {
         expect_after: &[u8; 32],
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut builder = CircuitBuilder::<Challenge>::new();
-        builder.enable_keccak_f1600::<F>();
+        builder.enable_poseidon2_perm::<KoalaBearD4Width16, _>(
+            generate_poseidon2_trace::<Challenge, KoalaBearD4Width16>,
+            whir_perm(),
+        );
+        builder.enable_recompose::<F>(generate_recompose_trace::<F, Challenge>);
 
         // The address is the nullifier digest. In the real transfer this is
         // computed in-circuit from sk_d and rho; here it is a constant, which
         // exercises the same bit decomposition and the same fold.
-        let nullifier_limbs = const_limbs(&mut builder, probe.as_bytes());
+        let ext = digest_to_ext(&Digest32::new(*probe.as_bytes())).expect("canonical");
+        let probe_digest: DigestExpr = [
+            builder.define_const(ext[0]),
+            builder.define_const(ext[1]),
+        ];
         let (root_before, root_after) =
-            constrain_nullifier_non_membership(&mut builder, &nullifier_limbs, witness)?;
+            constrain_nullifier_non_membership(&mut builder, &probe_digest, witness)?;
 
         for (actual, expected) in [(&root_before, expect_before), (&root_after, expect_after)] {
-            let expected_limbs = const_limbs(&mut builder, expected);
-            for limb in 0..KECCAK256_DIGEST_LIMBS {
-                let diff = builder.sub(actual[limb], expected_limbs[limb]);
+            let got = export_digest_limbs(&mut builder, actual)?;
+            let want = const_limbs(&mut builder, expected);
+            for limb in 0..DIGEST_LIMBS {
+                let diff = builder.sub(got[limb], want[limb]);
                 builder.assert_zero(diff);
             }
         }
@@ -309,13 +356,18 @@ mod tests {
         Ok(())
     }
 
+    fn populated_map() -> NullifierMap<Poseidon2Commitment> {
+        let mut map = NullifierMap::new(Poseidon2Commitment::default());
+        for seed in 1u8..=4 {
+            assert!(map.insert(&nf(&[seed])));
+        }
+        map
+    }
+
     #[test]
     fn circuit_fold_matches_native_map() {
-        let mut map = NullifierMap::new(Keccak256Commitment);
-        for seed in 1u8..=4 {
-            assert!(map.insert(&nf([seed; 32])));
-        }
-        let probe = nf([200u8; 32]);
+        let map = populated_map();
+        let probe = nf(b"probe");
         let w = map.non_inclusion_witness(&probe).expect("probe absent");
         let prepared = prepare_witness(&map, &w).expect("fits fold budget");
 
@@ -327,11 +379,8 @@ mod tests {
 
     #[test]
     fn circuit_rejects_a_wrong_root_before() {
-        let mut map = NullifierMap::new(Keccak256Commitment);
-        for seed in 1u8..=4 {
-            assert!(map.insert(&nf([seed; 32])));
-        }
-        let probe = nf([200u8; 32]);
+        let map = populated_map();
+        let probe = nf(b"probe");
         let w = map.non_inclusion_witness(&probe).expect("probe absent");
         let prepared = prepare_witness(&map, &w).expect("fits fold budget");
 
@@ -346,11 +395,8 @@ mod tests {
 
     #[test]
     fn circuit_rejects_a_wrong_root_after() {
-        let mut map = NullifierMap::new(Keccak256Commitment);
-        for seed in 1u8..=4 {
-            assert!(map.insert(&nf([seed; 32])));
-        }
-        let probe = nf([200u8; 32]);
+        let map = populated_map();
+        let probe = nf(b"probe");
         let w = map.non_inclusion_witness(&probe).expect("probe absent");
         let prepared = prepare_witness(&map, &w).expect("fits fold budget");
 
@@ -358,118 +404,8 @@ mod tests {
         let mut bogus = *map.root_after(&w, &probe).as_bytes();
         bogus[31] ^= 0x80;
         assert!(
-            fold_and_check(&probe, &prepared, before.as_bytes(), &bogus).is_err(),
+            fold_and_check(&probe, &prepared, &before.as_bytes(), &bogus).is_err(),
             "a wrong root_after must violate a constraint"
-        );
-    }
-
-    #[test]
-    fn circuit_rejects_a_witness_of_the_wrong_length() {
-        let mut map = NullifierMap::new(Keccak256Commitment);
-        assert!(map.insert(&nf([1u8; 32])));
-        let probe = nf([200u8; 32]);
-        let w = map.non_inclusion_witness(&probe).expect("probe absent");
-        let mut prepared = prepare_witness(&map, &w).expect("fits fold budget");
-        prepared.siblings.pop();
-
-        let mut builder = CircuitBuilder::<Challenge>::new();
-        builder.enable_keccak_f1600::<F>();
-        let limbs = const_limbs(&mut builder, probe.as_bytes());
-        assert!(constrain_nullifier_non_membership(&mut builder, &limbs, &prepared).is_err());
-    }
-
-    #[test]
-    fn dense_map_is_reported_not_silently_padded() {
-        // A nullifier differing from the probe at bit 0 forces start_height 0,
-        // far below the circuit floor. That must be an explicit error: padding
-        // it anyway would assert an emptiness that does not hold.
-        let mut map = NullifierMap::new(Keccak256Commitment);
-        let probe = [0u8; 32];
-        let near = {
-            let mut b = [0u8; 32];
-            b[0] = 1;
-            b
-        };
-        assert!(map.insert(&nf(near)));
-        let w = map.non_inclusion_witness(&nf(probe)).expect("probe absent");
-        let err = prepare_witness(&map, &w).expect_err("must refuse a dense map");
-        assert!(err.contains("too dense"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn padding_a_higher_start_height_is_exact() {
-        // When the true start is above FOLD_START the bottom levels are empty
-        // constants, so the padded fold must still land on the same roots.
-        let mut map = NullifierMap::new(Keccak256Commitment);
-        let far = {
-            let mut b = [0u8; 32];
-            b[31] = 0x80;
-            b
-        };
-        assert!(map.insert(&nf(far)));
-        let probe = nf([0u8; 32]);
-        let w = map.non_inclusion_witness(&probe).expect("probe absent");
-        assert_eq!(w.start_height, 255, "only the top bit differs");
-        let prepared = prepare_witness(&map, &w).expect("fits fold budget");
-        fold_and_check(
-            &probe,
-            &prepared,
-            map.root_before(&w, &probe).as_bytes(),
-            map.root_after(&w, &probe).as_bytes(),
-        )
-        .expect("padded fold must match the native roots");
-    }
-
-    /// Cost probe: how many rows and how long does one nullifier's proof cost?
-    ///
-    /// Not an assertion about correctness — a measurement that decides whether
-    /// the insert fold's 256 Keccak-f is affordable inside a transfer.
-    #[test]
-    #[ignore = "cost probe; run with --nocapture when sizing a block"]
-    fn measure_gadget_cost() {
-        use std::time::Instant;
-
-        let mut map = NullifierMap::new(Keccak256Commitment);
-        for seed in 1u8..=4 {
-            assert!(map.insert(&nf([seed; 32])));
-        }
-        let probe = nf([200u8; 32]);
-        let w = map.non_inclusion_witness(&probe).expect("probe absent");
-        let prepared = prepare_witness(&map, &w).expect("fits fold budget");
-
-        let before = map.root_before(&w, &probe);
-        let after = map.root_after(&w, &probe);
-
-        let built = Instant::now();
-        let mut builder = CircuitBuilder::<Challenge>::new();
-        builder.enable_keccak_f1600::<F>();
-        let limbs = const_limbs(&mut builder, probe.as_bytes());
-        let (got_before, got_after) =
-            constrain_nullifier_non_membership(&mut builder, &limbs, &prepared).expect("fold");
-        let want_before = const_limbs(&mut builder, before.as_bytes());
-        let want_after = const_limbs(&mut builder, after.as_bytes());
-        for limb in 0..KECCAK256_DIGEST_LIMBS {
-            let d_before = builder.sub(got_before[limb], want_before[limb]);
-            builder.assert_zero(d_before);
-            let d_after = builder.sub(got_after[limb], want_after[limb]);
-            builder.assert_zero(d_after);
-        }
-        let circuit = builder.build().expect("build");
-        let build_time = built.elapsed();
-
-        let ran = Instant::now();
-        let mut runner = circuit.runner();
-        runner.set_public_inputs(&[]).expect("public");
-        runner.set_private_inputs(&[]).expect("private");
-        let traces = runner.run().expect("run");
-        let witness = ran.elapsed();
-
-        let keccak = traces
-            .non_primitive_trace::<KeccakF1600Trace>(&NpoTypeId::keccak_f1600())
-            .map_or(0, |t: &KeccakF1600Trace| t.operations.len());
-        println!(
-            "gadget: build {build_time:.2?} witness {witness:.2?} keccak_f_rows {keccak} \
-             (FOLD_DEPTH {FOLD_DEPTH}, insert fold {NULLIFIER_TREE_DEPTH})"
         );
     }
 }

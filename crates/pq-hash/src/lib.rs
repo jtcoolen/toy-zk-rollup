@@ -59,7 +59,7 @@ pub use poseidon::{
     Poseidon2Commitment, Poseidon2Compress, Poseidon2Perm16, Poseidon2Sponge, DIGEST_ELEMS,
     KOALABEAR_P_U32, RATE, WIDTH,
 };
-pub use shielded::Sha3_256Shielded;
+pub use shielded::{Poseidon2Shielded, Sha3_256Shielded};
 pub use traits::{CommitmentHasher, ShieldedHasher};
 
 /// The digest length every implementation in this crate produces.

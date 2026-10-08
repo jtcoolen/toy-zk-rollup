@@ -4,7 +4,7 @@
 //!
 //! Per input note:
 //!
-//! 1. **Ownership** — `pk_d = H_sha3(DOMAIN_PK ‖ sk_d)`. The prover knows a
+//! 1. **Ownership** — `pk_d = H_p2(DOMAIN_PK ‖ sk_d)`. The prover knows a
 //!    preimage of the spend key, which is what makes the note spendable. Without
 //!    this the *sender*, who knows the full commitment preimage but not `sk_d`,
 //!    could pick any random `sk_d'`, compute a matching nullifier, and drain the
@@ -14,7 +14,7 @@
 //!    `pq_hash::Poseidon2Commitment` hasher (D-088).
 //! 3. **Membership** — the leaf folds through a sibling path to the published
 //!    root, one Poseidon2 permutation per level.
-//! 4. **Nullifier** — `nf = H_sha3(DOMAIN_NULLIFIER ‖ sk_d ‖ rho)`, published so
+//! 4. **Nullifier** — `nf = H_p2(DOMAIN_NULLIFIER ‖ sk_d ‖ rho)`, published so
 //!    a second spend of the same note is detectable.
 //!
 //! Globally:
@@ -27,22 +27,20 @@
 //!    published as `root_after`. The settlement contract therefore stores the
 //!    root instead of re-deriving it — the proof attests the whole transition.
 //!
-//! ## Three hashes, each doing one job
+//! ## One hash, doing every job
 //!
-//! * **SHA3-256** — nullifiers and spend-key derivation: never Merkle-folded,
-//!   so its cost is a handful of permutations per spend and nothing more.
-//! * **Poseidon2** — the commitment tree and everything the circuit must *prove
-//!   about* the tree: membership folds and output appends. Arity-16 over
-//!   `KoalaBear`, one permutation per node — cheap in circuit, which is what
-//!   made the in-circuit append of D-088 affordable.
-//! * **Keccak-f[1600]** — the nullifier map only. That tree stays Keccak
-//!   because the *contract* replays nullifier-absence folds with the native
-//!   `keccak256` opcode; the transfer proves each nullifier's absence
-//!   in-circuit and the contract re-checks the fold cheaply.
+//! * **Poseidon2** — everything: the note tree, the nullifier map, the
+//!   nullifier and spend-key derivations. Arity-16 over `KoalaBear`, one
+//!   narrow permutation per node. The nullifier fold is 96 insert + 32 absence
+//!   permutations on the same table the note tree already pays for.
 //!
-//! The commitment tree moved from Keccak to Poseidon2 in D-088 precisely because
-//! the contract no longer folds it: with the append inside the proof, the
-//! contract stores roots rather than re-deriving them (see `ShieldedPool`).
+//! SHA3-256 and Keccak-f[1600] are gone from the circuit (D-092 batch 82).
+//! They were the widest instances in the client proof — a Keccak-f row is
+//! several times the width of a Poseidon2 one — and nothing outside the proof
+//! needs them: the contract never replays a nullifier fold, it only chains the
+//! roots the proof publishes (see `ShieldedPool`). The collision margin is
+//! now the sponge's across the board, a reduction the operator accepted
+//! (D-092). The note tree made the same move in D-088 for the same reason.
 //!
 //! ## The public statement
 //!
@@ -83,7 +81,6 @@ use crate::commitment_gadget::{
     AppendParams, DigestExpr, DigestExt, FrontierWitness, DIGEST_LIMBS,
 };
 use crate::nullifier_gadget::{constrain_nullifier_non_membership, NullifierWitness};
-use crate::sha3_block::sha3_256_single_block;
 use crate::whir_recursion::{whir_perm, Challenge, F};
 
 /// Default trace height budget for transfer settlement.
@@ -92,8 +89,10 @@ use crate::whir_recursion::{whir_perm, Challenge, F};
 /// commits to, and `WhirConfig` *refuses to build* when the required bits exceed
 /// the budget. The transfer circuit's arity grows with what it does: a 1-in/1-out
 /// transfer needs 19 ground bits, a 2-in/2-out needs 20. The nullifier gadget
-/// added roughly 290 Keccak-f per spend (32 absence + 256 insert), which is
-/// what pushed this up from 24.
+/// added 96 + 32 Poseidon2 permutations per spend (96-level insert, 32-level
+/// absence) on the narrow perm table, replacing the far wider Keccak-f the
+/// fold used to run (D-092 batch 82). The arity this budget covers shrank
+/// accordingly — re-measure before lowering it further.
 ///
 /// This constant is the default for the *largest shape the tests exercise*, not
 /// a protocol parameter: `settle_transfer_circuit` takes `log_max_lde` per
@@ -212,7 +211,7 @@ impl Secret {
 ///
 /// The `WitnessChecks` bus needs a creator row for each witness, and only
 /// `Const`/`Public` rows, ALU rows, and non-primitive *outputs* create one. A
-/// limb that feeds only a Keccak permutation is a non-primitive *input*, which
+/// limb that feeds only a permutation table is a non-primitive *input*, which
 /// never creates, so the prover rejects the whole circuit as unsatisfiable.
 /// Multiplying by one is the cheapest row that creates the witness without
 /// adding any constraint beyond what the limb already carries.
@@ -239,37 +238,29 @@ pub(crate) fn const_limbs(builder: &mut CircuitBuilder<Challenge>, bytes: &[u8])
         .collect()
 }
 
-/// The 8-byte little-endian length prefix `pq_hash::Sha3_256Shielded` puts in
-/// front of every part of a hashed preimage.
+/// Poseidon2 shielded digest, in-circuit, over a domain tag and witness parts.
 ///
-/// The circuit must hash the *same bytes* the native hasher hashes. This is the
-/// single place that framing is re-expressed, and
-/// [`sha3_statement_matches_native`] pins it against
+/// Builds the same byte string `Poseidon2Shielded::hash_to_digest(domain,
+/// parts)` builds — `domain ‖ p₁ ‖ p₂ …`, concatenated then split into 16-bit
+/// limbs — with each `pᵢ` given as witness limbs instead of bytes, then
+/// absorbs it through the commitment sponge.
+///
+/// The framing is the commitment sponge's plain concatenation: every consensus
+/// preimage here has fixed-length parts (domain tags are fixed strings,
+/// `sk_d`/`rho`/`pk_d` are 32 bytes, amounts 8), so length prefixes would only
+/// add limbs to hash. The pin test
+/// [`circuit_p2_matches_native_shielded`] keeps this from drifting from
 /// [`pq_hash::ShieldedHasher::hash_to_digest`].
-const fn len_header(len: usize) -> [u8; 8] {
-    (len as u64).to_le_bytes()
-}
-
-/// SHA3-256, in-circuit, over a length-prefixed domain and some witness parts.
-///
-/// Builds the same byte string `Sha3_256Shielded::hash_to_digest(domain, parts)`
-/// builds — `len(domain)‖domain‖len(p₁)‖p₁‖len(p₂)‖p₂…` — with each `pᵢ` given
-/// as witness limbs instead of bytes, then hashes it in one block.
-///
-/// Every part's byte length is `2 · limbs`, so the framing stays even and the
-/// whole preimage fits one rate block for the sizes this protocol uses.
-fn sha3_framed(
+fn p2_framed(
     builder: &mut CircuitBuilder<Challenge>,
     domain: &[u8],
     parts: &[&[ExprId]],
-) -> Result<Vec<ExprId>, CircuitBuilderError> {
-    let mut message = const_limbs(builder, &len_header(domain.len()));
-    message.extend(const_limbs(builder, domain));
+) -> Result<DigestExpr, CircuitBuilderError> {
+    let mut limbs = const_limbs(builder, domain);
     for part in parts {
-        message.extend(const_limbs(builder, &len_header(2 * part.len())));
-        message.extend(part.iter().copied());
+        limbs.extend(part.iter().copied());
     }
-    sha3_256_single_block::<Challenge, F>(builder, &message)
+    p2_sponge_limbs(builder, &limbs)
 }
 
 /// A witnessed transfer circuit, ready to be settled.
@@ -352,7 +343,7 @@ impl TransferCircuit {
 /// # Errors
 ///
 /// Returns [`CircuitBuilderError`] if a preimage has an odd byte length (limbs
-/// pack two bytes), a Keccak-f call is malformed, or the witness slice does not
+/// pack two bytes), a digest is not canonical, or the witness slice does not
 /// line up with the number of spends.
 pub fn constrain_transfer(
     builder: &mut CircuitBuilder<Challenge>,
@@ -386,7 +377,15 @@ pub fn constrain_transfer(
     // nullifier; the final value must equal `public.nullifier_roots.after`.
     // Starting from `before` rather than a fresh constant is what makes the
     // ordering of nullifiers inside a transfer binding.
-    let mut nf_root = const_limbs(builder, public.nullifier_roots.before.as_bytes());
+    let nf_before = digest_to_ext(&Digest32::new(*public.nullifier_roots.before.as_bytes()))
+        .ok_or(CircuitBuilderError::InvalidDimension {
+            expected: DIGEST_LIMBS,
+            actual: 0,
+        })?;
+    let mut nf_root: DigestExpr = [
+        builder.define_const(nf_before[0]),
+        builder.define_const(nf_before[1]),
+    ];
 
     // The published commitment root as extension-field constants: both the
     // spends' membership folds and the outputs' frontier fold are pinned to
@@ -413,7 +412,8 @@ pub fn constrain_transfer(
 
         // (1) Ownership. `pk_d` is derived, never supplied: the only way to
         // produce a witness here is to know `sk_d`.
-        let pk_d = sha3_framed(builder, DOMAIN_PK, &[&sk.exprs])?;
+        let pk_d = p2_framed(builder, DOMAIN_PK, &[&sk.exprs])?;
+        let pk_d_limbs = export_digest_limbs(builder, &pk_d)?;
 
         // (2) Commitment, over the exact native preimage (D-088: the Poseidon2
         // sponge digest `Note::commit` produces with a Poseidon2 hasher).
@@ -421,7 +421,7 @@ pub fn constrain_transfer(
         leaf_msg.extend(amount.exprs.iter().copied());
         leaf_msg.extend(rho.exprs.iter().copied());
         leaf_msg.extend(psi.exprs.iter().copied());
-        leaf_msg.extend(pk_d.iter().copied());
+        leaf_msg.extend(pk_d_limbs.iter().copied());
         let leaf = p2_sponge_limbs(builder, &leaf_msg)?;
 
         // (3) Membership: fold to the root, mirroring
@@ -443,22 +443,22 @@ pub fn constrain_transfer(
         // different, emptier address. The fold asserts absence against the
         // current root and yields the root after insertion, which becomes the
         // next spend's starting root.
-        let nullifier = sha3_framed(builder, DOMAIN_NULLIFIER, &[&sk.exprs, &rho.exprs])?;
+        let nullifier = p2_framed(builder, DOMAIN_NULLIFIER, &[&sk.exprs, &rho.exprs])?;
         let (absent, next_root) =
             constrain_nullifier_non_membership(builder, &nullifier, nf_witness)?;
         // Arithmetic equality, not `connect`. From the second spend onward
         // `nf_root` is the *previous spend's* fold output — a live witness
         // expression, not a constant — and `connect` aliases witness slots.
-        // Keccak-f is a lookup argument, so aliasing two of its output slots
-        // desynchronises the LogUp multiplicities and the witness fails to
-        // balance. A subtraction is a plain ALU constraint and leaves the
+        // The perm table is a lookup argument, so aliasing two of its output
+        // slots desynchronises the LogUp multiplicities and the witness fails
+        // to balance. A subtraction is a plain ALU constraint and leaves the
         // lookup structure alone.
         for (got, want) in absent.iter().zip(&nf_root) {
             let diff = builder.sub(*got, *want);
             builder.assert_zero(diff);
         }
         nf_root = next_root;
-        statement.extend(nullifier);
+        statement.extend(export_digest_limbs(builder, &nullifier)?);
 
         input_amounts.push(amount);
     }
@@ -500,13 +500,21 @@ pub fn constrain_transfer(
     // Both roots are exported. `before` is already pinned as the fold's starting
     // point, but publishing it is what lets the settlement contract chain one
     // transfer's `after` onto the next transfer's `before`.
-    let before = const_limbs(builder, public.nullifier_roots.before.as_bytes());
-    let after = const_limbs(builder, public.nullifier_roots.after.as_bytes());
+    let nf_after = digest_to_ext(&Digest32::new(*public.nullifier_roots.after.as_bytes()))
+        .ok_or(CircuitBuilderError::InvalidDimension {
+            expected: DIGEST_LIMBS,
+            actual: 0,
+        })?;
+    let after: DigestExpr = [
+        builder.define_const(nf_after[0]),
+        builder.define_const(nf_after[1]),
+    ];
     for (got, want) in nf_root.iter().zip(&after) {
-        builder.connect(*got, *want);
+        let diff = builder.sub(*got, *want);
+        builder.assert_zero(diff);
     }
-    statement.extend(before);
-    statement.extend(after);
+    statement.extend(const_limbs(builder, public.nullifier_roots.before.as_bytes()));
+    statement.extend(const_limbs(builder, public.nullifier_roots.after.as_bytes()));
 
     let fee = Amount::private(builder, transfer.fee)?;
     private.extend(fee.limbs.iter().map(|&l| Challenge::from_u16(l)));
@@ -609,9 +617,9 @@ fn frontier_step(
 
 /// Build and witness a transfer circuit against a published [`TransferPublic`].
 ///
-/// A thin wrapper: create the builder, enable Keccak-f, Poseidon2 and
-/// recompose, constrain the transfer, install the statement sink, build, and
-/// witness. Every property lives in [`constrain_transfer`].
+/// A thin wrapper: create the builder, enable Poseidon2 and recompose,
+/// constrain the transfer, install the statement sink, build, and witness.
+/// Every property lives in [`constrain_transfer`].
 ///
 /// `public` is the single source of truth for the statement *and* for the root
 /// the inputs are proven against: the circuit recomputes the root from the
@@ -621,8 +629,9 @@ fn frontier_step(
 /// # Errors
 ///
 /// Returns a builder error if a preimage has an odd byte length (limbs pack two
-/// bytes), if a Keccak-f call is malformed, or — via the witness runner — if the
-/// transfer is unbalanced, since no carry chain witnesses a false balance.
+/// bytes), if a published root is not a canonical field encoding, or — via the
+/// witness runner — if the transfer is unbalanced, since no carry chain
+/// witnesses a false balance.
 pub fn build_transfer_circuit(
     transfer: &Transfer<'_>,
     public: &TransferPublic,
@@ -630,8 +639,8 @@ pub fn build_transfer_circuit(
     frontier: &FrontierWitness,
 ) -> Result<TransferCircuit, Box<dyn std::error::Error>> {
     let mut builder = CircuitBuilder::<Challenge>::new();
-    builder.enable_keccak_f1600::<F>();
-    // D-088: the commitment tree is Poseidon2, so the circuit needs the
+    // D-088/D-092: the note tree *and* the nullifier tree are Poseidon2, so the
+    // circuit needs the
     // permutation table (membership folds, output appends) and the recompose
     // table (base-coefficient packing the perm rows read). Same shape the
     // recursion circuit enables - one shared KoalaBear D4 width-16 config.
@@ -1024,7 +1033,7 @@ where
 mod tests {
     use super::*;
     use crate::fixtures::{public_and_witnesses, tree_with};
-    use pq_hash::{Poseidon2Commitment, Sha3_256Shielded, ShieldedHasher};
+    use pq_hash::{Poseidon2Commitment, Poseidon2Shielded, ShieldedHasher};
     use shielded::keys::{derive_spend_pk, SpendPublicKey};
     use shielded::transfer::Spend;
     use shielded::tree::{CommitmentTree, DEPTH};
@@ -1081,7 +1090,7 @@ mod tests {
         let (a, sk_a) = funded_note(1, 1_000);
         let (tree, paths) = tree_with(&[a]);
 
-        let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
+        let recipient = derive_spend_pk(&Poseidon2Shielded, &seed(9));
         let outputs = vec![Note::new(900, seed(20), seed(21), recipient)];
 
         let transfer = Transfer {
@@ -1136,7 +1145,7 @@ mod tests {
 
     fn funded_note(byte: u8, value: u64) -> (Note, [u8; 32]) {
         let sk_d = seed(byte);
-        let pk_d = derive_spend_pk(&Sha3_256Shielded, &sk_d);
+        let pk_d = derive_spend_pk(&Poseidon2Shielded, &sk_d);
         let note = Note::new(
             value,
             seed(byte.wrapping_add(100)),
@@ -1154,7 +1163,7 @@ mod tests {
         let (b, sk_b) = funded_note(2, 2_500);
         let (tree, paths) = tree_with(&[a, b]);
 
-        let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
+        let recipient = derive_spend_pk(&Poseidon2Shielded, &seed(9));
         let outputs = vec![
             Note::new(3_000, seed(20), seed(21), recipient),
             Note::new(400, seed(22), seed(23), recipient),
@@ -1198,7 +1207,7 @@ mod tests {
     fn settlement_rejects_a_different_statement() {
         let (a, sk_a) = funded_note(3, 500);
         let (tree, paths) = tree_with(&[a]);
-        let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(11));
+        let recipient = derive_spend_pk(&Poseidon2Shielded, &seed(11));
 
         let transfer = Transfer {
             spends: vec![Spend {
@@ -1230,7 +1239,7 @@ mod tests {
     fn unbalanced_transfer_cannot_be_witnessed() {
         let (a, sk_a) = funded_note(4, 500);
         let (tree, paths) = tree_with(&[a]);
-        let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(12));
+        let recipient = derive_spend_pk(&Poseidon2Shielded, &seed(12));
 
         let transfer = Transfer {
             spends: vec![Spend {
@@ -1268,7 +1277,7 @@ mod tests {
         };
         assert_ne!(root, wrong_root, "fixtures must differ");
 
-        let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(13));
+        let recipient = derive_spend_pk(&Poseidon2Shielded, &seed(13));
         let transfer = Transfer {
             spends: vec![Spend {
                 note: &a,
@@ -1288,15 +1297,16 @@ mod tests {
         );
     }
 
-    /// The in-circuit SHA3 framing must equal the native one, byte for byte.
+    /// The in-circuit Poseidon2 framing must equal the native one, byte for
+    /// byte.
     ///
-    /// This is the pin that keeps `sha3_framed` from drifting from
-    /// `Sha3_256Shielded::hash_to_digest`. The circuit computes the digest and
-    /// is connected to the natively computed digest as constants; any mismatch in
-    /// the length-prefix framing, the `0x06` pad, or the limb order makes the
-    /// witness inconsistent and the build fails.
+    /// This is the pin that keeps `p2_framed` from drifting from
+    /// `Poseidon2Shielded::hash_to_digest`. The circuit computes the digest and
+    /// is connected to the natively computed digest as constants; any mismatch
+    /// in the domain framing, the limb order, or the sponge absorbs makes the
+    /// witness inconsistent and the run fails.
     #[test]
-    fn circuit_sha3_matches_native_sha3() {
+    fn circuit_p2_matches_native_shielded() {
         let cases: [(&[u8], &[&[u8]]); 3] = [
             (DOMAIN_PK, &[&seed(1)]),
             (DOMAIN_NULLIFIER, &[&seed(2), &seed(3)]),
@@ -1304,10 +1314,14 @@ mod tests {
         ];
 
         for (domain, parts) in cases {
-            let native = Sha3_256Shielded.hash_to_digest(domain, parts);
+            let native = Poseidon2Shielded.hash_to_digest(domain, parts);
 
             let mut builder = CircuitBuilder::<Challenge>::new();
-            builder.enable_keccak_f1600::<F>();
+            builder.enable_poseidon2_perm::<KoalaBearD4Width16, _>(
+                generate_poseidon2_trace::<Challenge, KoalaBearD4Width16>,
+                whir_perm(),
+            );
+            builder.enable_recompose::<F>(generate_recompose_trace::<F, Challenge>);
             let mut witness = Vec::new();
             let mut circuit_parts = Vec::new();
             for part in parts {
@@ -1317,8 +1331,8 @@ mod tests {
                 circuit_parts.push(secret.exprs);
             }
             let refs: Vec<&[ExprId]> = circuit_parts.iter().map(Vec::as_slice).collect();
-            let computed =
-                sha3_framed(&mut builder, domain, &refs).expect("sha3_framed should build");
+            let computed = p2_framed(&mut builder, domain, &refs).expect("p2_framed should build");
+            let computed = export_digest_limbs(&mut builder, &computed).expect("export");
             let expected = const_limbs(&mut builder, native.as_bytes());
             for (got, want) in computed.iter().zip(&expected) {
                 builder.connect(*got, *want);
@@ -1332,7 +1346,7 @@ mod tests {
                 .expect("private inputs should fit");
             runner.run().unwrap_or_else(|err| {
                 panic!(
-                    "sha3 framing mismatch for {}: {err}",
+                    "p2 framing mismatch for {}: {err}",
                     String::from_utf8_lossy(domain)
                 )
             });
@@ -1344,7 +1358,6 @@ mod tests {
     fn oversized_amount_cannot_be_witnessed() {
         let value = shielded::MAX_VALUE + 1;
         let mut builder = CircuitBuilder::<Challenge>::new();
-        builder.enable_keccak_f1600::<F>();
         let amount = Amount::private(&mut builder, value)
             .expect("allocation is fine; the bound is enforced by the witness");
         let circuit = builder.build().expect("circuit should build");
@@ -1364,12 +1377,16 @@ mod tests {
     #[test]
     fn circuit_pk_derivation_matches_native() {
         let sk_d = seed(6);
-        let native: SpendPublicKey = derive_spend_pk(&Sha3_256Shielded, &sk_d);
+        let native: SpendPublicKey = derive_spend_pk(&Poseidon2Shielded, &sk_d);
         let mut builder = CircuitBuilder::<Challenge>::new();
-        builder.enable_keccak_f1600::<F>();
+        builder.enable_poseidon2_perm::<KoalaBearD4Width16, _>(
+            generate_poseidon2_trace::<Challenge, KoalaBearD4Width16>,
+            whir_perm(),
+        );
+        builder.enable_recompose::<F>(generate_recompose_trace::<F, Challenge>);
         let secret = Secret::new(&mut builder, &sk_d, "test.sk").expect("secret allocates");
-        let computed =
-            sha3_framed(&mut builder, DOMAIN_PK, &[&secret.exprs]).expect("should build");
+        let computed = p2_framed(&mut builder, DOMAIN_PK, &[&secret.exprs]).expect("should build");
+        let computed = export_digest_limbs(&mut builder, &computed).expect("export");
         let expected = const_limbs(&mut builder, native.as_bytes());
         for (got, want) in computed.iter().zip(&expected) {
             builder.connect(*got, *want);

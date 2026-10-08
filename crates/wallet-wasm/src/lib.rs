@@ -63,7 +63,7 @@
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use pq_hash::{Digest32, MerkleRoot, NoteHash, Nullifier, Poseidon2Commitment, Sha3_256Shielded};
+use pq_hash::{Digest32, MerkleRoot, NoteHash, Nullifier, Poseidon2Commitment, Poseidon2Shielded};
 use pq_sign::{Sha2_128f, SigningKey, SpendAuth, SphincsPlusAuth};
 use shielded::keys::derive_spend_pk;
 use shielded::transfer::NullifierRoots;
@@ -344,7 +344,7 @@ fn imp_pubkey(password: &[u8], vault_bytes: &[u8]) -> Result<String, Fail> {
     let keys = unlock(password, vault_bytes)?;
     let mut sk_d = [0u8; 32];
     sk_d.copy_from_slice(&keys.sk_d);
-    let pk_d = derive_spend_pk(&Sha3_256Shielded, &sk_d);
+    let pk_d = derive_spend_pk(&Poseidon2Shielded, &sk_d);
     let auth_sk = SigningKey::<Sha2_128f>::try_from(&keys.slh_sk[..])
         .map_err(|_| bad("vault holds a malformed SPHINCS+ key"))?;
     let vk = SphincsPlusAuth::public_key_to_bytes(&auth_sk.verifying_key());
@@ -530,10 +530,10 @@ fn imp_note_nullifier(password: &[u8], vault_bytes: &[u8], rho_hex: &str) -> Res
     sk_d.copy_from_slice(&keys.sk_d);
     // The note's pk_d is irrelevant to the nullifier (it is H(sk_d || rho)),
     // but Note requires one; pass the derived pk_d for honesty.
-    let pk_d = derive_spend_pk(&Sha3_256Shielded, &sk_d);
+    let pk_d = derive_spend_pk(&Poseidon2Shielded, &sk_d);
     let note = Note::new(0, rho, [0u8; 32], pk_d);
     Ok(hex::encode(
-        note.nullifier(&Sha3_256Shielded, &sk_d).as_bytes(),
+        note.nullifier(&Poseidon2Shielded, &sk_d).as_bytes(),
     ))
 }
 

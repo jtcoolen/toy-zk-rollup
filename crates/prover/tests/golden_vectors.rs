@@ -399,18 +399,18 @@ fn block_vectors() -> Result<(), Box<dyn Error>> {
     use prover::whir_recursion::InnerWhirConfig;
     use shielded::keys::derive_spend_pk;
 
-    use pq_hash::Keccak256Commitment;
+    use pq_hash::Poseidon2Commitment;
 
     let inner = InnerWhirConfig::new(LOG_MAX_LDE, 0)?;
     let (note, sk_d) = funded_note(11, 1_000);
-    let recipient = derive_spend_pk(&pq_hash::Sha3_256Shielded, &seed(9));
+    let recipient = derive_spend_pk(&pq_hash::Poseidon2Shielded, &seed(9));
     let output = shielded::Note::new(900, seed(0x51), seed(0x52), recipient);
 
     // D-088: the commitment tree is Poseidon2; the nullifier map stays Keccak.
     let (tree, paths) = prover::fixtures::tree_with(&[note]);
     let path = paths[0].clone();
 
-    let mut map = shielded::NullifierMap::new(Keccak256Commitment);
+    let mut map = shielded::NullifierMap::new(Poseidon2Commitment::default());
     let spec = ClientSpec {
         note: &note,
         sk_d: &sk_d,
@@ -550,7 +550,7 @@ impl BlockFixture {
         use shielded::keys::derive_spend_pk;
 
         let (note, sk_d) = funded_note(11, 1_000);
-        let recipient = derive_spend_pk(&pq_hash::Sha3_256Shielded, &seed(9));
+        let recipient = derive_spend_pk(&pq_hash::Poseidon2Shielded, &seed(9));
         let output = shielded::Note::new(900, seed(0x51), seed(0x52), recipient);
 
         let (tree, paths) = prover::fixtures::tree_with(&[note]);
@@ -585,7 +585,7 @@ impl BlockFixture {
     /// the always-on check pin the root/nullifier/commitment hex fields without
     /// a proving run.
     fn public_values(&self) -> shielded::TransferPublic {
-        let map = shielded::NullifierMap::new(pq_hash::Keccak256Commitment);
+        let map = shielded::NullifierMap::new(pq_hash::Poseidon2Commitment::default());
         let transfer = self.transfer();
         let (public, _witnesses, _frontier) =
             prover::fixtures::public_and_witnesses_from(&transfer, &self.tree, map);
@@ -613,7 +613,7 @@ impl BlockFixture {
     /// The child (transfer) statement — the fold's input, exposed separately so
     /// the check can recompute the fold root without re-deriving the fixture.
     fn child_statement(&self) -> Vec<prover::whir::F> {
-        let map = shielded::NullifierMap::new(pq_hash::Keccak256Commitment);
+        let map = shielded::NullifierMap::new(pq_hash::Poseidon2Commitment::default());
         let transfer = self.transfer();
         let (public, witnesses, frontier) =
             prover::fixtures::public_and_witnesses_from(&transfer, &self.tree, map);

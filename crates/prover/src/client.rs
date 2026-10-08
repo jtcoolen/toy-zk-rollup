@@ -30,7 +30,7 @@
 
 use std::error::Error;
 
-use pq_hash::{Digest32, Keccak256Commitment, MerkleRoot, Poseidon2Commitment, Sha3_256Shielded};
+use pq_hash::{Digest32, MerkleRoot, Poseidon2Commitment, Poseidon2Shielded};
 use shielded::transfer::Spend;
 use shielded::tree::CommitmentTree;
 use shielded::{Note, NullifierMap, Transfer, TransferPublic};
@@ -120,7 +120,7 @@ pub fn prove_client_transfer(
     inner: &InnerWhirConfig,
     spec: &ClientSpec<'_>,
     tree: &CommitmentTree<Poseidon2Commitment>,
-    map: &mut NullifierMap<Keccak256Commitment>,
+    map: &mut NullifierMap<Poseidon2Commitment>,
 ) -> Result<ClientTransferArtifacts, Box<dyn Error>> {
     let spend = Spend {
         note: spec.note,
@@ -163,7 +163,7 @@ pub fn prove_client_transfer(
     let root_after = fold_to_root(&hasher, &frontier_after);
     let public = transfer.public(
         &hasher,
-        &Sha3_256Shielded,
+        &Poseidon2Shielded,
         root,
         MerkleRoot::from_digest(root_after),
         nullifier_roots,
@@ -196,12 +196,12 @@ pub fn prove_client_transfer(
 /// [`crate::nullifier_gadget::FOLD_DEPTH`] allows.
 pub fn nullifier_transition(
     transfer: &Transfer<'_>,
-    map: &mut NullifierMap<Keccak256Commitment>,
+    map: &mut NullifierMap<Poseidon2Commitment>,
 ) -> Result<(shielded::NullifierRoots, Vec<NullifierWitness>), Box<dyn Error>> {
     let before = map.root();
     let mut witnesses = Vec::with_capacity(transfer.spends.len());
     for spend in &transfer.spends {
-        let nf = spend.note.nullifier(&Sha3_256Shielded, spend.sk_d);
+        let nf = spend.note.nullifier(&Poseidon2Shielded, spend.sk_d);
         let native = map
             .non_inclusion_witness(&nf)
             .ok_or("nullifier already spent: no absence witness exists")?;

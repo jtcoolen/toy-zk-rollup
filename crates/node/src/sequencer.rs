@@ -196,7 +196,7 @@ impl From<StateError> for SequencerError {
 pub struct Sequencer {
     state: PoolState,
     mempool: VecDeque<ClientTransferProof>,
-    pending: shielded::NullifierMap<pq_hash::Keccak256Commitment>,
+    pending: shielded::NullifierMap<pq_hash::Poseidon2Commitment>,
     pending_tree: shielded::tree::CommitmentTree<pq_hash::Poseidon2Commitment>,
     inner: InnerWhirConfig,
     max_transfers_per_block: usize,
@@ -291,7 +291,7 @@ impl Sequencer {
     /// own admission check (`check_admit_against`) demands this projection's
     /// root, so it is the only honest input to `prove_client_transfer`.
     #[must_use]
-    pub fn client_map(&self) -> shielded::NullifierMap<pq_hash::Keccak256Commitment> {
+    pub fn client_map(&self) -> shielded::NullifierMap<pq_hash::Poseidon2Commitment> {
         self.pending.clone()
     }
 

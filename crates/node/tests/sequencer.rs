@@ -19,7 +19,7 @@
 use node::{
     ClientTransferProof, PoolState, Sequencer, SequencerError, ShieldedTransfer, StateError,
 };
-use pq_hash::{Keccak256Commitment, MerkleRoot, Poseidon2Commitment, Sha3_256Shielded};
+use pq_hash::{MerkleRoot, Poseidon2Commitment, Poseidon2Shielded};
 use pq_sign::rand::{rngs::StdRng, SeedableRng};
 use pq_sign::{SpendAuth, SphincsPlusAuth};
 use prover::block::TransferShape;
@@ -55,7 +55,7 @@ fn client_prove(
     out_value: u64,
     recipient: shielded::SpendPublicKey,
     tree: &mut CommitmentTree<Poseidon2Commitment>,
-    map: &mut shielded::NullifierMap<Keccak256Commitment>,
+    map: &mut shielded::NullifierMap<Poseidon2Commitment>,
     key_seed: u64,
 ) -> Result<ClientTransferProof, Box<dyn std::error::Error>> {
     let output = shielded::Note::new(out_value, seed(0x51), seed(0x52), recipient);
@@ -135,7 +135,7 @@ fn tree_root_of(notes: &[shielded::Note]) -> MerkleRoot {
 #[test]
 fn two_client_proofs_settle_into_one_verified_block() -> Result<(), Box<dyn std::error::Error>> {
     let inner = InnerWhirConfig::new(LOG_MAX_LDE, 0)?;
-    let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
+    let recipient = derive_spend_pk(&Poseidon2Shielded, &seed(9));
 
     let (note_a, sk_a) = funded_note(11, 1_000);
     let (note_b, sk_b) = funded_note(22, 2_000);
@@ -143,7 +143,7 @@ fn two_client_proofs_settle_into_one_verified_block() -> Result<(), Box<dyn std:
 
     // One map across both transfers: the chain constraint only means
     // something if they are transitions of the same nullifier trie.
-    let mut map = shielded::NullifierMap::new(Keccak256Commitment);
+    let mut map = shielded::NullifierMap::new(Poseidon2Commitment::default());
 
     let tx_a = client_prove(
         &inner, &note_a, &sk_a, 0, 900, recipient, &mut tree, &mut map, 1,
@@ -166,7 +166,7 @@ fn two_client_proofs_settle_into_one_verified_block() -> Result<(), Box<dyn std:
     // `submit` takes ownership, so anything the assertions need is captured
     // before the move.
     let final_nf_root = tx_b.public.nullifier_roots.after;
-    let nf_a = note_a.nullifier(&Sha3_256Shielded, &sk_a);
+    let nf_a = note_a.nullifier(&Poseidon2Shielded, &sk_a);
     // The folded block statement (D-089), rebuilt independently from the two
     // child statements: header, fold root, endpoint digests, fees.
     let expected_statement = prover::block::block_statement(
@@ -223,18 +223,18 @@ fn two_client_proofs_settle_into_one_verified_block() -> Result<(), Box<dyn std:
 fn a_double_spend_across_the_batch_is_rejected_at_admission(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let inner = InnerWhirConfig::new(LOG_MAX_LDE, 0)?;
-    let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
+    let recipient = derive_spend_pk(&Poseidon2Shielded, &seed(9));
     let (note_a, sk_a) = funded_note(11, 1_000);
     let (note_b, sk_b) = funded_note(22, 2_000);
     let mut tree = shared_tree(&note_a, &note_b);
 
-    let mut map = shielded::NullifierMap::new(Keccak256Commitment);
+    let mut map = shielded::NullifierMap::new(Poseidon2Commitment::default());
     let tx_a = client_prove(
         &inner, &note_a, &sk_a, 0, 900, recipient, &mut tree, &mut map, 1,
     )?;
 
-    let nf_a = note_a.nullifier(&Sha3_256Shielded, &sk_a);
-    let nf_b = note_b.nullifier(&Sha3_256Shielded, &sk_b);
+    let nf_a = note_a.nullifier(&Poseidon2Shielded, &sk_a);
+    let nf_b = note_b.nullifier(&Poseidon2Shielded, &sk_b);
 
     let mut seq = Sequencer::funded(LOG_MAX_LDE, genesis_notes(&note_a, &note_b))?;
     seq.submit(tx_a)?;
@@ -244,7 +244,7 @@ fn a_double_spend_across_the_batch_is_rejected_at_admission(
     // one that fails) but a *committed* nullifier root rather than the pending
     // one. It is a valid proof of a real relation — it just isn't the relation
     // the pool is in. Admission is what must catch it.
-    let mut fresh_map = shielded::NullifierMap::new(Keccak256Commitment);
+    let mut fresh_map = shielded::NullifierMap::new(Poseidon2Commitment::default());
     // Same value as the honest transfer so the only difference is the
     // replayed nullifier. A different value would fail the balance check
     // first, and the test would pass without ever reaching admission.
