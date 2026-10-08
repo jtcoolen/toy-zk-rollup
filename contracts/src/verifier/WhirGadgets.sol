@@ -288,15 +288,42 @@ library WhirGadgets {
         returns (uint256)
     {
         uint256 nv = localR.length - arity;
-        uint256 s = KoalaBearExt4.ONE;
-        for (uint256 j; j < nv; ++j) {
-            uint256 r = localR[arity + j];
-            bool one = ((selIndex >> (nv - 1 - j)) & 1) == 1;
-            // Register-fused factors (batch 34): bit set -> s(x)r via _mulExt;
-            // bit clear -> s(x)(1-r) via _mulBySelectorFactor with c = 0, whose
-            // factor is exactly (1-r) + r(x)0. One reduction per lane instead
-            // of the packed mul/sub pair (~1.6k -> ~350 gas).
-            s = one ? _mulExt(s, r) : _mulBySelectorFactor(s, r, 0);
+        uint256 s;
+        assembly ("memory-safe") {
+            let P := 0x7f000001
+            let M := 0xffffffff
+            let W := 3
+            let arr := add(localR, add(32, mul(arity, 32)))
+            let c0 := 1
+            let c1 := 0
+            let c2 := 0
+            let c3 := 0
+            let bit := sub(nv, 1)
+            let j := 0
+            for { } lt(j, nv) { j := add(j, 1) } {
+                let r := mload(add(arr, mul(j, 32)))
+                let one := and(shr(bit, selIndex), 1)
+                bit := sub(bit, 1)
+                let r0 := shr(224, r)
+                let r1 := and(shr(192, r), M)
+                let r2 := and(shr(160, r), M)
+                let r3 := and(shr(128, r), M)
+                if iszero(one) {
+                    r0 := add(sub(P, r0), 1)
+                    r1 := sub(P, r1)
+                    r2 := sub(P, r2)
+                    r3 := sub(P, r3)
+                }
+                let a0 := c0
+                let a1 := c1
+                let a2 := c2
+                let a3 := c3
+                c0 := mod(add(mul(a0, r0), mul(W, add(mul(a3, r1), add(mul(a1, r3), mul(a2, r2))))), P)
+                c1 := mod(add(add(mul(a0, r1), mul(a1, r0)), mul(W, add(mul(a2, r3), mul(a3, r2)))), P)
+                c2 := mod(add(add(add(mul(a0, r2), mul(a1, r1)), mul(a2, r0)), mul(W, mul(a3, r3))), P)
+                c3 := mod(add(add(add(mul(a0, r3), mul(a1, r2)), mul(a2, r1)), mul(a3, r0)), P)
+            }
+            s := or(or(shl(224, c0), shl(192, c1)), or(shl(160, c2), shl(128, c3)))
         }
         return s;
     }
