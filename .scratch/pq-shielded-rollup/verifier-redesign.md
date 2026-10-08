@@ -2992,3 +2992,41 @@ verifier code floor for this proof is ~45M. **30M is unreachable by verifier cod
   into a consistency check. Needs soundness argument.
 Any ONE of these roughly halves the gap. None is a verifier-code edit — they are
 prover/config changes. The verifier is done optimizing; the proof shape is the lever.
+
+
+## Batch 64 — proof-shape parameter sweep (empirical, "shrink proof by different parameters?")
+
+Every honest prover knob measured end-to-end (regenerate v8 bundle -> forge test_gas_v8).
+Canonical: 330,004 B / 50,682,535 gas.
+
+| knob change | bundle | gas | delta | verdict |
+|---|---|---|---|---|
+| BASE_TRACE 1024 -> 256 | 328,660 B | 49,067,090 | -1.6M | weak: final settlement dominates |
+| InSC layers 2 -> 1 | 328,180 B | 49,050,804 | -1.6M | weak: same reason |
+| WHIR_POW_FLOOR 30 -> 32 | PANIC | — | — | infeasible: floor applies to INNER layers too, their LDE budget rejects 32 (serializing_challenger PoW assert) |
+| rate 4 -> 8 | n/a | — | — | unsupported: rate > folding factor (4) |
+| cap height 4 -> higher | n/a | — | — | CAP_HEIGHT=0 in whir_recursion (already minimal); the 4 is the composed path's, paths already pruned to the query frontier in v8 |
+
+Recorded grid (batch 45) says pow 40 -> 76 queries (-13% vs floor 30's ~87) but 2^40
+hashes per grind point is prover-infeasible. The grinding lever is capped at 30 by the
+inner layers, and 30 -> 32 already breaks them.
+
+### Why the shape knobs are exhausted
+The final Keccak settlement re-verifies a recursion CIRCUIT whose size is set by the
+WHIR verifier it emulates (Poseidon2 rows per Merkle path node), NOT by the base trace.
+Shrinking what the chain proves (trace, layers) shrinks the inner proofs but the final
+settlement's own query budget (87 queries x depth-21 paths x ext limbs) is fixed by the
+security target at this LDE. The 330 KB wire is ~88% final-settlement queries+paths.
+Gas tracks it: calldata 5.2M + per-query verify work.
+
+### The honest conclusion on 30M
+Proof-shape knobs: -1.6M best case (trace) — exhausted.
+Verifier-code floor for THIS proof: ~45M (batch 63 map).
+30M needs a DIFFERENT PROOF, not a tuned one:
+  - fewer security bits at the final layer is not acceptable;
+  - a smaller final LDE (CHAIN_LOG_MAX_LDE 24 -> 22) would cut queries ~25% but the
+    recursion circuit overflows 2^22 (PowBitsExceedBudget, documented at line 44 of
+    recursion_chain.rs) — the circuit must shrink first (fewer Poseidon2 rows per path
+    node = smaller hash arity, or batch fewer instances per layer);
+  - or commit C(zeta) to move CIDNTY's 10.15M into an opening check.
+Next experiment: CHAIN_LOG_MAX_LDE 24 -> 23 (halves the final query work if it fits).
