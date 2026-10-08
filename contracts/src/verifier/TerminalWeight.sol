@@ -480,6 +480,22 @@ contract TerminalWeight {
             }
             let p := 0x7f000001
             let rr := 0x01fffffe
+            let q00 := shr(224, r0)
+            let q01 := and(shr(192, r0), 0xffffffff)
+            let q02 := and(shr(160, r0), 0xffffffff)
+            let q03 := and(shr(128, r0), 0xffffffff)
+            let q10 := shr(224, r1)
+            let q11 := and(shr(192, r1), 0xffffffff)
+            let q12 := and(shr(160, r1), 0xffffffff)
+            let q13 := and(shr(128, r1), 0xffffffff)
+            let q20 := shr(224, r2)
+            let q21 := and(shr(192, r2), 0xffffffff)
+            let q22 := and(shr(160, r2), 0xffffffff)
+            let q23 := and(shr(128, r2), 0xffffffff)
+            let q30 := shr(224, r3)
+            let q31 := and(shr(192, r3), 0xffffffff)
+            let q32 := and(shr(160, r3), 0xffffffff)
+            let q33 := and(shr(128, r3), 0xffffffff)
             function swap32(x) -> y {
                 y := or(
                     or(and(shl(24, x), 0xff000000), and(shl(8, x), 0xff0000)),
@@ -488,7 +504,7 @@ contract TerminalWeight {
             }
             // One fused extension fold: a0 + r*(a1-a0), the exact lane
             // discipline of KoalaBearExt4._fold_once (deferred reductions).
-            function fold(a0, a1, r) -> o {
+            function foldL(a0, a1, c0, c1, c2, c3) -> o {
                 let pm := 0x7f000001
                 let M := 0xffffffff
                 let W := 3
@@ -500,10 +516,6 @@ contract TerminalWeight {
                 let d1 := add(sub(and(shr(192, a1), M), x1), pm)
                 let d2 := add(sub(and(shr(160, a1), M), x2), pm)
                 let d3 := add(sub(and(shr(128, a1), M), x3), pm)
-                let c0 := shr(224, r)
-                let c1 := and(shr(192, r), M)
-                let c2 := and(shr(160, r), M)
-                let c3 := and(shr(128, r), M)
                 let t0 := add(mul(c0, d0), mul(W, add(add(mul(c1, d3), mul(c2, d2)), mul(c3, d1))))
                 let t1 := add(add(mul(c0, d1), mul(c1, d0)), mul(W, add(mul(c2, d3), mul(c3, d2))))
                 let t2 := add(add(add(mul(c0, d2), mul(c1, d1)), mul(c2, d0)), mul(W, mul(c3, d3)))
@@ -603,21 +615,21 @@ contract TerminalWeight {
                     leaf := keccak256(scratch, 256)
                 }
                 // dims-4 fold tree: 16 elements at eB -> 1 value.
-                let l0 := fold(mload(add(eB, 0)),   mload(add(eB, 256)), r0)
-                let l1 := fold(mload(add(eB, 32)),  mload(add(eB, 288)), r0)
-                let l2 := fold(mload(add(eB, 64)),  mload(add(eB, 320)), r0)
-                let l3 := fold(mload(add(eB, 96)),  mload(add(eB, 352)), r0)
-                let l4 := fold(mload(add(eB, 128)), mload(add(eB, 384)), r0)
-                let l5 := fold(mload(add(eB, 160)), mload(add(eB, 416)), r0)
-                let l6 := fold(mload(add(eB, 192)), mload(add(eB, 448)), r0)
-                let l7 := fold(mload(add(eB, 224)), mload(add(eB, 480)), r0)
-                let m0 := fold(l0, l4, r1)
-                let m1 := fold(l1, l5, r1)
-                let m2 := fold(l2, l6, r1)
-                let m3 := fold(l3, l7, r1)
-                let n0 := fold(m0, m2, r2)
-                let n1 := fold(m1, m3, r2)
-                let fv := fold(n0, n1, r3)
+                let l0 := foldL(mload(add(eB, 0)),   mload(add(eB, 256)), q00, q01, q02, q03)
+                let l1 := foldL(mload(add(eB, 32)),  mload(add(eB, 288)), q00, q01, q02, q03)
+                let l2 := foldL(mload(add(eB, 64)),  mload(add(eB, 320)), q00, q01, q02, q03)
+                let l3 := foldL(mload(add(eB, 96)),  mload(add(eB, 352)), q00, q01, q02, q03)
+                let l4 := foldL(mload(add(eB, 128)), mload(add(eB, 384)), q00, q01, q02, q03)
+                let l5 := foldL(mload(add(eB, 160)), mload(add(eB, 416)), q00, q01, q02, q03)
+                let l6 := foldL(mload(add(eB, 192)), mload(add(eB, 448)), q00, q01, q02, q03)
+                let l7 := foldL(mload(add(eB, 224)), mload(add(eB, 480)), q00, q01, q02, q03)
+                let m0 := foldL(l0, l4, q10, q11, q12, q13)
+                let m1 := foldL(l1, l5, q10, q11, q12, q13)
+                let m2 := foldL(l2, l6, q10, q11, q12, q13)
+                let m3 := foldL(l3, l7, q10, q11, q12, q13)
+                let n0 := foldL(m0, m2, q20, q21, q22, q23)
+                let n1 := foldL(m1, m3, q20, q21, q22, q23)
+                let fv := foldL(n0, n1, q30, q31, q32, q33)
                 mstore(add(idxB, mul(q, 32)), idx)
                 mstore(add(digB, mul(q, 32)), leaf)
                 mstore(add(foldB, mul(q, 32)), fv)
