@@ -2651,3 +2651,42 @@ _mulByVirtualFactor) are cross-cutting — TWIGHT, QFOLD and CIDNTY all sit on t
 per-lane win there multiplies across all three whales. Also: the memo nv>10 cutoff
 means c0's selectors are recomputed; a cheaper memo (sparse, or keyed differently)
 could cut c0 directly.
+
+## Batch 56 — TWIGHT c0 decomposition + memo experiments (no win, knowledge banked)
+
+**c0 split (in-core probe, r1):** constraintWeight total 490k for c1..c4 tail
+(c1 244k, c2 140k, c3 83k, c4 56k — selVars loop is 423k of c0's 490k... no:
+c0's constraintWeight can't run in-core (groupDescs derived in satellite);
+the in-core probe measured c1-c4 + c0-selVars). Satellite-side: c0 = 3.17M
+total, selVars-Horner ~423k, mode-2 group walk ~2.75M (eqSelectorValue +
+eqBaseValue + Horner), derive ~666k, parse ~6k.
+
+**Selector structure (from deriveGroupDescs):** descs = per matrix, per point
+(zeta) × per column (sel = reverseBits(offset>>arity, nv)). The SAME sel
+repeats across the matrix's nPoints — that is the only reuse the memo can
+capture; across matrices of equal arity sel values are disjoint (offset
+advances per column globally). Memo cap10 already captures all of it.
+
+**Experiments (test_gas_v8):**
+- bounded direct-mapped memo (fixed 2048 words, key=sel+1, any nv): 52.94M —
+  WORSE than exact-memo cap10 (51.93M). Allocation of 2048 words per nv-change
+  costs more than the recompute it saves. Reverted.
+- (prior) cap12/14 52.43M, cap16 87.4M, memo-off 54.25M. cap10 optimal.
+
+**Conclusion:** c0's 2.75M mode-2 walk is intrinsic at this data layout:
+~nDistinctSel × nv fused ext-muls + nRuns × (arity ext-muls + inv). Cutting it
+needs a LAYOUT change (pre-parsed constraint tables + precomputed selector
+values in the wire/code-satellite = v9 item), not a memo. eqSelectorValue cost
+is O(nv) ext-muls per distinct sel; nv = k - arity is large (k=24 at r1).
+
+**Measurement lesson (banked):** satellite memory dies with the staticcall
+frame — fixed-slot counters in library code run in the CALLER context; to see
+satellite-side counters the satellite must RETURN them (reply > 96 B) or the
+distribution must be derived offline from the bundle + deriveGroupDescs logic.
+In-core probes CAN time library primitives directly (internal functions are
+callable from the test-linked copy) but see empty groupDescs for mode-2
+constraints because derivation happens in the satellite.
+
+Next (impact order): QFOLD 12.2M decomposition (early-return gates in the
+fallback QFOLD path; qfold frame sizes 9956/11332/12004 incl. selector are
+unique per round), then CIDNTY 9.71M.
