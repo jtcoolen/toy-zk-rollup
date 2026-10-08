@@ -3223,3 +3223,29 @@ CONCLUSION: security reduction is CLOSED as a lever (user floor >= 96, house tar
 (batch width 4->2, est -20M, the CIDNTY whale is per-instance recursion circuits),
 option B (commit C(zeta), -4..6M), option D code ideas. Canonical vectors restored;
 HEAD stays at 96-bit canonical 50,682,535 gas.
+
+## Batch 72 — DECISION: do NOT switch to midfall's full-Yul monolith (user: "switch to midfall's design with full assembly Yul verifier?")
+
+Evidence against a wholesale rewrite:
+1. The hot loops are ALREADY fused Yul: foldConstraints (714 gas/node, batch 38),
+   QFOLD/MROOTS/CIDNTY/TWIGHT satellite bodies, _loadRowFused/_loadRowHot.
+   ~80% of hot-path gas already executes inside assembly blocks.
+2. Satellite dispatch is already a Yul staticcall on a raw memory frame
+   (WhirVerifierCore._callSatellite:652) - no Solidity abi-encode/decode per call.
+   Dispatch overhead (staticcall base + frame copy ~1-2 KB) ~= 0.5-1M total.
+3. Batch 63 floor estimate: verifier-code floor for THIS proof shape ~= 45M vs
+   50.68M current. A monolithic rewrite captures at most a slice of 5.7M
+   (realistically 2-4M) at weeks of hand-Yul + soundness risk + re-proving 174
+   tests. The gap is 20.7M = proof SHAPE (links, instances, queries), not language.
+4. midfall's numbers come from a different proof shape (single proof, no
+   recursion chain), not from Yul per se.
+
+WHAT WE DO TAKE from midfall: (i) monolith-style inlining of the satellite
+dispatch as a FINAL polish pass (~1-3M, after structural levers); (ii) their
+discipline of one contiguous memory arena (we already frame-parse this way).
+
+The lever remains STRUCTURAL: V9 option A (fewer links/instances per verify).
+NOTE from re-reading batch 64: InSC layers 2->1 measured only -1.6M, which
+CONTRADICTS option A's -20M estimate if links == chain layers. The 4 "links"
+(prf.terminals.length == 4) are NOT simply chain layers - must establish what
+actually sets terminals.length before betting on A.
