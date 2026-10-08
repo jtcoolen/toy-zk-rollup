@@ -736,6 +736,7 @@ contract WhirVerifierV8P {
         _checkTerminalIdentity(
             th.allRandomness, out.randomness, constraints, fi.finalPoly, out.foldedClaim);
         acc[base + 5] += _gt - gasleft();
+
     }
 
     /// The terminal identity (D-086 step A):
@@ -925,6 +926,18 @@ contract WhirVerifierV8P {
     /// echoing the frame's own magic or reverts - the reply needs no magic
     /// or length re-check: a wrong answer is a revert, by construction.
     /// The frame must have 96 bytes of reserved space after it for the reply.
+    function _parseProbe(uint256 frame, uint256 size) private view returns (uint256 used) {
+        uint256 g0 = gasleft();
+        address satellite = SATELLITE;
+        uint256 reply = frame + size;
+        assembly ("memory-safe") {
+            // size-1: the parse's final length check cannot pass -> revert.
+            let ok := staticcall(gas(), satellite, frame, sub(size, 1), reply, 96)
+            pop(ok)
+        }
+        used = g0 - gasleft();
+    }
+
     function _callSatellite(uint256 frame, uint256 size)
         private
         view

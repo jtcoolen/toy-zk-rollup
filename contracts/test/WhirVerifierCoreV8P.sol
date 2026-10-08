@@ -79,11 +79,13 @@ library WhirVerifierCoreV8P {
             revert ConstantsExhausted(4 * n, t.constants.length - t.constOff);
         }
         uint256 end = t.constOff + 4 * n;
-        // One bulk pass: the payload is already in the transcript's byte order
-        // (little-endian words), so the absorber appends it verbatim after a
-        // per-word range check. Byte-identical to the previous per-word
-        // observeBase(swapBytes(..)) loop - pinned by the transcript vectors.
-        t.state.observeBasesLE(t.constants, t.constOff, n);
+        // One bulk pass, NO per-word range check: t.constants is always the
+        // CONFIG framing section (trusted setup, digest-pinned at deployment
+        // - WhirVerifierV6 rejects a chunk set whose keccak != CONFIG_DIGEST
+        // at construction), so a word >= p cannot reach here without breaking
+        // the pin first. The appended bytes are identical to the checked
+        // path - pinned by the transcript vectors.
+        t.state.observeBasesLERaw(t.constants, t.constOff, n);
         t.constOff = end;
     }
 
@@ -267,9 +269,6 @@ library WhirVerifierCoreV8P {
             for (uint256 c; c < s.perClaimConstants.length; ++c) fsum += s.perClaimConstants[c];
             t.acc[t.base + 27] = fsum;
         }
-        t.acc[t.base + 24] = input.openingEvals.length;
-        t.acc[t.base + 25] = input.oodAnswers.length;
-        t.acc[t.base + 26] = input.claimWidths.length;
         // --- claim registration ------------------------------------------------
         // Virtual claims: framing, then draw the point, then bind the answer.
         // The drawn point is the virtual eq group's univariate point; v5 keeps
@@ -780,7 +779,6 @@ library WhirVerifierCoreV8P {
         } else {
             // Legacy path (memory rows, per-query expanded paths): the JSON
             // harnesses and every non-v8 shape. Unchanged semantics.
-            uint256 _gq = gasleft();
             out.folds = new uint256[](input.numQueries);
             uint256[] memory elems = new uint256[](input.rowElems);
             uint256[] memory flat = input.rowsFlat;
@@ -808,7 +806,6 @@ library WhirVerifierCoreV8P {
                 );
             }
 
-            t.acc[t.base + 9] += _gq - gasleft();
             // --- 6: round batching challenge ---
             uint256 gamma = drawExt(t);
             out.gamma = gamma;

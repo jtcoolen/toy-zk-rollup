@@ -82,6 +82,13 @@ contract RecursionChainV8AttributionTest is Test {
             emit log_named_uint("   constraint weight", p.profileData(base + 3));
             emit log_named_uint("   verifyFinal", p.profileData(base + 4));
             emit log_named_uint("   terminal identity", p.profileData(base + 5));
+        {
+            uint256 j = 170 + r * 3;
+            emit log_named_uint("     allR len", p.profileData(j));
+            emit log_named_uint("     nConstraints", p.profileData(j + 1));
+            emit log_named_uint("     finalPoly len", p.profileData(j + 2));
+        }
+
             emit log_named_uint("     r: phases1-4", p.profileData(base + 8));
             emit log_named_uint("     r: query loop", p.profileData(base + 9));
             emit log_named_uint("     r: phases6-7", p.profileData(base + 10));

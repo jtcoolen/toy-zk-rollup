@@ -2506,3 +2506,148 @@ as SHARES, not absolutes. Real wrapper today: 55.49M, inner 53.94M.
   path only (t.constants source), gated on the V6 digest pin.
 - Probe forks regenerated and committed (they track src now; regen script
   embedded above).
+
+## Batch 53 — real-build skeleton (revert points), post framing-fix
+
+All numbers are REAL-BUILD cumulative gas at revert points inside the PASSING
+verify (test_gas_v8 = 51,930,230 total; wrapper adds ~1.55M over the engine).
+
+### Engine-level points (WhirVerifier.sol)
+- E1 2.885M  before verifyInitial (round 0): decode + statement + batch
+  transcript + r0 config decode.
+- E2 5.730M  before verifyFinal (round 0): + verifyInitial r0 + 4x
+  (verifyRound+QFOLD) + final framing = 2.845M for that stretch.
+- E3 6.391M  before TWIGHT call (round 0): verifyFinal r0 = 0.661M.
+- E4 42.219M before CIDNTY: rounds 1-4 + TWIGHT r0 = 35.83M (69% of total).
+- end - E4 = 9.711M: CIDNTY alone (19%).
+
+### Inside _qfold (TerminalWeight.sol), first intermediate of round 0
+- A 3.098M entry (after frame parse + work-array setup), before query loop.
+- B 3.661M after query loop: 563k for nq=14 => 40.2k per query.
+- C 3.703M after phase-7 dot: dot = 42k (cheap, leave alone).
+- D 4.013M after pruned Merkle walk: walk = 310k (nq=14, depth ~10-14).
+- so the walk is NOT the whale (batch 52 guess wrong); the QUERY LOOP is:
+  40.2k/query vs ~11k bench floor (foldRow 16x4) => ~29k/query spill tax.
+  20 intermediates x ~14 queries x ~29k = ~8M of recoverable spill tax.
+  THIS IS THE #1 LEVER: split the per-query kernel out of the giant _qfold
+  assembly block into its own function (small live set -> register fusion).
+
+### Ranked plan (real gas)
+1. QFOLD per-query kernel split: est -4 to -6M.
+2. CIDNTY 9.71M: decompose next (config parse per call? foldConstraints
+   loop? pre-parsed tables = v9). est -2 to -4M eventually.
+3. verifyInitial claim reg post-fix re-measure (framing fix may have moved
+   the 4.93M probe figure a lot).
+4. verifyFinal ~3M, initial sumcheck ~2.4M: algebra-bound, later.
+5. TWIGHT ~1.2M: small, skip.
+
+### Actions
+- Lever 1 next: _qfoldQuery(rowCd, rowLimbs, rowsAreBase, r0..r3 packed?)
+  as its own private pure function with its own assembly block; _qfold keeps
+  parse + dot + walk. Keep fold/eadd/emul helpers duplicated inside it.
+
+## Batch 54 — corrected skeleton; TWIGHT is the #1 whale; qfoldQuery split was a no-op
+
+### What batch 53's numbers actually meant (nq was wrong; fold is cheap)
+Revert points INSIDE the QFOLD kernel (real build): decode = 6,993 and fold
+tree = 9,183 for the FIRST intermediate's whole query loop => the loop is
+already at bench floor (~16k/query total incl leaf keccak). The 563k figure
+was the whole loop for nq=14 => 40k/query was WRONG arithmetic: 563k/14 =
+40k but the F/G points show decode+fold = 16.2k for the loop => nq must be
+~14 only if... no: F-A=6,993 is decode for ALL queries, G-F=9,183 fold for
+ALL queries => loop total ~16.2k, NOT 563k. The 563k (B-A) includes the
+frame-parse + work-array setup + first-query overhead? No - A was placed
+BEFORE the loop but AFTER setup. Resolution: the probe's qfold satellite tap
+(2.2-2.8M/round) is dominated NOT by decode+fold (16k) but by the MERKLE
+WALK + dot + call overhead: walk r0 = 310k (D-C), dot 42k... that leaves
+~1.8M UNACCOUNTED inside the r0 satellite call. The missing piece: the
+satellite's staticcall ENTRY cost is paid by the caller (E-point math), and
+the frame calldatacopy... actually the probe tap includes the caller-side
+_callSatellite overhead (codehash check + staticcall + 96B read) which is
+small. THE GAP IS UNRESOLVED - next batch: revert points at kernel ENTRY
+vs after parse vs after loop vs after walk vs before reply, all INSIDE
+_qfold, to close it. (Earlier A/B/C/D points: A=3.098M entry, B=3.661M after
+loop => loop = 563k REAL; F/G inside kernel say decode+fold = 16k => the
+loop's 563k is dominated by something between F and B... F/G were placed
+inside qfoldQuery which only exists in the SPLIT version - the split was
+reverted, so F/G measured the split kernel only. In the committed (unsplit)
+code the loop is 563k real for nq=14 => 40k/query. The split kernel measured
+16k/query because... the split DID change gas? No: split build measured
+51,930,230 IDENTICAL. Contradiction => F/G anchors landed on dead code or
+the revert fired before the loop ran 14 times. MOST LIKELY: the revert fired
+on the FIRST query iteration (revert kills the call), so F-A and G-F measure
+ONE query, not the loop: decode 7k + fold 9.2k per query = 16.2k/query,
+x14 = 227k, still < 563k. Remaining ~336k = per-query leaf+store+loop
+overhead + the dims-4 tree's 15 fold() calls at ~2k each... fold tree = 15
+folds x ~600 gas = 9k/query CHECKS OUT. So per query: decode 7k + fold 9.2k
++ misc ~14k?? The misc is the mystery - likely the row calldataloads are
+cheaper than the fold tree's mod ops. CONCLUSION: fold tree 9.2k/query x 14
+x 20 rounds = 2.6M; decode 7k x 14 x 20 = 2.0M; the rest of the 563k-loop
+figure needs the unsplit-code points. TODO next batch.)
+
+### Real-build round skeleton (test_gas_v8 = 51.93M)
+- pre-round (decode+batch transcript+r0 cfg): 2.885M
+- round 0: 4.816M (E1->R1... R1=7.701M is r1 entry: r0 = 7.701-2.885 = 4.816M)
+- round 1: 10.826M (R2-R1)
+- round 2: 7.772M (R3-R2)
+- round 3: 7.489M (R4-R3)
+- round 4: 8.430M (E4-R4)
+- CIDNTY: 9.711M (51.930-E4)
+- wrapper overhead: ~1.55M
+
+### Fresh probe table (post framing-fix, TOTAL 54.77M probe-gas)
+- TWIGHT (terminal identity tap): 1.185+4.831+2.915+2.591+3.022 = 14.54M
+  => ~13.8M REAL. #1 WHALE. r1 alone 4.83M probe (~4.6M real).
+- QFOLD satellite: 12.84M probe (~12.2M real) #2
+- CIDNTY: 8.60M probe (~8.1M real; real-build says 9.71M) #3
+- claim reg: 0.058+0.722+0.396+0.279+0.279 = 1.73M probe (framing fix cut
+  it from 4.93M - confirmed lever worked as predicted)
+- initial sumcheck: ~2.9M probe; verifyFinal: 3.35M probe; round sumcheck
+  ~0.65M; constraint weight (frame pack): 1.39M probe; pack qfold 0.72M.
+
+### Actions
+- qfoldQuery split: REVERTED (identical gas - via-IR already optimal there).
+- Next: decompose TWIGHT r1 (4.6M real for ONE call!). Suspects: eq group
+  evaluation O(total eq length) with ext muls; the mode-2 statement group
+  derivation; evalConstraintsPoly over finalPoly (large poly?); the r1
+  constraint has the most groups (statement columns + virtual points).
+
+
+## Batch 55 — TWIGHT decomposed to the constraint (probe-only; build green 51,930,230)
+
+**Correction to batch 54:** the "TWIGHT frame size 70,732" readings were MISLABELED —
+they were the NEXT round's phases1-4 gas slot (base+8), not a frame size. Real TWIGHT
+frame sizes (measured via a size stash in _callSatellite, published to acc[166+r]):
+  r0 qfold 9952 / r0 twight 11904 / r1 qfold 11328 / r1 twight 11328 / r2 qfold 12000.
+So TWIGHT frames are ~11-12 KB, not 70 KB. The whale is COMPUTE, not frame size.
+
+**Technique that finally works for in-body phase gates** (reverts never compile inside
+TerminalWeight's fallback — zero stack headroom): an EARLY RETURN keyed on a function
+ARGUMENT (allR.length == 24 selects r1's terminal call), returning a marker reply. A
+return terminates the body without adding live stack vars across it. To keep verify
+completing (so acc publishes), disable the caller's identity-equality revert with an
+opaque-false condition `block.number == 0` (runtime-opaque → not optimized out, no
+mutability warning). Reverts mid-expression still blow the stack; returns do not.
+
+**TWIGHT r1 (4.83M probe) phase split** (early-return gates in TerminalWeight fallback):
+  parse ................ ~6k      (truncation probe: revert at end-of-parse length check)
+  derive loop .......... ~666k    (deriveGroupDescs over mode-2 constraints)
+  evalConstraintsPoly .. ~4.13M   <-- the whale
+  evaluate_hypercube ... ~0       (finalPoly is 16 elems)
+
+**evalConstraintsPoly r1 per-constraint** (in-loop `if (i==j && allR.length==24) return total`):
+  before c0 .. 682k
+  c0 ......... 3.17M   <-- the initial constraint, single biggest TWIGHT line item
+  c1 ......... 0.55M
+  c2 ......... 0.27M
+  c3 ......... 0.16M
+  c4 ......... (rest)
+c0 dominates: it is the mode-2 initial constraint with the most statement groups. Its
+cost is eqSelectorValue recomputation — the selector memo self-disables when nv>10
+(allocation 2<<nv too big), so selectors recompute per group across ~501 groups.
+
+**Next lever:** the extension-field primitives (_mulExt, _mulBySelectorFactor,
+_mulByVirtualFactor) are cross-cutting — TWIGHT, QFOLD and CIDNTY all sit on them. A
+per-lane win there multiplies across all three whales. Also: the memo nv>10 cutoff
+means c0's selectors are recomputed; a cheaper memo (sparse, or keyed differently)
+could cut c0 directly.
