@@ -179,6 +179,20 @@ pub fn whir_mmcs(cap_height: usize) -> WhirMmcs {
 /// regime — Reed-Solomon correlated agreement is established at that radius — so
 /// this is the less conjectural choice, not merely the one that fits.
 #[must_use]
+/// D-092 batch 78: inner-regime override. Defaults to JohnsonBound even if
+/// WHIR_SOUNDNESS_REGIME (final) is set - CapacityBound cannot reach 96 bits
+/// at the inner shape (InitialClaimsBelowTarget 95.36).
+pub fn inner_soundness_regime() -> SecurityAssumption {
+    match std::env::var("WHIR_INNER_SOUNDNESS_REGIME")
+        .ok()
+        .as_deref()
+    {
+        Some("udr") => SecurityAssumption::UniqueDecoding,
+        Some("capacity") => SecurityAssumption::CapacityBound,
+        _ => SecurityAssumption::JohnsonBound,
+    }
+}
+
 pub fn protocol_params(pow_bits: usize) -> ProtocolParameters {
     protocol_params_with(pow_bits, 1)
 }
@@ -199,7 +213,7 @@ pub fn protocol_params_with(
         pow_bits,
         round_log_inv_rates: Vec::new(),
         folding_factor: FoldingFactor::Constant(FOLDING_FACTOR),
-        soundness_type: crate::whir::soundness_regime(),
+        soundness_type: inner_soundness_regime(),
         starting_log_inv_rate,
     }
 }

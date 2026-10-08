@@ -3396,3 +3396,21 @@ smaller -> final domain smaller. Delta: -50,514 gas, -1,120 B. Free lever.
 WHIR_POW_FLOOR=28 WHIR_INNER_POW_FLOOR=30 RC_LAYERS=0.
 Next: CapacityBound regime end-to-end test (52 vs 102 queries at 96 bits;
 open-conjecture caveat - measurement only, adoption is a user decision).
+
+## Batch 80 - circuit-size census (measure_circuit_sizes test, canonical env)
+
+  client proof (base fib, InSC/Poseidon2):        70,622 B
+  rc circuit (= in-circuit verifier):             45,316 ops
+      alu 35,882 | npo 6,774 | hint 1,949 | const 470 | public 241
+      witnesses 51,410 (trace pads to ~2^16 rows)
+      npo rows: recompose/coeff 3,260 + poseidon2 perm 3,124 + challenger 389
+  final settlement: raw bundle 553,232 B -> v8 split wire 287,972 B
+
+Insight: the in-circuit verifier is TINY (45K gates, ~2^16 trace rows). The
+whale is not verifier gate count - it is the final proof's 102-query walk over
+the rc trace (Merkle paths of depth 16 x 102 queries + fold work). Shrinking
+the rc circuit further saves ~1 Merkle level per query at best; the dominant
+term is the final query count itself (security-bound at 96 bits, JohnsonBound).
+CapacityBound regime would halve queries but caps at 88.03 bits at this shape
+(InitialClaimsBelowTarget) - open-conjecture regime, not adopted at 96.
+Capacity-88 end-to-end point pending (grind flake retry).

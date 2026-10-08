@@ -374,3 +374,75 @@ fn export_chain_bundle() {
     .expect("write sidecar");
     println!("bundle {} B, statement {:?}", bundle.len(), stmt);
 }
+
+/// D-092 batch 80: circuit-size census at the canonical shape. Prints:
+/// client proof bytes, rc circuit (the in-circuit verifier) op/witness/trace
+/// sizes with non-primitive breakdown, and the final proof bytes + per-
+/// instance matrix sizes. Run with the canonical env vars.
+#[test]
+#[ignore = "size census; run with --release and canonical env"]
+fn measure_circuit_sizes() {
+    use p3_circuit::Op;
+    let inner = InnerWhirConfig::new_with(CHAIN_LOG_MAX_LDE, CAP_HEIGHT, rate_inner())
+        .expect("inner config");
+    let air = FibonacciAir {};
+    let trace = generate_trace_rows::<F>(0, 1, BASE_TRACE);
+    let pis = vec![F::ZERO, F::ONE, fibonacci_output(BASE_TRACE)];
+
+    let base = p3_uni_stark::prove(&inner, &air, trace, &pis).expect("base prove");
+    let base_bytes = postcard::to_allocvec(&base).map_or(0, |v| v.len());
+    println!("CENSUS client proof (base fib, InSC): {base_bytes} B");
+
+    let rc = build_recursion_circuit(&inner, &air, &base, &pis).expect("rc1");
+    let mut alu = 0usize;
+    let mut consts = 0usize;
+    let mut publics = 0usize;
+    let mut hints = 0usize;
+    let mut npo = 0usize;
+    for op in &rc.circuit.ops {
+        match op {
+            Op::Const { .. } => consts += 1,
+            Op::Public { .. } => publics += 1,
+            Op::Alu { .. } => alu += 1,
+            Op::Hint { .. } => hints += 1,
+            Op::NonPrimitiveOpWithExecutor { .. } => npo += 1,
+        }
+    }
+    println!(
+        "CENSUS rc circuit (in-circuit verifier): ops={} (alu={alu} const={consts} public={publics} hint={hints} npo={npo}) witnesses={} public_flat={} private_flat={}",
+        rc.circuit.ops.len(),
+        rc.circuit.witness_count,
+        rc.circuit.public_flat_len,
+        rc.circuit.private_flat_len,
+    );
+    println!(
+        "CENSUS rc traces: alu_rows={} witness_vals={}",
+        rc.traces.alu_trace.op_kind.len(),
+        rc.traces.witness_trace.index.len(),
+    );
+    let mut npo_rows: Vec<(String, usize)> = rc
+        .traces
+        .non_primitive_traces
+        .iter()
+        .map(|(k, v)| (format!("{k:?}"), v.rows()))
+        .collect();
+    npo_rows.sort_by(|a, b| b.1.cmp(&a.1));
+    for (k, r) in &npo_rows {
+        println!("CENSUS rc npo trace {k}: {r} rows");
+    }
+    let total_npo: usize = npo_rows.iter().map(|(_, r)| r).sum();
+    println!("CENSUS rc npo rows total: {total_npo}");
+
+    let (bundle, config, _chunks) =
+        prover::composed_export::settlement_bundle_with_blob(&rc, &pis, rate_final())
+            .expect("settle");
+    println!("CENSUS final proof (bundle): {} B", bundle.len());
+    if let Some(insts) = config.get("instances").and_then(|v| v.as_array()) {
+        for (i, inst) in insts.iter().enumerate() {
+            let h = inst.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+            let w = inst.get("width").and_then(|v| v.as_u64()).unwrap_or(0);
+            let nodes = inst.get("nodes").and_then(|v| v.as_u64()).unwrap_or(0);
+            println!("CENSUS final inst{i}: height={h} width={w} nodes={nodes}");
+        }
+    }
+}
