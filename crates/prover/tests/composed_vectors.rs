@@ -299,3 +299,145 @@ fn block_program_equality_and_export() -> Result<(), Box<dyn Error>> {
         extras,
     )
 }
+
+/// D-092 batch 80: PRODUCTION shielded-pool size census (not the Fibonacci
+/// harness). One real client transfer (SPHINCS+ sig, SHA3 note derivation,
+/// nullifier absence fold) -> block recursion circuit -> Keccak settlement at
+/// the canonical env. Prints rows for every artifact: client circuit, client
+/// proof, rc circuit, final proof instances.
+#[test]
+#[ignore = "proves the real shielded chain; run with --release and canonical env"]
+fn shielded_size_census() -> Result<(), Box<dyn Error>> {
+    use p3_circuit::Op;
+    let (note, sk_d) = funded_note(11, 1_000);
+    let (tree, paths) = tree_with(&[note]);
+    let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
+    let inner = InnerWhirConfig::new(prover::transfer::LOG_MAX_LDE, 0).expect("inner config");
+    let out_note = Note::new(900, seed(200), seed(201), recipient);
+
+    // --- client transfer circuit (the shielded client proof's circuit) -----
+    let transfer = shielded::Transfer {
+        spends: vec![shielded::transfer::Spend { note: &note, sk_d: &sk_d, path: &paths[0], index: 0 }],
+        outputs: vec![out_note],
+        fee: 100,
+    };
+    let (public, nf_w, frontier) = prover::fixtures::public_and_witnesses(&transfer, &tree);
+    let tc = prover::transfer::build_transfer_circuit(&transfer, &public, &nf_w, &frontier)
+        .expect("transfer circuit");
+    let npo = tc.census_npo_rows();
+    println!(
+        "CENSUS client circuit: ops={} witnesses={} alu_rows={} npo={:?}",
+        tc.census_ops(), tc.census_witnesses(), tc.census_alu_rows(), npo);
+    let pad = |n: usize| n.next_power_of_two();
+    println!("CENSUS client circuit padded rows: alu->{}", pad(tc.census_alu_rows()));
+
+    // --- client proof (InSC/Poseidon2) --------------------------------------
+    let mut map = NullifierMap::new(Keccak256Commitment);
+    let spec = ClientSpec {
+        note: &note, sk_d: &sk_d, path: &paths[0], index: 0, output: &out_note, fee: 100,
+    };
+    let client = prove_client_transfer(&inner, &spec, &tree, &mut map).expect("client prove");
+    println!(
+        "CENSUS client proof: {} B (postcard), statement {} limbs",
+        postcard::to_allocvec(&client.proof).map_or(0, |v| v.len()),
+        client.statement.len());
+
+    // --- block recursion circuit (in-circuit verifier of the client proof) --
+    let shape = TransferShape { num_nullifiers: 1, num_outputs: 1 };
+    let children = vec![ChildProof {
+        verifier: &client.verifier, proof: &client.proof, statement: &client.statement, shape,
+    }];
+    let rc = build_multi_transfer_circuit(&inner, &children).expect("block circuit");
+    let mut alu = 0; let mut npoc = 0; let mut hint = 0; let mut cst = 0; let mut pubc = 0;
+    for op in &rc.circuit.ops {
+        match op {
+            Op::Const { .. } => cst += 1,
+            Op::Public { .. } => pubc += 1,
+            Op::Alu { .. } => alu += 1,
+            Op::Hint { .. } => hint += 1,
+            Op::NonPrimitiveOpWithExecutor { .. } => npoc += 1,
+        }
+    }
+    let mut npo_rows: Vec<(String, usize)> = rc.traces.non_primitive_traces.iter()
+        .map(|(k, v)| (format!("{k:?}"), v.rows())).collect();
+    npo_rows.sort_by(|a, b| b.1.cmp(&a.1));
+    println!(
+        "CENSUS rc circuit: ops={} (alu={alu} npo={npoc} hint={hint} const={cst} pub={pubc}) witnesses={} padded->{}",
+        rc.circuit.ops.len(), rc.circuit.witness_count, pad(rc.traces.alu_trace.op_kind.len()));
+    for (k, r) in &npo_rows { println!("CENSUS rc npo {k}: {r} rows"); }
+
+    // --- final settlement (Keccak OutSC, canonical rate) --------------------
+    let pis: Vec<prover::F> = block_statement([shape].iter(), [client.statement.as_slice()])?;
+    let rate: usize = std::env::var("WHIR_RATE_FINAL").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    let (bundle, config, _chunks) =
+        prover::composed_export::settlement_bundle_with_blob(&rc, &pis, rate).expect("settle");
+    println!("CENSUS final proof: {} B (raw bundle), rate={rate}", bundle.len());
+    if let Some(insts) = config.get("instances").and_then(|v| v.as_array()) {
+        for (i, inst) in insts.iter().enumerate() {
+            let h = inst.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+            let w = inst.get("width").and_then(|v| v.as_u64()).unwrap_or(0);
+            println!("CENSUS final inst{i}: height={h} width={w}");
+        }
+    }
+    Ok(())
+}
+/// D-092 batch 81: THE canonical v8 wire is now the SHIELDED POOL chain -
+/// one real client transfer (SPHINCS+ sig, SHA3 note derivation, nullifier
+/// absence fold, Poseidon2 commitment tree) -> block recursion circuit ->
+/// Keccak settlement. Replaces the Fibonacci harness export. Writes the same
+/// v8 vector filenames the contract tests read.
+#[test]
+#[ignore = "proves the real shielded chain; regenerates the canonical v8 vectors"]
+fn export_shielded_bundle_v8() -> Result<(), Box<dyn Error>> {
+    use p3_symmetric::CryptographicHasher;
+    let (note, sk_d) = funded_note(11, 1_000);
+    let (tree, paths) = tree_with(&[note]);
+    let recipient = derive_spend_pk(&Sha3_256Shielded, &seed(9));
+    let inner = InnerWhirConfig::new(prover::transfer::LOG_MAX_LDE, 0).expect("inner config");
+    let out_note = Note::new(900, seed(200), seed(201), recipient);
+    let mut map = NullifierMap::new(Keccak256Commitment);
+    let spec = ClientSpec {
+        note: &note, sk_d: &sk_d, path: &paths[0], index: 0, output: &out_note, fee: 100,
+    };
+    let client = prove_client_transfer(&inner, &spec, &tree, &mut map).expect("client prove");
+
+    let shape = TransferShape { num_nullifiers: 1, num_outputs: 1 };
+    let children = vec![ChildProof {
+        verifier: &client.verifier, proof: &client.proof, statement: &client.statement, shape,
+    }];
+    let rc = build_multi_transfer_circuit(&inner, &children).expect("block circuit");
+    let pis: Vec<prover::F> = block_statement([shape].iter(), [client.statement.as_slice()])?;
+
+    let rate: usize = std::env::var("WHIR_RATE_FINAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let (bundle, jj, blob) =
+        prover::composed_export::settlement_bundle_with_blob(&rc, &pis, rate).expect("settle");
+    let _ = &bundle;
+    let flat = prover::wbnd::flat_from_vectors(&jj);
+    let (v7, cfg) = prover::wbnd::encode_bundle_v8_split(&flat, &jj, &blob);
+    let chunks = prover::wbnd::chunk_config(&cfg, 24000);
+    let joined: Vec<u8> = chunks.iter().flatten().copied().collect();
+    let digest: [u8; 32] = p3_keccak::Keccak256Hash.hash_iter(joined.iter().copied());
+    let mut hexs = String::with_capacity(64);
+    for b in digest { use std::fmt::Write; write!(&mut hexs, "{b:02x}").expect("hex"); }
+
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contracts/test/vectors");
+    std::fs::write(format!("{dir}/recursion_chain_bundle_v8.bin"), &v7).expect("write v8");
+    std::fs::write(format!("{dir}/recursion_chain_config_v8.bin"), &cfg).expect("write cfg");
+    for (i, c) in chunks.iter().enumerate() {
+        std::fs::write(format!("{dir}/recursion_chain_config_chunk_v8_{i}.bin"), c).expect("write chunk");
+    }
+    let stmt: Vec<u64> = pis.iter().map(p3_field::PrimeField64::as_canonical_u64).collect();
+    let sidecar = serde_json::json!({
+        "statement": stmt,
+        "bundle_v8_len": v7.len(),
+        "config_len": cfg.len(),
+        "config_digest": format!("0x{}", hexs),
+        "chunk_lens": chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+    });
+    std::fs::write(format!("{dir}/recursion_chain_sidecar_v8.json"), sidecar.to_string()).expect("write sidecar");
+    println!("SHIELDED v8 bundle {} B, config {} B, {} chunks, rate={}", v7.len(), cfg.len(), chunks.len(), rate);
+    Ok(())
+}

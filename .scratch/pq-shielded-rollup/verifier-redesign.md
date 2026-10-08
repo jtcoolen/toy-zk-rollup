@@ -3414,3 +3414,41 @@ term is the final query count itself (security-bound at 96 bits, JohnsonBound).
 CapacityBound regime would halve queries but caps at 88.03 bits at this shape
 (InitialClaimsBelowTarget) - open-conjecture regime, not adopted at 96.
 Capacity-88 end-to-end point pending (grind flake retry).
+
+## Batch 81 - CORRECTION: the shielded pool is ~3x the Fibonacci harness. 300 KB NOT met on the real circuits.
+
+The user caught what the record must own: every "287,972 B under 300 KB" claim
+was the FIBONACCI harness, a recursion-mechanism stand-in, never a size model
+for the shielded pool. First true census of the production chain
+(shielded_size_census, composed_vectors.rs; client transfer = SPHINCS+ sig +
+SHA3 note derivation + nullifier absence fold + Poseidon2 tree, 1 spend/1 out):
+
+  client circuit:   29,624 ops (keccak_f1600 290 rows, poseidon2 144) -> pads 2^15
+  client proof:     822,343 B postcard (InSC)          [fib: 70,622 B]
+  rc circuit:      569,699 ops / 710,041 witnesses -> pads 2^19-2^20
+      npo rows: recompose/coeff 86,720 + poseidon2 25,682 + challenger 11,015
+                                                    [fib: 45,316 ops / 2^16]
+  final proof:     903,268 B raw at rate 2           [fib: 553,232 raw / 287,972 wire]
+
+WHY 2-3x: final proof size ~ queries x (Merkle path + opened row width) summed
+over rounds. Shielded rc is bigger on BOTH axes: trace pads 2^19-2^20 vs 2^16
+(+3-4 path levels x 102 queries) and the opened row is wider (710K vs 51K
+witnesses). The rc circuit is big because it verifies the REAL client proof
+in-circuit: 290 Keccak-f rows (SHA3 note derivation) + Poseidon2 tree folds +
+SPHINCS+ key derivation vs fib's ~1K ops. Every in-circuit verification row is
+a committed trace row -> carries a Merkle path in the final proof.
+
+RATE 4 BLOCKED on shielded shape: witness pads 2^20; stacked domain at rate 4
+needs 2^24 = KoalaBear's whole two-adicity, no room for grinding -> whir_config
+panic (pcs.rs:443). Rate 3 (2^23) should fit; export running (bash-8691).
+Honest prior: rate 3 wire ~380-420 KB; rate 3 + 88-bit claim ~330 KB; 300 KB at
+96 bits likely needs rc-circuit surgery (in-circuit gadget work upstream in
+p3_recursion: SHA3/SPHINCS gadgets dominate the rc trace) or ~80-88 bits.
+
+Fibonacci removal: user directive - canonical vectors must come from the
+shielded path. export_shielded_bundle_v8 added to composed_vectors.rs (writes
+the same v8 filenames; claim layout is config-driven so the contract digests
+it without surgery). Fibonacci harness tests to be retired as vectors move.
+Gas on the shielded wire is UNMEASURED until the first shielded v8 export lands
+- expect ~2-3x the fib 47.5M (i.e. ~90-140M) before any new optimisation; the
+whole gas frontier (batches 63-79) must be re-derived on shielded vectors.

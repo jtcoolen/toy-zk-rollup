@@ -291,6 +291,31 @@ impl fmt::Debug for TransferCircuit {
 }
 
 impl TransferCircuit {
+    /// D-092 batch 80: census accessors (op/trace sizes of the client circuit).
+    #[must_use]
+    pub fn census_ops(&self) -> usize {
+        self.circuit.ops.len()
+    }
+    #[must_use]
+    pub fn census_witnesses(&self) -> u32 {
+        self.circuit.witness_count
+    }
+    #[must_use]
+    pub fn census_alu_rows(&self) -> usize {
+        self.traces.alu_trace.op_kind.len()
+    }
+    #[must_use]
+    pub fn census_npo_rows(&self) -> Vec<(String, usize)> {
+        let mut v: Vec<(String, usize)> = self
+            .traces
+            .non_primitive_traces
+            .iter()
+            .map(|(k, v)| (format!("{k:?}"), v.rows()))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
+    }
+
     /// The exported statement: the exact slice `verify(&proof, statement)` must be
     /// called with.
     #[must_use = "the statement is what the settlement verifier must be called with"]
