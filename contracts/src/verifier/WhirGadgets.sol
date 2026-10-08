@@ -300,28 +300,36 @@ library WhirGadgets {
             let c3 := 0
             let bit := sub(nv, 1)
             let j := 0
-            for { } lt(j, nv) { j := add(j, 1) } {
-                let r := mload(add(arr, mul(j, 32)))
-                let one := and(shr(bit, selIndex), 1)
-                bit := sub(bit, 1)
-                let r0 := shr(224, r)
-                let r1 := and(shr(192, r), M)
-                let r2 := and(shr(160, r), M)
-                let r3 := and(shr(128, r), M)
-                if iszero(one) {
-                    r0 := add(sub(P, r0), 1)
-                    r1 := sub(P, r1)
-                    r2 := sub(P, r2)
-                    r3 := sub(P, r3)
+            for { } lt(j, nv) { } {
+                let end := add(j, 6)
+                if gt(end, nv) { end := nv }
+                for { } lt(j, end) { j := add(j, 1) } {
+                    let r := mload(add(arr, mul(j, 32)))
+                    let one := and(shr(bit, selIndex), 1)
+                    bit := sub(bit, 1)
+                    let r0 := shr(224, r)
+                    let r1 := and(shr(192, r), M)
+                    let r2 := and(shr(160, r), M)
+                    let r3 := and(shr(128, r), M)
+                    if iszero(one) {
+                        r0 := add(sub(P, r0), 1)
+                        r1 := sub(P, r1)
+                        r2 := sub(P, r2)
+                        r3 := sub(P, r3)
+                    }
+                    let a0 := c0
+                    let a1 := c1
+                    let a2 := c2
+                    let a3 := c3
+                    c0 := add(mul(a0, r0), mul(W, add(mul(a3, r1), add(mul(a1, r3), mul(a2, r2)))))
+                    c1 := add(add(mul(a0, r1), mul(a1, r0)), mul(W, add(mul(a2, r3), mul(a3, r2))))
+                    c2 := add(add(add(mul(a0, r2), mul(a1, r1)), mul(a2, r0)), mul(W, mul(a3, r3)))
+                    c3 := add(add(add(mul(a0, r3), mul(a1, r2)), mul(a2, r1)), mul(a3, r0))
                 }
-                let a0 := c0
-                let a1 := c1
-                let a2 := c2
-                let a3 := c3
-                c0 := mod(add(mul(a0, r0), mul(W, add(mul(a3, r1), add(mul(a1, r3), mul(a2, r2))))), P)
-                c1 := mod(add(add(mul(a0, r1), mul(a1, r0)), mul(W, add(mul(a2, r3), mul(a3, r2)))), P)
-                c2 := mod(add(add(add(mul(a0, r2), mul(a1, r1)), mul(a2, r0)), mul(W, mul(a3, r3))), P)
-                c3 := mod(add(add(add(mul(a0, r3), mul(a1, r2)), mul(a2, r1)), mul(a3, r0)), P)
+                c0 := mod(c0, P)
+                c1 := mod(c1, P)
+                c2 := mod(c2, P)
+                c3 := mod(c3, P)
             }
             s := or(or(shl(224, c0), shl(192, c1)), or(shl(160, c2), shl(128, c3)))
         }
