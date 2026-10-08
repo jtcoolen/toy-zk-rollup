@@ -2889,3 +2889,57 @@ loop ~61% (7.7M), walk ~25% (3.2M), sort ~9%, dot ~5%.
 2. **TWIGHT ~12.7M** (r1 evalPoly ~3.7M, r2 2.17M, r3 2.20M, r0 1.07M, tails).
 3. **CIDNTY ~8.6M** (foldConstraints ~5.9M at ~700 gas/node x 7,361 nodes).
 4. verifyInitial ~4.8M, verifyFinal ~3.4M, decode ~2.75M.
+
+
+## Batch 62 — authoritative top-level gas map (revert-gate sweep, batch-61b build, total 50,682,535)
+
+Solidity-level gates need `revert("g")` (the 2-arg `revert(0,0)` is Yul-only — three
+failed builds before that clicked). Measured cumulative gas at every phase boundary:
+
+| point (cumulative) | gas | delta |
+|---|---|---|
+| after verifyInitial | 3,036,499 | 3.04M |
+| after verifyRound i=0 | 4,043,622 | 1.01M |
+| after verifyRound i=1 | 5,001,110 | 0.96M |
+| after verifyRound i=2 | 5,670,965 | 0.67M |
+| after verifyRound i=3 | 12,881,087 | **7.21M** |
+| after verifyFinal (first link) | 6,368,509 | — |
+| end of link 1 (allRlen=16) | 7,537,899 | 7.54M total |
+| end of link 2 (allRlen=20) | 17,877,788 | 10.34M |
+| QFOLD calls (depths 18–24, 7 calls) | — | **5.0M total** |
+| TWIGHT evalConstraintsPoly (4 calls) | — | **9.14M** |
+| calldata floor (330,004 B, 4,517 zeros) | — | 5.23M |
+
+Corrections to earlier guesses:
+- QFOLD is NOT the whale: 7 calls total only ~5.0M (d21 call = 0.44M).
+- The per-query decode mods are small-operand DIV (8 gas each), not the whale.
+- The whale is the AGGREGATE: no single component > 10M. Round i=3 (7.2M) is the
+  largest single block — its cw build (expandFromUnivariate + powConstBase per
+  query, per-query memory allocation) plus the heaviest sumcheck/QFOLD round.
+- TWIGHT 9.14M across 4 calls = constraint-poly Horner over ~501 eq groups/link.
+
+### Why micro-opts are now modest (the strategic answer)
+
+Every batch 55–61 win (foldL hoist, selector cache, fused Yul selector, staging)
+shaved 1–2% of a FIXED computation. The remaining 50.7M is spread across many
+medium components (calldata 5.2M, verifyInitial 3.0M, 4 rounds ~9.8M, TWIGHT 9.1M,
+link overhead ~23M) — there is no single whale left to slay in the verifier code.
+Micro-optimisation has hit diminishing returns by construction.
+
+### The three structural paths to 30M (gap = 20.7M = 41% of total)
+
+1. **Proof shape (prover-side, biggest lever).** Gas is proportional to proof
+   size and chain length. Knobs: number of chain links (2 vs 4), numQueries per
+   round, powBits, foldConstraints node count. A 2-link chain or −25% queries
+   cuts proportionally: ~10–15M available. NOT verifier code changes.
+2. **Constraint weight off the eval path.** TWIGHT re-evaluates the 501-group
+   eq-poly Horner in-circuit (9.14M). The prover could send the evaluated weight
+   and the verifier check it with one consistency equation instead of re-running
+   the walk — moves ~6–8M off the hot path. Needs a soundness argument (the
+   weight is a public function of transcript randomness, so it can be committed
+   and opened, not re-derived).
+3. **Calldata/parse (v9 mainline).** Pre-swapped framing, pre-parsed constraint
+   tables (skip LE-decode ~0.6M), CONFIG already off the wire. ~1–2M.
+
+Realistic ceiling for verifier-code-only work: ~45M. The 30M target requires
+path 1 or 2 — proof-shape or protocol-level changes, not more Yul fusion.
