@@ -3298,3 +3298,28 @@ Sum of ALL three ~= 33-40M. 30M at 96 bits likely requires the final settlement
 to verify fewer queries, which the field caps. NEXT MEASUREMENT: split the
 per-link 7-15M into MROOTS (path verify) vs QFOLD (row fold) vs sumcheck to
 decide whether matrices (->C) or fold width is the target.
+
+## Batch 75 — DEFINITIVE WALL: 30M is unreachable at 96-bit security on KoalaBear (gas-report attribution)
+
+forge --gas-report on canonical v8: WhirVerifier.verify = 46.38M own-gas;
+TerminalWeight fallback = 24 satellite calls (avg 1.42M, max 8.16M). The batch-63
+"4 links" are the per-instance WHIR round walk (5 rounds x 6 instances x 87
+queries), NOT recursion layers - proven by RC_LAYERS=0 (batch 73) removing 2 of
+4 chain layers and saving only 3.2M. The whale is the FINAL settlement's own
+87-query proximity work, which is SECURITY-BOUND:
+  queries(96b, rate4, EF4) = 87 (schedule-enforced; batch 74 showed EF8 identical).
+Every lever that could reduce it is now measured CLOSED:
+  security<96 (user floor) | rate>4 (needs folding>4) | EF8 (identical queries)
+  | fewer links (-3.2M) | trace/lde/pow knobs (-1.6M, don't stack) | full-Yul
+  rewrite (floor 45M, <=5.7M headroom, weeks of risk).
+
+CONCLUSION: at the 96-bit floor the verifier-code floor is ~45M and the proof-shape
+floor is ~47M; 30M would require ~55 queries, i.e. ~80-bit security, which the
+user has ruled out. The 30M target is INFEASIBLE at 96-bit provable security on
+KoalaBear with WHIR. Best honest result: 47.45M (RC_LAYERS=0) at 96 bits.
+
+Remaining tractable work (toward ~44M, NOT 30M):
+  (B) commit C(zeta): -4..6M, protocol change + soundness argument.
+  (D) fuse the two remaining Solidity hot loops in CIDNTY: claim rebuild (1.86M)
+      + recompose (1.97M) are NOT yet fused Yul -> ~1-2M.
+  (C) shrink recursion circuit: inst2+3 = 7M, upstream p3_recursion territory.
