@@ -441,3 +441,69 @@ fn export_shielded_bundle_v8() -> Result<(), Box<dyn Error>> {
     println!("SHIELDED v8 bundle {} B, config {} B, {} chunks, rate={}", v7.len(), cfg.len(), chunks.len(), rate);
     Ok(())
 }
+
+/// D-092 batch 84: FULL SHAPE REPORT - per-op-kind rows for every circuit in
+/// the recursion, WHIR schedule at both levels, proof field breakdown.
+#[test]
+#[ignore = "proves the real shielded chain; prints the complete shape census"]
+fn shielded_shape_report() -> Result<(), Box<dyn Error>> {
+    use p3_circuit::Op;
+    let (note, sk_d) = funded_note(11, 1_000);
+    let (tree, paths) = tree_with(&[note]);
+    let recipient = derive_spend_pk(&Poseidon2Shielded, &seed(9));
+    let inner = InnerWhirConfig::new(prover::transfer::LOG_MAX_LDE, 0).expect("inner config");
+    let out_note = Note::new(900, seed(200), seed(201), recipient);
+
+    // ---- client circuit ----------------------------------------------------
+    let transfer = shielded::Transfer {
+        spends: vec![shielded::transfer::Spend { note: &note, sk_d: &sk_d, path: &paths[0], index: 0 }],
+        outputs: vec![out_note],
+        fee: 100,
+    };
+    let (public, nf_w, frontier) = prover::fixtures::public_and_witnesses(&transfer, &tree);
+    let tc = prover::transfer::build_transfer_circuit(&transfer, &public, &nf_w, &frontier).expect("tc");
+    for (k, r) in tc.census_alu_by_kind() { println!("SHAPE client alu {k}: {r}"); }
+    println!("SHAPE client circuit: ops={} witnesses={} alu_rows={}",
+        tc.census_ops(), tc.census_witnesses(), tc.census_alu_rows());
+    for (k, r) in tc.census_npo_rows() { println!("SHAPE client npo {k}: {r}"); }
+
+    // ---- client proof ------------------------------------------------------
+    let mut map = NullifierMap::new(Poseidon2Commitment::default());
+    let spec = ClientSpec { note: &note, sk_d: &sk_d, path: &paths[0], index: 0, output: &out_note, fee: 100 };
+    let client = prove_client_transfer(&inner, &spec, &tree, &mut map).expect("client prove");
+    let raw = postcard::to_allocvec(&client.proof).map_or(0, |v| v.len());
+    println!("SHAPE client proof: {} B raw, statement {} limbs", raw, client.statement.len());
+    println!("SHAPE client proof: rows={:?} ext_degree={} non_primitives={} table_packing={:?}",
+        client.proof.rows, client.proof.ext_degree, client.proof.non_primitives.len(), client.proof.table_packing);
+
+    // ---- rc circuit --------------------------------------------------------
+    let shape = TransferShape { num_nullifiers: 1, num_outputs: 1 };
+    let children = vec![ChildProof { verifier: &client.verifier, proof: &client.proof, statement: &client.statement, shape }];
+    let rc = build_multi_transfer_circuit(&inner, &children).expect("rc");
+    let mut alu_by: std::collections::BTreeMap<String, usize> = Default::default();
+    for op in &rc.circuit.ops {
+        if let Op::Alu { kind, .. } = op {
+            *alu_by.entry(format!("{kind:?}")).or_default() += 1;
+        }
+    }
+    println!("SHAPE rc circuit: ops={} witnesses={} alu_rows={}", rc.circuit.ops.len(), rc.circuit.witness_count, rc.traces.alu_trace.op_kind.len());
+    for (k, v) in &alu_by { println!("SHAPE rc alu {k}: {v}"); }
+    for (k, r) in rc.traces.non_primitive_traces.iter().map(|(k, v)| (format!("{k:?}"), v.rows())) { println!("SHAPE rc npo {k}: {r}"); }
+
+    // ---- settlement --------------------------------------------------------
+    let pis: Vec<prover::F> = block_statement([shape].iter(), [client.statement.as_slice()])?;
+    let rate: usize = std::env::var("WHIR_RATE_FINAL").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    let (bundle, jj, _blob) = prover::composed_export::settlement_bundle_with_blob(&rc, &pis, rate).expect("settle");
+    println!("SHAPE final proof: {} B raw rate={}", bundle.len(), rate);
+    if let Some(insts) = jj.get("instances").and_then(|v| v.as_array()) {
+        for (i, inst) in insts.iter().enumerate() {
+            println!("SHAPE final inst{i}: {}", serde_json::to_string(inst).unwrap_or_default().chars().take(200).collect::<String>());
+        }
+    }
+    if let Some(m) = jj.as_object() {
+        let mut sizes: Vec<(String, usize)> = m.iter().map(|(k, v)| (k.clone(), serde_json::to_string(v).map_or(0, |s| s.len()))).collect();
+        sizes.sort_by(|a, b| b.1.cmp(&a.1));
+        for (k, s) in sizes.iter().take(25) { println!("SHAPE final json field {k}: ~{s} B"); }
+    }
+    Ok(())
+}

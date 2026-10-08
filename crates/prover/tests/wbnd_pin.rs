@@ -85,12 +85,9 @@ fn check_shape(src: &str, flat: &str, bundle: &str) {
 #[test]
 #[ignore = "regenerates committed artifacts; run explicitly after a wire change"]
 fn regenerate_committed_bundles() {
+    // D-092 batch 84: the fib pair is retired - the canonical wire is the
+    // shielded block chain.
     for (src, flat, bundle) in [
-        (
-            "composed_vectors.json",
-            "composed_flat.json",
-            "composed_bundle.bin",
-        ),
         (
             "block_composed_vectors.json",
             "block_composed_flat.json",
@@ -109,15 +106,6 @@ fn regenerate_committed_bundles() {
         std::fs::write(vectors_dir().join(bundle), &mine_bundle).expect("write bundle");
         println!("{bundle}: {} bytes", mine_bundle.len());
     }
-}
-
-#[test]
-fn wbnd_encoder_matches_js_fib_artifact() {
-    check_shape(
-        "composed_vectors.json",
-        "composed_flat.json",
-        "composed_bundle.bin",
-    );
 }
 
 #[test]

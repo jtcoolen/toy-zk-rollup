@@ -295,6 +295,16 @@ impl TransferCircuit {
     pub fn census_alu_rows(&self) -> usize {
         self.traces.alu_trace.op_kind.len()
     }
+    /// D-092 batch 84: ALU rows grouped by op kind.
+    #[must_use]
+    pub fn census_alu_by_kind(&self) -> Vec<(String, usize)> {
+        let mut m: std::collections::BTreeMap<String, usize> = Default::default();
+        for k in &self.traces.alu_trace.op_kind {
+            *m.entry(format!("{k:?}")).or_default() += 1;
+        }
+        m.into_iter().collect()
+    }
+
     #[must_use]
     pub fn census_npo_rows(&self) -> Vec<(String, usize)> {
         let mut v: Vec<(String, usize)> = self
