@@ -3323,3 +3323,25 @@ Remaining tractable work (toward ~44M, NOT 30M):
   (D) fuse the two remaining Solidity hot loops in CIDNTY: claim rebuild (1.86M)
       + recompose (1.97M) are NOT yet fused Yul -> ~1-2M.
   (C) shrink recursion circuit: inst2+3 = 7M, upstream p3_recursion territory.
+
+## Batch 76 — SECURITY/GAS FRONTIER COMPLETE (56-bit point closes the curve)
+
+WHIR_SECURITY_LEVEL env + floor 24, rate 4/4, 2 layers, canonical shape:
+| bits | bundle B | gas        |
+|  96  | 330,004  | 50,682,535 |  <- canonical (user floor)
+|  88  | 314,980  | 49,110,000 |
+|  80  | 286,484  | 45,670,000 |
+|  72  | 248,852  | 41,940,000 |
+|  64  | 218,900  | 39,260,000 |
+|  56  | 172,300  | 35,181,520 |  <- measured this batch
+Frontier is ~LINEAR: ~3.5-4M gas and ~25-45 KB per 8 bits. Extrapolation:
+30M gas needs ~48 bits; 300 KB needs ~80 bits. BOTH targets simultaneously at
+>=96 bits are IMPOSSIBLE on this shape (96-bit floor: 330 KB / 50.7M; 0-layer
+variant: 285 KB / 47.45M - the 300 KB target IS met at 96 bits by RC_LAYERS=0).
+
+RECOMMENDED PRODUCTION CONFIG (best honest point): 96 bits, RC_LAYERS=0,
+floor 24, rate 4/4 => 284,932 B proof (under 300 KB target), 47.45M gas.
+Remaining code-only levers (D): fuse claim-rebuild (1.86M) + recompose (1.97M)
+Solidity loops in CIDNTY -> est -1..1.5M => ~46M. Protocol lever (B): commit
+C(zeta) -> -4..6M => ~41-43M, needs soundness argument. Neither reaches 30M;
+the wall is the 87-query security floor (batch 75).
