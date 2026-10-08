@@ -2800,3 +2800,92 @@ loop ~61% (7.7M), walk ~25% (3.2M), sort ~9%, dot ~5%.
 - Measurement lesson: **never trust the probe fork for phase shares after a
   feature lands in the real engine.** Revert-point sweeps on the real engine are
   the ground truth and cost one test run per data point.
+
+---
+
+## Batch 59 - foldL hoist + TWIGHT r1 anatomy (committed 39ffec2)
+
+- foldL lane hoist in `TerminalWeight._qfold` (q00..q33 hoisted out of the
+  per-query loop): **-39.7k -> 51,890,522**.
+- The legacy (non-pruned) query branch in `verifyRound` is DEAD for v8: every
+  v8 round carries a pruned digest stream, so the QFOLD satellite path is the
+  only live one.
+- Bundle calldata floor: 330,004 B with 4,517 zero bytes = **5,225,860 gas** of
+  pure calldata cost inside `test_gas_v8` (16/4 per nonzero/zero byte). The
+  182,200 B CONFIG is constructor-stored (ConfigChunk[]), not in verify().
+- TWIGHT r1 phase split (revert gates): parse 652k, deriveGroupDescs 652k,
+  evalConstraintsPoly 4.13M, tail (hypercube+reply) ~0.68M.
+- TWIGHT allR round map (cumulative verify gas at each evalPoly entry):
+  r0 (allR=20) 6.46M, r1 (24) 14.18M, r2 (23) 23.74M, r3 (22) 39.06M.
+- Per-intermediate verifyRound costs: i0 ~1.10M, i1 ~1.04M, i2 ~0.73M,
+  i3 ~0.58M.
+- Monty finding (recorded, NOT implemented): `montMul(v*R2) == v*R mod p` is a
+  valid division-free decode for KoalaBear (p'=0x7effffff, R2=0x17f7efe4,
+  rr=0x01fffffe); swap32 must stay outside the montMul; gain ~5 gas/limb.
+
+## Batch 60 - direct-mapped selector cache (committed e6ecbaf)
+
+- `constraintWeight` mode-2 walk: capped exact memo (keyed on sel alone, reset
+  on nv change, disabled past nv=10) replaced by a direct-mapped (nv,sel)-tagged
+  2048-entry cache: **-55.3k -> 51,835,266**.
+- Per-constraint cost map (revert gates inside evalConstraintsPoly, pre-61):
+  - r1 (allR=24): c0 done 14,194,692 (c0 ~9.7k); **c1 = 3,172,690**; c2 ~486k;
+    c3 ~243k; c4 ~140k (5 constraints).
+  - r2 (allR=23): c0 ~9.7k; c1 ~1.48M; c2 ~464k; c3 ~229k; c4 ~130k.
+  - r3 (allR=22): c0 ~170k; c1 ~1.67M; c2 ~441k; c3 ~215k.
+  - r0 (allR=20): c0 ~9.7k; c1 ~398k; c2 ~396k; c3 ~187k.
+- foldConstraints ~683-706 gas/node; QFOLD ~16.2k/query (tree ~9.7k + decode
+  ~7.0k).
+- **Revert-DATA spill channel works**: temp test wraps `verify` in try/catch,
+  copies revert data with `returndatacopy` into a `new bytes(256)` and logs it.
+  NEVER `mstore(0x40,...)` hacks (corrupts the allocator). `returndatasize()`
+  is not callable outside assembly (error 7576).
+- **WhirVerifierV6.sol:196 caps bubbled revert data at 96 B**
+  (`if gt(rd, 96) { rd := 96 }`) - spills >96 B truncate at the outer wrapper.
+  Counter spills must fit 96 B (3 words) or gate deeper.
+- Spill of r1's first constraint (allR=24): (501 groups, 503 sel-loop iters,
+  257 cache misses) - the cache engaged (246 hits) yet c0 barely moved: the
+  per-group cost is NOT dominated by selector re-eval.
+
+## Batch 61 - fused Yul selector product (committed 151eb49 + 428beca)
+
+- `eqSelectorValue`: the per-bit branch + per-bit 4-lane mod (batch 34, ~350
+  gas/bit) replaced by ONE Yul block that keeps the accumulator unpacked across
+  SIX unreduced muls, reducing lanes once per stage:
+  **-1,117,164 (stage-1) then -35,567 (stage-6) -> 50,682,535**.
+- Overflow bound: each mul maps lane max A -> 10*A*F (4 terms, W=3, factors
+  < P+1 = 2^31). After k unreduced muls lane < 10^k * P^(k+1): k=6 gives
+  ~2^237 < 2^256 (fits); k=7 gives ~2^271 (overflows). **Stage size 6 is the
+  max safe.**
+- Bug found via differential test (test/EqSelDiff.t.sol): the first draft
+  dropped the W factor on the a3*r1 wrap term of lane 0 (c0). The JS
+  simulation passed because it was written from the same wrong mental model -
+  the SOLIDITY differential test against the old implementation caught it.
+  Lesson: simulate in JS from the SPEC, or diff against the old impl; do not
+  simulate from the code you are about to write.
+- eqBaseValue ablation (k=24 gate): base evals (incl. one `inv` per call) are
+  only ~120k of r1's c0+c1 - NOT the whale. Selector evals were 1.85M of the
+  3.22M pair pre-61; post-61 the pair is ~2.0M.
+- Shared-cache experiment (one cache across constraints in evalConstraintsPoly):
+  +142k WORSE (allocation + key-tag overhead exceeded the ~246 saved evals);
+  reverted. The per-constraint cache stays.
+- Fresh cumulative map post-61 (revert gates): evalPoly entry r0 6.456M, r1
+  14.170M, r2 23.293M, r3 38.265M; evalPoly exit r0 7.526M, r1 17.866M, r2
+  25.466M, r3 40.467M. Round totals: r0 1.07M, r1 3.70M, r2 2.17M, r3 2.20M.
+- Engine loop (_runOneIntermediate x4) ends at 12.93M cumulative; verifyFinal
+  ends at 13.48M; the TWIGHT call is ~37.9M cumulative (pack ~43k, call+eval
+  ~12.7M). **The ~24M between the engine loop end and the TWIGHT call is the
+  QFOLD satellite work across the 18 rounds** (depth>=21 gate: first QFOLD
+  entry at 9.53M cumulative).
+- `block.number == 0` gates NEVER fire in forge tests (block.number = 1) -
+  opaque-false must be a real never-true condition on local data.
+- `deny = "warnings"` makes unconditional `revert(0,0)` gates fail the build
+  (unreachable code) - always key gates on opaque runtime values.
+
+### Corrected whale ranking (post-61, gas to attack)
+
+1. **QFOLD ~24M region** (18 rounds x ~69 queries, ~16k gas/query): tree
+   ~9.7k + decode ~7.0k per query. THE whale now.
+2. **TWIGHT ~12.7M** (r1 evalPoly ~3.7M, r2 2.17M, r3 2.20M, r0 1.07M, tails).
+3. **CIDNTY ~8.6M** (foldConstraints ~5.9M at ~700 gas/node x 7,361 nodes).
+4. verifyInitial ~4.8M, verifyFinal ~3.4M, decode ~2.75M.
