@@ -2729,3 +2729,74 @@ error; use assembly gt(calldatasize(),1) guard; (b) satellite counters cross
 the staticcall boundary ONLY via the reply (extend return(0, N), probe core
 staticcalls with bigger outsize, copies to fixed slots, publishes to acc);
 (c) prog/opened pointers are NOT small ints — index dumps by loop var.
+
+
+## Batch 58 - fresh REAL-ENGINE attribution (the probe fork was stale)
+
+**Why**: the probe core (WhirVerifierV8P) predates QFOLD, so its "qfold satellite"
+tap measured the retired v8 MROOTS path. Every whale ranking after batch 55 was
+built on a stale number. Fixed-slot tap regions (0x400200, 0x200000, 0x800000)
+ALL failed: the engine's own allocator grows past 4 MB while decoding the bundle,
+so it clobbers any fixed region, and a bumped free pointer costs ~134 Mgas in
+expansion. The technique that works is the **revert-point sweep**: insert one
+guarded `revert(0,0)` at a point in the PASSING verify, read the cumulative gas
+off `test_gas_v8`'s FAIL line, revert the edit, repeat. Cheap, exact, no memory.
+
+### Top-level (inner gas, real engine, floor-30 v8 bundle)
+
+| phase | gas | share |
+|---|---|---|
+| decode + statement check | 2,752,119 | 5.5% |
+| batch transcript walk | 71,092 | 0.1% |
+| 5x verifyInitial | 4,830,000 | 9.6% |
+| 18x intermediate verifyRound | 16,210,000 | 32.2% |
+| 5x verifyFinal | 3,370,000 | 6.7% |
+| 5x TWIGHT (terminal identity) | 14,550,000 | 28.9% |
+| CIDNTY (constraint identity) | 8,597,644 | 17.1% |
+| **total inner** | **50,375,272** | 100% |
+
+Round boundaries (cumulative): r0 4.74M, r1 10.78M, r2 7.82M, r3 7.46M, r4 8.15M.
+nInter per opening round = [3,4,4,4,3] = 18 intermediate rounds.
+
+### Inside the 18 intermediate rounds (16.21M)
+
+Per-intermediate verifyRound, from the (ridx,i) revert sweep: i0 ~1.10M,
+i1 ~1.04M, i2 ~0.73M, i3 ~0.58M; constraint-weight build ~50k each (0.9M total).
+In-satellite phase timers (extended 384-B QFOLD reply, first three calls =
+round 0's i0/i1/i2, nq 35/20/14, depth 20/19/18):
+
+| phase | i0 | i1 | i2 |
+|---|---|---|---|
+| query loop (decode+leaf+fold) | 563,212 | 590,460 | 413,457 |
+| phase-7 dot product | 42,226 | 25,126 | 18,286 |
+| insertion sort | 79,648 | 27,656 | 16,319 |
+| amortized pruned walk | 230,928 | 129,114 | 85,802 |
+
+Satellite share of an intermediate round is ~78%, so **QFOLD total ~= 12.6M**:
+loop ~61% (7.7M), walk ~25% (3.2M), sort ~9%, dot ~5%.
+
+### Corrected whale ranking (real, gas to attack, biggest first)
+
+1. **QFOLD query loop ~7.7M** - 16k gas/query, 18 rounds x ~69 queries.
+2. **TWIGHT ~14.55M** - r1 alone 4.83M; evalPoly c0 3.17M of which the mode-2
+   selector walk is ~2.75M at the data-layout floor (memo cap10 already optimal:
+   cap12/14/16 and direct-mapped all measured worse).
+3. **CIDNTY 8.60M** - foldConstraints ~5.9M at a ~700 gas/node floor over 7,361
+   nodes; v9 lever is pre-parsed node tables (~100 gas/node ~= 590k).
+4. **verifyInitial 4.83M** - r1's 1.91M is the outlier (claim registration).
+5. **decode 2.75M**, **verifyFinal 3.37M**.
+
+### v9 implications (recorded, not yet built)
+
+- The 30M target needs ~22M cut, i.e. more than the whole TWIGHT+CIDNTY pair.
+  No single-phase tweak reaches it; the levers have to be structural:
+  (a) CONFIG off the wire and into code satellites (extcodecopy) - kills most of
+  the 2.75M decode and the ~590k LE-decode floors inside TWIGHT/CIDNTY;
+  (b) pre-parsed constraint/node tables so TWIGHT/CIDNTY stop re-decoding;
+  (c) foldConstraints node-count reduction is prover-side (fewer nodes, same
+  identity) and is the only lever that moves the 5.9M floor materially;
+  (d) QFOLD loop: 16k/query is the next kernel target - the leaf hash and the
+  15-fold fold are the two costs inside it.
+- Measurement lesson: **never trust the probe fork for phase shares after a
+  feature lands in the real engine.** Revert-point sweeps on the real engine are
+  the ground truth and cost one test run per data point.
