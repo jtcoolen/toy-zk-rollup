@@ -44,7 +44,7 @@ use crate::settlement_replay::{
     settlement_params, settlement_params_for, Challenge, Dft, OpeningClaims, OpeningProof,
     ReplayOut, SemConfig, CAP_HEIGHT,
 };
-use crate::whir::FOLDING_FACTOR;
+use crate::whir::folding_factor_final;
 use crate::whir_recursion::{RecursionCircuit, LOG_MAX_LDE};
 use crate::whir_walk::{verify_whir_round, RoundWalk, TerminalWalk, WhirRoundWalk};
 use crate::F;
@@ -293,7 +293,7 @@ pub fn composed_run_with(
                 }
                 let stacked =
                     checked_stacked_num_variables(shapes.iter().map(|&(log_height, width)| {
-                        (padded_arity(log_height, FOLDING_FACTOR), width)
+                        (padded_arity(log_height, folding_factor_final()), width)
                     }))
                     .map_err(|e| format!("round {round}: stacked arity: {e:?}"))?;
                 let config =
@@ -313,11 +313,11 @@ pub fn composed_run_with(
                         TableSpec::new(TableShape::new(log_height, width), schedule)
                     })
                     .collect();
-                let protocol = OpeningProtocol::new(specs).pad_to_min_num_variables(FOLDING_FACTOR);
+                let protocol = OpeningProtocol::new(specs).pad_to_min_num_variables(folding_factor_final());
                 let mut points = Vec::new();
                 let mut scales: Vec<Vec<Challenge>> = Vec::new();
                 for (&(log_height, _), zetas) in shapes.iter().zip(&points_per_matrix) {
-                    let arity = padded_arity(log_height, FOLDING_FACTOR).get();
+                    let arity = padded_arity(log_height, folding_factor_final()).get();
                     let mut row = Vec::with_capacity(zetas.len());
                     for &zeta in zetas {
                         let (point, scale) = univariate_eq_point(zeta, arity);
@@ -369,7 +369,7 @@ pub fn composed_run_with(
                     "stacked_num_variables": stacked,
                     "matrices": claim.matrices.iter().map(|m| json!({
                         "domain": dom_json(&m.domain),
-                        "arity": padded_arity(m.domain.log_size(), FOLDING_FACTOR).get(),
+                        "arity": padded_arity(m.domain.log_size(), folding_factor_final()).get(),
                         "points": m.points.iter().map(|pt| json!({
                             "point": ext_json(&pt.point),
                             "values": pt.values.iter().map(ext_json).collect::<Vec<_>>(),
@@ -391,7 +391,7 @@ pub fn composed_run_with(
                 inside the batch delegate at the real opening shapes; program equality
                 against the native run is asserted by one_run",
             "field": "KoalaBear",
-            "folding_factor": FOLDING_FACTOR,
+            "folding_factor": folding_factor_final(),
             "num_rounds": rounds_json.len(),
             "rounds": rounds_json,
             "zeta": ext_json(&out.zeta),

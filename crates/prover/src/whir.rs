@@ -136,6 +136,22 @@ pub fn security_level() -> usize {
 /// backend's supported extension degree and keeps the round count low.
 pub const FOLDING_FACTOR: usize = 4;
 
+/// D-092 batch 88: settlement-layer folding factor as a sweep knob.
+///
+/// Folding 8 halves the WHIR round count: half the round commitments, half the
+/// Merkle path layers per query, half the transcript draws. Costs: each fold
+/// statement is degree-8 instead of degree-4 (wider constraint fan-in), and the
+/// first round folds 8 variables at once so the initial sumcheck is wider. The
+/// inner (client-proof) layer stays at 4 - the in-circuit verifier is built for
+/// the recursion backend's extension degree.
+pub fn folding_factor_final() -> usize {
+    std::env::var("WHIR_FOLDING_FINAL")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|f| *f == 4 || *f == 8)
+        .unwrap_or(FOLDING_FACTOR)
+}
+
 /// Arity the zero-knowledge masks add to every committed polynomial.
 ///
 /// Blinding doubles each committed height, and the stacked arity WHIR sizes its
@@ -190,7 +206,7 @@ pub fn protocol_params() -> ProtocolParameters {
         security_level: security_level(),
         pow_bits: 0,
         round_log_inv_rates: Vec::new(),
-        folding_factor: FoldingFactor::Constant(FOLDING_FACTOR),
+        folding_factor: FoldingFactor::Constant(folding_factor_final()),
         soundness_type: soundness_regime(),
         starting_log_inv_rate: 1,
     }

@@ -3591,3 +3591,24 @@ commitment round (one less cap + transcript round in Solidity), one WHIR fold
 round. Blocker: WhirUniPcs::ZK is an associated const (vendor pcs.rs:949)
 read at compile time by batch-stark - needs a type-level const-generic flag
 through vendor + settlement_replay + Solidity ProofCodec.
+
+## Batch 88 - FOLDING FACTOR 8 (settlement): CLOSED, worse on both axes.
+
+WHIR_FOLDING_FINAL env knob added (whir.rs folding_factor_final(), default 4;
+composed_export follows). Results at inner rate 3:
+
+| folding | rate | final raw | verdict |
+|---|---|---:|---|
+| 4 | 4 | 675,312 B | canonical |
+| 8 | 4 | panic: serializing_challenger:233 assert 1<<bits < F::ORDER_U64 - schedule demands >=31 grind bits, KoalaBear caps at 30 | INFEASIBLE |
+| 8 | 3 | 1,073,864 B | +45% vs folding 4 rate 3 (740,112) |
+
+Why: folding 8 halves the round count but each fold statement is degree-8 and
+the Johnson-bound schedule pays it back in queries/grinding - the query term
+dominates the wire. Folding 4 stays canonical. Knob kept (default 4).
+
+NEXT: non-ZK recursion (user-directed). Client proof keeps ZK (secrets live
+only in the client trace); rc/settlement layer drops blinding: no trace
+doubling (commit 2^17 not 2^18), ZK_ARITY_SLACK 2->1, no R commitment round.
+Plan: const-generic ZK flag on vendored WhirUniPcs; SemPcs/settlement Pcs
+instantiated false; Solidity verifier skips R absorption + R opening.
