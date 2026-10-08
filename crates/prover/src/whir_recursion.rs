@@ -199,7 +199,7 @@ pub fn protocol_params_with(
         pow_bits,
         round_log_inv_rates: Vec::new(),
         folding_factor: FoldingFactor::Constant(FOLDING_FACTOR),
-        soundness_type: SecurityAssumption::JohnsonBound,
+        soundness_type: crate::whir::soundness_regime(),
         starting_log_inv_rate,
     }
 }
@@ -318,7 +318,11 @@ impl InnerWhirConfig {
         // smaller inner proofs AND a smaller recursion circuit (the in-circuit
         // verifier's Poseidon2 work scales with inner queries). KoalaBear caps
         // pow_bits at 30 (field order 2^31-1); the floor is clamped there.
-        if let Some(floor) = std::env::var("WHIR_POW_FLOOR").ok().and_then(|v| v.parse::<usize>().ok()) {
+        if let Some(floor) = std::env::var("WHIR_INNER_POW_FLOOR")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .or_else(|| std::env::var("WHIR_POW_FLOOR").ok().and_then(|v| v.parse::<usize>().ok()))
+        {
             if floor > pow_bits {
                 pow_bits = floor.min(30);
             }

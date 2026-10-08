@@ -3364,3 +3364,35 @@ fused Yul, recompose ~2.1M); claim rebuild + parse = 2.75M. Rounds walk 40.53M
 NOTE: gate technique now uses assembly("memory-safe"){ if iszero(calldataload(0x10000000)){revert(0,0)} }
 + staticcall-delta test patch (deny=warnings rejects unconditional revert; plain
 assembly hits stack-too-deep in viaIR).
+
+## Batch 78 — in-circuit verification ARITY: already 1; inner-grind lever opened
+
+User question: can the recursion circuit verify ONE proof (arity 1) instead of
+several? Verified at the call sites: build_batch_recursion_circuit takes a
+single &proof (recursion_chain.rs:94,141,212,282,348) - "batch" = batch-AIR
+structure, not multiple client proofs. The final proof's 6 instances are AIR
+matrices of the two circuits (fib main/perm + rc main/perm + quotients), not 6
+client proofs. Nothing to cut there; RC_LAYERS=0 already removed the second
+in-circuit recursion verification (batch 73).
+
+New lever from the same question: the ONE in-circuit verification's circuit
+size (inst2+inst3 ~7.2M CIDNTY) scales with the INNER proof's query count.
+Grinding bits substitute for queries at equal security, and the inner proof
+never goes on-chain -> WHIR_INNER_POW_FLOOR knob added (falls back to
+WHIR_POW_FLOOR). Test: inner floor 30 (field cap), final floor 28.
+
+Also wired WHIR_SOUNDNESS_REGIME (udr|johnson|capacity) + regime sweep:
+at 96 bits total queries: UDR 402/339, JOHNSON 152/102, CAPACITY 52 (lir=3).
+CapacityBound would HALVE the whale (queries = 40.5M of 47.5M) but rests on an
+OPEN conjecture (list-decodability to capacity) - experiment knob only, not
+adopted. JohnsonBound stays canonical.
+
+## Batch 79 — WHIR_INNER_POW_FLOOR=30: 47,513,515 gas / 286,852 B
+
+Inner proof grind floor raised to 30 (field cap; inner proof never goes on-
+chain, grind cost is prover-side). Inner queries drop slightly -> rc circuit
+smaller -> final domain smaller. Delta: -50,514 gas, -1,120 B. Free lever.
+174/174 green. Canonical env now: WHIR_RATE_FINAL=4 WHIR_RATE_INNER=4
+WHIR_POW_FLOOR=28 WHIR_INNER_POW_FLOOR=30 RC_LAYERS=0.
+Next: CapacityBound regime end-to-end test (52 vs 102 queries at 96 bits;
+open-conjecture caveat - measurement only, adoption is a user decision).

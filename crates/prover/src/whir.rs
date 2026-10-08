@@ -154,6 +154,18 @@ pub const FOLDING_FACTOR: usize = 4;
 /// `log_max_lde + 2`, so that is the arity the budget is read off.
 pub const ZK_ARITY_SLACK: usize = 2;
 
+/// D-092 batch 78: soundness regime env override. "udr" | "capacity" |
+/// default "johnson". CapacityBound claims the same bits at ~half the queries
+/// but rests on an OPEN conjecture (list-decodability to capacity); it is an
+/// experiment knob, not a production default.
+pub fn soundness_regime() -> SecurityAssumption {
+    match std::env::var("WHIR_SOUNDNESS_REGIME").ok().as_deref() {
+        Some("udr") => SecurityAssumption::UniqueDecoding,
+        Some("capacity") => SecurityAssumption::CapacityBound,
+        _ => SecurityAssumption::JohnsonBound,
+    }
+}
+
 /// Build the WHIR protocol parameters.
 ///
 /// `round_log_inv_rates` is left empty so the round schedule is derived per commit.
@@ -179,7 +191,7 @@ pub fn protocol_params() -> ProtocolParameters {
         pow_bits: 0,
         round_log_inv_rates: Vec::new(),
         folding_factor: FoldingFactor::Constant(FOLDING_FACTOR),
-        soundness_type: SecurityAssumption::JohnsonBound,
+        soundness_type: soundness_regime(),
         starting_log_inv_rate: 1,
     }
 }
@@ -343,6 +355,40 @@ mod tests {
         type EF4 = BinomialExtensionField<F, 4>;
         type EF8 = BinomialExtensionField<F, 8>;
 
+        // Batch 78: soundness-regime comparison at the canonical shape.
+        for regime in [
+            SecurityAssumption::UniqueDecoding,
+            SecurityAssumption::JohnsonBound,
+            SecurityAssumption::CapacityBound,
+        ] {
+            let name = match regime {
+                SecurityAssumption::UniqueDecoding => "UDR",
+                SecurityAssumption::JohnsonBound => "JOHNSON",
+                SecurityAssumption::CapacityBound => "CAPACITY",
+            };
+            for (lir, pow) in [(2usize, 24usize), (3, 32)] {
+                let params = ProtocolParameters {
+                    security_level: SECURITY_LEVEL,
+                    pow_bits: pow,
+                    round_log_inv_rates: Vec::new(),
+                    folding_factor: FoldingFactor::Constant(FOLDING_FACTOR),
+                    soundness_type: regime,
+                    starting_log_inv_rate: lir,
+                };
+                match WhirConfig::<EF4, F, Challenger>::new(25, params) {
+                    Ok(cfg) => {
+                        let total: usize = cfg
+                            .round_parameters()
+                            .iter()
+                            .map(|r| r.num_queries)
+                            .sum::<usize>()
+                            + cfg.final_round_config().num_queries;
+                        println!("  regime={name} lir={lir} pow={pow}: rounds={} total_queries={total}", cfg.n_rounds());
+                    }
+                    Err(e) => println!("  regime={name} lir={lir} pow={pow}: ERR {e:?}"),
+                }
+            }
+        }
         for (label, rows) in [("ext4", sweep_q::<EF4>()), ("ext8", sweep_q::<EF8>())] {
             for (lir, pow, rounds, total) in rows {
                 println!(
