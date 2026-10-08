@@ -306,7 +306,17 @@ impl InnerWhirConfig {
         log_max_lde_height: usize,
         cap_height: usize,
     ) -> Result<Self, WhirVerifierParamsError> {
-        Self::new_with(log_max_lde_height, cap_height, 1)
+        // D-092 batch 85: the client-proof starting rate is a sweep knob.
+        // The rc circuit's size is dominated by verifying the client proof,
+        // so this knob moves the whole recursion: a bigger inner rate means
+        // fewer client queries, a smaller rc trace, and a smaller settlement
+        // proof. Default 1 keeps the canonical configuration.
+        let rate = std::env::var("WHIR_INNER_RATE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|r| (1..=3).contains(r))
+            .unwrap_or(1);
+        Self::new_with(log_max_lde_height, cap_height, rate)
     }
 
     /// [`InnerWhirConfig::new`] at an explicit starting inverse rate (see
