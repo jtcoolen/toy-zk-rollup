@@ -1,0 +1,188 @@
+\section{System overview and actors}
+\label{sec:overview}
+
+This section fixes the vocabulary used throughout the specification: the
+components that make up the system, the pipeline that carries a value transfer
+from a wallet to an on-chain state update, and the actors together with the
+trust boundaries that separate them. Everything stated here is what the code
+\emph{enforces}; where a source comment states an intent that the code does not
+back, a spec delta records the gap.
+
+\subsection{What the system is}
+
+The repository implements a shielded value pool that proves its own state
+transitions with hash-based STARKs and settles them on an EVM chain by
+replaying the proof under the native \code{keccak256} opcode \src{README.md:3}.
+The state the system tracks is two roots: a Poseidon2-Merkleized commitment
+tree of note commitments and a nullifier map of spent notes
+\src{contracts/src/ShieldedPool.sol:71-77}. A note commitment is a Keccak-256
+digest of its contents, the commitment tree is Merkleized with Poseidon2 (the
+one granted hash seam), and nullifiers are SHA3-256 over spend material; spend
+authorization is a SPHINCS+ signature over a canonical statement encoding
+\src{README.md:31-38}. The precise primitives and encodings are given in the
+primitives section; here it suffices that no elliptic-curve primitive sits in
+the trust path and that the settlement contract never opens the Poseidon2 tree
+\src{README.md:3-14}. End to end the demonstration proves: shielded transfers,
+one per-transfer STARK each, a block that recursively verifies its children and
+folds them into a single statement, and SNARK-free EVM settlement
+\src{README.md:29-54}.
+
+\subsection{Components}
+
+Table~\ref{tab:components} lists the workspace components and the role each
+plays. The split is taken verbatim from the repository layout
+\src{README.md:56-71}.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+\textbf{Path} & \textbf{Role} \\
+\midrule
+\code{crates/pq-hash} & SHA3-256 note/nullifier hashing; Poseidon2 trees and commitments \src{README.md:60} \\
+\code{crates/pq-sign} & SPHINCS+ (\code{slh-dsa}) key/sign/verify wrappers; canonical statement encoding \src{README.md:61} \\
+\code{crates/vault} & password-derived SPHINCS+ vault format, shared by wallet and node \src{README.md:62} \\
+\code{crates/shielded} & transfer statement, witness, admission rules (\code{PoolState}) \src{README.md:63} \\
+\code{crates/prover} & transfer and block circuits; WHIR configs (Poseidon2 and Keccak); statement fold; vector generators \src{README.md:64} \\
+\code{crates/node} & sequencer actor; HTTP API; tokens/ACL/rate-limit; settlement submitter \src{README.md:65} \\
+\code{crates/wallet-wasm} & the wasm the extension ships (same crates as the node) \src{README.md:66} \\
+\code{crates/recursion-test} & recursion harnesses against upstream \code{p3-recursion} \src{README.md:67} \\
+\code{contracts/} & \code{ShieldedPool}, \code{BlockStatement} decoder, \code{LimbCodec}, generated \code{WhirVerifier} and tests \src{README.md:68} \\
+\code{extension/} & MV3 wallet (plain JS + wasm) \src{README.md:69} \\
+\code{vendor/p3-recursion} & the recursion tree (upstream repo, own workspace) \src{README.md:70} \\
+\code{scripts/} & quality gate and the two end-to-end drivers \src{README.md:71} \\
+\bottomrule
+\end{tabularx}
+\caption{Workspace components and their roles.}
+\label{tab:components}
+\end{table}
+
+\subsection{Pipeline}
+
+The path from a transfer to a settled state update is a four-stage composition.
+The hash and transcript used at each stage differ by design, so that the layer
+the EVM must replay is Keccak-only \src{.scratch/pq-shielded-rollup/map.md:62-72}.
+
+\begin{enumerate}
+\item \textbf{Client transfer proof.} A wallet proves one transfer with a
+  multi-matrix AIR (\code{p3-multi-stark}) whose WHIR commitments run over a
+  Poseidon2 transcript, with zero-knowledge blinding on
+  \src{README.md:39-42}\src{.scratch/pq-shielded-rollup/map.md:109}. Each spend
+  proves nullifier non-membership in-circuit and each output append is
+  re-derived in-circuit as a Poseidon2 frontier fold, so the post-transition
+  roots are exported as public values \src{contracts/src/ShieldedPool.sol:18-37}.
+\item \textbf{Block / recursion circuit.} A block circuit verifies $n \ge 1$
+  child proofs in-circuit (recursion via the vendored \code{WhirRecursionBackend}),
+  chains each transfer's \code{after} roots to the next transfer's \code{before}
+  roots, and folds every child's \emph{verified} public statement into one
+  256-bit $\code{statementRoot}$ (D-089) using Poseidon2
+  \src{README.md:42-45}\src{contracts/src/BlockStatement.sol:18-29}.
+\item \textbf{Keccak re-expression and on-chain replay.} The block proof's WHIR
+  transcript is re-instantiated under a Keccak-256 configuration and the
+  generated Solidity \code{WhirVerifier} replays the entire FRI/WHIR
+  verification using only the native \code{keccak256} opcode
+  \src{README.md:46-51}\src{contracts/src/verifier/WhirVerifier.sol:9-34}.
+\item \textbf{Settlement.} \code{ShieldedPool.applyBlock} verifies the proof,
+  checks root and nullifier continuity against its own stored state, and records
+  the attested roots and fee \src{contracts/src/ShieldedPool.sol:144-178}.
+\end{enumerate}
+
+The block statement carried across stages 2--4 has the fixed layout
+$[\, n, (\text{inputs}_i, \text{outputs}_i)_{i<n}, \code{statementRoot},
+\code{rootBefore}, \code{rootAfter}, \code{nfRootBefore}, \code{nfRootAfter},
+(\code{fee}_i)_{i<n}\,]$, of length $81 + 6n$ base-field limbs independent of how
+many nullifiers and outputs each transfer carries
+\src{contracts/src/BlockStatement.sol:11-15}\src{contracts/src/BlockStatement.sol:63-72}.
+
+\subsection{Node HTTP surface}
+
+The node exposes the endpoints in Table~\ref{tab:endpoints}. The router wires
+each route and applies one authorization guard, a body-size limit, and a CORS
+layer \src{crates/node/src/main.rs:726-740}. Authorization is a stateless
+HMAC-SHA256 bearer token carrying a single role; the access-control list is
+deny-by-default and maps each path to the minimum role that may call it
+\src{crates/node/src/auth.rs:256-293}. The three roles are totally ordered,
+\code{ReadOnly} $<$ \code{Submitter} $<$ \code{Admin}, with the access test
+$\text{role} \ge \text{required}$ \src{crates/node/src/auth.rs:51-66}.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}llX@{}}
+\toprule
+\textbf{Endpoint} & \textbf{Min.\ role} & \textbf{Behavior} \\
+\midrule
+\code{GET /health} & ReadOnly & liveness \src{crates/node/src/auth.rs:277} \\
+\code{GET /metrics} & ReadOnly & Prometheus text \src{crates/node/src/auth.rs:278} \\
+\code{GET /v1/state} & ReadOnly & committed state \src{crates/node/src/auth.rs:280} \\
+\code{GET /v1/roots} & ReadOnly & witness roots \src{crates/node/src/auth.rs:281} \\
+\code{POST /v1/transfer} & Submitter & parse + SPHINCS+ verify + state admission; double-spend / stale root $\to$ 422; valid and admissible $\to$ 501 (remote proof admission deferred, D-079) \src{crates/node/src/auth.rs:283}\src{README.md:123} \\
+\code{POST /v1/demo/transfer} & Admin & scripted demo prover path (holds fixture spend keys) \src{crates/node/src/auth.rs:290} \\
+\code{POST /v1/block/produce} & Admin & prove and seal the pending block \src{crates/node/src/auth.rs:285} \\
+\code{POST /v1/block/settle} & Admin & submit the settlement bundle to the chain \src{crates/node/src/auth.rs:287} \\
+\code{POST /v1/admin/rotate-key} & Admin & signing-key rotation \src{crates/node/src/auth.rs:292} \\
+\bottomrule
+\end{tabularx}
+\caption{Node endpoints and the minimum role each requires. A path not listed
+in the ACL is denied.}
+\label{tab:endpoints}
+\end{table}
+
+\subsection{Actors and trust boundaries}
+
+Table~\ref{tab:actors} enumerates the actors and what each is trusted to do.
+The settlement state machine treats the prover as untrusted and the injected
+verifier as correct: every state transition is gated on
+\code{IWhirVerifier.verify} \src{contracts/src/ShieldedPool.sol:52-55}\src{contracts/src/ShieldedPool.sol:145}.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}lXl@{}}
+\toprule
+\textbf{Actor} & \textbf{Capability / trust} & \textbf{Boundary} \\
+\midrule
+Wallet / note owner & Holds SPHINCS+ keys in a password-derived wasm vault; builds and signs transfers locally. Keys never leave the vault; the node sees only nullifiers, commitments, and a signature \src{README.md:52-55}\src{README.md:166-167} & wallet $\to$ node \\
+Submitter-token holder & May \code{POST /v1/transfer} a SPHINCS+ envelope \src{crates/node/src/auth.rs:283} & client $\to$ node \\
+Admin-token holder & Drives \code{/v1/block/produce}, \code{/v1/block/settle}, \code{/v1/demo/transfer}, \code{/v1/admin/rotate-key} \src{crates/node/src/auth.rs:285-292} & operator $\to$ node \\
+Sequencer / prover (node) & Untrusted for \emph{what} and \emph{when} it batches; cannot forge a block since every transition is proof-gated \src{contracts/src/ShieldedPool.sol:52-55} & node $\to$ L1 \\
+Settlement submitter (node) & Sends the proof bundle as an L1 transaction to \code{applyBlock} \src{README.md:126}\src{crates/node/src/auth.rs:287} & node $\to$ L1 \\
+L1 caller of \code{applyBlock} & Any externally owned account; the only gate is the proof check --- there is no access control \finding{H-01} \src{contracts/src/ShieldedPool.sol:144-145} & L1 $\to$ pool \\
+Deployer & Fixes the immutable verifier address, the fee recipient, and the genesis commitment and nullifier roots at construction \src{contracts/src/ShieldedPool.sol:123-136} & deploy-time \\
+Fee recipient & The sole address that may withdraw accumulated fees \src{contracts/src/ShieldedPool.sol:88-89}\src{contracts/src/ShieldedPool.sol:182-189} & pool $\to$ EOA \\
+\bottomrule
+\end{tabularx}
+\caption{Actors and trust boundaries.}
+\label{tab:actors}
+\end{table}
+
+\paragraph{Permissionless settlement.}
+\code{applyBlock} is declared \code{external} with no caller restriction: any
+account may submit a \code{(statement, proof)} pair, and the function proceeds
+on the verifier's boolean alone \src{contracts/src/ShieldedPool.sol:144-145}.
+The soundness of the system therefore rests entirely on what that verifier
+binds. The adequacy of that gate is examined in \finding{H-01}.
+
+\paragraph{Verifier bound to the proof bundle, not the circuit.}
+The injected verifier consumes a single caller-controlled bundle whose three
+sections are \code{CONFIG} (the batch framing prefix: seed, degree bits,
+preprocessed/verifying-key digest, grind difficulties, and each round's
+schedule), \code{PROOF}, and \code{STATEMENT}
+\src{contracts/src/verifier/WhirVerifier.sol:13-34}. The \code{CONFIG} section
+is read from that bundle as calldata; the contract itself does not pin it, the
+source comment only recommending that a deployment pin
+$\Hk(\code{configSection})$ \src{contracts/src/verifier/WhirVerifier.sol:21-24}\src{contracts/src/verifier/WhirVerifier.sol:209-231}.
+Because the circuit description the verifier replays is taken from the same
+bundle a caller supplies, the binding between the on-chain verifier and the
+honest block circuit is not established on-chain; this is examined in
+\finding{V-01}.
+
+\begin{specdelta}
+The security-model prose states that the chain trusts ``the operator set
+allowed to call \code{applyBlock}'' \src{README.md:160-162}. The deployed
+contract contains no such set: \code{applyBlock} carries no access-control
+modifier and no operator mapping, so settlement is permissionless in the code
+as written \src{contracts/src/ShieldedPool.sol:144} (cross-reference
+\finding{H-01}).
+\end{specdelta}

@@ -1,0 +1,485 @@
+\section{The block relation and statement fold}
+\label{sec:block}
+
+A block proof attests that $n \ge 1$ client-produced transfer proofs were each
+verified inside one recursion circuit, that their commitment-tree and
+nullifier-map transitions compose into a single chain, and that their full
+statements were absorbed into one Poseidon2 running digest. The block circuit is
+assembled per call by \code{build\_multi\_transfer\_circuit}
+\src{crates/prover/src/block.rs:416-615}; it carries the Poseidon2, recompose and
+statement tables only \src{crates/prover/src/block.rs:23-30} and is proven under
+the Keccak settlement configuration by \code{settle\_block\_circuit}
+\src{crates/prover/src/block.rs:769-811}. This section states the relation that
+construction enforces, the fold (D-089), the exported statement layout, and its
+decoding on L1. Field and limb notation follows Section~\ref{sec:primitives}; the
+per-transfer statement $x$ is the one of Section~\ref{subsec:transfer-stmt}.
+
+%---------------------------------------------------------------------------
+\subsection{Transfer shapes and statement projections}
+\label{subsec:block-shape}
+
+\begin{definition}[Transfer shape]
+\label{def:block-shape}
+A shape is a pair $s=(k,m)$ of input and output counts
+(\code{num\_nullifiers}, \code{num\_outputs}).
+\src{crates/prover/src/block.rs:170-176}
+With $\sigma(s) = k+m$, the implied statement length is
+\begin{equation}
+  \ell(s) \;=\; 16\,(\sigma(s)+4) + 4 ,
+  \label{eq:block-len}
+\end{equation}
+sixteen limbs per hash and four fee limbs (\code{LIMBS\_PER\_HASH}$=16$,
+\code{FEE\_LIMBS}$=4$).
+\src{crates/prover/src/block.rs:157-161,179-183}
+\end{definition}
+
+\begin{definition}[Statement projections]
+\label{def:block-proj}
+For a child statement $x \in \F^{\ell(s)}$ and $\sigma=\sigma(s)$, write
+$x[a,b)$ for the slice of limbs $a,\dots,b-1$. The block circuit reads exactly
+the following slices:
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l l l X@{}}
+\toprule
+Projection & Slice & Section~\ref{subsec:transfer-stmt} field & Source \\
+\midrule
+$\mathsf{rt}(x)$  & $x[16\sigma,\ 16\sigma+16)$    & $\limbs(rt)$                       & \code{root\_offset} \src{crates/prover/src/block.rs:185-189} \\
+$\mathsf{rt}'(x)$ & $x[16\sigma+16,\ 16\sigma+32)$ & $L(T_m)$                           & \code{root\_after\_offset} \src{crates/prover/src/block.rs:191-196} \\
+$\mathsf{nb}(x)$  & $x[16\sigma+32,\ 16\sigma+48)$ & $\limbs(R_{\mathsf{before}})$      & \code{nullifier\_before\_offset} \src{crates/prover/src/block.rs:198-202} \\
+$\mathsf{na}(x)$  & $x[16\sigma+48,\ 16\sigma+64)$ & $\limbs(R_{\mathsf{after}})$       & \code{nullifier\_after\_offset} \src{crates/prover/src/block.rs:204-208} \\
+$\varphi(x)$      & $x[16\sigma+64,\ 16\sigma+68)$ & $\varphi$                          & \code{fee\_offset} $=\ell(s)-4$ \src{crates/prover/src/block.rs:210-214} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+Each 16-limb slice is extracted bounds-checked, as an error rather than a panic
+or short read.
+\src{crates/prover/src/block.rs:635-650}
+\end{definition}
+
+Every offset in Def.~\ref{def:block-proj}, and $\ell(s)$ itself, is a function of
+$\sigma(s)=k+m$ only; the individual split $(k,m)$ enters the block relation
+solely through the exported header (Def.~\ref{def:block-stmt}).
+
+%---------------------------------------------------------------------------
+\subsection{Child objects and in-circuit verification}
+\label{subsec:block-child}
+
+\begin{definition}[Child]
+A child is a tuple $(V_c, \pi_c, x_c, s_c)$: a retained circuit verifier object
+$V_c$, a batch-STARK proof $\pi_c$, the statement $x_c \in \F^{*}$ it was proven
+against, and a shape $s_c$ (\code{ChildProof}). The verifier ``travels with the
+proof'' so that a block may mix transfer shapes.
+\src{crates/prover/src/block.rs:374-388}
+\end{definition}
+
+\paragraph{Build-time gates.}
+The following are checks that refuse to construct the circuit; they are not
+constraints of the relation.
+\begin{itemize}
+\item $n \ge 1$. \src{crates/prover/src/block.rs:420-422}
+\item $|x_c| = \ell(s_c)$ for every $c$. \src{crates/prover/src/block.rs:480-488}
+\item $V_c$ declares a statement-table instance.
+  \src{crates/prover/src/block.rs:490-494}
+\item $V_c$ natively accepts $(\pi_c, x_c)$: the trusted entry point calls
+  \code{verifier.verify(proof, statement)} before allocating any target.
+  \src{vendor/p3-recursion/recursion/src/verifier/batch\_stark.rs:761-763}
+\item The verified statement-target slice has length $|x_c|$.
+  \src{crates/prover/src/block.rs:524-531}
+\item Every header count fits a \code{u16}.
+  \src{crates/prover/src/block.rs:238-256}
+\end{itemize}
+
+\paragraph{In-circuit verification.}
+For each child, in order, the block calls
+\code{verify\_trusted\_p3\_batch\_proof\_circuit} with $V_c$, $\pi_c$, $x_c$, the
+inner WHIR PCS parameters and the \code{KOALA\_BEAR\_D4\_W16} challenger
+permutation.
+\src{crates/prover/src/block.rs:424-425,496-514}
+The verified relation (table AIRs, trace degree bits, per-table public values) is
+reconstructed from $V_c$, not from the proof's transport metadata.
+\src{vendor/p3-recursion/recursion/src/verifier/batch\_stark.rs:524-580}
+\src{vendor/p3-recursion/recursion/src/verifier/batch\_stark.rs:764}
+The call allocates, in this order: per-instance AIR public-value targets as
+circuit public-input slots, the proof targets, and the common-data targets, the
+latter including the child's preprocessed commitment as public-input cap entries.
+\src{vendor/p3-recursion/recursion/src/public\_inputs.rs:738-746}
+\src{vendor/p3-recursion/recursion/src/types/proof.rs:166-176}
+\src{vendor/p3-recursion/recursion/src/pcs/fri/targets.rs:1072-1080}
+The block packs the corresponding values in the same order (AIR public values,
+proof values, common data) and assigns them as the runner's public inputs.
+\src{vendor/p3-recursion/recursion/src/public\_inputs.rs:365-389}
+\src{crates/prover/src/block.rs:551-557,595-596}
+
+\begin{definition}[Verified statement targets]
+$\tau_c$ is the AIR public-value target slice of $V_c$'s statement-table instance,
+i.e.\ the targets the in-circuit verifier constrained against $\pi_c$; its witness
+values are $x_c$.
+\src{crates/prover/src/block.rs:516-523}
+\src{vendor/p3-recursion/circuit-prover/src/batch\_stark\_prover.rs:2783-2803}
+Every value the block derives from child $c$ (fold input, chain limbs, fees) is
+read from $\tau_c$. \src{crates/prover/src/block.rs:537-549}
+\end{definition}
+
+Each child's in-circuit verification instantiates a fresh circuit challenger and
+absorbs, in order: the batch-shape domain-separator seed, each instance's extended
+degree bits (as constants), the trace commitment, every instance's public values
+(including $\tau_c$), the child's preprocessed commitment if present, then the
+lookup challenges, permutation commitment, lookup terminals, $\alpha$, the
+quotient commitment, the randomization commitment, and $\zeta$.
+\src{vendor/p3-recursion/recursion/src/verifier/batch\_stark.rs:1204-1279}
+Each child carries its own private-data replay keyed on the op ids its
+verification allocated; the replays are applied per child and never merged.
+\src{crates/prover/src/block.rs:437-440,559-564,597-607}
+The remainder of the in-circuit verifier, and its soundness, is the subject of
+Section~6 (see also \finding{V-08}).
+
+\paragraph{Child verifying key.}
+The child's preprocessed-commitment targets are public-input slots filled from
+$V_c$'s common data \src{crates/prover/src/block.rs:551-556}. The WHIR backend
+provides a helper that constrains these targets to a fixed constant
+(\code{constrain\_trusted\_preprocessing})
+\src{vendor/p3-recursion/recursion/src/backend/whir.rs:1619-1640}, but
+\code{build\_multi\_transfer\_circuit} does not invoke it, and the settlement
+verifier assigns an empty public vector to every primitive table, checking only
+the statement table against the caller's statement.
+\src{vendor/p3-recursion/circuit-prover/src/batch\_stark\_prover.rs:2757-2803}
+The child preprocessed commitment is therefore a prover-assigned value bound only
+by in-circuit constraints, not pinned to a canonical transfer verifying key
+\finding{V-06}.
+
+%---------------------------------------------------------------------------
+\subsection{The block relation}
+\label{subsec:rblock}
+
+\begin{definition}[Header]
+For shapes $s_1,\dots,s_n$ with $s_c=(k_c,m_c)$,
+\[
+  \mathsf{Hdr}(s_1,\dots,s_n) \;=\; (n,\ k_1,\ m_1,\ \dots,\ k_n,\ m_n) \in \F^{1+2n},
+\]
+emitted by \code{shape\_header}; its width is \code{shape\_header\_len}$(n)=1+2n$.
+\src{crates/prover/src/block.rs:217-256}
+\end{definition}
+
+\begin{definition}[Block relation $R_{\mathsf{block}}$]
+\label{def:rblock}
+$R_{\mathsf{block}}$ is the set of pairs
+$\big(X;\ (V_c,\pi_c,x_c,s_c)_{c=1}^{n}\big)$ with $n\ge1$ such that
+\begin{align}
+  &\text{(B1)}\quad \mathsf{Verify}^{\mathrm{circ}}_{V_c}(\pi_c,\ \tau_c)
+     \ \text{holds, with } \tau_c = x_c, && c=1,\dots,n, \label{eq:b1}\\
+  &\text{(B2)}\quad \mathsf{rt}'(x_c) = \mathsf{rt}(x_{c+1}), && 1\le c<n, \label{eq:b2}\\
+  &\text{(B3)}\quad \mathsf{na}(x_c) = \mathsf{nb}(x_{c+1}), && 1\le c<n, \label{eq:b3}\\
+  &\text{(B4)}\quad \Sigma_0 = 0^8,\quad \Sigma_c = \Hp\big(\Sigma_{c-1}\,\|\,x_c\big), && c=1,\dots,n, \label{eq:b4}\\
+  &\text{(B5)}\quad X = \mathsf{Hdr}(s_1,\dots,s_n)\ \|\ L(\Sigma_n)\ \|\ \mathsf{rt}(x_1)\ \|\ \mathsf{rt}'(x_n)
+     \ \|\ \mathsf{nb}(x_1)\ \|\ \mathsf{na}(x_n) \nonumber\\
+  &\qquad\quad \|\ \varphi(x_1)\ \|\ \cdots\ \|\ \varphi(x_n). && \label{eq:b5}
+\end{align}
+\src{crates/prover/src/block.rs:479-590}
+\end{definition}
+
+\noindent
+(B1) is the in-circuit verifier of Section~\ref{subsec:block-child}
+\src{crates/prover/src/block.rs:496-514}.
+(B2) and (B3) are imposed by \code{CommitmentChain::advance} and
+\code{NullifierChain::advance}: the first child records its \emph{before} slice as
+the block endpoint; every later child's \emph{before} slice is constrained equal
+to the previous child's \emph{after} slice; the last \emph{after} slice is the
+other endpoint.
+\src{crates/prover/src/block.rs:669-705}
+\src{crates/prover/src/block.rs:718-753}
+Each slice equality is sixteen constraints $a_i - b_i = 0$ over $\K$
+(\code{sub} then \code{assert\_zero}), deliberately not \code{connect}, which
+aliases witness slots and would desynchronise the per-instance LogUp
+multiplicities of the statement tables.
+\src{crates/prover/src/block.rs:617-633}
+For $n=1$, (B2) and (B3) are empty. (B4) is Section~\ref{subsec:block-fold};
+(B5) is Section~\ref{subsec:block-stmt}.
+
+\begin{property}[Single transitions]
+\label{prop:block-chain}
+Under (B2), the commitment-tree transitions
+$\mathsf{rt}(x_c)\to\mathsf{rt}'(x_c)$ compose to one transition
+$\mathsf{rt}(x_1)\to\mathsf{rt}'(x_n)$ with every intermediate root equal to a
+predecessor's output; likewise (B3) composes the nullifier-map transitions to
+$\mathsf{nb}(x_1)\to\mathsf{na}(x_n)$. Order within the block is therefore part of
+the relation.
+\src{crates/prover/src/block.rs:60-90}
+\src{crates/prover/src/block.rs:574-587}
+\end{property}
+
+Whether each per-child edge is itself a valid tree or map transition is a
+property of the child's relation, which (B1) takes from $V_c$
+(Section~\ref{subsec:block-child}).
+
+%---------------------------------------------------------------------------
+\subsection{The statement fold (D-089)}
+\label{subsec:block-fold}
+
+\begin{definition}[Statement fold]
+\label{def:block-fold}
+With $\Hp$ the overwrite sponge over $\F^{*}$ (Def.~\ref{def:sponge}),
+\begin{align}
+  \Sigma_0 &= 0^8, \nonumber\\
+  \Sigma_c &= \Hp\big(\Sigma_{c-1}[0]\,\|\cdots\|\,\Sigma_{c-1}[7]\ \|\ x_c[0]\,\|\cdots\|\,x_c[|x_c|-1]\big),
+  \qquad c = 1,\dots,n, \label{eq:fold}
+\end{align}
+and $\mathsf{statementRoot} = L(\Sigma_n)$.
+\src{crates/prover/src/block.rs:273-290}
+\src{crates/prover/src/commitment\_gadget.rs:363-399}
+\end{definition}
+
+\paragraph{In-circuit form.}
+The running digest is held as two $\K$ expressions $(\Sigma^{\mathrm{lo}},\Sigma^{\mathrm{hi}})$
+and seeded with the constant pair $(0,0)$.
+\src{crates/prover/src/block.rs:447-452}
+\code{fold\_statement} decomposes each element to its four base coefficients by an
+ALU chain (lo first, then hi), appends the targets $\tau_c$, and absorbs the result
+with \code{p2\_sponge\_limbs}.
+\src{crates/prover/src/commitment\_gadget.rs:388-399}
+\src{crates/prover/src/block.rs:533-537}
+That gadget absorbs eight base elements per permutation row, packed four per $\K$
+lane; the first row starts a fresh chain; a short final chunk takes the missing
+lane coefficients from the previous row's output (overwrite mode); the output is
+the two rate lanes of the last row.
+\src{crates/prover/src/commitment\_gadget.rs:289-361}
+Since $\Sigma_{c-1}$ is exactly one rate block, each child costs
+$1+\lceil |x_c|/8 \rceil$ permutations ($14$ for $|x_c|=100$).
+\src{crates/prover/src/commitment\_gadget.rs:378-381}
+No domain tag and no length prefix is absorbed; the input length
+$8+\ell(s_c)$ of each fold step is fixed at build time by $s_c$.
+
+\paragraph{Native mirror.}
+\code{fold\_statement\_native} computes (\ref{eq:fold}) with
+\code{Poseidon2Commitment::hash\_elements}, which is the overwrite sponge over the
+element sequence.
+\src{crates/prover/src/block.rs:279-290}
+\src{crates/pq-hash/src/poseidon.rs:203-206}
+Agreement of the two chains, including a fold step that ends mid-chunk
+($8+68$ elements), is pinned by \code{fold\_statement\_matches\_native}.
+\src{crates/prover/src/commitment\_gadget.rs:792-847}
+The binding of $\Sigma_n$ to the absorbed $x_c$ inherits the properties of the
+in-circuit sponge gadget \finding{V-07}.
+
+\paragraph{Export.}
+$\Sigma_n$ is exported with \code{export\_digest\_limbs}: each of the eight base
+coefficients is bit-decomposed to $31$ bits and emitted as a low $16$-bit and a
+high $15$-bit limb, giving $L(\Sigma_n)$ (Def.~\ref{def:limbs} and the digest limb
+export of Section~\ref{subsec:digest-enc}).
+\src{crates/prover/src/commitment\_gadget.rs:401-431}
+\src{crates/prover/src/block.rs:567-573}
+The native encoder \code{digest\_to\_limbs} produces the same sixteen limbs from
+\code{elements\_to\_digest}$(\Sigma_n)$ by reading each little-endian \code{u32}
+word as (low $16$ bits, high $16$ bits).
+\src{crates/prover/src/block.rs:292-305}
+
+\paragraph{L1 consumer.}
+\code{BlockStatement.decode} reads $\mathsf{statementRoot}$ into the decoded
+block \src{contracts/src/BlockStatement.sol:93}; \code{ShieldedPool.applyBlock}
+reads only the four endpoint digests and \code{totalFee} from it, and the
+\code{BlockApplied} event does not carry it.
+\src{contracts/src/ShieldedPool.sol:144-179}
+The fold root therefore has no on-chain consumer \finding{L-04}.
+
+%---------------------------------------------------------------------------
+\subsection{Block statement layout}
+\label{subsec:block-stmt}
+
+\begin{definition}[Block statement]
+\label{def:block-stmt}
+The exported statement (B5) is the limb vector
+\begin{equation}
+  X \;=\; \big[\, n,\ (k_c, m_c)_{c=1}^{n},\ L(\Sigma_n),\ \mathsf{rt}(x_1),\
+  \mathsf{rt}'(x_n),\ \mathsf{nb}(x_1),\ \mathsf{na}(x_n),\ (\varphi(x_c))_{c=1}^{n} \,\big]
+  \label{eq:block-stmt}
+\end{equation}
+of length
+\begin{equation}
+  |X| \;=\; (1+2n) + 16 + 4\cdot 16 + 4n \;=\; 81 + 6n .
+\end{equation}
+\src{crates/prover/src/block.rs:265-271}
+\src{crates/prover/src/block.rs:456-477,567-590}
+\end{definition}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l l l X@{}}
+\toprule
+Field & Offset (0-based) & Len & Origin in circuit \\
+\midrule
+$n$ & $0$ & 1 & constant \src{crates/prover/src/block.rs:473-476} \\
+$k_c,\ m_c$ & $2c-1,\ 2c$ & 1, 1 & constants from $s_c$ \src{crates/prover/src/block.rs:467-476} \\
+$L(\Sigma_n)$ & $1+2n$ & 16 & fold export \src{crates/prover/src/block.rs:571-573} \\
+$\mathsf{rt}(x_1)$ & $17+2n$ & 16 & $\tau_1$ slice, commitment chain start \src{crates/prover/src/block.rs:579-586} \\
+$\mathsf{rt}'(x_n)$ & $33+2n$ & 16 & $\tau_n$ slice, commitment chain end \\
+$\mathsf{nb}(x_1)$ & $49+2n$ & 16 & $\tau_1$ slice, nullifier chain start \src{crates/prover/src/block.rs:582-586} \\
+$\mathsf{na}(x_n)$ & $65+2n$ & 16 & $\tau_n$ slice, nullifier chain end \\
+$\varphi(x_c)$ & $81+2n+4(c-1)$ & 4 & $\tau_c$ fee slice, child order \src{crates/prover/src/block.rs:539-544,588-589} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Every entry is a \code{StatementExport::Base}; the export list is fixed by
+\code{set\_statement\_exports} and its width is asserted (debug) to equal
+\code{block\_statement\_len}$(n)$.
+\src{crates/prover/src/block.rs:590-592}
+The header limbs are created with \code{define\_const}, so they are entries of the
+block circuit's constant table rather than prover-supplied values, and are not
+placed in the public-input vector.
+\src{crates/prover/src/block.rs:456-476}
+The native reconstruction \code{block\_statement} (used by the node driver, the
+vector generators and tests) emits the same layout from the same
+\code{shape\_header} function, after checking $|x_c| = \ell(s_c)$ and that the
+shape and statement counts agree.
+\src{crates/prover/src/block.rs:307-372}
+
+\paragraph{Header binding.}
+The values $(k_c,m_c)$ are taken from the client-supplied shapes
+\src{crates/prover/src/block.rs:467}. The only check relating a shape to its child
+is $|x_c|=\ell(s_c)$ \src{crates/prover/src/block.rs:480-488}, and by
+(\ref{eq:block-len}) and Def.~\ref{def:block-proj} both that check and every
+projection (B2)--(B5) consume depend on $k_c+m_c$ alone. The individual split in
+the header is therefore bound to the child only through its sum
+\finding{L-05}.
+
+%---------------------------------------------------------------------------
+\subsection{L1 decoding: \code{LimbCodec} and \code{BlockStatement}}
+\label{subsec:block-l1}
+
+\begin{definition}[Digest from limbs]
+\label{def:digest-from-limbs}
+For a statement array $S$ and offset $o$, \code{digestFromLimbs}$(S,o)$ requires
+$|S| \ge o+16$ and $S[o+i] \le \code{0xffff}$ for $i=0,\dots,15$, else reverts.
+With $l_i = S[o+i]$ it sets bytes
+$\beta_{2i} = l_i \bmod 2^8$ and $\beta_{2i+1} = \lfloor l_i/2^8 \rfloor$ and returns
+\[
+  D \;=\; \sum_{j=0}^{31} \beta_j \, 2^{8(31-j)} \quad(\code{bytes32}),
+\]
+i.e.\ $\beta_0$ is the most significant byte.
+\src{contracts/src/LimbCodec.sol:16-46}
+\end{definition}
+
+\begin{property}[Round trip with the prover encoding]
+For a digest $d\in\F^8$ with canonical words $w_i<2^{31}$, the byte string
+$\beta_0\cdots\beta_{31}$ that \code{digestFromLimbs} assigns to $L(d)$ is
+$\code{elements\_to\_digest}(d)=\mathrm{LE32}(w_0)\|\cdots\|\mathrm{LE32}(w_7)$:
+limb $2i$ of $L(d)$ is $w_i \bmod 2^{16}$, whose two bytes are bytes $4i,4i+1$ of
+$\mathrm{LE32}(w_i)$, and limb $2i+1$ is $\lfloor w_i/2^{16}\rfloor$, whose two
+bytes are bytes $4i+2,4i+3$. Equivalently $D$ is the inverse of $\limbs$
+(Def.~\ref{def:limbs}) on $32$-byte strings, read big-endian.
+\src{contracts/src/LimbCodec.sol:22-31}
+\src{crates/pq-hash/src/poseidon.rs:157-163}
+\src{crates/prover/src/block.rs:292-305}
+\end{property}
+
+\begin{definition}[Value from limbs]
+\code{u64FromLimbs}$(S,o)$ requires $|S|\ge o+4$ and $S[o+i]\le\code{0xffff}$ for
+$i=0,\dots,3$, else reverts, and returns
+$v = \sum_{i=0}^{3} S[o+i]\,2^{16i} \le 2^{64}-1$ as \code{uint64}.
+\src{contracts/src/LimbCodec.sol:48-64}
+\end{definition}
+
+\begin{specdelta}[Top fee limb width]
+The \code{u64FromLimbs} documentation states that the top limb holds $14$ bits and
+the range is $2^{62}$ \src{contracts/src/LimbCodec.sol:50-51}; the code bounds every
+limb, including the top one, only by \code{0xffff}. The $14$-bit top-limb bound is
+enforced inside the transfer relation's amount range checks
+\src{crates/prover/src/transfer.rs:117-123,155-166}, so on L1 it holds only to the
+extent that (B1) verifies that relation (Section~\ref{subsec:block-child}).
+\end{specdelta}
+
+\begin{definition}[Block decoding]
+\label{def:block-decode}
+\code{BlockStatement.decode}$(S)$ performs no cryptographic check (the caller must
+already have verified the proof against $S$) and evaluates, in order:
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}r X l@{}}
+\toprule
+\# & Step & Source \\
+\midrule
+1 & require $|S|\ge 1$; $n := S[0]$; require $1 \le n \le 2^{16}-1$ & \src{BlockStatement.sol:80-83} \\
+2 & $\mathit{cur} := 1+2n$ (header counts skipped) & \src{BlockStatement.sol:85-89} \\
+3 & require $|S| = \code{expectedLen}(n) = 1+2n+5\cdot16+4n = 81+6n$ & \src{BlockStatement.sol:63-72,90} \\
+4 & \code{statementRoot}, \code{rootBefore}, \code{rootAfter},
+    \code{nullifierBefore}, \code{nullifierAfter} $:=$ \code{digestFromLimbs} at
+    $\mathit{cur}, \mathit{cur}+16, \dots, \mathit{cur}+64$ & \src{BlockStatement.sol:92-102} \\
+5 & $\code{totalFee} := \sum_{c=1}^{n} \code{u64FromLimbs}(S,\ 81+2n+4(c-1))$ (\code{uint256}) & \src{BlockStatement.sol:104-107} \\
+6 & require $\mathit{cur} = |S|$ & \src{BlockStatement.sol:108-111} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+\src{contracts/src/BlockStatement.sol:74-112}
+\end{definition}
+
+\code{ShieldedPool.applyBlock} verifies the proof against $S$ before calling
+\code{decode}, then requires $\code{rootBefore}=\code{currentRoot}$ and
+$\code{nullifierBefore}=\code{currentNullifierRoot}$ before storing
+\code{rootAfter} and \code{nullifierAfter}.
+\src{contracts/src/ShieldedPool.sol:144-166}
+The verifier's binding of $S$ to the proof, including how limb values are compared
+to the proof's statement words, is specified in Section~7.
+
+\begin{specdelta}[Header split is not read on L1]
+Comments state that the contract ``re-derives the same split from the statement's
+own length'' \src{crates/prover/src/block.rs:463-466} and ``reads the split from
+the proof'' \src{contracts/src/BlockStatement.sol:26-29}. The enforced behaviour
+is that \code{decode} reads only $n=S[0]$, skips $S[1..2n]$ without inspecting
+them, and constrains the statement only through $|S| = 81+6n$, which is
+independent of every $(k_c,m_c)$.
+\src{contracts/src/BlockStatement.sol:85-90}
+Together with the in-circuit header binding of Section~\ref{subsec:block-stmt}, the split
+is checked only by its sum \finding{L-05}.
+\end{specdelta}
+
+%---------------------------------------------------------------------------
+\subsection{Construction order}
+\label{subsec:block-order}
+
+\code{build\_multi\_transfer\_circuit} emits the circuit in one linear pass:
+\begin{enumerate}
+\item Prepare the WHIR recursion backend (\code{WhirRecursionBackend<16,8>},
+  extension degree $4$) on a fresh builder.
+  \src{crates/prover/src/block.rs:424-432}
+\item Define the constant $0$ seed of the fold; export the $1+2n$ header
+  constants. \src{crates/prover/src/block.rs:451-477}
+\item For $c=1,\dots,n$: length gate; in-circuit verification of $\pi_c$ under
+  $V_c$ (B1); fold $\tau_c$ into $\Sigma$ (B4); collect $\varphi(\tau_c)$; advance
+  the commitment chain (B2) and the nullifier chain (B3); pack public and private
+  values; record the replay.
+  \src{crates/prover/src/block.rs:479-565}
+\item Export $L(\Sigma_n)$, the four chain endpoints, and the fees; fix the export
+  schema; build. \src{crates/prover/src/block.rs:567-593}
+\item Run the witness: set public inputs, set private inputs, apply each child's
+  private-data replay, generate traces.
+  \src{crates/prover/src/block.rs:595-614}
+\end{enumerate}
+\code{settle\_block\_circuit} then proves the resulting circuit under
+\code{crate::whir::config(BLOCK\_CAP\_HEIGHT, log\_max\_lde)} with
+$\code{BLOCK\_CAP\_HEIGHT}=0$, registering the shared Poseidon2, recompose and
+statement tables (the latter from the circuit's export schema) and returning the
+proof together with the settlement verifier.
+\src{crates/prover/src/block.rs:769-811}
+\src{crates/prover/src/block.rs:155}
+The driver value $\code{BLOCK\_LOG\_MAX\_LDE}=25$ is documented as measured for
+fan-in $2$; fan-in $1$ settles at $24$.
+\src{crates/prover/src/block.rs:115-138}
+
+%---------------------------------------------------------------------------
+\subsection{Scope of the relation}
+
+Stated neutrally; impact is assessed in the findings report.
+\begin{itemize}
+\item The relation each child is verified against is the one carried by $V_c$;
+  the child's preprocessed commitment is not constrained to a fixed value
+  \finding{V-06}.
+\item The header counts $(k_c,m_c)$ are bound to the children only through
+  $k_c+m_c$, in circuit and on L1 \finding{L-05}.
+\item $L(\Sigma_n)$ is exported and decoded but has no L1 consumer
+  \finding{L-04}.
+\item Native verification of each child, the length gates and the shape/statement
+  agreement are build-time checks of the honest builder, not constraints.
+\item Per-child tree/map validity, fee range, and value conservation are
+  properties of the child relation (Section~\ref{sec:transfer}) and reach the block only
+  through (B1).
+\end{itemize}

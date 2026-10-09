@@ -1,0 +1,334 @@
+\section{Cryptographic primitives and encodings}
+\label{sec:primitives}
+
+This section states the field and extension arithmetic, the Poseidon2 commitment
+hashes, the byte/limb/digest encodings, the shielded-layer hashes, and the Keccak
+Fiat--Shamir transcript \emph{as the deployed code computes them}. Where a source
+comment and the code's own behaviour test disagree, the tested behaviour is taken
+as the specification and the discrepancy is recorded as a spec delta.
+
+\subsection{Base field}
+
+\begin{definition}[KoalaBear prime]
+The base field is $\F$ with
+\[
+  p \;=\; 2^{31} - 2^{24} + 1 \;=\; \code{0x7f000001} \;=\; 2130706433 .
+\]
+\src{contracts/lib/sol-whir-p3/field/KoalaBear.sol:5}
+The Rust commitment layer pins the same value as \code{KOALABEAR\_P\_U32 = 0x7F00\_0001}.
+\src{crates/pq-hash/src/poseidon.rs:79}
+\end{definition}
+
+The Solidity field library treats its two additive operations as acting on
+\emph{canonical} representatives in $[0,p)$ and does not re-reduce arbitrary
+accumulators \src{contracts/lib/sol-whir-p3/field/KoalaBear.sol:8-9}:
+\begin{align}
+  \code{add}(a,b) &= \begin{cases} a+b-p & a+b \ge p\\ a+b & \text{otherwise}\end{cases}
+  & &\src{KoalaBear.sol:10-15}\\
+  \code{sub}(a,b) &= \begin{cases} a-b & a \ge b\\ a+p-b & \text{otherwise}\end{cases}
+  & &\src{KoalaBear.sol:19-23}\\
+  \code{mul}(a,b) &= a\cdot b \bmod p \quad(\code{mulmod}) & &\src{KoalaBear.sol:25-27}
+\end{align}
+Multiplication uses the EVM \code{mulmod} and is therefore total; \code{inv}(a)=a^{p-2}
+via square-and-multiply, reverting on $a \equiv 0$.
+\src{KoalaBear.sol:29-47}
+
+\subsection{Quartic extension}
+
+\begin{definition}[Extension field]
+The extension is
+\[
+  \K \;=\; \F[X]/(X^4 - W), \qquad W = 3 ,
+\]
+so the reduction relation is $X^4 = W = 3$.
+\src{contracts/lib/sol-whir-p3/field/KoalaBear.sol:6}
+\src{contracts/lib/sol-whir-p3/field/KoalaBearExt4.sol:6-7}
+\end{definition}
+
+An element $a = c_0 + c_1 X + c_2 X^2 + c_3 X^3 \in \K$ with canonical coefficients
+$c_i \in [0,p)$ is \emph{packed} into a single 256-bit word in the top four 32-bit
+lanes, the low 128 bits being unused padding:
+\[
+  \code{pack}(a) \;=\; (c_0 \ll 224)\ \big|\ (c_1 \ll 192)\ \big|\ (c_2 \ll 160)\ \big|\ (c_3 \ll 128).
+\]
+\src{KoalaBearExt4.sol:19-31}
+The multiplicative identity is \code{ONE} $= 1 \ll 224$ (i.e.\ $c_0=1$), and
+\code{unpack} masks each lane with \code{COEFF\_MASK} $=\code{0xffffffff}$.
+\src{KoalaBearExt4.sol:12,8,26-31}
+
+Extension multiplication is the negacyclic-style convolution under $X^4=W$, each
+output lane reduced once mod $p$:
+\begin{align}
+  c_0 &= a_0 b_0 + W\,(a_1 b_3 + a_2 b_2 + a_3 b_1)\\
+  c_1 &= a_0 b_1 + a_1 b_0 + W\,(a_2 b_3 + a_3 b_2)\\
+  c_2 &= a_0 b_2 + a_1 b_1 + a_2 b_0 + W\,(a_3 b_3)\\
+  c_3 &= a_0 b_3 + a_1 b_2 + a_2 b_1 + a_3 b_0
+\end{align}
+\src{KoalaBearExt4.sol:365-388}
+Two further constants support inversion and extrapolation: the $d$-th-root used by
+the Frobenius map, \code{DTH\_ROOT} $= 2113994754$, and \code{INV\_TWO} $= 1065353217$.
+\src{KoalaBearExt4.sol:14-15}
+Inversion computes the norm via the conjugate product and multiplies by the base
+inverse of the norm.
+\src{KoalaBearExt4.sol:96-109}
+
+\begin{property}[Packed addition/subtraction assume canonical lanes]
+\label{prop:ext-lanes}
+\code{KoalaBearExt4.add} performs a single 256-bit \code{add} of the two packed
+words and then extracts and reduces each lane; it is correct only when every lane
+sum stays below $2^{32}$, which the code documents as the canonical-input bound
+``each lane sum $\in [0,2M-2]$''. \code{sub} adds a per-lane bias $p$ before
+subtracting under the same assumption.
+\src{KoalaBearExt4.sol:33-72}
+Proof-carried extension elements consumed by this arithmetic are not uniformly
+range-checked to canonical per-lane form, and the transcript absorb path reduces
+each limb modulo $p$ (\code{observeExt4Mont}, \src{KeccakChallenger.sol:154-179})
+whereas these packed \code{add}/\code{sub} routines propagate a carry across the
+32-bit lane boundary on non-canonical input; see \finding{M-04}.
+\end{property}
+
+\subsection{Montgomery encoding on the wire}
+
+Observed base words travel in Montgomery form while sampled challenges are raw
+canonical values.
+\begin{definition}[Montgomery map]
+\[
+  \code{mont}(v) \;=\; v \cdot R \bmod p, \qquad R = 2^{32} \bmod p = 33554430 = \code{0x01fffffe}.
+\]
+\src{contracts/src/verifier/WhirVerifier.sol:442-444}
+\src{contracts/lib/sol-whir-p3/transcript/KeccakChallenger.sol:160}
+\end{definition}
+The verifier checks a public statement coefficient against its wire word by
+comparing $\code{mont}(\text{statement}_i)$ to the byte-swapped blob word.
+\src{WhirVerifier.sol:436}
+The transcript's \code{observeExt4Mont} absorbs a packed $\K$ element as four
+words $\code{mont}(c_i)$ in little-endian byte order.
+\src{KeccakChallenger.sol:154-179}
+
+\subsection{The Poseidon2 permutation}
+
+\begin{definition}[Permutation]
+$\pi$ is \code{Poseidon2KoalaBear<16>}: the Plonky3 default KoalaBear Poseidon2
+over $\F$ with width $\code{WIDTH}=16$, $x^3$ S-box, and the audited Plonky3
+constant set (\code{default\_koalabear\_poseidon2\_16}). The sponge rate is
+$\code{RATE}=8$ and a digest is $\code{DIGEST\_ELEMS}=8$ field elements.
+\src{crates/pq-hash/src/poseidon.rs:46-88}
+\end{definition}
+
+Three hash functions are built from $\pi$ and are byte-for-byte the WHIR MMCS leaf
+and node hashes.
+\src{poseidon.rs:3-40,56-66}
+
+\begin{definition}[Overwrite sponge $\Hp$]
+\label{def:sponge}
+For input $x=(x_0,\dots,x_{n-1}) \in \F^{*}$, initialise $s := 0^{16}$. For each
+successive chunk $c$ of $x$ of length up to \code{RATE} $=8$ (the final chunk may be
+shorter), set $s[0..|c|) := c$ and then $s := \pi(s)$; output the first $8$ state
+elements. This is \code{PaddingFreeSponge<\_,16,8,8>} in overwrite mode.
+\src{poseidon.rs:60-62,196-206}
+\end{definition}
+
+\begin{specdelta}[Short final chunk is overwrite-only, not zero-padded]
+\label{delta:overwrite}
+The module documentation states a ``zero-padded final chunk''
+\src{poseidon.rs:33,197}, but the enforced behaviour, pinned by the behaviour test,
+is pure overwrite: a short final chunk overwrites only the positions it fills and
+leaves the remaining rate lanes at the value the previous permutation left --- the
+sponge does \emph{not} zero the tail.
+\src{poseidon.rs:319-328}
+An empty input performs no permutation at all, so $\Hp(\varepsilon)=0^8$ and the
+byte hash of the empty string is the all-zero digest.
+\src{poseidon.rs:332-338}
+\end{specdelta}
+
+\begin{definition}[Compression $\Cp$]
+For two digests $l,r$, $\Cp(l,r) = \pi(l \,\|\, r)[0..8)$: one permutation of the
+16-element state $l\|r$, output the first $8$ elements. This is
+\code{TruncatedPermutation<\_,2,8,16>} and is not symmetric
+($\Cp(l,r) \ne \Cp(r,l)$ in general).
+\src{poseidon.rs:64-66,208-216,289-307}
+The children here are decoded by the \emph{lenient} word decoder
+(\S\ref{subsec:digest-enc}), so $\Cp$ is a total function of its byte inputs: a
+non-canonical child word is reduced mod $p$ rather than rejected.
+\src{poseidon.rs:124-133,212-216}
+\end{definition}
+
+\begin{definition}[Byte hash $\Hp(\cdot)$]
+For a list of byte parts, concatenate them, require an even total length, split into
+16-bit limbs (Def.~\ref{def:limbs}), sponge-absorb, and encode the $8$-element
+output as a digest:
+\[
+  \Hp(\mathit{parts}) \;=\; \code{elements\_to\_digest}\big(\Hp(\limbs(\mathrm{concat}\ \mathit{parts}))\big).
+\]
+Concatenating first means a part boundary never straddles a limb.
+\src{poseidon.rs:226-238,341-350}
+\end{definition}
+
+Two pinned known-answer anchors fix the construction:
+\begin{Verbatim}[fontsize=\small]
+H(b"pq-rollup/note-commit/v1")
+  = d806ed0043c329383dab56651706f32567961328cd3099435d362d5fc60b7c53
+C(0^256, 0^256)
+  = 44917757aa9a1104a1ad4b7cbe60fe659316d4334d2ca2295e2525771877632b
+\end{Verbatim}
+\src{poseidon.rs:361-374}
+
+\subsection{Byte, limb and digest encodings}
+\label{subsec:digest-enc}
+
+\begin{definition}[Little-endian 16-bit limbs]
+\label{def:limbs}
+For an even-length byte string $b$, the limb encoding emits one field element per
+pair of bytes:
+\[
+  \limbs(b)_i \;=\; b_{2i} + 2^8\, b_{2i+1} \in \F .
+\]
+Odd length is a programmer error (panics). This is the \code{p3\_circuit}
+\code{bytes\_to\_limbs} convention the circuit mirrors.
+\src{poseidon.rs:90-111,30-34}
+\end{definition}
+
+\begin{definition}[Digest serialization]
+A digest $d=(d_0,\dots,d_7)\in\F^8$ serializes to the $32$-byte string
+$\mathrm{LE32}(d_0)\,\|\cdots\|\,\mathrm{LE32}(d_7)$; \code{elements\_to\_digest}
+emits each element's canonical \code{u32} little-endian, and the \code{Digest32}
+newtype carries these $32$ bytes on the wire.
+\src{poseidon.rs:155-163}
+\src{crates/pq-hash/src/digest.rs:10-32}
+\end{definition}
+
+Two decoders read a digest back to field elements, differing at trust boundaries:
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}l l X@{}}
+\toprule
+Decoder & Non-canonical word ($\ge p$) & Use \\
+\midrule
+\code{decode\_words} (lenient)      & reduced mod $p$ via \code{Field::new} & inside $\Cp$; total function \\
+\code{digest\_to\_elements} (strict)& returns \code{None} (rejected)        & wire trust boundary, anti-malleation \\
+\bottomrule
+\end{tabularx}
+\end{center}
+\src{poseidon.rs:124-153,275-286}
+The strict decoder rejects any 4-byte word $\ge \code{KOALABEAR\_P\_U32}$; a test
+pins that $p$, $p{+}1$, and \code{u32::MAX} are all rejected rather than silently
+reduced.
+\src{poseidon.rs:142-153,274-286}
+
+\begin{definition}[Digest limb export $L(d)$]
+For the in-circuit mirror, each digest element $d_i$ with canonical value
+$w_i < 2^{31}$ is split into a low and a high limb,
+\[
+  L(d) \;=\; \big(\,w_0 \bmod 2^{16},\ \lfloor w_0/2^{16}\rfloor,\ \dots,\ w_7 \bmod 2^{16},\ \lfloor w_7/2^{16}\rfloor\,\big),
+\]
+i.e.\ per base coefficient the low $16$ bits then the high $15$ bits --- the
+little-endian 16-bit limbs of the digest's 32 bytes, $16$ limbs in all.
+\src{crates/prover/src/block.rs:292-305}
+\src{crates/prover/src/commitment_gadget.rs:401-406}
+A coefficient's 31-bit decomposition admits one non-canonical witness per element;
+the limbs are pinned against the contract's stored root bytes, which fixes the
+canonical value.
+\src{crates/prover/src/commitment_gadget.rs:408-412}
+\end{definition}
+
+\subsection{Shielded-layer hashes}
+
+The shielded layer defines two domain-separated keyed hashes over 32-byte digests.
+
+\begin{definition}[SHA3-256 shielded hash]
+\[
+  \code{hash\_to\_digest}(\mathit{dom},\mathit{parts}) = \mathrm{SHA3\text{-}256}\Big(\mathrm{LE64}(|\mathit{dom}|)\,\|\,\mathit{dom}\,\big\|\!\!\!\prod_{p_i \in \mathit{parts}}\!\!\mathrm{LE64}(|p_i|)\,\|\,p_i\Big).
+\]
+Every length prefix is a little-endian \code{u64}, making the framing unambiguous
+($(\code{ab},\code{c}) \ne (\code{a},\code{bc})$).
+\src{crates/pq-hash/src/shielded.rs:13-34,57-70}
+\end{definition}
+
+\begin{definition}[Poseidon2 shielded hash]
+\[
+  \code{hash\_to\_digest}(\mathit{dom},\mathit{parts}) = \Hp\big(\mathit{dom} \,\|\, p_1 \,\|\, p_2 \,\|\cdots\big),
+\]
+i.e.\ the domain tag is prepended as an extra part and the whole is run through the
+commitment byte hash $\Hp$ of Def.~\ref{def:sponge}, with \emph{no} length prefixes
+(every consensus preimage here has fixed-length parts).
+\src{crates/pq-hash/src/shielded.rs:73-105}
+This trades SHA3's margin for the Poseidon2 sponge collision bound, a documented
+operator decision.
+\src{crates/pq-hash/src/shielded.rs:80-86}
+\end{definition}
+
+\subsection{Keccak Fiat--Shamir transcript}
+
+The settlement verifier replays the WHIR transcript natively with a
+\code{HashChallenger}-style Keccak sponge. Its state is
+$(\code{inputBuffer}, \code{inputLen}, \code{outputBlock}, \code{outputIndex})$.
+\src{contracts/lib/sol-whir-p3/transcript/KeccakChallenger.sol:10-15}
+A \emph{flush} hashes the whole input buffer with \code{keccak256}, stores the
+32-byte digest as both the appended input and the \code{outputBlock}, and sets
+\code{outputIndex} $= 32$; subsequent input chains on top of that digest.
+\src{KeccakChallenger.sol:1215-1231}
+
+\begin{definition}[Observe]
+Appending any bytes first clears the squeeze cursor (\code{outputIndex := 0}), so a
+sample after an observe re-flushes rather than resuming a stale block.
+\code{observeBase} range-checks $v<p$ and appends the four bytes of $v$
+little-endian; \code{observeBytes} appends raw bytes.
+\src{KeccakChallenger.sol:17-41,1277-1290}
+\end{definition}
+
+\begin{definition}[Sample]
+\code{\_sampleUint32} flushes if the cursor is empty and then consumes four bytes
+from the current 32-byte \code{outputBlock}, reading from the \emph{end} of the
+block: the first byte returned is \code{digest[31]}, then \code{digest[30]}, and so
+on (the low byte of the squeezed \code{uint32} is the lowest-addressed byte).
+\src{KeccakChallenger.sol:1233-1243,1093-1116}
+The derived samplers are:
+\end{definition}
+
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}l X l@{}}
+\toprule
+Operation & Enforced behaviour & Source \\
+\midrule
+\code{sampleByte} / \code{sampleBytes}
+  & one byte (then $-1$ to cursor) / loop; same end-of-block order
+  & \src{KeccakChallenger.sol:1105-1124} \\
+\code{sampleBase}
+  & reject-sample $\code{\_sampleUint32} \,\&\, \code{0x7fffffff}$ until $< p$
+  & \src{KeccakChallenger.sol:1126-1135} \\
+\code{sampleBits}($b$)
+  & require $2^{b} \le p$, return low $b$ bits of \code{\_sampleUint32}
+  & \src{KeccakChallenger.sol:1137-1154} \\
+\code{sampleExt4/5/8Coeffs}
+  & $4/5/8$ independent \code{sampleBase} draws (canonical $\K$ coeffs)
+  & \src{KeccakChallenger.sol:1156-1178} \\
+\code{checkWitness}($b$,$w$) (grind)
+  & $b{=}0 \Rightarrow$ accept; else \code{sampleByte} (flush), \code{observeBase}($w$), require \code{sampleBits}($b$)$=0$
+  & \src{KeccakChallenger.sol:1192-1206} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+The sample mask is $\code{KOALABEAR\_SAMPLE\_MASK}=\code{0x7fffffff}$ (31 bits), so
+each \code{sampleBase} draw is a 31-bit value retried until it falls below $p$.
+\src{KeccakChallenger.sol:6,1126-1135}
+In the grinding check the leading \code{sampleByte} is load-bearing: it flushes the
+accumulated observations into a digest before the witness is appended, so the
+proof-of-work bits are measured over the correct chaining digest.
+\src{KeccakChallenger.sol:1179-1206}
+
+\begin{specdelta}[Vendored challenger patches re-applied]
+The transcript diverges from upstream \code{sol-whir-p3} by two correctness
+patches that must survive any refresh: \code{sampleByte}/\code{sampleBytes} are
+added for byte-level replay (end-of-block order, matching p3's pop-from-end), and
+two existing functions are fixed --- \code{observeBase} now clears
+\code{outputIndex} (so an observe-after-sample no longer desynchronises later
+samples) and \code{checkWitness} now performs the discarded squeeze before
+absorbing the witness. A 3{,}551-operation recorded transcript (224 field samples,
+779 bit draws, 23 proof-of-work checks) pins the result.
+\src{contracts/lib/sol-whir-p3/PATCHES.md:1-89}
+\end{specdelta}
+
+Observed samples are canonical field values whereas observed field \emph{inputs}
+are Montgomery wire bytes; both forms are intentional and are what a faithful
+verifier must reproduce.
+\src{contracts/lib/sol-whir-p3/PATCHES.md:83-89}

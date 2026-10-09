@@ -1,0 +1,450 @@
+\section{The transfer relation}
+\label{sec:transfer}
+
+This section states the relation $R_{\mathsf{transfer}}$ that the client
+transfer circuit enforces for one shielded transfer with $k$ inputs (spends) and
+$m$ outputs. The whole relation is laid into a builder by
+\code{constrain\_transfer} \src{crates/prover/src/transfer.rs:358-537}; the
+stand-alone client circuit wraps it with the Poseidon2 permutation and
+recompose tables enabled, exports the returned expressions as the statement,
+and witnesses it \src{crates/prover/src/transfer.rs:645-701}. The block circuit
+reuses the same function unchanged inside a larger builder
+\src{crates/prover/src/transfer.rs:328-334}. Everything below is read from the
+constraints the code emits; the module-level description of the relation
+\src{crates/prover/src/transfer.rs:1-62} is used only where the code agrees
+with it. Hash and encoding notation ($\Hp$, $\Cp$, $\limbs$, $L$) is that of
+\S\ref{sec:primitives}.
+
+\subsection{Shape parameters and domain tags}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l l X@{}}
+\toprule
+Constant & Value & Role and source \\
+\midrule
+\code{VALUE\_LIMBS}  & $4$  & 16-bit limbs per amount \src{crates/prover/src/transfer.rs:113} \\
+\code{LIMB\_BITS}    & $16$ & range of a secret limb and of amount limbs $0..2$ \src{crates/prover/src/transfer.rs:116} \\
+\code{TOP\_LIMB\_BITS} & $14$ & range of amount limb $3$, so an amount lies in $[0,2^{62})$ \src{crates/prover/src/transfer.rs:123} \\
+\code{CARRY\_BITS}   & $8$  & range of an interior balance carry \src{crates/prover/src/transfer.rs:135} \\
+\code{MAX\_PARTIES}  & $16$ & cap on $\max(k,m+1)$ \src{crates/prover/src/transfer.rs:141} \\
+\code{DEPTH}         & $32$ & commitment-tree depth (frontier slots per append) \src{crates/shielded/src/tree.rs:39} \\
+\code{NULLIFIER\_TREE\_DEPTH} & $96$ & nullifier-map depth (address bits) \src{crates/shielded/src/nullifier\_tree.rs:64} \\
+\code{FOLD\_DEPTH}   & $32$ & levels covered by the absence fold \src{crates/prover/src/nullifier\_gadget.rs:71} \\
+\code{FOLD\_START}   & $96-32=64$ & height at which the absence fold starts \src{crates/prover/src/nullifier\_gadget.rs:74} \\
+\code{ADDR\_LIMBS}   & $96/16=6$ & digest limbs the address bits are read from \src{crates/prover/src/nullifier\_gadget.rs:78} \\
+\code{DIGEST\_EXT}   & $2$  & a digest is two $\K$ elements (8 base coefficients) \src{crates/prover/src/commitment\_gadget.rs:72} \\
+\code{DIGEST\_LIMBS} & $16$ & wire limbs per digest \src{crates/prover/src/commitment\_gadget.rs:82} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+The native amount domain matches the circuit range: $\code{MAX\_VALUE}=2^{62}-1$
+\src{crates/shielded/src/transfer.rs:45}, checked at compile time against
+$2^{62}$ \src{crates/prover/src/transfer.rs:125}.
+
+\begin{center}
+\small
+\begin{tabular}{@{}l l c c@{}}
+\toprule
+Symbol & Byte string & Bytes & Limbs \\
+\midrule
+$D_{\mathsf{PK}}$   & \code{pq-rollup/spendpk/v1}     & 20 & 10 \\
+$D_{\mathsf{NOTE}}$ & \code{pq-rollup/note-commit/v1} & 24 & 12 \\
+$D_{\mathsf{NF}}$   & \code{pq-rollup/nullifier/v1}   & 22 & 11 \\
+\bottomrule
+\end{tabular}
+\end{center}
+\src{crates/shielded/src/keys.rs:29}\src{crates/shielded/src/note.rs:38,41}
+Each tag enters the circuit as the constant limb vector $\limbs(D)$
+(\code{const\_limbs}) \src{crates/prover/src/transfer.rs:234-239}.
+
+\subsection{In-circuit gadgets}
+
+All circuit values are elements of $\K$ (the builder is
+\code{CircuitBuilder<Challenge>}). A digest is carried as a pair in $\K^2$.
+
+\begin{definition}[Digest constants]
+For a 32-byte digest $d$, $\langle d\rangle\in\K^2$ is \code{digest\_to\_ext}$(d)$:
+the strict decoder of \S\ref{sec:primitives} followed by packing base
+coefficients $0..3$ and $4..7$ into one $\K$ element each; a non-canonical word
+yields no value and the circuit is not built.
+\src{crates/prover/src/commitment\_gadget.rs:101-106}
+\end{definition}
+
+\begin{definition}[Compression gadget $\Cp^{\mathrm{c}}$]
+$\Cp^{\mathrm{c}}(l,r)$ for $l,r\in\K^2$ is one row of the width-16 Poseidon2
+table with \code{new\_start} set, all four extension slots supplied as
+$(l_0,l_1,r_0,r_1)$, and the two rate outputs returned.
+\src{crates/prover/src/commitment\_gadget.rs:265-287}
+\end{definition}
+
+\begin{definition}[Sponge gadget $\Hp^{\mathrm{c}}$]
+$\Hp^{\mathrm{c}}(x)$ for a limb vector $x$ is \code{p2\_sponge\_limbs}: $x$ is cut into
+chunks of $8$ base elements; each chunk is recomposed into the two rate slots
+and absorbed by one permutation row. The first row has \code{new\_start} set and
+supplies only the two rate slots; later rows chain the capacity through the
+table. In a short final chunk a partially filled rate slot is completed with
+base coefficients decomposed from the previous row's output, and a wholly
+empty rate slot is left unsupplied. The output is the last row's two rate
+elements; $\Hp^{\mathrm{c}}(\varepsilon)=(0,0)$.
+\src{crates/prover/src/commitment\_gadget.rs:306-367}
+The framed form $\Hp^{\mathrm{c}}(D;\,p_1,\dots)$ is $\Hp^{\mathrm{c}}(\limbs(D)\,\|\,p_1\,\|\cdots)$
+(\code{p2\_framed}).
+\src{crates/prover/src/transfer.rs:254-264}
+\end{definition}
+
+The gadget is intended to mirror the native overwrite sponge of
+Def.~\ref{def:sponge}. In the Poseidon2 AIR the chain-start zero-capacity
+constraint applies only to challenger sponge rows (a challenger-only table, or
+the trusted challenger-start selector of a shared table); on a table that also
+carries caller-supplied rows a \code{new\_start} row's capacity is whatever the
+caller fed it
+\src{vendor/p3-recursion/poseidon2-circuit-air/src/air.rs:119-128,1166-1185}.
+The configuration these rows are keyed by has \code{challenger: false}
+\src{vendor/p3-recursion/circuit/src/ops/poseidon2\_perm/config.rs:135-145}
+\src{crates/prover/src/commitment\_gadget.rs:69}. Consequently
+$\Hp^{\mathrm{c}}$ does not bind its input as the native $\Hp$ does (initial
+capacity and short-final-chunk handling) \finding{V-07}. The preimage lengths
+used by this relation are:
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}X c c c@{}}
+\toprule
+Use & Limbs & Perm.\ rows & Short final chunk \\
+\midrule
+$\mathsf{pk}$ derivation (T2): $\limbs(D_{\mathsf{PK}})\|\mathit{sk}$ & $10+16=26$ & 4 & yes (2 limbs) \\
+leaf / commitment (T3, T6): $\limbs(D_{\mathsf{NOTE}})\|v\|\rho\|\psi\|\mathit{pk}$ & $64$ & 8 & no \\
+nullifier (T5): $\limbs(D_{\mathsf{NF}})\|\mathit{sk}\|\rho$ & $11+16+16=43$ & 6 & yes (3 limbs) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+(The leaf preimage is $12+4+16+16+16=64$ limbs.)
+
+\begin{definition}[Digest export $L$]
+$L(y)$ for $y\in\K^2$ is \code{export\_digest\_limbs}: each $\K$ element is
+decomposed into its 4 base coefficients by ALU rows, each coefficient into 31
+bits, and each bit vector recombined into a low 16-bit and a high 15-bit limb,
+giving 16 limbs. \src{crates/prover/src/commitment\_gadget.rs:417-431}
+\end{definition}
+
+Selection is $\mathsf{sel}(c,x,y)=x$ if $c=1$ and $y$ if $c=0$, with $c$
+boolean-constrained at the call site
+\src{crates/prover/src/transfer.rs:742-753}.
+
+\begin{definition}[Path fold]
+For $x\in\K^2$, constants $s_0,\dots,s_{n-1}\in\K^2$ and boolean expressions
+$a_0,\dots,a_{n-1}$,
+\begin{align}
+  c_0 &= x, \qquad
+  c_{\ell+1} = \Cp^{\mathrm{c}}\big(\mathsf{sel}(a_\ell,s_\ell,c_\ell),\ \mathsf{sel}(a_\ell,c_\ell,s_\ell)\big),\\
+  \mathsf{Fold}(x,s,a) &= c_n ,
+\end{align}
+i.e.\ $a_\ell=1$ places the sibling on the left. The membership fold
+\src{crates/prover/src/transfer.rs:716-757} and the nullifier-map fold
+\src{crates/prover/src/nullifier\_gadget.rs:203-231} are both of this form.
+\end{definition}
+
+\begin{definition}[Frontier fold and append]
+Let $E_h=\langle\mathrm{empty}_h\rangle$ be the commitment-tree empty-subtree
+constants for $h<32$ \src{crates/prover/src/commitment\_gadget.rs:121-133}.
+For $f\in(\K^2)^{32}$ and booleans $b\in\{0,1\}^{32}$,
+\begin{align}
+  y_0 &= (0,0), &
+  y_{h+1} &= \Cp^{\mathrm{c}}\big(\mathsf{sel}(b_h,f_h,y_h),\ \mathsf{sel}(b_h,y_h,E_h)\big), &
+  \mathsf{FoldF}(f,b) &= y_{32},
+\end{align}
+\src{crates/prover/src/commitment\_gadget.rs:570-599}, the circuit form of the
+native \code{fold\_to\_root} \src{crates/prover/src/commitment\_gadget.rs:191-204}.
+For a leaf $C\in\K^2$, $\mathsf{Append}(f,b,C)$ is defined by
+\begin{align}
+  g_{-1} &= C, & g_h &= \mathsf{sel}\big(b_h,\ \Cp^{\mathrm{c}}(f_h,g_{h-1}),\ g_{h-1}\big),\\
+  \kappa_0 &= 1, & \kappa_{h+1} &= \kappa_h b_h,\\
+  b'_h &= b_h+\kappa_h-2\kappa_h b_h, & f'_h &= \mathsf{sel}\big(\kappa_h-\kappa_h b_h,\ g_h,\ f_h\big),
+\end{align}
+with the constraint $\kappa_{32}=0$ (the tree is not full), and
+$\mathsf{Append}(f,b,C)=\mathsf{FoldF}(f',b')$.
+\src{crates/prover/src/commitment\_gadget.rs:519-557}
+\end{definition}
+
+\subsection{Instance, circuit constants and witness}
+
+Three kinds of data enter the circuit.
+
+\begin{itemize}
+\item \textbf{Statement} $x$: the exported limbs (\S\ref{subsec:transfer-stmt}).
+\item \textbf{Circuit constants} (\code{define\_const}), fixed when the circuit is
+built and therefore part of the circuit description: $\langle rt\rangle$,
+$\langle R_{\mathsf{before}}\rangle$, $\langle R_{\mathsf{after}}\rangle$, $\limbs(rt)$,
+$\limbs(rt')$, $\limbs(R_{\mathsf{before}})$, $\limbs(R_{\mathsf{after}})$
+\src{crates/prover/src/transfer.rs:390-410,492,499,513-527};
+each input's membership siblings $s_i$
+\src{crates/prover/src/transfer.rs:727-734}; each output's recipient key
+limbs $\limbs(\mathit{pk}'_j)$ \src{crates/prover/src/transfer.rs:573-579};
+each input's nullifier-map siblings $\sigma_i\in(\K^2)^{32}$ and lower
+empty-subtree digests $\epsilon_i\in(\K^2)^{65}$, taken from the
+\code{NullifierWitness} and checked by count only
+\src{crates/prover/src/nullifier\_gadget.rs:249-260,271-288}; and the $E_h$.
+\item \textbf{Private inputs}, in allocation order:
+\end{itemize}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l c X@{}}
+\toprule
+Block (repeated) & Elements & Content and constraint source \\
+\midrule
+input $i$ ($i=1..k$) & $16+16+16+4$ & $\mathit{sk}_i,\rho_i,\psi_i$ limbs, amount limbs $v_i$ \src{crates/prover/src/transfer.rs:414-421} \\
+                     & $n_i$       & membership index bits $a_{i,\ell}$ \src{crates/prover/src/transfer.rs:735-742} \\
+output $j$ ($j=1..m$) & $16+16+4$  & $\rho'_j,\psi'_j$ limbs, amount limbs $v'_j$ \src{crates/prover/src/transfer.rs:566-571} \\
+                     & $64+32$     & frontier $f_j\in(\K^2)^{32}$, count bits $b_j$ \src{crates/prover/src/commitment\_gadget.rs:489-506} \\
+fee (once)           & $4$         & fee limbs $\varphi$ \src{crates/prover/src/transfer.rs:529-530} \\
+carries (once)       & $3$         & $d_1,d_2,d_3$ \src{crates/prover/src/transfer.rs:823-831} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+For a limb vector $w=(w_0,\dots,w_3)$ write $\mathrm{val}(w)=\sum_{t=0}^{3}2^{16t}w_t$.
+
+\subsection{The relation}
+
+\begin{definition}[$R_{\mathsf{transfer}}$]
+\label{def:rtransfer}
+$(x;\,w)\in R_{\mathsf{transfer}}$ for the circuit built from constants as above
+iff all of the following hold.
+
+\medskip\noindent\textbf{T1 (ranges).} Every limb of $\mathit{sk}_i,\rho_i,\psi_i,\rho'_j,\psi'_j$
+lies in $[0,2^{16})$ (16-bit decomposition) \src{crates/prover/src/transfer.rs:191-207};
+for every amount $w\in\{v_i\}\cup\{v'_j\}\cup\{\varphi\}$, $w_0,w_1,w_2\in[0,2^{16})$
+and $w_3\in[0,2^{14})$, so $\mathrm{val}(w)\in[0,2^{62})$
+\src{crates/prover/src/transfer.rs:157-172}; $d_1,d_2,d_3\in[0,2^{8})$
+\src{crates/prover/src/transfer.rs:827-829}; every $a_{i,\ell}$ and every
+entry of $b_j$ is boolean \src{crates/prover/src/transfer.rs:742}
+\src{crates/prover/src/commitment\_gadget.rs:501-506}.
+
+\medskip\noindent\textbf{T2 (ownership).} For each input,
+\[
+  P_i = \Hp^{\mathrm{c}}\big(D_{\mathsf{PK}};\ \mathit{sk}_i\big)\in\K^2 .
+\]
+$P_i$ is computed, never supplied; it constrains the witness only through T3.
+\src{crates/prover/src/transfer.rs:423-426}
+
+\medskip\noindent\textbf{T3 (input leaf).}
+\[
+  \lambda_i = \Hp^{\mathrm{c}}\big(\limbs(D_{\mathsf{NOTE}})\,\|\,v_i\,\|\,\rho_i\,\|\,\psi_i\,\|\,L(P_i)\big).
+\]
+\src{crates/prover/src/transfer.rs:428-435}
+This is the circuit form of the native
+$\code{commit}=\Hp(D_{\mathsf{NOTE}},\mathrm{LE64}(v),\rho,\psi,\mathit{pk})$, since
+$\limbs(\mathrm{LE64}(v))=v$ by \code{split\_value}
+\src{crates/shielded/src/note.rs:108-111}\src{crates/prover/src/transfer.rs:224-231}.
+
+\medskip\noindent\textbf{T4 (membership).} With $n_i=|s_i|$,
+\[
+  \mathsf{Fold}\big(\lambda_i,\ s_i,\ (a_{i,0},\dots,a_{i,n_i-1})\big) = \langle rt\rangle ,
+\]
+as two equalities in $\K$. \src{crates/prover/src/transfer.rs:437-447}
+The index bits are tied to nothing else; $n_i$ is the length of the supplied
+path and is not compared to \code{DEPTH} \finding{L-05}.
+
+\medskip\noindent\textbf{T5 (nullifier and map transition).} For each input,
+\[
+  N_i = \Hp^{\mathrm{c}}\big(D_{\mathsf{NF}};\ \mathit{sk}_i,\ \rho_i\big),
+\]
+\src{crates/prover/src/transfer.rs:456}
+and the address bits are $u_{i,16q+r} = $ bit $r$ of $L(N_i)_q$ for $q<6$,
+$r<16$ (so bits $31,63,95$ are identically zero, the high limbs being 15-bit)
+\src{crates/prover/src/nullifier\_gadget.rs:166-182,262-263}. With
+$R_0=\langle R_{\mathsf{before}}\rangle$,
+\begin{align}
+  \mathsf{Fold}\big(\epsilon_{i,64},\ \sigma_i,\ (u_{i,64},\dots,u_{i,95})\big) &= R_{i-1}
+  &&\text{(absence)}\\
+  R_i &= \mathsf{Fold}\big(N_i,\ (\epsilon_{i,0},\dots,\epsilon_{i,63})\,\|\,\sigma_i,\ (u_{i,0},\dots,u_{i,95})\big)
+  &&\text{(insertion)}
+\end{align}
+\src{crates/prover/src/nullifier\_gadget.rs:265-290}
+\src{crates/prover/src/transfer.rs:457-470}
+and finally $R_k=\langle R_{\mathsf{after}}\rangle$
+\src{crates/prover/src/transfer.rs:513-525}. For $k=0$ this forces
+$R_{\mathsf{before}}=R_{\mathsf{after}}$.
+
+\medskip\noindent\textbf{T6 (outputs and commitment-tree transition).} For each output,
+\[
+  C_j = \Hp^{\mathrm{c}}\big(\limbs(D_{\mathsf{NOTE}})\,\|\,v'_j\,\|\,\rho'_j\,\|\,\psi'_j\,\|\,\limbs(\mathit{pk}'_j)\big),
+\]
+where $\limbs(\mathit{pk}'_j)$ is a circuit constant
+\src{crates/prover/src/transfer.rs:573-581}. With $T_0=\langle rt\rangle$,
+\begin{align}
+  \mathsf{FoldF}(f_j,b_j) &= T_{j-1}, &
+  T_j &= \mathsf{Append}(f_j,b_j,C_j), &
+  L(T_m) &= \limbs(rt') .
+\end{align}
+\src{crates/prover/src/transfer.rs:557-598}
+\src{crates/prover/src/commitment\_gadget.rs:508-517}
+\src{crates/prover/src/transfer.rs:498-503}
+Each append allocates its own $(f_j,b_j)$, constrained only through
+$\mathsf{FoldF}(f_j,b_j)=T_{j-1}$ \finding{H-02}. For $m=0$, $T_0=\langle rt\rangle$
+and the pin forces $rt'=rt$.
+
+\medskip\noindent\textbf{T7 (value conservation).} With
+$\beta=\max(k,m+1)$, $A_t=\sum_{i}v_{i,t}$, $B_t=\varphi_t+\sum_{j}v'_{j,t}$,
+$d_0=d_4=\beta$ (constants), for $t=0,1,2,3$:
+\begin{equation}
+  A_t + 2^{16}\,d_{t+1} \;=\; B_t + d_t + \beta\,(2^{16}-1)
+  \qquad\text{in }\K .
+\end{equation}
+\src{crates/prover/src/transfer.rs:792-844}
+
+\medskip\noindent\textbf{T8 (shape).} $\max(k,m+1)\le 16$; the number of
+nullifier witnesses equals $k$; $|\sigma_i|=32$, $|\epsilon_i|=65$; $|f_j|=|b_j|=32$.
+These are build-time checks that refuse to construct the circuit, not
+constraints. \src{crates/prover/src/transfer.rs:366-383}
+\src{crates/prover/src/nullifier\_gadget.rs:249-260}
+\src{crates/prover/src/commitment\_gadget.rs:482-487}
+\end{definition}
+
+\paragraph{Emission order.} Constraints are laid in the order: for each input
+$i=1..k$ in spend order, T1 (secrets, amount), T2, T3, T4, T5 (nullifier,
+absence against $R_{i-1}$, insertion, export of $L(N_i)$); then for each output
+$j=1..m$ in output order, T1, T6 (commitment, export of $L(C_j)$, append);
+then the root exports, the $R_k$ pin, the fee range check, and T7.
+\src{crates/prover/src/transfer.rs:413-534}
+\src{crates/prover/src/transfer.rs:565-597}
+Because $R_{i-1}$ is the previous spend's insertion output, the order of
+nullifiers within a transfer is part of the relation.
+\src{crates/prover/src/transfer.rs:385-389}
+
+\subsection{Statement layout}
+\label{subsec:transfer-stmt}
+
+The returned expressions are exported one base element each
+(\code{StatementExport::Base}) \src{crates/prover/src/transfer.rs:673-677},
+and the build refuses unless the export width equals the length of the native
+flattening \code{statement\_limbs(public)}
+\src{crates/prover/src/transfer.rs:680-688}, which emits the same order
+\src{crates/prover/src/transfer.rs:862-900}:
+\begin{align}
+  x = {}& L(N_1)\|\cdots\|L(N_k)\ \|\ L(C_1)\|\cdots\|L(C_m) \nonumber\\
+        & \|\ \limbs(rt)\ \|\ L(T_m)\ \|\ \limbs(R_{\mathsf{before}})\ \|\ \limbs(R_{\mathsf{after}})\ \|\ \varphi .
+\end{align}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l l l X@{}}
+\toprule
+Slice & Offset & Len & Origin in circuit \\
+\midrule
+$L(N_i)$, $i=1..k$ & $16(i-1)$ & 16 & computed nullifier digest \src{crates/prover/src/transfer.rs:471} \\
+$L(C_j)$, $j=1..m$ & $16(k+j-1)$ & 16 & computed output commitment \src{crates/prover/src/transfer.rs:581} \\
+$\limbs(rt)$ & $16(k+m)$ & 16 & constant limbs of the published root \src{crates/prover/src/transfer.rs:492} \\
+$L(T_m)$ & $16(k+m+1)$ & 16 & computed root after appends, pinned to $\limbs(rt')$ \src{crates/prover/src/transfer.rs:498-504} \\
+$\limbs(R_{\mathsf{before}})$ & $16(k+m+2)$ & 16 & constant \src{crates/prover/src/transfer.rs:526} \\
+$\limbs(R_{\mathsf{after}})$ & $16(k+m+3)$ & 16 & constant \src{crates/prover/src/transfer.rs:527} \\
+$\varphi$ & $16(k+m+4)$ & 4 & private fee limbs (T1 ranges) \src{crates/prover/src/transfer.rs:529-531} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+The statement length is therefore $|x| = 16(k+m+4)+4$: $100$ for one input and
+one output (consistent with the ``100-limb transfer'' the block fold is costed
+against \src{crates/prover/src/commitment\_gadget.rs:380-381}) and $132$ for
+two-in/two-out. The fee value is fixed by the statement: the exported
+$\varphi$ must equal $\code{split\_value}(\mathit{fee})$
+\src{crates/prover/src/transfer.rs:898}.
+
+\subsection{Value conservation over the integers}
+
+The column constraint as emitted:
+\begin{Verbatim}[fontsize=\small]
+// A_j + 2^16 d_{j+1} - B_j - d_j - bias(2^16 - 1) = 0
+let lhs = builder.mul_add(two_16, next_expr, a_expr);
+let carries = builder.add(b_expr, carry_expr);
+let rhs = builder.add(carries, offset_expr);
+let diff = builder.sub(lhs, rhs);
+builder.assert_zero(diff);
+\end{Verbatim}
+\src{crates/prover/src/transfer.rs:833-838}
+
+\begin{property}[T7 is an integer identity]
+\label{prop:balance}
+If T1, T7 and T8 hold then
+$\sum_{i=1}^{k}\mathrm{val}(v_i) = \sum_{j=1}^{m}\mathrm{val}(v'_j)+\mathrm{val}(\varphi)$ in $\mathbb{Z}$.
+\end{property}
+
+\noindent\emph{Derivation.} By T1 every term is a small non-negative integer.
+With $k,m+1,\beta\le 16$ (T8), each side of a column equation is bounded by
+\[
+  A_t + 2^{16}d_{t+1} \le 16(2^{16}-1) + 2^{16}(2^{8}-1) < 2^{25},\qquad
+  B_t + d_t + \beta(2^{16}-1) \le 32(2^{16}-1) + 2^{8} < 2^{22},
+\]
+(the top column has $d_4=\beta\le16$), both below $p>2^{30}$, so each field
+equation is an integer equation \src{crates/prover/src/transfer.rs:127-135}.
+Multiplying column $t$ by $2^{16t}$ and summing telescopes the carries:
+\[
+  \sum_t 2^{16t}(A_t-B_t) = d_0 - 2^{64}d_4 + \beta(2^{64}-1) = 0
+  \quad\text{since } d_0=d_4=\beta ,
+\]
+and $\sum_t 2^{16t}A_t=\sum_i\mathrm{val}(v_i)$,
+$\sum_t 2^{16t}B_t=\mathrm{val}(\varphi)+\sum_j\mathrm{val}(v'_j)$.
+\src{crates/prover/src/transfer.rs:759-791}
+The honest prover computes $d_{t+1}=\lfloor(B_t+d_t+\beta(2^{16}-1)-A_t)/2^{16}\rfloor$
+\src{crates/prover/src/transfer.rs:826}. \hfill$\square$
+
+\subsection{Scope of the relation}
+
+The following are stated neutrally as properties of what is and is not
+enforced; impact is discussed in the findings report.
+
+\begin{itemize}
+\item \textbf{Sponge binding.} T2, T3, T5 and T6 rest on $\Hp^{\mathrm{c}}$,
+  whose first-row capacity and short-final-chunk completion are not pinned as
+  in the native definition; the nullifier and $\mathsf{pk}$ preimages have short
+  final chunks \finding{V-07}.
+\item \textbf{Instance-specific constants.} Membership siblings $s_i$ and
+  recipient keys $\limbs(\mathit{pk}'_j)$ are circuit constants, hence part of
+  the preprocessed circuit description rather than of the witness
+  \finding{H-03}. The nullifier-map siblings $\sigma_i$ and lower empties
+  $\epsilon_i$ are likewise constants and are checked by count only.
+\item \textbf{Append position.} The frontier $f_j$ and count bits $b_j$ are fresh
+  private inputs at every append, related to the tree only through
+  $\mathsf{FoldF}(f_j,b_j)=T_{j-1}$; the count $\sum_h 2^h b_{j,h}$ is not
+  carried from one append to the next \finding{H-02}.
+\item \textbf{Path length.} $n_i$ is not constrained to equal \code{DEPTH}
+  \finding{L-05}.
+\item \textbf{Spend authorization.} No SPHINCS+ verification and no
+  \code{DOMAIN\_TX} message appear in \code{constrain\_transfer}; spend
+  authority inside $R_{\mathsf{transfer}}$ is knowledge of $\mathit{sk}_i$
+  satisfying T2--T5 \src{crates/prover/src/transfer.rs:358-537}
+  \src{crates/shielded/src/signing.rs:35} \finding{M-02}.
+\end{itemize}
+
+\subsection{Spec deltas}
+
+\begin{specdelta}[Nullifier map is Poseidon2, not Keccak]
+Two comments still describe the nullifier map as Keccak:
+\src{crates/prover/src/commitment\_gadget.rs:15-16} and the proving entry point's
+list of non-primitive operations \src{crates/prover/src/transfer.rs:904-906}.
+The enforced map fold is $\Cp^{\mathrm{c}}$ on the same Poseidon2 table as the
+note tree \src{crates/prover/src/nullifier\_gadget.rs:203-231}, and only the
+Poseidon2 and recompose tables are enabled for the client circuit
+\src{crates/prover/src/transfer.rs:657-661}.
+\end{specdelta}
+
+\begin{specdelta}[Digest export is canonical]
+The export comment states that each 31-bit coefficient decomposition admits one
+non-canonical witness \src{crates/prover/src/commitment\_gadget.rs:408-412}.
+The vendored \code{decompose\_to\_bits} additionally pins every full-width
+($31$-bit for $\F$) chunk below $p$
+\src{vendor/p3-recursion/circuit/src/builder/circuit\_builder.rs:1435-1449}, so
+$L(y)$ is the unique canonical limb vector of $y$.
+\end{specdelta}
+
+\begin{specdelta}[One frontier per append, not one per transfer]
+The entry-point documentation describes a single frontier witness ``at
+\code{public.root}'' that the gadget pins before appending
+\src{crates/prover/src/transfer.rs:346-351}. The circuit instead takes a
+separately allocated $(f_j,b_j)$ per output, derived natively by
+\code{frontier\_step} \src{crates/prover/src/transfer.rs:600-626}, and pins
+each only against the running root $T_{j-1}$ (T6) \finding{H-02}.
+\end{specdelta}

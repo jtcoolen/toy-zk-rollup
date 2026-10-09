@@ -1,0 +1,556 @@
+\section{Shielded state: keys, notes, trees}
+\label{sec:shielded-state}
+
+This section fixes the objects that make up the shielded state: the spend key
+pair, the note and its two derived digests (commitment and nullifier), the
+append-only note-commitment tree, and the sparse nullifier tree. For each
+object it gives the native definition (the \code{shielded} crate, which
+describes itself as the executable specification of the rules the STARK
+proves \src{crates/shielded/src/lib.rs:6-9}) and, where the circuit
+re-derives the object, the in-circuit relation actually enforced. Notation
+follows Section~\ref{sec:primitives}: $\Hp(\cdot)$ is the Poseidon2 byte hash
+over little-endian 16-bit limbs, $\Cp$ is the Poseidon2 two-to-one
+compression, $\|$ is byte concatenation, and a digest is $8$ canonical
+$\F$-elements $d_0,\dots,d_7$ serialized as $\mathrm{LE32}(d_0)\|\cdots\|\mathrm{LE32}(d_7)$
+\src{crates/pq-hash/src/poseidon.rs:155-163}.
+
+%----------------------------------------------------------------------
+\subsection{Hash instantiation in the shielded layer}
+\label{subsec:ss-hashes}
+
+The \code{shielded} crate is generic over two unrelated traits,
+\code{ShieldedHasher} (spend key, nullifier) and \code{CommitmentHasher}
+(note commitment, tree nodes) \src{crates/pq-hash/src/traits.rs:19-44}. Every
+production path instantiates both with Poseidon2:
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l l l X@{}}
+\toprule
+Object & Trait & Instance & Where instantiated \\
+\midrule
+$\mathsf{pk}_d$ & \code{ShieldedHasher} & \code{Poseidon2Shielded}
+  & \src{crates/wallet-wasm/src/lib.rs:347} \src{crates/prover/src/fixtures.rs:108} \\
+$\mathsf{nf}$ & \code{ShieldedHasher} & \code{Poseidon2Shielded}
+  & \src{crates/prover/src/client.rs:204} \src{crates/wallet-wasm/src/lib.rs:536} \\
+$\mathsf{cm}$ & \code{CommitmentHasher} & \code{Poseidon2Commitment}
+  & \src{crates/prover/src/client.rs:147,155} \\
+tree node & \code{hash\_pair} & \code{Poseidon2Commitment}
+  & \src{crates/prover/src/client.rs:122} \\
+SMT node & \code{hash\_pair} & \code{Poseidon2Commitment}
+  & \src{crates/prover/src/client.rs:123,199} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\code{Poseidon2Commitment} implements \code{hash} as the byte hash $\Hp$ and
+overrides \code{hash\_pair} with $\Cp$
+\src{crates/pq-hash/src/poseidon.rs:225-243}. \code{Poseidon2Shielded} prepends
+the domain tag as an extra part and calls the same \code{Poseidon2Commitment::hash}
+\src{crates/pq-hash/src/shielded.rs:96-105}. Consequently
+\begin{equation}
+\label{eq:shielded-hash}
+  \code{Poseidon2Shielded.hash\_to\_digest}(\mathit{dom}, (p_1,\dots,p_k))
+  \;=\; \Hp(\mathit{dom}\,\|\,p_1\,\|\cdots\|\,p_k),
+\end{equation}
+with no length prefixes \src{crates/pq-hash/src/shielded.rs:87-94}: the
+spend-key, nullifier and commitment digests are all the \emph{same} function
+$\Hp$ applied to different byte strings, and their separation rests on the
+distinct domain tags together with the fixed preimage lengths of
+Table~\ref{tab:ss-preimages}.
+
+\begin{specdelta}[Stale hash names in comments]
+\label{delta:ss-sha3}
+Several comments still name SHA3-256 or Keccak-256 for these objects: the
+spend-key derivation (``SHA3-256 preimage knowledge''
+\src{crates/shielded/src/keys.rs:36-38}), the commitment (``Keccak-256''
+\src{crates/shielded/src/note.rs:104-106}), the nullifier (``SHA3-256''
+\src{crates/shielded/src/note.rs:118-120}), the trait contracts
+\src{crates/pq-hash/src/traits.rs:10-12,24-32}, and the nullifier tree (``keeps
+Keccak'') \src{crates/shielded/src/tree.rs:30-31}
+\src{crates/prover/src/commitment\_gadget.rs:15-16}
+\src{crates/pq-hash/src/poseidon.rs:19-22}. The enforced instantiation is
+Poseidon2 throughout, as tabulated above and as the circuit itself states
+\src{crates/prover/src/transfer.rs:30-43}
+\src{crates/prover/src/nullifier\_gadget.rs:12-18}. The SHA3/Keccak instances
+appear only in unit tests of the \code{shielded} crate
+\src{crates/shielded/src/note.rs:185}
+\src{crates/shielded/src/nullifier\_tree.rs:364}. See \finding{I-02}.
+\end{specdelta}
+
+%----------------------------------------------------------------------
+\subsection{Keys}
+\label{subsec:ss-keys}
+
+\begin{definition}[Spend secret]
+The spend secret is a byte string $\mathsf{sk}_d \in \{0,1\}^{256}$. The
+\code{shielded} crate has no type for it and only receives it as a borrowed
+\code{[u8; 32]} \src{crates/shielded/src/keys.rs:11-16}. The wallet draws it as
+$32$ bytes from an RNG seeded by caller entropy
+\src{crates/wallet-wasm/src/lib.rs:300-303}.
+\end{definition}
+
+\begin{definition}[Spend public key]
+\label{def:ss-pk}
+With $\code{DOMAIN\_PK} = \code{"pq-rollup/spendpk/v1"}$ ($20$ bytes)
+\src{crates/shielded/src/keys.rs:29},
+\begin{equation}
+  \mathsf{pk}_d \;=\; \Hp\big(\code{DOMAIN\_PK}\,\|\,\mathsf{sk}_d\big) \in \{0,1\}^{256}.
+\end{equation}
+\src{crates/shielded/src/keys.rs:40-42}
+The preimage is $52$ bytes, i.e.\ $26$ limbs, absorbed in rate-$8$ chunks of
+sizes $8,8,8,2$ (a short final chunk; cf.\ Spec delta~\ref{delta:overwrite}).
+\code{SpendPublicKey} is an opaque 32-byte newtype
+\src{crates/shielded/src/keys.rs:49-64}.
+\end{definition}
+
+The tag length is even by design so that the preimage is limb-aligned
+\src{crates/shielded/src/keys.rs:22-28}; the byte hash asserts an even total
+length \src{crates/pq-hash/src/poseidon.rs:231-235}.
+
+\begin{specdelta}[$\mathsf{pk}_d$ is not a signature verifying key]
+The module documentation describes \code{SpendPublicKey} as ``the SPHINCS+
+verifying key, published in the note preimage''
+\src{crates/shielded/src/keys.rs:5-7}. The enforced $\mathsf{pk}_d$ is the
+Poseidon2 digest of Definition~\ref{def:ss-pk}; the wallet generates the
+SPHINCS+ key pair independently of $\mathsf{sk}_d$ from the same RNG stream
+\src{crates/wallet-wasm/src/lib.rs:300-305} and stores both secrets side by side
+\src{crates/wallet-wasm/src/lib.rs:309-312}. No relation between $\mathsf{pk}_d$
+and the SPHINCS+ verifying key is computed; see \finding{M-02}.
+\end{specdelta}
+
+\begin{definition}[Incoming viewing key]
+\code{IncomingViewingKey} is an opaque 32-byte newtype with a constructor and
+an accessor only \src{crates/shielded/src/keys.rs:80-95}.
+\end{definition}
+
+\begin{specdelta}[No viewing-key derivation]
+The documentation states $\mathsf{ivk} = H(\code{DOMAIN\_IVK}\,\|\,\mathsf{sk}_d)$
+\src{crates/shielded/src/keys.rs:77-79}, but no \code{DOMAIN\_IVK} constant and
+no derivation function exist in the workspace; the type is only constructed
+from raw bytes \src{crates/shielded/src/keys.rs:85-87}.
+\end{specdelta}
+
+%----------------------------------------------------------------------
+\subsection{Notes, commitments and nullifiers}
+\label{subsec:ss-notes}
+
+\begin{definition}[Note]
+A note is a tuple
+\[
+  n = (v, \rho, \psi, \mathsf{pk}_d), \qquad v \in [0, 2^{64}),\ \ \rho,\psi \in \{0,1\}^{256},\ \ \mathsf{pk}_d \in \{0,1\}^{256},
+\]
+stored as \code{u64}, \code{[u8;32]}, \code{[u8;32]}, \code{SpendPublicKey}
+\src{crates/shielded/src/note.rs:48-58}. \code{Note::new} performs no validation
+\src{crates/shielded/src/note.rs:66-74}.
+\end{definition}
+
+The value domain is restricted elsewhere: natively, \code{check\_balance}
+rejects any input, output or fee value above
+$\code{MAX\_VALUE} = 2^{62}-1$ \src{crates/shielded/src/transfer.rs:45,77-84};
+in-circuit, each amount is four private 16-bit limbs with the top limb
+range-checked to $14$ bits, so $v < 2^{62}$
+\src{crates/prover/src/transfer.rs:111-125,157-172}.
+
+\begin{definition}[Note commitment]
+\label{def:ss-cm}
+With $\code{DOMAIN\_NOTE} = \code{"pq-rollup/note-commit/v1"}$ ($24$ bytes)
+\src{crates/shielded/src/note.rs:38},
+\begin{equation}
+  \mathsf{cm}(n) \;=\; \Hp\big(\code{DOMAIN\_NOTE}\,\|\,\mathrm{LE64}(v)\,\|\,\rho\,\|\,\psi\,\|\,\mathsf{pk}_d\big).
+\end{equation}
+\src{crates/shielded/src/note.rs:108-112}
+\end{definition}
+
+\begin{definition}[Nullifier]
+\label{def:ss-nf}
+With $\code{DOMAIN\_NULLIFIER} = \code{"pq-rollup/nullifier/v1"}$ ($22$ bytes)
+\src{crates/shielded/src/note.rs:41},
+\begin{equation}
+  \mathsf{nf}(n, \mathsf{sk}_d) \;=\; \Hp\big(\code{DOMAIN\_NULLIFIER}\,\|\,\mathsf{sk}_d\,\|\,\rho\big).
+\end{equation}
+\src{crates/shielded/src/note.rs:125-127}
+\end{definition}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\linewidth}{@{}l X r r l@{}}
+\toprule
+Digest & Byte layout (offset:length) & Bytes & Limbs & Rate chunks \\
+\midrule
+$\mathsf{pk}_d$ & \code{DOMAIN\_PK} 0:20, $\mathsf{sk}_d$ 20:32 & 52 & 26 & 8,8,8,2 \\
+$\mathsf{nf}$ & \code{DOMAIN\_NULLIFIER} 0:22, $\mathsf{sk}_d$ 22:32, $\rho$ 54:32 & 86 & 43 & 8,8,8,8,8,3 \\
+$\mathsf{cm}$ & \code{DOMAIN\_NOTE} 0:24, $\mathrm{LE64}(v)$ 24:8, $\rho$ 32:32, $\psi$ 64:32, $\mathsf{pk}_d$ 96:32 & 128 & 64 & $8\times 8$ \\
+\bottomrule
+\end{tabularx}
+\caption{Preimage layouts of the three shielded digests. Limbs are the
+little-endian 16-bit limbs of the concatenation (Def.~\ref{def:limbs}).
+\src{crates/shielded/src/keys.rs:29,41}
+\src{crates/shielded/src/note.rs:38,41,109-111,126}}
+\label{tab:ss-preimages}
+\end{table}
+
+\begin{property}[What the nullifier depends on]
+\label{prop:ss-nf-inputs}
+$\mathsf{nf}$ is a function of $(\mathsf{sk}_d, \rho)$ only: it does not
+depend on $v$, $\psi$, $\mathsf{pk}_d$ or the note's position in the
+commitment tree \src{crates/shielded/src/note.rs:125-127}. Two notes with the
+same $(\mathsf{sk}_d,\rho)$ therefore share a nullifier; for output notes
+$\rho$ is constrained in-circuit only by its 16-bit limb range checks
+(Table~\ref{tab:ss-circuit-notes}). See \finding{M-08}.
+\end{property}
+
+\paragraph{In-circuit re-derivation.} The transfer circuit recomputes all three
+digests with the in-circuit sponge \code{p2\_sponge\_limbs}
+\src{crates/prover/src/commitment\_gadget.rs:306-367}, prepending the domain tag
+as constant limbs exactly as Equation~\eqref{eq:shielded-hash}
+(\code{p2\_framed}) \src{crates/prover/src/transfer.rs:254-264}. Each private
+byte string is allocated as 16-bit limbs, each range-checked to $16$ bits
+\src{crates/prover/src/transfer.rs:185-207}. For an input note, $\mathsf{pk}_d$
+is \emph{derived} from $\mathsf{sk}_d$ and fed into the commitment preimage as
+its exported limbs $L(\mathsf{pk}_d)$ (Section~\ref{subsec:digest-enc})
+\src{crates/prover/src/transfer.rs:423-435}; for an output note $\mathsf{pk}_d$
+is a circuit constant \src{crates/prover/src/transfer.rs:573-580}.
+Table~\ref{tab:ss-circuit-notes} summarises the roles. Whether the in-circuit
+sponge is a function of its input on the shared permutation table (chain-start
+capacity and partial-chunk carries) is the subject of \finding{V-07}.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\linewidth}{@{}l l l X@{}}
+\toprule
+Field & Input note & Output note & Source \\
+\midrule
+$\mathsf{sk}_d$ & private, 16 limbs & --- & \src{crates/prover/src/transfer.rs:414} \\
+$\rho$ & private, 16 limbs & private, 16 limbs & \src{crates/prover/src/transfer.rs:415,566} \\
+$\psi$ & private, 16 limbs & private, 16 limbs & \src{crates/prover/src/transfer.rs:416,567} \\
+$v$ & private, 4 limbs, $<2^{62}$ & private, 4 limbs, $<2^{62}$ & \src{crates/prover/src/transfer.rs:417,568} \\
+$\mathsf{pk}_d$ & $\Hp(\code{DOMAIN\_PK}\|\mathsf{sk}_d)$ in-circuit & constant & \src{crates/prover/src/transfer.rs:425,579} \\
+$\mathsf{cm}$ & in-circuit, leaf of membership fold & in-circuit, exported, appended & \src{crates/prover/src/transfer.rs:435,580-581} \\
+$\mathsf{nf}$ & in-circuit, exported, SMT address & --- & \src{crates/prover/src/transfer.rs:456,471} \\
+\bottomrule
+\end{tabularx}
+\caption{Per-note roles in the transfer circuit.}
+\label{tab:ss-circuit-notes}
+\end{table}
+
+%----------------------------------------------------------------------
+\subsection{Note-commitment tree}
+\label{subsec:ss-cmtree}
+
+\begin{definition}[Shape and empty subtrees]
+\label{def:ss-empties}
+The commitment tree is a binary Merkle tree of fixed depth
+$D = \code{DEPTH} = 32$ (capacity $2^{32}$ leaves)
+\src{crates/shielded/src/tree.rs:39}. A leaf is the 32-byte commitment
+$\mathsf{cm}$ viewed as a digest \src{crates/shielded/src/tree.rs:46-48}.
+The empty-subtree digests are
+\begin{equation}
+  E_0 = 0^{256} \ (\text{all-zero digest}), \qquad E_h = \Cp(E_{h-1}, E_{h-1}) \quad (1 \le h \le D),
+\end{equation}
+\src{crates/shielded/src/tree.rs:65-73}
+and the empty-tree root is $E_D$ \src{crates/shielded/src/tree.rs:85-87}. The
+empty leaf $E_0$ is the same byte string as an all-zero leaf digest.
+\end{definition}
+
+\begin{definition}[Root]
+For leaves $\ell_0,\dots,\ell_{n-1}$ appended in order ($n \le 2^D$), define for a
+leaf range $[s,e)$ at height $h$
+\begin{equation}
+  N(s,e,h) \;=\;
+  \begin{cases}
+    E_h & s \ge e,\\
+    \ell_s & h = 0,\\
+    \Cp\big(N(s,m,h-1),\,N(m,e,h-1)\big), \ \ m = \min(s+2^{h-1}, e) & \text{otherwise},
+  \end{cases}
+\end{equation}
+\src{crates/shielded/src/tree.rs:223-235}
+and $\mathsf{root} = N(0, n, D)$ \src{crates/shielded/src/tree.rs:214-216}.
+\code{append} assigns index $n$ and refuses when $n = 2^D$
+\src{crates/shielded/src/tree.rs:202-210}.
+\end{definition}
+
+\begin{definition}[Membership path and fold]
+\label{def:ss-membership}
+A path is a sibling list $(\sigma_0,\dots,\sigma_{D-1})$, leaf-to-root, and an
+index $i$ \src{crates/shielded/src/tree.rs:99-105}. Natively the path is
+rejected if $|\sigma| \ne D$ or $i \ge 2^D$; otherwise, with $b_h$ the bit $h$
+of $i$,
+\begin{equation}
+  c_0 = \ell, \qquad
+  c_{h+1} =
+  \begin{cases}
+    \Cp(\sigma_h, c_h) & b_h = 1,\\
+    \Cp(c_h, \sigma_h) & b_h = 0,
+  \end{cases}
+  \qquad \mathsf{root} = c_D .
+\end{equation}
+\src{crates/shielded/src/tree.rs:127-150}
+\end{definition}
+
+In-circuit, the input leaf $\mathsf{cm}$ is folded by the same recurrence
+(\code{fold\_membership\_p2}): each $b_h$ is a private input constrained
+boolean, each $\sigma_h$ enters as a circuit constant, and the side is chosen
+with \code{select} \src{crates/prover/src/transfer.rs:716-757}. The final digest
+is constrained equal, by arithmetic difference, to the constant
+$\mathsf{root}$ taken from the public statement
+\src{crates/prover/src/transfer.rs:405-410,442-447}. The in-circuit fold iterates
+over the supplied sibling list without checking $|\sigma| = D$
+(\finding{L-05}), and the siblings being circuit constants is the subject of
+\finding{H-03}.
+
+\begin{definition}[Frontier]
+\label{def:ss-frontier}
+The append witness is a frontier $(f_0,\dots,f_{D-1};\ b_0,\dots,b_{D-1})$ with
+$b_h \in \{0,1\}$ and implied count $n = \sum_h b_h 2^h$
+\src{crates/prover/src/commitment\_gadget.rs:144-174}. For $b_h = 1$, $f_h$ is
+the root of the complete $2^h$-leaf block ending at the last leaf; slots with
+$b_h = 0$ are unused \src{crates/prover/src/commitment\_gadget.rs:144-148}. Its
+root is
+\begin{equation}
+  \label{eq:ss-frontier-fold}
+  c \leftarrow E_0;\quad \text{for } h = 0,\dots,D-1:\ \
+  c \leftarrow
+  \begin{cases}
+    \Cp(f_h, c) & b_h = 1,\\
+    \Cp(c, E_h) & b_h = 0,
+  \end{cases}
+  \qquad \mathsf{Fold}(f,b) = c .
+\end{equation}
+\src{crates/prover/src/commitment\_gadget.rs:191-204}
+Native append of a leaf $\lambda$ carries upward: $g \leftarrow \lambda$; for
+$h = 0,1,\dots$: if $b_h = 1$ then $g \leftarrow \Cp(f_h, g)$, $b_h \leftarrow 0$;
+else $f_h \leftarrow g$, $b_h \leftarrow 1$ and stop; failing to stop means the
+tree is full \src{crates/prover/src/commitment\_gadget.rs:214-237}.
+\end{definition}
+
+\begin{definition}[In-circuit append relation]
+\label{def:ss-append}
+\code{constrain\_append} takes $(f,b)$ as private inputs ($2$ extension elements
+per slot, then $D$ bits, each constrained boolean)
+\src{crates/prover/src/commitment\_gadget.rs:489-506} and enforces, for a leaf
+$\lambda$ and a pinned $R_{\mathrm{before}}$:
+\begin{align}
+  &\mathsf{Fold}(f,b) = R_{\mathrm{before}}
+    && \text{\src{commitment\_gadget.rs:508-517}}\\
+  &g_{-1} = \lambda,\quad g_h = b_h\ ?\ \Cp(f_h, g_{h-1}) : g_{h-1}
+    && \text{\src{commitment\_gadget.rs:519-530}}\\
+  &\kappa_0 = 1,\quad b'_h = b_h + \kappa_h - 2 b_h\kappa_h,\quad
+    f'_h = \kappa_h(1-b_h)\ ?\ g_h : f_h,\quad \kappa_{h+1} = \kappa_h b_h
+    && \text{\src{commitment\_gadget.rs:532-552}}\\
+  &\kappa_D = 0
+    && \text{\src{commitment\_gadget.rs:553-554}}\\
+  &R_{\mathrm{after}} = \mathsf{Fold}(f', b')
+    && \text{\src{commitment\_gadget.rs:556-557}}
+\end{align}
+The empty-subtree constants are derived at circuit-build time from
+\code{Poseidon2Commitment} and enter as constants
+\src{crates/prover/src/commitment\_gadget.rs:117-133,577-585}
+\src{crates/prover/src/transfer.rs:557}.
+\end{definition}
+
+Within one transfer the appends chain: the first $R_{\mathrm{before}}$ is the
+public $\mathsf{root}$ as a constant, output $i$'s $R_{\mathrm{after}}$ is output
+$i{+}1$'s $R_{\mathrm{before}}$, and the last $R_{\mathrm{after}}$ is exported
+and pinned to the public \code{root\_after}
+\src{crates/prover/src/transfer.rs:548-598,494-504}. The frontier witness for
+output $i$ is computed natively by replaying the first $i$ outputs
+\src{crates/prover/src/transfer.rs:610-626}. $R_{\mathrm{before}}$ constrains
+$(f,b)$ only through Equation~\eqref{eq:ss-frontier-fold}; the root does not
+separately commit to the count $n$, and $E_0$ coincides with the all-zero
+digest, so $b$ is not uniquely determined by $R_{\mathrm{before}}$. The
+resulting freedom in the append position is \finding{H-02}.
+
+\begin{property}[On-chain treatment]
+The settlement contract never folds the commitment tree. It stores
+\code{currentRoot}, requires the block's \code{rootBefore} to equal it, and then
+stores the proof-attested \code{rootAfter}
+\src{contracts/src/ShieldedPool.sol:9-23,73-74,152-154,165}. The genesis root is
+a constructor argument \src{contracts/src/ShieldedPool.sol:108-113,133}.
+\end{property}
+
+%----------------------------------------------------------------------
+\subsection{Nullifier sparse Merkle tree}
+\label{subsec:ss-smt}
+
+\begin{definition}[Shape, address, leaf, empty constants]
+\label{def:ss-smt}
+The nullifier map is a sparse binary Merkle tree of depth
+$D_{\mathsf{nf}} = \code{NULLIFIER\_TREE\_DEPTH} = 96$
+\src{crates/shielded/src/nullifier\_tree.rs:64}. For a nullifier digest
+$\mathsf{nf} \in \{0,1\}^{256}$ with bytes $\mathsf{nf}[0..32)$, the address is
+\begin{equation}
+  a(\mathsf{nf}) = (a_0,\dots,a_{95}), \qquad
+  a_i = \big\lfloor \mathsf{nf}[\lfloor i/8 \rfloor] / 2^{\,i \bmod 8} \big\rfloor \bmod 2 ,
+\end{equation}
+i.e.\ the low $96$ bits of the byte string, little-endian within each byte
+\src{crates/shielded/src/nullifier\_tree.rs:66-70}. The leaf value stored at
+$a(\mathsf{nf})$ is the full digest $\mathsf{nf}$
+\src{crates/shielded/src/nullifier\_tree.rs:200-204,307-318}. The empty
+constants follow the same recurrence and hasher as the commitment tree,
+$E_0 = 0^{256}$, $E_h = \Cp(E_{h-1},E_{h-1})$ for $1 \le h \le 96$
+\src{crates/shielded/src/nullifier\_tree.rs:128-140}, so the two trees share
+$E_0,\dots,E_{32}$, and the empty-map root is $E_{96}$
+\src{crates/shielded/src/nullifier\_tree.rs:187-189}.
+\end{definition}
+
+Since bytes $0..11$ of a digest are $\mathrm{LE32}(d_0)\|\mathrm{LE32}(d_1)\|\mathrm{LE32}(d_2)$,
+the address bits are $a_{32k+j} = $ bit $j$ of $d_k$ for $k \in \{0,1,2\}$,
+$0 \le j < 32$. Every digest emitted by $\Hp$ has canonical elements
+$d_k < p < 2^{31}$ \src{crates/pq-hash/src/poseidon.rs:155-163}, so
+$a_{31} = a_{63} = a_{95} = 0$ for every honestly derived nullifier.
+
+\begin{definition}[Native root]
+For the spent set $S$ (32-byte strings) and $A \subseteq S$,
+\begin{equation}
+  T(h, A) \;=\;
+  \begin{cases}
+    E_h & A = \emptyset,\\
+    \text{first element of } A & h = 0,\\
+    \Cp\big(T(h-1, A_0),\, T(h-1, A_1)\big), \ \ A_\beta = \{x \in A : a_{h-1}(x) = \beta\} & \text{otherwise},
+  \end{cases}
+\end{equation}
+\src{crates/shielded/src/nullifier\_tree.rs:196-220}
+and $\mathsf{root}_{\mathsf{nf}} = T(96, S)$
+\src{crates/shielded/src/nullifier\_tree.rs:180-183}.
+\end{definition}
+
+\begin{specdelta}[Address coincidences in the native map]
+\label{delta:ss-smt-collide}
+The depth comment states that two nullifiers agreeing on the $96$ address bits
+``are treated as duplicates (the insert refuses)''
+\src{crates/shielded/src/nullifier\_tree.rs:57-63}. The enforced behaviour
+differs: the spent set is a \code{HashSet} keyed on all $32$ bytes
+\src{crates/shielded/src/nullifier\_tree.rs:122,172-176}, so \code{insert} accepts
+a second nullifier with an equal address; at height $0$, $T$ returns the first
+element of $A$ in the set's iteration order
+\src{crates/shielded/src/nullifier\_tree.rs:181,200-204}; and
+\code{highest\_differing\_bit} returns \code{None} for such a pair, so the
+witness builder does not bucket it
+\src{crates/shielded/src/nullifier\_tree.rs:78-92,265-272}. See
+\finding{M-09}. The module header still describes full 256-bit addressing
+\src{crates/shielded/src/nullifier\_tree.rs:13-22,45-49}; see \finding{I-02}.
+\end{specdelta}
+
+\begin{definition}[Fold and native witness]
+For a start height $s$, start node $x$, siblings $(\sigma_s,\dots,\sigma_{95})$
+and address $a$,
+\begin{equation}
+  \mathsf{Fold}_s(x;\sigma;a):\quad c_s = x,\qquad
+  c_{h+1} =
+  \begin{cases}
+    \Cp(\sigma_h, c_h) & a_h = 1,\\
+    \Cp(c_h, \sigma_h) & a_h = 0,
+  \end{cases}
+  \qquad \text{output } c_{96}.
+\end{equation}
+\src{crates/shielded/src/nullifier\_tree.rs:223-241}
+For an unspent $\mathsf{nf}$, the witness has start height
+$h^\ast = \min_{x \in S} \mathrm{hdb}(a(\mathsf{nf}), a(x))$ (or $96$ if no
+spent address differs), where $\mathrm{hdb}$ is the highest differing address
+bit, and siblings $\sigma_h = T(h, B_h)$ for $h^\ast \le h < 96$, with $B_h$ the
+spent addresses whose highest differing bit is $h$
+\src{crates/shielded/src/nullifier\_tree.rs:250-283}. Natively,
+\begin{align}
+  R_{\mathrm{before}} &= \mathsf{Fold}_{h^\ast}\big(E_{h^\ast};\ \sigma;\ a(\mathsf{nf})\big)
+    && \text{\src{nullifier\_tree.rs:292-299}}\\
+  R_{\mathrm{after}} &= \mathsf{Fold}_{0}\big(\mathsf{nf};\ (E_0,\dots,E_{h^\ast-1},\sigma_{h^\ast},\dots,\sigma_{95});\ a(\mathsf{nf})\big)
+    && \text{\src{nullifier\_tree.rs:307-318}}
+\end{align}
+The standalone checker additionally requires $h^\ast \le 96$ and
+$|\sigma| = 96 - h^\ast$ and compares the folded root bytewise
+\src{crates/shielded/src/nullifier\_tree.rs:328-359}.
+\end{definition}
+
+\begin{definition}[In-circuit absence and insertion]
+\label{def:ss-smt-circuit}
+The circuit fixes $\code{FOLD\_DEPTH} = 32$ and
+$\code{FOLD\_START} = 96 - 32 = 64$
+\src{crates/prover/src/nullifier\_gadget.rs:71-74}. The native witness is padded
+to heights $64..95$ by inserting $E_h$ for $64 \le h < h^\ast$, and proving is
+refused when $h^\ast < 64$
+\src{crates/prover/src/nullifier\_gadget.rs:128-155}. With $\mathsf{nf}$ the
+in-circuit nullifier digest, the address bits are the 16-bit decompositions of
+its first $6$ exported limbs $L(\mathsf{nf})_0,\dots,L(\mathsf{nf})_5$
+\src{crates/prover/src/nullifier\_gadget.rs:76-78,166-182}, and the gadget
+enforces
+\begin{align}
+  R_{\mathrm{before}} &= \mathsf{Fold}_{64}\big(E_{64};\ (\sigma_{64},\dots,\sigma_{95});\ a(\mathsf{nf})\big)
+    && \text{\src{nullifier\_gadget.rs:271-276}}\\
+  R_{\mathrm{after}} &= \mathsf{Fold}_{0}\big(\mathsf{nf};\ (E_0,\dots,E_{63},\sigma_{64},\dots,\sigma_{95});\ a(\mathsf{nf})\big)
+    && \text{\src{nullifier\_gadget.rs:285-288}}
+\end{align}
+where every $\sigma_h$ and $E_h$ enters as a circuit constant built from the
+prover-side witness (\code{const\_digest})
+\src{crates/prover/src/nullifier\_gadget.rs:191-197,203-231}. The 31-bit
+decomposition behind $L(\cdot)$ is constrained canonical
+\src{crates/prover/src/commitment\_gadget.rs:417-431}
+\src{vendor/p3-recursion/circuit/src/builder/circuit\_builder.rs:1435-1449}, and
+odd-indexed limbs are $15$-bit high halves, so $a(\mathsf{nf})$ is uniquely
+determined by the digest and $a_{31} = a_{63} = a_{95} = 0$ in-circuit as well.
+\end{definition}
+
+Across the spends of one transfer the root is threaded: the first
+$R_{\mathrm{before}}$ is the public \code{nullifier\_roots.before} as a constant,
+each spend's $R_{\mathrm{before}}$ is constrained equal to the running root, the
+running root becomes that spend's $R_{\mathrm{after}}$, and the final running
+root is constrained equal to the public \code{nullifier\_roots.after}
+\src{crates/prover/src/transfer.rs:390-398,456-470,513-525}.
+
+\begin{property}[What in-circuit absence certifies]
+\label{prop:ss-absence}
+Because the absence fold starts from the constant $E_{64}$ at height $64$, a
+satisfying assignment asserts (under collision resistance of $\Cp$) that the
+height-$64$ node on the path selected by $a_{64},\dots,a_{95}$ is empty under
+$R_{\mathrm{before}}$, i.e.\ that no leaf has an address agreeing with
+$a(\mathsf{nf})$ on bits $64$ through $95$; the low bits $a_0,\dots,a_{63}$
+enter only the insertion fold, which places $\mathsf{nf}$ as the sole leaf of
+that height-$64$ subtree. Bits $a_{64..95}$ are the bits of the third digest
+element $d_2$, so the in-circuit absence predicate separates nullifiers by
+$d_2$ alone. The spendability consequences of this, together with
+Spec delta~\ref{delta:ss-smt-collide}, are \finding{M-09}.
+\end{property}
+
+\begin{property}[On-chain treatment]
+The contract holds no nullifier set. It stores \code{currentNullifierRoot},
+requires the block's \code{nullifierBefore} to equal it, and stores the
+attested \code{nullifierAfter}
+\src{contracts/src/ShieldedPool.sol:76-77,155-157,166}. A zero genesis argument
+selects the pinned constant
+\src{contracts/src/ShieldedPool.sol:79-86,133-135}
+\begin{Verbatim}[fontsize=\small]
+EMPTY_NULLIFIER_ROOT =
+  0x83265b7a2c40cc6eca237b6016b764606335cd0c6ff0732470e20a484d5a7329
+\end{Verbatim}
+documented as the Poseidon2 $E_{96}$; the golden-vector generator derives
+\code{nullifier\_before\_hex} from an empty
+\code{NullifierMap<Poseidon2Commitment>} and the vector file carries the same
+bytes \src{crates/prover/tests/golden\_vectors.rs:413,495}
+\src{contracts/test/vectors/block\_vectors.json:4}. The constructor comment
+still describes a depth-256 Keccak empty root
+\src{contracts/src/ShieldedPool.sol:114-117} (\finding{I-02}).
+\end{property}
+
+%----------------------------------------------------------------------
+\subsection{Constants}
+\label{subsec:ss-constants}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l l X@{}}
+\toprule
+Name & Value & Source \\
+\midrule
+\code{DOMAIN\_PK} & \code{"pq-rollup/spendpk/v1"} (20 B, 10 limbs) & \src{crates/shielded/src/keys.rs:29} \\
+\code{DOMAIN\_NOTE} & \code{"pq-rollup/note-commit/v1"} (24 B, 12 limbs) & \src{crates/shielded/src/note.rs:38} \\
+\code{DOMAIN\_NULLIFIER} & \code{"pq-rollup/nullifier/v1"} (22 B, 11 limbs) & \src{crates/shielded/src/note.rs:41} \\
+\code{MAX\_VALUE} & $2^{62}-1$ & \src{crates/shielded/src/transfer.rs:45} \\
+\code{DEPTH} ($D$) & $32$ & \src{crates/shielded/src/tree.rs:39} \\
+\code{NULLIFIER\_TREE\_DEPTH} & $96$ & \src{crates/shielded/src/nullifier\_tree.rs:64} \\
+\code{FOLD\_DEPTH} / \code{FOLD\_START} & $32$ / $64$ & \src{crates/prover/src/nullifier\_gadget.rs:71-74} \\
+$E_0$ (both trees) & $0^{256}$ & \src{crates/shielded/src/tree.rs:67} \src{crates/shielded/src/nullifier\_tree.rs:130} \\
+\bottomrule
+\end{tabularx}
+\end{center}
