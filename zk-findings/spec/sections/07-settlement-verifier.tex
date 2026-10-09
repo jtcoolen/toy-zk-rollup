@@ -87,7 +87,7 @@ Reader & Layout and checks \\
 \code{\_blobArr32} & byte count $n$, then $\lfloor n/32\rfloor$ digests \src{WhirVerifier.sol:1186-1203} \\
 \code{\_raw32} & one 32-byte item, no prefix \src{WhirVerifier.sol:1206-1215} \\
 \code{\_raw32Arr} & count $n$, then $n$ packed $\K$ words; reverts if any low-128-bit padding is nonzero \src{WhirVerifier.sol:1218-1240} \\
-\code{\_extArr} & byte count with bit~31 as an in-band flag: set $\Rightarrow$ 16 bytes per element (four big-endian u32 lanes, lifted to bits 224..128); clear $\Rightarrow$ 32 bytes per element, padding must be zero \src{WhirVerifier.sol:1243-1285} \\
+\code{\_extArr} & byte count with bit~31 as an in-band flag (masked off before use): set $\Rightarrow$ 16 bytes per element (four big-endian u32 lanes placed in the high 128 bits, lane offsets 224/192/160/128, low 128 bits zero); clear $\Rightarrow$ 32 bytes per element, low-128-bit padding must be zero \src{WhirVerifier.sol:1243-1285} \\
 \bottomrule
 \end{tabularx}
 \end{center}
@@ -218,7 +218,10 @@ One sponge $\mathcal{S}$ runs the whole verification
   \code{seedBytes}, then of every word of \code{degreeBytes}; each word must be
   $<p$ \src{BatchTranscript.sol:77-84,\allowbreak{}208-218} \src{KeccakChallenger.sol:32-41}.
 \item[S1.] \textbf{Main} (PROOF). $\mathsf{Obs}_{32}(\code{mainDigest})$, then
-  $\mathsf{Obs}_{\F}(\mathit{pv}_i)$ for all $i$ \src{BatchTranscript.sol:87-93}.
+  $\mathsf{Obs}_{\F}$ of each of the $\lceil|\code{pvBytes}|/4\rceil$ wire words
+  of the blob \src{BatchTranscript.sol:87-93,\allowbreak{}208-218}; this is
+  $\mathit{pv}_0,\dots,\mathit{pv}_{n-1}$ when $|\code{pvBytes}| \equiv 0 \pmod 4$,
+  and otherwise one further (partial) word that \eqref{eq:sv-stm} does not cover.
 \item[S2.] \textbf{Preprocessed} (CONFIG). $\mathsf{Obs}_{32}(\code{preDigest})$,
   unconditionally \src{BatchTranscript.sol:99-101}.
 \item[S3.] \textbf{Lookup.} If \code{lookupPowBits}$=0$ then \code{lookupPow}
@@ -236,7 +239,8 @@ One sponge $\mathcal{S}$ runs the whole verification
   \code{oodPow}; then $\zeta \gets \mathsf{Draw}_{\K}$
   \src{BatchTranscript.sol:146-153}.
 \end{enumerate}
-S0--S6 correspond to T0--T7 of \S\ref{subsec:ps-transcript}. Only the
+S0--S6 correspond to T0--T7 of \S\ref{subsec:ps-transcript}: S0 covers T0 and
+T1, and S$k$ corresponds to T$(k{+}1)$ for $1 \le k \le 6$. Only the
 randomisation digest is conditional; S2, S3 and S4 run regardless of whether the
 shape has preprocessed columns or lookups. The engine then hands $\mathcal{S}$ to
 the WHIR core without reseeding \src{WhirVerifier.sol:295-296}. The challenges
@@ -294,7 +298,7 @@ the most significant index bit:
 
 \paragraph{Initial phase} \src{WhirVerifierCore.sol:259-331}. Inputs: virtual
 answers $y_0,\dots,y_{m_0-1}$ (\code{initOodAnswers}), bound evaluations
-$\mathbf{b}$ (\code{boundEvals}), widths $(w_c)$ and permutation $\pi$ from
+$\mathbf{b}$ (\code{boundEvals}), widths $(w_c)$ and \code{claimPerm} from
 $\Sigma_r$.
 \begin{enumerate}
 \item For $i<m_0$: absorb \code{framingPre}$[i]$ framing words,
@@ -303,9 +307,12 @@ $\Sigma_r$.
   $\mathsf{Obs}_{\K}$ of its $w_c$ evaluations; reverts if they do not fit in
   $\mathbf{b}$. No opening point is absorbed.
 \item Absorb \code{framingBatching} framing words; $\gamma_0 \gets \mathsf{Draw}_{\K}$.
-\item With $N = |\mathbf{b}|$ and $\pi$ mapping placement order to proof order,
+\item With $N = |\mathbf{b}|$ and $\varpi$ the evaluation order that
+  \code{claimPerm} and $(w_c)$ induce from placement order to proof order (the
+  identity when \code{claimPerm} is empty; positions it does not fill map to $0$)
+  \src{WhirVerifierCore.sol:202-227},
   \begin{align}
-    \sigma_0 \;=\; \sum_{k<N} b_{\pi(k)}\,\gamma_0^{k} \;+\; \sum_{i<m_0} y_i\,\gamma_0^{N+i}.
+    \sigma_0 \;=\; \sum_{k<N} b_{\varpi(k)}\,\gamma_0^{k} \;+\; \sum_{i<m_0} y_i\,\gamma_0^{N+i}.
   \end{align}
 \item Absorb \code{framingSeps}$[0]$ framing words; then, with
   $b^{\mathrm{sc}}_0 = \code{startingPowBits}$,
@@ -332,7 +339,9 @@ $C_{-1}$ the round block's \code{batchCommitment}, and $\mathbf{u} =
   row $\in\{2^{|\mathbf u|}, 4\cdot 2^{|\mathbf u|}\}$
   \src{WhirVerifierCore.sol:685-707}. The row-buffer length compared there is
   computed by the engine as $Q_i$ times the row width
-  \src{WhirVerifier.sol:583-585}.
+  \src{WhirVerifier.sol:583-585}; the wire limb count of the intermediate rows
+  only advances the decoder cursor and is not compared with it
+  \src{WhirVerifier.sol:1033-1044}.
 \item $\mathsf{Obs}_{32}(C_i)$; for $j<m_i$: $z_{i,j} \gets \mathsf{Draw}_{\K}$,
   $\mathsf{Obs}_{\K}(y_{i,j})$.
 \item $\mathsf{Grind}_{b^{\mathrm q}_i}(\cdot)$ must accept.
@@ -349,6 +358,10 @@ $C_{-1}$ the round block's \code{batchCommitment}, and $\mathbf{u} =
   \ldots)$ on the round's slices of \code{scA}, \code{scInf}, \code{scPow}, whose
   lengths are \code{scLens}$[i]$, \code{scPowLens}$[i]$.
 \end{enumerate}
+The per-round slices of \code{oodAnswers}, \code{scA}, \code{scInf} and
+\code{scPow} are cut at running offsets by \code{\_slice}, which does not compare
+offset plus length with the length of the source array
+\src{WhirVerifier.sol:569-571,\allowbreak{}605-611,\allowbreak{}1297-1306}.
 In step 5, when \code{prunedLens}$[i] \ne 0$ (a v8 pruned path stream), the
 engine requires
 $2^{|\mathbf u|} = 16$, $|\mathbf u| = 4$ and calldata rows, draws $\gamma_{i+1}$,
@@ -365,9 +378,10 @@ remaining node, and that node equal to $C_{i-1}$
 repeated indices, enter $\sigma_{i+1}$ \src{TerminalWeight.sol:637-647}. Rows of
 repeated indices other than the retained one are not compared with it
 \finding{V-04}. The commitment $C_{-1}$ that round $0$ opens against is taken from
-the round block and is not compared with \code{mainDigest}, \code{quotDigest},
-\code{preDigest} or \code{permDigest} absorbed in S1--S5
-\src{WhirVerifier.sol:567-568,\allowbreak{}670} \finding{V-03}.
+the round block, is not itself absorbed into the transcript, and is not compared
+with \code{mainDigest}, \code{quotDigest}, \code{preDigest} or \code{permDigest}
+absorbed in S1--S5 \src{WhirVerifier.sol:567-568,\allowbreak{}670,\allowbreak{}1027}
+\finding{V-03}.
 
 \paragraph{Final phase} \src{WhirVerifierCore.sol:938-1040}
 \src{WhirVerifier.sol:653-699}. Schedule: PoW bits $b^{\mathrm q}_\star$, query
@@ -456,7 +470,9 @@ uint256[] memory allR = _concat(allRandomness, closing);
 (uint256 weight, uint256 value) =
     _terminalWeight(allR, constraints, finalPoly, closing);
 uint256 expected = KoalaBearExt4.mul(weight, value);
-if (foldedClaim != expected) revert TerminalClaimMismatch(expected, foldedClaim);
+if (foldedClaim != expected) {
+    revert TerminalClaimMismatch(expected, foldedClaim);
+}
 \end{Verbatim}
 
 The query points $x_q$ are derived from transcript indices. The opening points $z$
@@ -629,9 +645,11 @@ builds that frame.
 \code{0x01FFFFFE} is $2^{32} \bmod p$ \src{TerminalWeight.sol:67-68}.
 \code{StirOpenings} documents per-query paths as the verification strategy
 \src{StirOpenings.sol:59-67}; intermediate rounds of v8 bundles use the pruned
-walk. \code{BatchTranscript.lookupPair} has no caller; the lookup challenge pairs
-are recomputed in \code{CIDNTY} \src{BatchTranscript.sol:155-172}
-\src{TerminalWeight.sol:1122-1134}.
+walk. \code{BatchTranscript.lookupPair} has no caller outside a unit test
+\src{contracts/\allowbreak{}test/\allowbreak{}BatchTranscriptNative.t.sol:87}; the lookup
+challenge pairs are recomputed in \code{CIDNTY}, which uses
+$\beta^{\max(W,1)}$ where \code{lookupPair} uses $\beta^{W}$ (the two differ only
+at $W=0$) \src{BatchTranscript.sol:155-172} \src{TerminalWeight.sol:1122-1134}.
 \end{specdelta}
 
 \fussy
