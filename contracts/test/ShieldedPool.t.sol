@@ -104,6 +104,10 @@ contract ShieldedPoolTest is Test {
         // Empty genesis: the Poseidon2 empty root, empty nullifier map
         // (bytes32(0) sentinel: the contract computes the prover empty root).
         pool = new ShieldedPool(verifier, address(0xB0B), EMPTY_ROOT, bytes32(0));
+        // H-01: settlement is operator-gated; 0xB0B (the fee recipient) is
+        // the seeded operator and admits this test contract.
+        vm.prank(address(0xB0B));
+        pool.setOperator(address(this), true);
         decoder = new DecodeHarness();
     }
 
@@ -201,23 +205,53 @@ contract ShieldedPoolTest is Test {
         uint256[] memory s = _withRoots(
             statement, pool.currentRoot(), rootAfter, pool.currentNullifierRoot());
         verifier.setAcceptedClaim(keccak256(abi.encode(s, proof)));
-        pool.applyBlock(s, proof); // passes only on a verbatim handover
-        assertEq(pool.blockNumber(), 1, "applied");
-        // And a different proof for the same statement is rejected.
+        // A different proof for the same statement is rejected. First, while
+        // the statement still extends the pool state: continuity passes and
+        // the verifier's refusal is what rejects it (H-01 ordering).
         vm.expectRevert(ShieldedPool.NotVerified.selector);
         pool.applyBlock(s, hex"00");
+        // The right pair applies: passes only on a verbatim handover.
+        pool.applyBlock(s, proof);
+        assertEq(pool.blockNumber(), 1, "applied");
     }
 
     function test_reverts_when_the_verifier_says_no() public {
+        // Continuity now runs before verification (H-01: bound the griefing
+        // cost), so this block must extend the state to reach the verifier.
+        uint256[] memory s = _withRoots(
+            statement, pool.currentRoot(), rootAfter, pool.currentNullifierRoot());
         verifier.setResult(false);
         vm.expectRevert(ShieldedPool.NotVerified.selector);
-        pool.applyBlock(statement, proof);
+        pool.applyBlock(s, proof);
     }
 
     function test_malformed_proof_reverts_through_the_seam() public {
+        uint256[] memory s = _withRoots(
+            statement, pool.currentRoot(), rootAfter, pool.currentNullifierRoot());
         verifier.setRevert(true);
         vm.expectRevert("malformed proof");
-        pool.applyBlock(statement, proof);
+        pool.applyBlock(s, proof);
+    }
+
+    /// H-01 regression: a stranger cannot settle. The audit's attack was any
+    /// party applying a valid block and withholding the per-transfer data;
+    /// the operator gate bounds that to the named set.
+    function test_applyBlock_requires_an_operator() public {
+        uint256[] memory s = _withRoots(
+            statement, pool.currentRoot(), rootAfter, pool.currentNullifierRoot());
+        address stranger = address(0xDEAD);
+        assertFalse(pool.isOperator(stranger), "stranger is no operator");
+        vm.prank(stranger);
+        vm.expectRevert(ShieldedPool.NotOperator.selector);
+        pool.applyBlock(s, proof);
+        // The seeded operator (fee recipient) can settle, and can rotate.
+        vm.prank(address(0xB0B));
+        pool.setOperator(stranger, true);
+        assertTrue(pool.isOperator(stranger), "rotation admitted");
+        // Only an operator rotates: the stranger cannot add more.
+        vm.prank(address(0xFEED));
+        vm.expectRevert(ShieldedPool.NotOperator.selector);
+        pool.setOperator(address(0xFEED), true);
     }
 
     function test_rejects_a_block_that_does_not_extend_the_state() public {

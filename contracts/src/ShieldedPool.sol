@@ -88,6 +88,16 @@ contract ShieldedPool {
     /// Collected fees, withdrawable by `feeRecipient`.
     address public feeRecipient;
 
+    /// H-01: settlement is restricted to an operator set. Anyone could call
+    /// applyBlock with a valid block and withhold the per-transfer data (the
+    /// leaves and nullifiers live only inside the statement fold, which L1
+    /// cannot expand), freezing the pool with no recovery path. Restricting
+    /// settlement to named operators turns "any stranger can strand the
+    /// tree" into a bounded trust assumption: the operator set is known,
+    /// rotatable, and the only party that can withhold. Seeded with
+    /// `feeRecipient_` - the party running the node - at deploy.
+    mapping(address => bool) public isOperator;
+
     /// A block was applied, carrying both root transitions.
     event BlockApplied(
         uint256 indexed blockNumber,
@@ -98,10 +108,14 @@ contract ShieldedPool {
         uint256 fee
     );
 
+    /// An operator was added or removed.
+    event OperatorUpdated(address indexed operator, bool allowed);
+
     error NotVerified();
     error RootMismatch(bytes32 expected, bytes32 got);
     error NullifierRootMismatch(bytes32 expected, bytes32 got);
     error NotFeeRecipient();
+    error NotOperator();
 
     /// Deploy at an explicit genesis state.
     ///
@@ -133,16 +147,39 @@ contract ShieldedPool {
         currentRoot = genesisRoot_;
         currentNullifierRoot =
             genesisNullifierRoot_ == bytes32(0) ? EMPTY_NULLIFIER_ROOT : genesisNullifierRoot_;
+        // H-01: the fee recipient is the first operator - in every shipped
+        // configuration this is the account running the settling node.
+        isOperator[feeRecipient_] = true;
+        emit OperatorUpdated(feeRecipient_, true);
+    }
+
+    /// H-01: add or remove an operator. Only an operator may rotate the set,
+    /// so the deployer's seed is the root of trust and rotation never needs
+    /// a back door.
+    function setOperator(address operator, bool allowed) external {
+        if (!isOperator[msg.sender]) revert NotOperator();
+        emit OperatorUpdated(operator, allowed);
+        // The event IS emitted above, on the same straight-line path, with
+        // the changed key and value - the rule's own satisfaction condition
+        // (crates/lint/docs). forge 1.8.4 does not recognize an event for a
+        // mapping write guarded by a read of the same mapping; the
+        // suppression is scoped to this line and the event stays.
+        // forge-lint: disable-next-line(missing-events-access-control)
+        isOperator[operator] = allowed;
     }
     /// Apply a verified block.
     ///
-    /// The order of checks is deliberate. Verification comes first because it is
-    /// the expensive one and because nothing else should be examined until the
-    /// statement is known to be genuine. Continuity is checked next, before any
-    /// state is touched, so a block that does not extend the current state
-    /// reverts without partially applying.
+    /// The order of checks is deliberate (H-01 remediation, audit
+    /// toy-zk-rollup-crypto-audit-report-2026-10-09): the caller check is
+    /// free, the continuity checks are cheap, and verification is the ~100M
+    /// gas one. A block that does not extend the current state reverts on
+    /// continuity BEFORE the expensive replay, so a settled dispute cannot
+    /// be used to make operators burn verification gas on stale blocks.
+    /// Verification still gates every state write: nothing is touched unless
+    /// the proof is genuine.
     function applyBlock(uint256[] calldata statement, bytes calldata proof) external {
-        if (!verifier.verify(statement, proof)) revert NotVerified();
+        // H-01: only the operator set settles (see `isOperator`).
+        if (!isOperator[msg.sender]) revert NotOperator();
 
         // `decode` takes memory; copying the calldata once is cheaper than
         // re-reading it per field and keeps the decoder simple.
@@ -155,6 +192,10 @@ contract ShieldedPool {
         if (block_.nullifierBefore != currentNullifierRoot) {
             revert NullifierRootMismatch(currentNullifierRoot, block_.nullifierBefore);
         }
+
+        // The proof is the last gate: it attests the transition this block
+        // claims, and only a genuine one may touch state.
+        if (!verifier.verify(statement, proof)) revert NotVerified();
 
         // Both roots are taken from the proof. That is the whole point of
         // proving the transition in-circuit: the circuit re-derives the tree

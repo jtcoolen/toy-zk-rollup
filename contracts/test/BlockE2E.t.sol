@@ -48,6 +48,10 @@ contract BlockE2ETest is Test {
 
         WhirVerifier verifier = new WhirVerifier(address(new TerminalWeight()), 0xf9e905866cf3a97f9149a84ab19a6d4cc43758814b140499650dfb771876c6e5);
         pool = new ShieldedPool(verifier, address(0xB0B), genesisRoot, bytes32(0));
+        // H-01: settlement is operator-gated; 0xB0B (the fee recipient) is
+        // the seeded operator and admits this test contract.
+        vm.prank(address(0xB0B));
+        pool.setOperator(address(this), true);
     }
 
     function _proof() internal view returns (bytes memory) {
