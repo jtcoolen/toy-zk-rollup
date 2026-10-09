@@ -128,6 +128,33 @@ contract WhirVerifierTest is Test {
         verifier.verify(statement, b);
     }
 
+    // V-02 regression: every STATEMENT opening point must equal zeta * G_L^q.
+    // Offsets are the packed ext WORDS of the points in composed_bundle.bin's
+    // STATEMENT section (32-byte word right after its u32 length word):
+    // round 0 matrix 0 point 0 at byte 762628, round 0 matrix 2 point 1 at
+    // 762760. Before the fix a substituted point flowed into the terminal
+    // weight's equality groups unchecked.
+    function test_verify_rejects_opening_point_not_zeta() public {
+        bytes memory b = _bundle();
+        // Flip one limb byte of round 0 / matrix 0 / point 0 (the local point
+        // must be exactly zeta).
+        b[762628] = b[762628] ^ hex"01";
+        vm.expectRevert(
+            abi.encodeWithSelector(WhirVerifier.OpeningPointMismatch.selector, 0, 0)
+        );
+        verifier.verify(statement, b);
+    }
+
+    function test_verify_rejects_opening_point_not_zeta_next_row() public {
+        bytes memory b = _bundle();
+        // Round 0 / matrix 2 / point 1: the next-row point must be zeta * G_14.
+        b[762760] = b[762760] ^ hex"01";
+        vm.expectRevert(
+            abi.encodeWithSelector(WhirVerifier.OpeningPointMismatch.selector, 0, 1)
+        );
+        verifier.verify(statement, b);
+    }
+
     /// No satellite, no verifier: the constructor refuses a zero address and
     /// an address with no code, so a deployment can never pin nothing.
     function test_constructor_requires_a_pinned_satellite() public {

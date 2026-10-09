@@ -117,6 +117,16 @@ contract WhirVerifier is IWhirVerifier {
     /// toy-zk-rollup-crypto-audit-report-2026-10-09, V-03).
     error RoundRootMismatch(uint256 round);
 
+    /// V-02: a STATEMENT opening point is not the transcript point zeta scaled
+    /// by the matrix domain's generator (point[q] must equal zeta * G_L^q).
+    /// The terminal identity is checked AT zeta; if the opened values are
+    /// taken at prover-chosen points the central DEEP-ALI binding is gone
+    /// (audit toy-zk-rollup-crypto-audit-report-2026-10-09, V-02).
+    error OpeningPointMismatch(uint256 round, uint256 point);
+
+    /// The STATEMENT section's matrix walk ran past the section's end.
+    error BadStatementSection();
+
     /// The terminal-weight frame magic: ASCII "TWIGHT", matching TerminalWeight.
     uint256 private constant TERMINAL_MAGIC = 0x5457_4947_4854;
 
@@ -298,6 +308,10 @@ contract WhirVerifier is IWhirVerifier {
         BatchTranscript.quotientPhase(s, prf.quotDigest, prf.randDigest, cfg.hasRand);
         uint256 zeta = BatchTranscript.oodPhase(s, cfg.oodPowBits, prf.oodPow);
 
+        // V-02: the STATEMENT opening points must be zeta-derived. Runs before
+        // any round: fail-fast, and the satellite consumes these same bytes.
+        _checkOpeningPoints(proof, stm, zeta);
+
         // Hand the sponge to the WHIR core: the batch layer delegates to the PCS
         // layer on the SAME challenger, so no reseed happens here.
         WhirVerifierCore.Transcript memory t;
@@ -441,6 +455,67 @@ contract WhirVerifier is IWhirVerifier {
         // The proof section repeats the round count as a sanity anchor; skip it
         // (the CONFIG count drives the loop).
         (, no) = _word(m, no);
+    }
+
+    /// V-02: every STATEMENT opening point must be the transcript point zeta
+    /// scaled by the matrix domain's two-adic generator: point[q] == zeta * G_L^q
+    /// (ext-mul over x^4 = 3). The terminal-weight satellite reads these points
+    /// verbatim as the evaluation points of its equality groups, and the
+    /// constraint identity is checked AT zeta - so a point that is not
+    /// zeta-derived lets the WHIR argument prove evaluations at prover-chosen
+    /// points while the identity treats them as taken at zeta. The reference
+    /// verifier cannot be fooled because it derives the points itself
+    /// (p3-batch-stark verifier/mod.rs); this closes the same gap here.
+    ///
+    /// The walk mirrors TerminalWeight.deriveGroupDescs' framing exactly: per
+    /// round u32 n_mats, per matrix u32 log_size, u32 width, u32 n_points, per
+    /// point u32 byte_len (32) + one packed ext word (limbs at bits
+    /// 224/192/160/128). Runs right after zeta is drawn, before any round.
+    function _checkOpeningPoints(
+        bytes calldata proof,
+        StmRef memory stm,
+        uint256 zeta
+    ) private pure {
+        // stm.abs is an ABSOLUTE calldata byte offset (proof.offset + section
+        // start), so every read below is a direct calldataload at that offset.
+        uint256 c = stm.abs;
+        uint256 end = c + stm.len;
+        uint256 numRounds = _leWordAt(proof, c);
+        c += 4;
+        for (uint256 r; r < numRounds; ++r) {
+            uint256 nMats = _leWordAt(proof, c);
+            c += 4;
+            for (uint256 i; i < nMats; ++i) {
+                if (c + 12 > end) revert BadStatementSection();
+                uint256 logSize = _leWordAt(proof, c);
+                c += 8; // skip width: consumed by the satellite walk
+                uint256 nPoints = _leWordAt(proof, c);
+                c += 4;
+                uint256 g = twoAdicGenerator(logSize);
+                uint256 expected = zeta;
+                for (uint256 q; q < nPoints; ++q) {
+                    uint256 blen = _leWordAt(proof, c);
+                    c += 4;
+                    if (blen != 32 || c + 32 > end) revert BadStatementSection();
+                    uint256 point;
+                    assembly {
+                        point := calldataload(c)
+                    }
+                    if (point != expected) revert OpeningPointMismatch(r, q);
+                    c += 32;
+                    expected = KoalaBearExt4.mulBase(expected, g);
+                }
+            }
+        }
+        if (c != end) revert BadStatementSection();
+    }
+
+    /// u32 LE at an absolute calldata byte offset.
+    function _leWordAt(bytes calldata, uint256 absByte) private pure returns (uint256 v) {
+        assembly {
+            v := shr(224, calldataload(absByte))
+        }
+        v = _swapBytes(v);
     }
 
     /// The public values the proof absorbs must be the caller's statement: this
