@@ -84,8 +84,20 @@
     },
     {
       "id": "F-02",
+      "status": "confirmed_by_experiment",
+      "summary": "WHIR opening points (per-matrix zeta / zeta_next) used to build the terminal-weight eq groups are read from the caller-supplied STATEMENT section of the bundle (TerminalWeight.deriveGroupDescs, TerminalWeight.sol:186-192) while the constraint identity rescales the bound evaluations with the transcript zeta (TerminalWeight.sol:1100-1149); no comparison between the two was found. Needs fp-check: if confirmed, the PCS claims are not bound to the DEEP point even with CONFIG pinned. UPDATE: agent A forge experiment (scratch test/agentA/StmPoint.t.sol) - replacing the round-1/2/3 statement-table opening point in block_composed_bundle.bin with z' != zeta still yields verify()==true; the STATEMENT section is never absorbed into the transcript.",
+      "owner_skill": "onchain-verifier-auditor"
+    },
+    {
+      "id": "F-03",
       "status": "candidate",
-      "summary": "WHIR opening points (per-matrix zeta / zeta_next) used to build the terminal-weight eq groups are read from the caller-supplied STATEMENT section of the bundle (TerminalWeight.deriveGroupDescs, TerminalWeight.sol:186-192) while the constraint identity rescales the bound evaluations with the transcript zeta (TerminalWeight.sol:1100-1149); no comparison between the two was found. Needs fp-check: if confirmed, the PCS claims are not bound to the DEEP point even with CONFIG pinned.",
+      "summary": "Per-round WHIR batchCommitment (WhirVerifier.sol:~1027) is read from PROOF and never compared with the mainDigest/quotDigest/permDigest absorbed by BatchTranscript (BatchTranscript.sol:91/100/124/139) or the CONFIG preDigest.",
+      "owner_skill": "onchain-verifier-auditor"
+    },
+    {
+      "id": "F-04",
+      "status": "candidate",
+      "summary": "QFOLD/MROOTS pruned query walk (TerminalWeight.sol:329-337, 665-673) dedups repeated query indices without checking the duplicate rows agree; p3-merkle-tree rejects InconsistentDuplicateOpenings (mmcs/mod.rs:563-572).",
       "owner_skill": "onchain-verifier-auditor"
     }
   ],
@@ -103,7 +115,7 @@
     "crypto-fp-check every surviving candidate; PoCs for High/Critical.",
     "Write LaTeX specification and report."
   ],
-  "updated_at": "2026-10-09T13:55:00Z",
+  "updated_at": "2026-10-09T14:20:00Z",
   "extensions": {
     "methodology": "zkcrypto-audit (github.com/Yue-Zhou1/zkcrypto-audit), staged flow router->context->spec-delta->domain->fp-check->report->zkbugs-index",
     "head_commit": "a54c1976b875f73beafa3aeab5521866ed971399"
