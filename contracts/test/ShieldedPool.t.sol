@@ -254,6 +254,25 @@ contract ShieldedPoolTest is Test {
         pool.setOperator(address(0xFEED), true);
     }
 
+    /// M-01 (contract-side half): the pool pins the chain it was deployed on
+    /// and refuses settlement anywhere else - the same deployment state
+    /// synced or migrated to a different chain id cannot settle there. The
+    /// pool-address half of M-01 needs the statement schema to carry the
+    /// binding (circuit-side, tracked with the circuit audit work).
+    function test_applyBlock_refuses_a_different_chain() public {
+        uint256[] memory s = _withRoots(
+            statement, pool.currentRoot(), rootAfter, pool.currentNullifierRoot());
+        uint256 pinned = pool.CHAIN_ID();
+        assertEq(pinned, 31337, "pinned at deploy");
+        vm.chainId(pinned + 1);
+        vm.expectRevert(
+            abi.encodeWithSelector(ShieldedPool.ChainMismatch.selector, pinned, pinned + 1));
+        pool.applyBlock(s, proof);
+        vm.chainId(pinned);
+        pool.applyBlock(s, proof); // back home: applies
+        assertEq(pool.blockNumber(), 1, "settled at home");
+    }
+
     function test_rejects_a_block_that_does_not_extend_the_state() public {
         // The vector block names the funded-note root; a fresh pool is at the
         // empty root, so this block must not apply.

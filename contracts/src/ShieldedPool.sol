@@ -98,6 +98,16 @@ contract ShieldedPool {
     /// `feeRecipient_` - the party running the node - at deploy.
     mapping(address => bool) public isOperator;
 
+    /// M-01 (contract-side half): the chain this pool is bound to, pinned at
+    /// construction. The same deployed bytecode settled on two chains would
+    /// otherwise accept the identical (statement, proof) pair on both - a
+    /// block settled on chain A replays on chain B. The remaining half of
+    /// M-01 - binding the POOL address into the proven statement so two
+    /// pools on one chain cannot replay each other's blocks - is a circuit
+    /// change (the statement schema gains limbs the constraint identity
+    /// consumes) and is tracked with the circuit-side audit work.
+    uint256 public immutable CHAIN_ID;
+
     /// A block was applied, carrying both root transitions.
     event BlockApplied(
         uint256 indexed blockNumber,
@@ -116,6 +126,7 @@ contract ShieldedPool {
     error NullifierRootMismatch(bytes32 expected, bytes32 got);
     error NotFeeRecipient();
     error NotOperator();
+    error ChainMismatch(uint256 expected, uint256 got);
 
     /// Deploy at an explicit genesis state.
     ///
@@ -151,6 +162,8 @@ contract ShieldedPool {
         // configuration this is the account running the settling node.
         isOperator[feeRecipient_] = true;
         emit OperatorUpdated(feeRecipient_, true);
+        // M-01: bind this deployment to the chain it was made on.
+        CHAIN_ID = block.chainid;
     }
 
     /// H-01: add or remove an operator. Only an operator may rotate the set,
@@ -178,6 +191,8 @@ contract ShieldedPool {
     /// Verification still gates every state write: nothing is touched unless
     /// the proof is genuine.
     function applyBlock(uint256[] calldata statement, bytes calldata proof) external {
+        // M-01: a block settled on the pinned chain settles nowhere else.
+        if (block.chainid != CHAIN_ID) revert ChainMismatch(CHAIN_ID, block.chainid);
         // H-01: only the operator set settles (see `isOperator`).
         if (!isOperator[msg.sender]) revert NotOperator();
 
