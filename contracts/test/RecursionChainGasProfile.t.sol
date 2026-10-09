@@ -15,7 +15,7 @@ contract RecursionChainGasProfileTest is Test {
     uint256[] internal statement;
 
     function setUp() public {
-        verifier = new WhirVerifier(address(new TerminalWeight()));
+        verifier = new WhirVerifier(address(new TerminalWeight()), 0xddd87cbec535a1b0b97cf4e29a4aa3254a2ce159f3791ee8e14cef8dd267d5c5);
         string memory j = vm.readFile("test/vectors/recursion_chain_sidecar.json");
         statement = vm.parseJsonUintArray(j, ".statement");
     }

@@ -31,6 +31,18 @@ contract Deploy is Script {
         // re-hashes. Genesis files carry `genesis_root_hex` (0x-prefixed).
         bytes32 genesisRoot = vm.parseJsonBytes32(genesis, ".genesis_root_hex");
 
+        // V-01: the verifier pins keccak256 of the CONFIG section - the whole
+        // circuit description (seed, degree, preprocessed digest, round
+        // schedules, constraint programs) - so a proof of some other circuit
+        // can never pass as a proof of this block shape. The default is the
+        // digest of the committed block vectors' CONFIG; CONFIG_DIGEST
+        // overrides for a different canonical shape (the node must prove
+        // under the same WHIR parameters the vectors were generated with).
+        bytes32 configDigest = vm.envOr(
+            "CONFIG_DIGEST",
+            bytes32(0xf9e905866cf3a97f9149a84ab19a6d4cc43758814b140499650dfb771876c6e5)
+        );
+
         // The broadcast context comes from the CLI (--private-key or
         // --unlocked --sender); msg.sender inside run() is that account.
         address deployer = msg.sender;
@@ -38,7 +50,7 @@ contract Deploy is Script {
         // D-086 step A: the terminal-weight satellite first - the verifier
         // pins its codehash at construction and re-checks it before every call.
         TerminalWeight terminalWeight = new TerminalWeight();
-        WhirVerifier verifier = new WhirVerifier(address(terminalWeight));
+        WhirVerifier verifier = new WhirVerifier(address(terminalWeight), configDigest);
         // The nullifier root: bytes32(0) makes ShieldedPool compute the empty
         // sparse-tree root itself; the genesis file may pin one explicitly.
         bytes32 nullifierRoot = bytes32(0);

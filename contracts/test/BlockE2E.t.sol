@@ -46,7 +46,7 @@ contract BlockE2ETest is Test {
         bytes32 genesisRoot = vm.parseJsonBytes32(j, ".genesis_root_hex");
         expectedRootAfter = _asBytes32(vm.parseJsonBytes(j, ".pool_root_after_hex"));
 
-        WhirVerifier verifier = new WhirVerifier(address(new TerminalWeight()));
+        WhirVerifier verifier = new WhirVerifier(address(new TerminalWeight()), 0xf9e905866cf3a97f9149a84ab19a6d4cc43758814b140499650dfb771876c6e5);
         pool = new ShieldedPool(verifier, address(0xB0B), genesisRoot, bytes32(0));
     }
 

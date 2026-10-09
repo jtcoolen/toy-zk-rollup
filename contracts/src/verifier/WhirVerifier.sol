@@ -142,6 +142,14 @@ contract WhirVerifier is IWhirVerifier {
     /// toy-zk-rollup-crypto-audit-report-2026-10-09, M-05).
     error RoundShapeMismatch(uint256 round, uint256 field);
 
+    /// V-01: the bundle's CONFIG section is not the circuit description this
+    /// deployment pinned. A proof of SOME circuit must never pass as a proof
+    /// of THIS circuit (audit toy-zk-rollup-crypto-audit-report-2026-10-09,
+    /// V-01): the CONFIG carries the seed, degree, preprocessed digest, every
+    /// round schedule, and the constraint programs, so accepting an
+    /// unpinned CONFIG accepts any circuit the prover can build.
+    error ConfigNotPinned();
+
     /// The terminal-weight frame magic: ASCII "TWIGHT", matching TerminalWeight.
     uint256 private constant TERMINAL_MAGIC = 0x5457_4947_4854;
 
@@ -154,14 +162,24 @@ contract WhirVerifier is IWhirVerifier {
     /// the code the core was sized and reviewed against.
     bytes32 private immutable SATELLITE_CODEHASH;
 
-    /// Pin the terminal-weight satellite. Empty code is rejected here rather
-    /// than discovered as a failed call on the first verify.
-    constructor(address terminalWeight) {
+    /// V-01: keccak256 of the CONFIG section this deployment accepts, or
+    /// bytes32(0) for "unpinned" (test harnesses only - a deployment must
+    /// pin). Checked against every bundle before anything is decoded.
+    bytes32 public immutable CONFIG_DIGEST;
+
+    /// Pin the terminal-weight satellite and (V-01) the CONFIG digest.
+    /// `configDigest` is keccak256 of the CONFIG section bytes of the
+    /// canonical bundle for the block shape this deployment settles; every
+    /// bundle must carry exactly that CONFIG. bytes32(0) means "unpinned"
+    /// and is for test harnesses only. Empty satellite code is rejected here
+    /// rather than discovered as a failed call on the first verify.
+    constructor(address terminalWeight, bytes32 configDigest) {
         if (terminalWeight == address(0) || terminalWeight.code.length == 0) {
             revert SatelliteUnpinned();
         }
         SATELLITE = terminalWeight;
         SATELLITE_CODEHASH = terminalWeight.codehash;
+        CONFIG_DIGEST = configDigest;
     }
 
     // ---------------------------------------------------------------------
@@ -274,6 +292,22 @@ contract WhirVerifier is IWhirVerifier {
         // by WhirVerifierV6 and never arrive as 6.
         if (version != 5 && version != 7 && version != 8) revert BadVersion(version);
         if (proof.length < 20 + (cfgWords + prfWords) * 4) revert ProofTooShort();
+        // V-01: the CONFIG section IS the circuit description - seed, degree,
+        // preprocessed digest, round schedules, constraint programs. A
+        // deployment pins keccak256(CONFIG) and every bundle must carry
+        // exactly those bytes, so a proof of some other circuit cannot pass
+        // as a proof of this one. bytes32(0) means unpinned (tests only).
+        // The CONFIG bytes are in-bounds by the length check above.
+        if (CONFIG_DIGEST != bytes32(0)) {
+            uint256 cfgLen = cfgWords * 4;
+            bytes memory cfgBuf = new bytes(cfgLen);
+            bytes32 cfgDigest;
+            assembly ("memory-safe") {
+                calldatacopy(add(cfgBuf, 32), add(proof.offset, 16), cfgLen)
+                cfgDigest := keccak256(add(cfgBuf, 32), cfgLen)
+            }
+            if (cfgDigest != CONFIG_DIGEST) revert ConfigNotPinned();
+        }
         // v5 header tail: u32 LE STATEMENT word count right after PROOF.
         StmRef memory stm;
         assembly ("memory-safe") {

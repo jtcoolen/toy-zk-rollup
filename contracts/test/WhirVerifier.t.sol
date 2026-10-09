@@ -41,7 +41,7 @@ contract WhirVerifierTest is Test {
 
     function setUp() public {
         satellite = new TerminalWeight();
-        verifier = new WhirVerifier(address(satellite));
+        verifier = new WhirVerifier(address(satellite), 0xffb29fe8ec40aa096a33e45823ec3525d224fe4458522e7f68f2c944dffd1443);
         statement.push(0);
         statement.push(1);
         statement.push(377841674);
@@ -118,6 +118,43 @@ contract WhirVerifierTest is Test {
         b[0] = 0x58;
         vm.expectRevert(WhirVerifier.BadMagic.selector);
         verifier.verify(statement, b);
+    }
+
+    // V-01 regressions: the CONFIG section is the circuit description, so a
+    // deployment pins keccak256(CONFIG) and a proof of some OTHER circuit is
+    // rejected before anything is decoded. setUp's verifier pins the
+    // settlement vectors' CONFIG digest.
+
+    /// The same verifier, pinned to the BLOCK circuit's CONFIG, must refuse
+    /// the settlement proof: two unrelated circuits, one verifier address.
+    /// This is the audit's forged-block shape (V-01) - the statement check
+    /// cannot catch it because the attacker's proof is valid for its own
+    /// (attacker-chosen) CONFIG.
+    function test_verify_rejects_foreign_circuit_config() public {
+        WhirVerifier blockPinned = new WhirVerifier(
+            address(new TerminalWeight()),
+            0xf9e905866cf3a97f9149a84ab19a6d4cc43758814b140499650dfb771876c6e5
+        );
+        vm.expectRevert(WhirVerifier.ConfigNotPinned.selector);
+        blockPinned.verify(statement, _bundle());
+    }
+
+    /// One byte inside the CONFIG - the constraint programs, the schedules -
+    /// is a different circuit, not a corrupted proof: same rejection.
+    function test_verify_rejects_tampered_config_section() public {
+        bytes memory b = _bundle();
+        // Byte 16 is the first CONFIG word; the CONFIG runs 33333 words.
+        b[16] = b[16] ^ hex"01";
+        vm.expectRevert(WhirVerifier.ConfigNotPinned.selector);
+        verifier.verify(statement, b);
+    }
+
+    /// The pin is what gates: an unpinned verifier (bytes32(0), test-only)
+    /// still accepts the same bytes, so the rejection above is the digest
+    /// check and not an incidental decode failure.
+    function test_unpinned_verifier_accepts_the_same_bundle() public {
+        WhirVerifier unpinned = new WhirVerifier(address(new TerminalWeight()), bytes32(0));
+        assertTrue(unpinned.verify(statement, _bundle()), "unpinned accepts");
     }
 
     // V-03 regression: each round's opening root must equal the commitment
@@ -230,10 +267,10 @@ contract WhirVerifierTest is Test {
     /// an address with no code, so a deployment can never pin nothing.
     function test_constructor_requires_a_pinned_satellite() public {
         vm.expectRevert(WhirVerifier.SatelliteUnpinned.selector);
-        new WhirVerifier(address(0));
+        new WhirVerifier(address(0), bytes32(0));
         // An address with no code (an EOA) is equally unpinnable.
         vm.expectRevert(WhirVerifier.SatelliteUnpinned.selector);
-        new WhirVerifier(address(0xB0B));
+        new WhirVerifier(address(0xB0B), bytes32(0));
     }
 
     /// The codehash is re-checked before every call: swapping the satellite's
@@ -252,7 +289,7 @@ contract WhirVerifierTest is Test {
     function test_verify_rejects_wrong_length_reply() public {
         address s = address(new TerminalWeight());
         vm.etch(s, address(new StubWrongLength()).code);
-        WhirVerifier v = new WhirVerifier(s); // pins the stub's codehash
+        WhirVerifier v = new WhirVerifier(s, bytes32(0)); // pins the stub's codehash
         // Garbage weight/value: the terminal identity (claim == weight*eval)
         // is the fail-closed net. eval is 0 at this shape, so expected = 0
         // and the actual is the proof's claimed terminal value.
@@ -269,7 +306,7 @@ contract WhirVerifierTest is Test {
     function test_verify_rejects_wrong_magic_reply() public {
         address s = address(new TerminalWeight());
         vm.etch(s, address(new StubWrongMagic()).code);
-        WhirVerifier v = new WhirVerifier(s);
+        WhirVerifier v = new WhirVerifier(s, bytes32(0));
         vm.expectRevert(abi.encodeWithSelector(
             WhirVerifier.TerminalClaimMismatch.selector,
             0,

@@ -19,7 +19,7 @@ contract RecursionChainV8Test is Test {
     bytes32 internal configDigest;
 
     function setUp() public {
-        engineV5 = new WhirVerifier(address(new TerminalWeight()));
+        engineV5 = new WhirVerifier(address(new TerminalWeight()), 0xddd87cbec535a1b0b97cf4e29a4aa3254a2ce159f3791ee8e14cef8dd267d5c5);
         string memory j = vm.readFile("test/vectors/recursion_chain_sidecar_v8.json");
         statement = vm.parseJsonUintArray(j, ".statement");
         configDigest = vm.parseJsonBytes32(j, ".config_digest");

@@ -7,7 +7,7 @@ import {TerminalWeight} from "../src/verifier/TerminalWeight.sol";
 
 contract SizeCheckTest is Test {
     function test_size() public {
-        WhirVerifier v = new WhirVerifier(address(new TerminalWeight()));
+        WhirVerifier v = new WhirVerifier(address(new TerminalWeight()), bytes32(0));
         emit log_named_uint("runtime bytes", address(v).code.length);
     }
 }

@@ -22,6 +22,15 @@ ANVIL_PID=""
 NODE_PID=""
 RPC=http://127.0.0.1:8545
 NODE=http://127.0.0.1:3000
+# V-01: the deployed verifier pins keccak256 of the block vectors' CONFIG, so
+# the node must prove under the SAME WHIR parameters the committed vectors
+# were generated with (the canonical sweep configuration). Changing any of
+# these without regenerating the vectors and the pinned digest breaks
+# settlement with ConfigNotPinned - by design.
+export WHIR_INNER_RATE=${WHIR_INNER_RATE:-3}
+export WHIR_RATE_FINAL=${WHIR_RATE_FINAL:-4}
+export WHIR_POW_FLOOR=${WHIR_POW_FLOOR:-28}
+export WHIR_INNER_POW_FLOOR=${WHIR_INNER_POW_FLOOR:-29}
 # Anvil's default dev account 0 - the settlement sender. The node holds no
 # keys (D-080): eth_sendTransaction asks the *chain* to sign from this
 # unlocked dev account, which is exactly the anvil dev-mode contract.
