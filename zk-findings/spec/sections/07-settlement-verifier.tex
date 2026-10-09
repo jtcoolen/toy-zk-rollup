@@ -1,7 +1,5 @@
 \section{The deployed Solidity settlement verifier}
 \label{sec:settlement-verifier}
-% Local line-breaking slack for long \code/\src runs; \fussy at section end.
-\sloppy
 
 This section states what the on-chain settlement verifier enforces when the pool
 calls \code{verify(statement, proof)}. The deployment script creates the
@@ -652,4 +650,3 @@ $\beta^{\max(W,1)}$ where \code{lookupPair} uses $\beta^{W}$ (the two differ onl
 at $W=0$) \src{BatchTranscript.sol:155-172} \src{TerminalWeight.sol:1122-1134}.
 \end{specdelta}
 
-\fussy
