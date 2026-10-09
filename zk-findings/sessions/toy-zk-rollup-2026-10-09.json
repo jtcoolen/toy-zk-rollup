@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "engagement_id": "toy-zk-rollup-2026-10-09",
-  "phase": "reporting_in_progress",
+  "phase": "closed",
   "targets": [
     "contracts/src (ShieldedPool, BlockStatement, LimbCodec, verifier/*)",
     "contracts/lib/sol-whir-p3 (field, transcript)",
@@ -268,7 +268,10 @@
   ],
   "artifacts": {
     "reports": [
-      "zk-findings/reports/toy-zk-rollup-crypto-audit-report-2026-10-09.md"
+      "zk-findings/README.md",
+      "zk-findings/reports/toy-zk-rollup-crypto-audit-report-2026-10-09.md",
+      "zk-findings/spec/toy-zk-rollup-spec.pdf",
+      "zk-findings/spec/toy-zk-rollup-spec.tex"
     ],
     "pocs": [
       "contracts/test/audit/PocD01SettlementAccess.t.sol",
@@ -286,12 +289,12 @@
   },
   "remediation_verifications": [],
   "next_steps": [
-    "Compile spec PDF once workflow completes; commit.",
-    "Port scratch experiments V-02..V-05, M-03, M-04 into contracts/test/audit/.",
-    "Execute sketched PoCs for V-06, V-07, V-08 (circuit-level).",
-    "Closeout."
+    "Port scratch experiments V-02, V-03, V-04, V-05, M-03, M-04 into contracts/test/audit/ as in-repo PoCs.",
+    "Execute the sketched circuit-level PoCs for V-06, V-07, V-08 (witness-mutation / check_constraints style) before any fix is declared complete.",
+    "Remediation design: one verifying key per block shape (fixes V-01, V-06, H-03 together); then the verifier-side checks V-02..V-05.",
+    "Re-audit after fixes (fix-verification route)."
   ],
-  "updated_at": "2026-10-09T16:40:00Z",
+  "updated_at": "2026-10-09T15:05:00Z",
   "extensions": {
     "methodology": "zkcrypto-audit (github.com/Yue-Zhou1/zkcrypto-audit), staged flow router->context->spec-delta->domain->fp-check->report->zkbugs-index",
     "head_commit": "a54c1976b875f73beafa3aeab5521866ed971399",
@@ -497,6 +500,30 @@
       "B_circuits": "B-01..B-13 (child VK, sponge IV/tail, append position, VK privacy, faerie gold, fold depth)",
       "C_recursion": "C-01/C-02 criticals, M-01 hiding, PATCHES.md inaccuracy; diff at scratch/agentC/p3-recursion-local.diff",
       "D_application": "D01..D21 (permissionless settle+DA, envelope binding, pipeline atomicity, replay, rate limiter, vault panic)"
+    },
+    "phase_history": [
+      "intake_pending",
+      "domain_in_progress",
+      "verification_in_progress",
+      "reporting_in_progress",
+      "indexing_in_progress",
+      "closed"
+    ],
+    "indexing": {
+      "action": "prior-art lookup only (no org index write)",
+      "refs": [
+        "zkbugs/openvm-org/openvm/GHSA-4w7p-8f9q-f4g2",
+        "zkbugs/succinctlabs/sp1/ghsa-8m24-3cfx-9fjw",
+        "external/gnark/audit-contests/missing-public-instance-binding",
+        "external/risc0/zellic/private-witness-logged"
+      ],
+      "note": "verified findings are candidates for a local index entry once the scratch experiments are ported in-repo"
+    },
+    "spec": {
+      "sections": 10,
+      "pages": 56,
+      "build": "make -C zk-findings/spec",
+      "verification": "each section written by one agent and re-checked by an independent verifier agent against source; 09/10 verifier passes did not complete before closeout (writer-verified, rendered output reviewed by lead)"
     }
   }
 }
