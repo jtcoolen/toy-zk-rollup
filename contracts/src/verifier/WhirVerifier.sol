@@ -134,6 +134,14 @@ contract WhirVerifier is IWhirVerifier {
     /// toy-zk-rollup-crypto-audit-report-2026-10-09, M-04).
     error NonCanonicalExt();
 
+    /// M-05: a WHIR shape quantity in the proof disagrees with the value the
+    /// pinned CONFIG fixes. `field` numbers the check (see _checkRoundShapes).
+    /// The reference verifier derives every shape from parameters
+    /// (p3-whir-0.8.0 pcs/verifier/mod.rs); taking them from proof array
+    /// lengths leaves shapes the verifier never pins (audit
+    /// toy-zk-rollup-crypto-audit-report-2026-10-09, M-05).
+    error RoundShapeMismatch(uint256 round, uint256 field);
+
     /// The terminal-weight frame magic: ASCII "TWIGHT", matching TerminalWeight.
     uint256 private constant TERMINAL_MAGIC = 0x5457_4947_4854;
 
@@ -329,7 +337,12 @@ contract WhirVerifier is IWhirVerifier {
         // after the walk: keep them (one section per opening round; the
         // identity walk consumes them by role: main, quotient, pre, perm).
         uint256[][] memory boundEvalsOf;
-        (co, boundEvalsOf) = _runRounds(proof, co, po, t, stm, cfg, prf);
+        (co, po, boundEvalsOf) = _runRounds(proof, co, po, t, stm, cfg, prf);
+        // M-05: end-of-section cursor check. The round walk must land exactly
+        // on the STATEMENT boundary - no slack for trailing PROOF bytes that
+        // nothing consumed (the batch sections check their own ends inside
+        // their decoders).
+        if (po != 4 + cfgWords + prfWords) revert ProofTooShort();
 
         // --- the constraint identity (D-076), on the satellite (batch 48) -------
         // The last layer of verify_batch: per instance, recompute every opened
@@ -341,6 +354,9 @@ contract WhirVerifier is IWhirVerifier {
         // that verdict authoritative, exactly as for MROOTS.
         uint256 csWords;
         (csWords, co) = _word(proof, co);
+        // M-05: the constraint program is the tail of CONFIG; after it the
+        // CONFIG cursor must sit exactly on the PROOF boundary.
+        if (co + csWords != 4 + cfgWords) revert ProofTooShort();
         _callIdentity(
             zeta, constraintAlpha, lookupAlpha, beta, prf.terminals, statement,
             proof, co, csWords, boundEvalsOf
@@ -362,8 +378,9 @@ contract WhirVerifier is IWhirVerifier {
         StmRef memory stm,
         BatchCfg memory cfg,
         BatchPrf memory prf
-    ) private view returns (uint256 no, uint256[][] memory boundEvalsOf) {
+    ) private view returns (uint256 no, uint256 npo, uint256[][] memory boundEvalsOf) {
         uint256 numRounds;
+        npo = po;
         (numRounds, no) = _word(proof, co);
         boundEvalsOf = new uint256[][](numRounds);
         // round_starts is a test-harness artifact (per-round sponge seeding);
@@ -373,7 +390,11 @@ contract WhirVerifier is IWhirVerifier {
             RoundCfg memory c;
             (c, no) = _decodeRoundCfg(proof, no);
             RoundPrf memory p;
-            (p, po) = _decodeRoundPrf(proof, po);
+            (p, npo) = _decodeRoundPrf(proof, npo);
+            // M-05: pin every shape quantity to the CONFIG before anything
+            // consumes it - the reference fixes shapes from parameters, not
+            // from proof lengths.
+            _checkRoundShapes(r, c, p);
             // V-03: the round's opening root must BE the commitment the batch
             // phase absorbed for this round's role. The identity satellite
             // hardcodes the same schedule (r0 main, r1 quotient, r2
@@ -391,6 +412,113 @@ contract WhirVerifier is IWhirVerifier {
             }
             boundEvalsOf[r] = p.boundEvals;
             _runRound(t, c, p, stm, r);
+        }
+    }
+
+    /// M-05: pin every proof shape quantity to the CONFIG before anything
+    /// consumes it. The reference derives each of these from parameters
+    /// (p3-whir-0.8.0/src/pcs/verifier/mod.rs:247-368); the wire repeats them
+    /// as array lengths and the engine used to trust those lengths. `field`
+    /// numbers the failed check:
+    ///  1 boundEvals          2 initOodAnswers    3 oodAnswers
+    ///  4 oodAnswerLens       5 powWitnesses      6 initScA
+    ///  7 initScInf           8 initScPow         9 scLens
+    /// 10 scA                11 scInf            12 scPowLens
+    /// 13 scPow              14 finalScA         15 finalScInf
+    /// 16 finalScPow         17 finalPoly        18 rows
+    /// 19 finalRows          20 paths            21 finalPaths
+    /// 22 roundCommitments   23 prunedLens       24 CONFIG shape
+    function _checkRoundShapes(uint256 r, RoundCfg memory c, RoundPrf memory p) private pure {
+        uint256 n = c.nInter;
+        // CONFIG self-consistency: the schedule arrays must all describe the
+        // same nInter rounds (params is 4 words per round: num_variables,
+        // log_folded_domain_size, ood_samples, folding_pow_bits).
+        if (c.params.length != n * 4 || c.schedPowBits.length != n || c.schedFoldPowBits.length != n
+            || c.schedNumQueries.length != n || c.schedOodSamples.length != n
+            || c.schedLogFolded.length != n || c.schedLogInvRate.length != n
+            || c.rowsIsBase.length != n) { revert RoundShapeMismatch(r, 24); }
+        if (p.roundCommitments.length != n) revert RoundShapeMismatch(r, 22);
+        // 1: bound evaluations cover every claimed column exactly once.
+        uint256 sumCW = 0;
+        for (uint256 i; i < c.claimWidths.length; ++i) { sumCW += c.claimWidths[i]; }
+        if (p.boundEvals.length != sumCW) revert RoundShapeMismatch(r, 1);
+        // 2: commitment-phase OOD answers.
+        if (p.initOodAnswers.length != c.commitmentOodSamples) revert RoundShapeMismatch(r, 2);
+        // 3/4: per-intermediate-round OOD answers, split per round.
+        uint256 sumOod = 0;
+        for (uint256 i; i < n; ++i) { sumOod += c.schedOodSamples[i]; }
+        if (p.oodAnswers.length != sumOod) revert RoundShapeMismatch(r, 3);
+        if (p.oodAnswerLens.length != n) revert RoundShapeMismatch(r, 4);
+        for (uint256 i; i < n; ++i) {
+            if (p.oodAnswerLens[i] != c.schedOodSamples[i]) revert RoundShapeMismatch(r, 4);
+        }
+        // 5: one grind witness per intermediate round that grinds.
+        uint256 cnt = 0;
+        for (uint256 i; i < n; ++i) { if (c.schedPowBits[i] > 0) { ++cnt; } }
+        if (p.powWitnesses.length != cnt) revert RoundShapeMismatch(r, 5);
+        // Sumcheck round counts. The initial phase folds numVariables down to
+        // the first intermediate round's variable count (params[0]), one
+        // variable per sumcheck round; intermediate round i folds params[4i]
+        // down to params[4(i+1)], or to the final domain's variable count
+        // finalLogFolded - finalLogInvRate for the last round.
+        uint256 initRounds = c.numVariables - c.params[0];
+        if (p.initScA.length != initRounds) revert RoundShapeMismatch(r, 6);
+        if (p.initScInf.length != initRounds) revert RoundShapeMismatch(r, 7);
+        if (p.initScPow.length != (c.startingPowBits > 0 ? initRounds : 0)) {
+            revert RoundShapeMismatch(r, 8);
+        }
+        uint256 finalVars = c.finalLogFolded - c.finalLogInvRate;
+        uint256 sumSc = 0;
+        uint256 sumScPow = 0;
+        uint256 prevR = initRounds;
+        uint256 rowsExp = 0;
+        uint256 pathsExp = 0;
+        for (uint256 i; i < n; ++i) {
+            uint256 next = (i + 1 < n) ? c.params[(i + 1) * 4] : finalVars;
+            uint256 sc = c.params[i * 4] - next;
+            if (p.scLens.length != n || p.scLens[i] != sc) revert RoundShapeMismatch(r, 9);
+            sumSc += sc;
+            // 18: each query's row holds 2^prevR elements - one limb each for
+            // base rows, four for extension rows.
+            rowsExp += c.schedNumQueries[i] * (uint256(1) << prevR)
+                * (c.rowsIsBase[i] == 1 ? 1 : 4);
+            // 12: the fold grind witness exists exactly when the round grinds.
+            uint256 pl = c.schedFoldPowBits[i] > 0 ? sc : 0;
+            if (p.scPowLens.length != n || p.scPowLens[i] != pl) revert RoundShapeMismatch(r, 12);
+            sumScPow += pl;
+            // 20: expanded paths are logFolded siblings per query (32 B each).
+            pathsExp += c.schedNumQueries[i] * c.schedLogFolded[i] * 8;
+            prevR = sc;
+        }
+        // 10/11/13: sumcheck transcripts sized by the round counts above.
+        if (p.scA.length != sumSc) revert RoundShapeMismatch(r, 10);
+        if (p.scInf.length != sumSc) revert RoundShapeMismatch(r, 11);
+        if (p.scPow.length != sumScPow) revert RoundShapeMismatch(r, 13);
+        // 14/15/16: the closing sumcheck folds finalVars variables; its grind
+        // witnesses exist exactly when the final phase grinds.
+        if (p.finalScA.length != finalVars) revert RoundShapeMismatch(r, 14);
+        if (p.finalScInf.length != finalVars) revert RoundShapeMismatch(r, 15);
+        if (p.finalScPow.length != (c.finalFoldPowBits > 0 ? finalVars : 0)) {
+            revert RoundShapeMismatch(r, 16);
+        }
+        // 17: the final polynomial is the dense multilinear over finalVars.
+        if (p.finalPoly.length != (uint256(1) << finalVars)) revert RoundShapeMismatch(r, 17);
+        // 18/19: row streams match the query schedule (final rows are always
+        // extension-encoded over the last round's fold).
+        if (p.rowsLen != rowsExp) revert RoundShapeMismatch(r, 18);
+        if (p.finalRowsLen != c.finalNumQueries * (uint256(1) << prevR) * 4) {
+            revert RoundShapeMismatch(r, 19);
+        }
+        // 20/21/23: path streams. v8 replaces the expanded grid with one
+        // digest stream per round (prunedLens counts them); the final phase
+        // always ships expanded paths.
+        if (p.prunedLens.length == 0) {
+            if (p.pathsWords != pathsExp) revert RoundShapeMismatch(r, 20);
+        } else if (p.prunedLens.length != n) {
+            revert RoundShapeMismatch(r, 23);
+        }
+        if (p.finalPathsWords != c.finalNumQueries * c.finalLogFolded * 8) {
+            revert RoundShapeMismatch(r, 21);
         }
     }
 
@@ -1080,6 +1208,10 @@ contract WhirVerifier is IWhirVerifier {
         // mediate). _paths reads straight from these offsets.
         uint256 pathsAbs;
         uint256 finalPathsAbs;
+        /// M-05: the path blobs' word counts as decoded (flag bit masked), so
+        /// the shape check can pin them against the CONFIG schedule.
+        uint256 pathsWords;
+        uint256 finalPathsWords;
         // v8: per-intermediate digest counts of the pruned stream, in wire
         // order; empty when the bundle carries expanded paths.
         uint256[] prunedLens;
@@ -1171,6 +1303,7 @@ contract WhirVerifier is IWhirVerifier {
                 abs := add(m.offset, mul(no, 4))
             }
             p.pathsAbs = abs;
+            p.pathsWords = nBytes / 4;
             no += nBytes / 4;
             if (pruned) {
                 (p.prunedLens, no) = _arr(m, no);
@@ -1209,6 +1342,7 @@ contract WhirVerifier is IWhirVerifier {
                 abs := add(m.offset, mul(no, 4))
             }
             p.finalPathsAbs = abs;
+            p.finalPathsWords = nBytes / 4;
             no += nBytes / 4;
         }
         (p.finalScA, no) = _extArr(m, no);

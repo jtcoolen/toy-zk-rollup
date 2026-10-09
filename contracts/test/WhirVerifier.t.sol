@@ -199,6 +199,33 @@ contract WhirVerifierTest is Test {
         verifier.verify(statement, b);
     }
 
+    /// M-05: every proof shape quantity is pinned to the CONFIG. Round 0's
+    /// oodAnswerLens stream (byte 296260, values [2,2,2]) must equal the
+    /// CONFIG schedOodSamples per round. Inflating the first entry to 3 is a
+    /// pure value lie - it shifts nothing downstream - so the shape check
+    /// fires before anything consumes it.
+    function test_verify_rejects_inflated_ood_answer_len() public {
+        bytes memory b = _bundle();
+        b[296260] = hex"03";
+        vm.expectRevert(abi.encodeWithSelector(WhirVerifier.RoundShapeMismatch.selector, 0, 4));
+        verifier.verify(statement, b);
+    }
+
+    /// M-05 fail-closed backstop: a header whose PROOF word count lies is
+    /// rejected before the walk can alias bytes across the section boundary
+    /// (the STATEMENT framing check trips first here; the end-of-section
+    /// cursor check is the second net).
+    function test_verify_rejects_proof_length_mismatch() public view {
+        bytes memory b = _bundle();
+        // prfWords is u32 LE at bytes 12..15: 157313 = 0x26681 -> +1 = 0x26682.
+        b[12] = hex"82";
+        b[13] = hex"66";
+        b[14] = hex"02";
+        b[15] = hex"00";
+        (bool ok,) = address(verifier).staticcall(abi.encodeCall(WhirVerifier.verify, (statement, b)));
+        assertFalse(ok, "lying header must not verify");
+    }
+
     /// No satellite, no verifier: the constructor refuses a zero address and
     /// an address with no code, so a deployment can never pin nothing.
     function test_constructor_requires_a_pinned_satellite() public {
