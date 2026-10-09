@@ -4,6 +4,7 @@
 \usepackage{amsmath,amssymb,amsthm}
 \usepackage{booktabs,longtable,tabularx,array}
 \usepackage{xcolor}
+\sloppy  % prefer looser spacing to margin overflow in citation-dense paragraphs
 \usepackage{fancyvrb}
 \usepackage[colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
 
@@ -19,5 +20,8 @@
 \newcommand{\Hk}{H_{\mathsf{K}}}
 \newcommand{\limbs}{\mathsf{limbs}}
 \newcommand{\code}[1]{\texttt{#1}}
-\newcommand{\src}[1]{{\small\textcolor{gray}{[\texttt{#1}]}}}
+% Source citations are long monospace paths. \path is fragile inside other
+% macros' arguments, so keep \texttt and instead permit a line break before and
+% after each citation (the overflow came from runs of consecutive citations).
+\newcommand{\src}[1]{\allowbreak{\small\textcolor{gray}{[\texttt{#1}]}}\allowbreak}
 \newcommand{\finding}[1]{\textbf{[#1]}}
