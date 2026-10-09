@@ -138,7 +138,7 @@ contract WhirVerifierTest is Test {
         vm.expectRevert(abi.encodeWithSelector(
             WhirVerifier.TerminalClaimMismatch.selector,
             0,
-            7310951842385423194496838757449039760275611913632498172033385521528619139072
+            5145738483257368734721048007920492166929493615645799605964670266337445019648
         ));
         v.verify(statement, _bundle());
     }
@@ -152,7 +152,7 @@ contract WhirVerifierTest is Test {
         vm.expectRevert(abi.encodeWithSelector(
             WhirVerifier.TerminalClaimMismatch.selector,
             0,
-            7310951842385423194496838757449039760275611913632498172033385521528619139072
+            5145738483257368734721048007920492166929493615645799605964670266337445019648
         ));
         v.verify(statement, _bundle());
     }

@@ -51,7 +51,9 @@ contract BatchTranscriptNativeTest is Test {
         bytes32 mainDigest = bytes32(_slice(b.raw, b.varOff, 32));
         bytes32 permDigest = bytes32(_slice(b.raw, b.varOff + 32, 32));
         bytes32 quotDigest = bytes32(_slice(b.raw, b.varOff + 160, 32));
-        bytes32 randDigest = bytes32(_slice(b.raw, b.varOff + 192, 32));
+        // D-092 batch 89: settlement blinding is off - no randomization round,
+        // so the wire carries no rand digest. hasRand=false ignores the value.
+        bytes32 randDigest = bytes32(0);
 
         // The six LogUp terminals, canonical packed, from the JSON (the proof codec's
         // job in production; the blob's copies are the same values in wire form).
@@ -70,7 +72,7 @@ contract BatchTranscriptNativeTest is Test {
             BatchTranscript.lookupPhase(s, 0, vm.parseJsonUint(j, ".pow_witnesses.lookup"));
         uint256 constraintAlpha =
             BatchTranscript.permutationPhase(s, permDigest, terminals);
-        BatchTranscript.quotientPhase(s, quotDigest, randDigest);
+        BatchTranscript.quotientPhase(s, quotDigest, randDigest, false);
         uint256 zeta = BatchTranscript.oodPhase(s, 0, vm.parseJsonUint(j, ".pow_witnesses.ood"));
 
         assertEq(lookupAlpha, parseExt(j, ".lookup_alpha"), "lookup alpha");

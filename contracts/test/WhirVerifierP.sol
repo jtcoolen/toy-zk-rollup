@@ -250,7 +250,7 @@ contract WhirVerifierP {
         BatchCfg memory cfg;
         (cfg, co) = _decodeBatchCfg(proof, co);
         BatchPrf memory prf;
-        (prf, po) = _decodeBatchPrf(proof, po);
+        (prf, po) = _decodeBatchPrf(proof, po, cfg.hasRand);
         _checkStatement(prf.pvBytes, statement);
 
         acc[0] += _g - gasleft();
@@ -273,7 +273,7 @@ contract WhirVerifierP {
         BatchTranscript.preprocessedPhase(s, cfg.preDigest);
         (uint256 lookupAlpha, uint256 beta) = BatchTranscript.lookupPhase(s, cfg.lookupPowBits, prf.lookupPow);
         uint256 constraintAlpha = BatchTranscript.permutationPhase(s, prf.permDigest, prf.terminals);
-        BatchTranscript.quotientPhase(s, prf.quotDigest, prf.randDigest);
+        BatchTranscript.quotientPhase(s, prf.quotDigest, prf.randDigest, cfg.hasRand);
         uint256 zeta = BatchTranscript.oodPhase(s, cfg.oodPowBits, prf.oodPow);
 
         // Hand the sponge to the WHIR core: the batch layer delegates to the PCS
@@ -344,6 +344,7 @@ contract WhirVerifierP {
         bytes32 preDigest;
         uint256 lookupPowBits;
         uint256 oodPowBits;
+        bool hasRand;
     }
 
     /// The batch layer's varying absorbs from PROOF.
@@ -367,10 +368,11 @@ contract WhirVerifierP {
         (c.preDigest, no) = _raw32(m, no);
         (c.lookupPowBits, no) = _word(m, no);
         (c.oodPowBits, no) = _word(m, no);
+        { uint256 hr; (hr, no) = _word(m, no); c.hasRand = hr != 0; }
         if (no != end) revert ProofTooShort();
     }
 
-    function _decodeBatchPrf(bytes calldata m, uint256 off) private pure returns (BatchPrf memory p, uint256 no) {
+    function _decodeBatchPrf(bytes calldata m, uint256 off, bool hasRand) private pure returns (BatchPrf memory p, uint256 no) {
         uint256 len;
         (len, no) = _word(m, off);
         uint256 end = no + len; // len counts words, no is a word offset
@@ -380,7 +382,9 @@ contract WhirVerifierP {
         (p.permDigest, no) = _raw32(m, no);
         (p.terminals, no) = _raw32Arr(m, no);
         (p.quotDigest, no) = _raw32(m, no);
-        (p.randDigest, no) = _raw32(m, no);
+        if (hasRand) {
+            (p.randDigest, no) = _raw32(m, no);
+        }
         (p.oodPow, no) = _word(m, no);
         if (no != end) revert ProofTooShort();
         // The proof section repeats the round count as a sanity anchor; skip it
@@ -1335,7 +1339,9 @@ contract WhirVerifierP {
 
     function _claimLayout(ConstraintsCfg memory c, uint256 round) private pure returns (ClaimLayout memory L) {
         uint256 n = c.numInstances;
-        uint256[] memory ar = c.roundArities[round];
+        // `round` is the ROLE (1=main, 2=quotient, 3=preprocessed, 4=permutation);
+        // the 4-round frame stores them at indices 0..3 (D-092 batch 89).
+        uint256[] memory ar = c.roundArities[round - 1];
         if (round == 1 || round == 3) {
             uint256 cnt = 0;
             for (uint256 i; i < n; ++i) {
@@ -1417,7 +1423,9 @@ contract WhirVerifierP {
         uint256[] calldata statement
     ) private pure {
         uint256 n = c.numInstances;
-        if (c.roundArities.length != 5) revert BadConstraints();
+        // D-092 batch 89: the identity frame is 4 rounds (r0=main, r1=quotient,
+        // r2=preprocessed, r3=permutation) - the initial OOD round is gone.
+        if (c.roundArities.length != 4) revert BadConstraints();
         // zeta_next per instance: zeta * g, g the two-adic generator of the
         // trace domain (shift-1 domains: next_point(zeta) = zeta * h).
         uint256[] memory zetaNext = new uint256[](n);
@@ -1477,7 +1485,8 @@ contract WhirVerifierP {
         // each 4-value group of the claimed values.
         for (uint256 round = 1; round <= 4; ++round) {
             ClaimLayout memory L = _claimLayout(c, round);
-            uint256[] memory bound = boundEvalsOf[round];
+            // Role r (1..4) reads bound evals of frame round r-1 (batch 89).
+            uint256[] memory bound = boundEvalsOf[round - 1];
             uint256 boff = 0;
             uint256[] memory qIdx = new uint256[](n);
             for (uint256 j; j < L.count; ++j) {

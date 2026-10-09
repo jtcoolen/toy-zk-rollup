@@ -44,22 +44,21 @@ use std::path::PathBuf;
 
 use p3_air::BaseAir;
 use p3_batch_stark::CommonData;
-use p3_circuit_prover::CircuitVerifier;
 use p3_commit::UnivariateStarkPcs;
 use p3_field::{BasedVectorSpace, PrimeCharacteristicRing};
 use serde_json::json;
 
-use prover::semantic_blob::{classify_observations, replay_blob};
+use prover::composed_export::structural_batch_fixed;
+use prover::semantic_blob::replay_blob;
 use prover::semantic_trace::SemChallenger;
 use prover::whir_recursion::LOG_MAX_LDE;
 
 use prover::settlement_replay::{
     base_json, bus_layout, com_json, dom_json, ext_json, fib_recursion, hex, one_run, Challenge,
-    ReplayOut, SemConfig, SemPcs, EXT_DEG, F,
+    SemConfig, SemPcs, EXT_DEG, F,
 };
 
-/// Independent proving runs; two is the minimum that separates fixed from varying.
-const RUNS: usize = 2;
+
 
 /// One instance's lookup metadata: trusted-setup data, never proof data (D-063).
 fn lookup_meta(lookups: &[p3_lookup::Lookup<F>]) -> Vec<serde_json::Value> {
@@ -99,36 +98,29 @@ fn settlement_program_equality() {
     println!("instances: {}", out.challenges.len());
 }
 
-/// Prove, verify and replay RUNS times, classify every transcript position as config-fixed
+/// Prove, verify and replay once, classify every transcript position as config-fixed
 /// or proof-varying, and write the artifacts the Solidity side drives from.
+///
+/// D-092 batch 89: settlement blinding is off, so a second run is byte-identical
+/// and classifies nothing. The split is structural (see `structural_batch_fixed`).
 #[test]
-#[ignore = "proves the settlement batch RUNS times (~5s each); regenerates the artifacts"]
+#[ignore = "proves the settlement batch once (~5s); regenerates the artifacts"]
 #[allow(clippy::too_many_lines)] // the artifact document is one literal; splitting the json! across helpers hides the schema
 fn export_batch_stark_vectors() {
     let (pis, rc) = fib_recursion();
-    let mut programs = Vec::new();
-    let mut last: Option<(
-        ReplayOut,
-        CircuitVerifier<SemConfig>,
-        p3_circuit_prover::BatchStarkProof<SemConfig>,
-    )> = None;
-    for _ in 0..RUNS {
-        let (program, out, verifier, proof) = one_run(&pis, &rc, None);
-        programs.push(program);
-        last = Some((out, verifier, proof));
-    }
-    let (out, verifier, proof) = last.expect("at least one run");
+    let (program, out, verifier, proof) = one_run(&pis, &rc, None);
     let batch = &proof.proof;
     let common: &CommonData<SemConfig> = verifier.common_data();
     let airs = verifier.table_airs::<EXT_DEG>().expect("airs");
     let public_values = verifier.table_public_values(&pis).expect("public values");
 
-    // Fixed/varying classification over the native verifier programs (D-059). The blob
-    // and every exported value must describe the SAME proof: each run re-masks, so a
-    // blob from run 1 and challenges from run 2 would disagree on every sample.
-    let (fixed, varying) = classify_observations(&programs);
-    let program = programs.last().expect("at least one run");
-    let blob = replay_blob(program, &fixed).expect("replay blob");
+    // Fixed/varying classification (D-059 lineage, D-092 batch 89 form): the
+    // batch region is structural, the delegate region is all proof data. The
+    // blob and every exported value describe the SAME proof - the same-run
+    // discipline of D-059.
+    let fixed = structural_batch_fixed(&program, &out.phase_marks);
+    let varying: Vec<usize> = (0..program.len()).filter(|&i| fixed[i].is_none()).collect();
+    let blob = replay_blob(&program, &fixed).expect("replay blob");
     let fixed_runs: Vec<String> = fixed
         .iter()
         .map(|f| {
@@ -251,7 +243,9 @@ fn batch_stark_artifact_shape_is_pinned() {
     };
     let doc: serde_json::Value = serde_json::from_str(&text).expect("valid json");
     assert_eq!(doc["num_instances"].as_u64().unwrap(), 6);
-    assert!(doc["is_zk"].as_bool().unwrap());
+    // D-092 batch 89: the settlement layer proves without ZK blinding (the
+    // client transfer proof stays ZK; only the settlement STARK drops it).
+    assert!(!doc["is_zk"].as_bool().unwrap());
     assert_eq!(doc["ext_degree"].as_u64().unwrap(), 4);
     let dbs: Vec<u64> = doc["degree_bits"]
         .as_array()
@@ -260,15 +254,18 @@ fn batch_stark_artifact_shape_is_pinned() {
         .map(|v| v.as_u64().unwrap())
         .collect();
     assert_eq!(dbs.len(), 6, "one degree-bit entry per instance");
-    assert!(dbs.iter().all(|&d| d > 0 && d <= LOG_MAX_LDE as u64));
+    // Non-ZK drops the blinding columns, so an instance's constraint degree can
+    // fall to 0 (constant). Degrees must still fit the declared LDE cap.
+    assert!(dbs.iter().all(|&d| d <= LOG_MAX_LDE as u64));
     // Every settlement instance carries lookups (measured shape), so the permutation
-    // commitment, the randomization commitment and the preprocessed commitment are all
-    // present, and both proof-of-work witnesses are the free-search value.
+    // commitment and the preprocessed commitment are present. Non-ZK: the
+    // randomization commitment is null. Both proof-of-work witnesses are the
+    // free-search value.
     for inst in doc["instances"].as_array().unwrap() {
         assert!(!inst["lookups"].as_array().unwrap().is_empty());
     }
     assert!(doc["commitments"]["permutation"].is_string());
-    assert!(doc["commitments"]["random"].is_string());
+    assert!(doc["commitments"]["random"].is_null());
     assert!(doc["commitments"]["preprocessed"].is_string());
     assert_eq!(doc["pow_witnesses"]["ood"].as_u64().unwrap(), 0);
     assert_eq!(doc["pow_witnesses"]["lookup"].as_u64().unwrap(), 0);

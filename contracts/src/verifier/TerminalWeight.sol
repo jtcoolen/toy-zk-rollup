@@ -758,7 +758,8 @@ contract TerminalWeight {
     //   [5] nTerm, then nTerm packed-ext terminal words
     //   [6] nStm, then nStm canonical-u32 statement words
     //   [7] cfgWords, then cfgWords*4 raw CONFIG CONSTRAINTS bytes
-    //   then for rounds 1..4: boundLen, then boundLen packed-ext words
+    //   then for each opening round (count = config round count): boundLen,
+    //   then boundLen packed-ext words
     //
     // The satellite parses CONSTRAINTS itself (node programs stay in the
     // frame's calldata, read in place), rebuilds every opened value from the
@@ -781,7 +782,7 @@ contract TerminalWeight {
 
     /// The claims of one opening round: widths, owning matrix, arity, point
     /// index (0 = zeta, 1 = zeta_next of the matrix). Ported verbatim from
-    /// the engine (batch 48) - including the round-2 arity quirk (ar[j]).
+    /// the engine (batch 48) - including the quotient-round arity quirk (ar[j]).
     struct ClaimLayout {
         uint256 count;
         uint256[] widths;
@@ -797,10 +798,10 @@ contract TerminalWeight {
     {
         uint256 n = c.n;
         uint256[] memory ar = c.roundArities[round];
-        if (round == 1 || round == 3) {
+        if (round == 0 || round == 2) {
             uint256 cnt = 0;
             for (uint256 i; i < n; ++i) {
-                cnt += (round == 1 ? c.hasMainNext[i] : c.hasPreNext[i]) ? 2 : 1;
+                cnt += (round == 0 ? c.hasMainNext[i] : c.hasPreNext[i]) ? 2 : 1;
             }
             L.count = cnt;
             L.widths = new uint256[](cnt);
@@ -809,8 +810,8 @@ contract TerminalWeight {
             L.point = new uint256[](cnt);
             uint256 j = 0;
             for (uint256 i; i < n; ++i) {
-                uint256 w = round == 1 ? c.width[i] : c.preWidth[i];
-                uint256 reps = (round == 1 ? c.hasMainNext[i] : c.hasPreNext[i]) ? 2 : 1;
+                uint256 w = round == 0 ? c.width[i] : c.preWidth[i];
+                uint256 reps = (round == 0 ? c.hasMainNext[i] : c.hasPreNext[i]) ? 2 : 1;
                 for (uint256 q; q < reps; ++q) {
                     L.widths[j] = w;
                     L.matrix[j] = i;
@@ -819,7 +820,7 @@ contract TerminalWeight {
                     j++;
                 }
             }
-        } else if (round == 2) {
+        } else if (round == 1) {
             uint256 cnt = 0;
             for (uint256 i; i < n; ++i) {
                 cnt += c.numChunks[i];
@@ -1015,16 +1016,8 @@ contract TerminalWeight {
         uint256 cfg = c;
         c += cfgWords * 4;
 
-        uint256[][] memory boundEvalsOf = new uint256[][](5);
-        for (uint256 r = 1; r <= 4; ++r) {
-            uint256 bl = _cdWord(c); c += 32;
-            uint256[] memory b = new uint256[](bl);
-            assembly ("memory-safe") { calldatacopy(add(b, 32), c, mul(bl, 32)) }
-            c += bl * 32;
-            boundEvalsOf[r] = b;
-        }
-        if (c != msg.data.length) revert BadIdentityFrame(1, c, msg.data.length);
-
+        // CONFIG first: it carries the round count, which sizes the bound-eval
+        // sections that follow (D-092 batch 89: no longer pinned to 5).
         uint256 p = cfg;
         uint256 n = _leWordAt(p); p += 4;
         uint256 stmInst = _leWordAt(p); p += 4;
@@ -1086,12 +1079,22 @@ contract TerminalWeight {
             hasTerminal[i] = _leWordAt(p) != 0; p += 4;
         }
         uint256 nr = _leWordAt(p); p += 4;
-        if (nr != 5) revert BadIdentityFrame(2, nr, p);
+        if (nr == 0) revert BadIdentityFrame(2, nr, p);
         uint256[][] memory roundArities = new uint256[][](nr);
         for (uint256 r; r < nr; ++r) {
             (roundArities[r], p) = _leArr(p);
         }
         if (p != cfg + cfgWords * 4) revert BadIdentityFrame(3, p, cfg + cfgWords * 4);
+
+        uint256[][] memory boundEvalsOf = new uint256[][](nr);
+        for (uint256 r; r < nr; ++r) {
+            uint256 bl = _cdWord(c); c += 32;
+            uint256[] memory b = new uint256[](bl);
+            assembly ("memory-safe") { calldatacopy(add(b, 32), c, mul(bl, 32)) }
+            c += bl * 32;
+            boundEvalsOf[r] = b;
+        }
+        if (c != msg.data.length) revert BadIdentityFrame(1, c, msg.data.length);
 
         // --- opened values, exactly as the engine built them (D-076) ---
         uint256[] memory zetaNext = new uint256[](n);
@@ -1133,7 +1136,7 @@ contract TerminalWeight {
             opened[stmInst].publicValues = statement;
         }
 
-        for (uint256 round = 1; round <= 4; ++round) {
+        for (uint256 round = 0; round < nr; ++round) {
             IdentityCfg memory icfg = IdentityCfg(
                 n, width, preWidth, auxWidth, hasMainNext, hasPreNext, numChunks, roundArities);
             ClaimLayout memory L = _claimLayoutS(icfg, round);
@@ -1145,19 +1148,19 @@ contract TerminalWeight {
                 uint256 z = L.point[j] == 0 ? zeta : zetaNext[mi];
                 uint256 sc = _claimScale(z, L.arities[j]);
                 uint256 w = L.widths[j];
-                if (round == 1) {
+                if (round == 0) {
                     if (L.point[j] == 0) {
                         opened[mi].mainLocal = _claimed(bound, boff, w, sc);
                     } else {
                         opened[mi].mainNext = _claimed(bound, boff, w, sc);
                     }
-                } else if (round == 3) {
+                } else if (round == 2) {
                     if (L.point[j] == 0) {
                         opened[mi].preLocal = _claimed(bound, boff, w, sc);
                     } else {
                         opened[mi].preNext = _claimed(bound, boff, w, sc);
                     }
-                } else if (round == 2) {
+                } else if (round == 1) {
                     quotBuf[mi][qIdx[mi]] = _fromExt4Group(bound, boff, w, sc)[0];
                     qIdx[mi]++;
                 } else {

@@ -43,7 +43,8 @@ contract VerifierGasTest is Test {
         bytes32 mainDigest = bytes32(_slice(b.raw, b.varOff, 32));
         bytes32 permDigest = bytes32(_slice(b.raw, b.varOff + 32, 32));
         bytes32 quotDigest = bytes32(_slice(b.raw, b.varOff + 160, 32));
-        bytes32 randDigest = bytes32(_slice(b.raw, b.varOff + 192, 32));
+        // D-092 batch 89: settlement blinding is off - no rand digest on the wire.
+        bytes32 randDigest = bytes32(0);
         uint256 numInstances = vm.parseJsonUint(j, ".num_instances");
         uint256[] memory terminals = new uint256[](numInstances);
         for (uint256 i; i < numInstances; ++i) {
@@ -59,7 +60,7 @@ contract VerifierGasTest is Test {
         BatchTranscript.preprocessedPhase(s, preDigest);
         (uint256 lookupAlpha, uint256 beta) = BatchTranscript.lookupPhase(s, 0, lookupPow);
         uint256 constraintAlpha = BatchTranscript.permutationPhase(s, permDigest, terminals);
-        BatchTranscript.quotientPhase(s, quotDigest, randDigest);
+        BatchTranscript.quotientPhase(s, quotDigest, randDigest, false);
         uint256 zeta = BatchTranscript.oodPhase(s, 0, oodPow);
         uint256 walkGas = g0 - gasleft();
         emit layer("batch_transcript_walk", walkGas);

@@ -84,7 +84,7 @@ pub type Mmcs = crate::config::Mmcs;
 /// The commitment type the transcript absorbs.
 pub type Commitment = <Mmcs as p3_commit::Mmcs<F>>::Commitment;
 /// The semantic PCS: the WHIR core over a recording challenger.
-pub type SemPcs = WhirUniPcs<Challenge, F, Dft, Mmcs, SemChallenger, PrefixProver<F, Challenge>>;
+pub type SemPcs = WhirUniPcs<Challenge, F, Dft, Mmcs, SemChallenger, PrefixProver<F, Challenge>, false>;
 /// The semantic settlement config: same PCS and field as production, recording challenger.
 pub type SemConfig = StarkConfig<SemPcs, Challenge, SemChallenger>;
 /// The evaluation domain the settlement PCS opens over.
@@ -100,8 +100,32 @@ pub const RUNS: usize = 2;
 /// A recording challenger bound to sink, wrapping the production Keccak challenger.
 #[must_use]
 pub fn sem_challenger_with(sink: &SemSink) -> SemChallenger {
-    let inner =
-        SerializingChallenger32::new(HashChallenger::new(Vec::new(), p3_keccak::Keccak256Hash {}));
+    sem_challenger_with_seed(sink, 0)
+}
+
+/// `sem_challenger_with` with a perturbed Fiat-Shamir initial state.
+///
+/// D-092 batch 89: with settlement blinding off, two runs over the same circuit,
+/// statement and witness are byte-identical, so a same-run diff classifies
+/// nothing. Perturbing the challenger's *initial state* - which the sink never
+/// observes, so it records no event and shifts no program position - changes every
+/// subsequent challenge (zeta, the sumcheck alphas, the query indices) while
+/// leaving the program's shape identical. Witness-dependent values (evaluations,
+/// Merkle digests, grind witnesses) then differ between seeds and classify as
+/// varying; keccak framing labels are config-derived constant words absorbed
+/// identically under every seed and classify as fixed. This is the delegate-region
+/// classifier: run the settlement twice under two seeds and diff the programs.
+#[must_use]
+pub fn sem_challenger_with_seed(sink: &SemSink, seed: u64) -> SemChallenger {
+    let initial_state: Vec<u8> = if seed == 0 {
+        Vec::new()
+    } else {
+        seed.to_le_bytes().to_vec()
+    };
+    let inner = SerializingChallenger32::new(HashChallenger::new(
+        initial_state,
+        p3_keccak::Keccak256Hash {},
+    ));
     SemChallenger::new(inner, sink.clone())
 }
 
@@ -142,9 +166,11 @@ pub fn settlement_params_pow(
     rate: usize,
     pow_floor: usize,
 ) -> p3_whir::parameters::ProtocolParameters {
-    let mut pow_bits =
-        crate::whir::required_pow_bits_with(log_max_lde + crate::whir::ZK_ARITY_SLACK, rate)
-            .expect("settlement shape reaches the security target");
+    let mut pow_bits = crate::whir::required_pow_bits_with(
+        log_max_lde + crate::whir::NON_ZK_ARITY_SLACK,
+        rate,
+    )
+    .expect("settlement shape reaches the security target");
     if pow_floor > pow_bits {
         pow_bits = pow_floor;
     }
@@ -164,14 +190,27 @@ pub fn sem_config(sink: &SemSink) -> SemConfig {
 /// `sem_config` at an explicit `log_max_lde`.
 #[must_use]
 pub fn sem_config_for(sink: &SemSink, log_max_lde: usize, rate: usize) -> SemConfig {
+    sem_config_for_seed(sink, log_max_lde, rate, 0)
+}
+
+/// `sem_config_for` with a perturbed Fiat-Shamir initial state (see
+/// `sem_challenger_with_seed`). Both the PCS challenger and the Stark challenger
+/// carry the same seed so prover and verifier share one perturbed transcript.
+#[must_use]
+pub fn sem_config_for_seed(
+    sink: &SemSink,
+    log_max_lde: usize,
+    rate: usize,
+    seed: u64,
+) -> SemConfig {
     let pcs = SemPcs::new(
         settlement_params_for(log_max_lde, rate),
         Dft::default(),
         crate::config::mmcs(CAP_HEIGHT),
-        sem_challenger_with(sink),
+        sem_challenger_with_seed(sink, seed),
         log_max_lde,
     );
-    StarkConfig::new(pcs, sem_challenger_with(sink))
+    StarkConfig::new(pcs, sem_challenger_with_seed(sink, seed))
 }
 
 /// The witnessed recursion circuit for one Fibonacci proof, with its statement.
@@ -221,7 +260,25 @@ pub fn settle_sem_for(
     CircuitVerifier<SemConfig>,
     p3_circuit_prover::BatchStarkProof<SemConfig>,
 ) {
-    let settlement = sem_config_for(sink, log_max_lde, rate);
+    settle_sem_for_seed(rc, sink, log_max_lde, rate, 0)
+}
+
+/// `settle_sem_for` with a perturbed Fiat-Shamir initial state (see
+/// `sem_challenger_with_seed`). Same circuit, statement and witness; only the
+/// transcript seed differs, so the proof is a valid twin under a different
+/// challenge stream.
+#[must_use]
+pub fn settle_sem_for_seed(
+    rc: &RecursionCircuit,
+    sink: &SemSink,
+    log_max_lde: usize,
+    rate: usize,
+    seed: u64,
+) -> (
+    CircuitVerifier<SemConfig>,
+    p3_circuit_prover::BatchStarkProof<SemConfig>,
+) {
+    let settlement = sem_config_for_seed(sink, log_max_lde, rate, seed);
     let shared = Poseidon2Config::KOALA_BEAR_D4_W16.for_shared_challenger_table();
     let preprocessors: Vec<Box<dyn NpoPreprocessor<F>>> = vec![
         Box::new(Poseidon2SharedPreprocessor::new(vec![shared])),
@@ -625,8 +682,30 @@ pub fn one_run_for(
     CircuitVerifier<SemConfig>,
     p3_circuit_prover::BatchStarkProof<SemConfig>,
 ) {
+    one_run_for_seed(pis, rc, opening, log_max_lde, rate, 0)
+}
+
+/// `one_run_for` with a perturbed Fiat-Shamir initial state (see
+/// `sem_challenger_with_seed`). The whole cycle - prove, native verify, manual
+/// replay - runs under one seed, so the returned program is that seed's variant.
+/// Diff two seeds' programs to separate fixed framing from varying witness data in
+/// the delegate region.
+#[must_use]
+pub fn one_run_for_seed(
+    pis: &[F],
+    rc: &RecursionCircuit,
+    opening: Option<&mut OpeningReplacer<'_>>,
+    log_max_lde: usize,
+    rate: usize,
+    seed: u64,
+) -> (
+    SemProgram,
+    ReplayOut,
+    CircuitVerifier<SemConfig>,
+    p3_circuit_prover::BatchStarkProof<SemConfig>,
+) {
     let sink = SemSink::new();
-    let (verifier, proof) = settle_sem_for(rc, &sink, log_max_lde, rate);
+    let (verifier, proof) = settle_sem_for_seed(rc, &sink, log_max_lde, rate, seed);
 
     // The prover shares the sink; mark where the verifier's program begins.
     let mark = sink.program().len();
@@ -643,7 +722,7 @@ pub fn one_run_for(
         .expect("table public values");
 
     let sink_manual = SemSink::new();
-    let manual_config = sem_config_for(&sink_manual, log_max_lde, rate);
+    let manual_config = sem_config_for_seed(&sink_manual, log_max_lde, rate, seed);
     let out = manual_replay(
         &manual_config,
         &verifier,

@@ -37,10 +37,10 @@ use p3_circuit_prover::CircuitVerifier;
 use p3_lookup::LogUpGadget;
 
 use crate::constraint_ir::{instance_identity_json, EF};
-use crate::semantic_blob::{classify_observations, replay_blob};
+use crate::semantic_blob::replay_blob;
 use crate::semantic_trace::{SemChallenger, SemEvent, SemProgram};
 use crate::settlement_replay::{
-    base_json, bus_layout, com_json, dom_json, ext_json, fib_recursion, hex, one_run_for,
+    base_json, bus_layout, com_json, dom_json, ext_json, fib_recursion, hex, one_run_for_seed,
     settlement_params, settlement_params_for, Challenge, Dft, OpeningClaims, OpeningProof,
     ReplayOut, SemConfig, CAP_HEIGHT,
 };
@@ -262,6 +262,27 @@ pub fn composed_run_with(
     rounds_json: &mut Vec<serde_json::Value>,
     round_starts: &mut Vec<usize>,
 ) -> Result<(serde_json::Value, ReplayOut, SemProgram), Box<dyn Error>> {
+    composed_run_with_seed(pis, rc, params, log_max_lde, rate, 0, rounds_json, round_starts)
+}
+
+/// `composed_run_with` under a perturbed Fiat-Shamir initial state (see
+/// `crate::settlement_replay::sem_challenger_with_seed`). Same circuit, statement
+/// and witness; only the challenge stream differs. Two seeds produce program
+/// *twins*: identical shape (length, round starts, event kinds, grind counts)
+/// with every witness-dependent value different. Diffing a pair separates fixed
+/// framing constants from varying proof data in the delegate region - the
+/// replacement for the old two-run blinding diff, which died with settlement
+/// blinding.
+pub fn composed_run_with_seed(
+    pis: &[F],
+    rc: &RecursionCircuit,
+    params: &p3_whir::parameters::ProtocolParameters,
+    log_max_lde: usize,
+    rate: usize,
+    seed: u64,
+    rounds_json: &mut Vec<serde_json::Value>,
+    round_starts: &mut Vec<usize>,
+) -> Result<(serde_json::Value, ReplayOut, SemProgram), Box<dyn Error>> {
     {
         let mut replacer = |ch: &mut SemChallenger,
                             claims: &OpeningClaims,
@@ -384,7 +405,7 @@ pub fn composed_run_with(
             Ok(())
         };
         let (program, out, verifier, proof) =
-            one_run_for(pis, rc, Some(&mut replacer), log_max_lde, rate);
+            one_run_for_seed(pis, rc, Some(&mut replacer), log_max_lde, rate, seed);
         let constraint_identity = constraint_identity_block(&verifier, &proof, &out, pis)?;
         let doc = json!({
             "description": "composed settlement-shape WHIR walk: the shared walk driven
@@ -524,6 +545,193 @@ fn varying_positions(program: &SemProgram, fixed: &[Option<Vec<u32>>]) -> Vec<us
     (0..program.len()).filter(|&i| fixed[i].is_none()).collect()
 }
 
+/// D-092 batch 89: the structural fixed/varying classification for the batch
+/// (pre-delegate) region, derived from the phase marks instead of a diff of two
+/// settlement proofs.
+///
+/// With settlement blinding off (`Pcs::ZK = false`) two runs over the same
+/// circuit and statement are byte-identical, so `classify_observations` marks
+/// every position fixed and the batch digests - which the contract must read
+/// from the proof section - collapse into the trusted constant table (the
+/// wbnd walk then panics with no main digest). The classification is not a
+/// property of the run pair; it is a property of the protocol:
+///
+/// * `ObserveBase` before the end of `main_phase` is the domain seed, the
+///   claimed degree, and the statement's public values - fixed per block, so
+///   they ride in the bundle's constant section (the bundle is per block).
+/// * The single `ObserveBytes` digest inside `preprocessed_phase` is the
+///   trusted-setup commitment - fixed.
+/// * Every other observation is proof data: the main/permutation/quotient
+///   commitment digests, the permutation terminals, and everything from the
+///   delegate onward (round regions absorb only client-proof-dependent values
+///   once blinding is off, so the whole delegate region is varying; the
+///   framing tables and claim schedules degrade to single varying runs, which
+///   the contract consumes as data - the bundle bytes are identical either
+///   way, only the section each word rides in changes).
+///
+/// Marks are END positions: the phase of a site is the first mark whose end
+/// exceeds it, matching the wbnd walk's `phase_of`.
+#[must_use]
+pub fn structural_batch_fixed(
+    program: &SemProgram,
+    marks: &[(String, usize)],
+) -> Vec<Option<Vec<u32>>> {
+    let mark_at = |name: &str| -> Option<usize> {
+        marks.iter().find(|(n, _)| n == name).map(|(_, at)| *at)
+    };
+    let main_end = mark_at("main_phase").unwrap_or(usize::MAX);
+    let delegate = mark_at("before_delegate").unwrap_or(program.len());
+    let mut sorted: Vec<(usize, &str)> = marks.iter().map(|(n, at)| (*at, n.as_str())).collect();
+    sorted.sort_by_key(|(at, _)| *at);
+    let phase_of = |site: usize| -> &str {
+        sorted
+            .iter()
+            .find(|(at, _)| *at > site)
+            .map_or("after", |(_, name)| name)
+    };
+    program
+        .iter()
+        .enumerate()
+        .map(|(i, event)| {
+            if i >= delegate {
+                return None;
+            }
+            match event {
+                SemEvent::ObserveBase { value } if i < main_end => Some(vec![*value]),
+                SemEvent::ObserveBytes { bytes } if phase_of(i) == "preprocessed_phase" => {
+                    Some(
+                        bytes
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .copied()
+                            .map(u32::from_le_bytes)
+                            .collect(),
+                    )
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// The Fiat-Shamir seed for the classification twin. Seed 0 is the production
+/// transcript (empty initial state); seed 1 perturbs every challenge while
+/// leaving the program shape identical.
+pub const TWIN_SEED: u64 = 0x5EED_092;
+
+/// Fixed/varying classification from a seed-twin pair: two settlement runs over
+/// the same circuit, statement and witness under two Fiat-Shamir seeds.
+///
+/// The batch (pre-delegate) region keeps the structural rule - those observations
+/// are block-public values (seed, degree, public values, preprocessed digest)
+/// that no seed perturbation changes, and the wbnd walk needs the batch digests
+/// classified as proof data. In the delegate region the diff decides: an
+/// `ObserveBase`/`ObserveBytes` event whose value is identical under both seeds
+/// is protocol framing (keccak labels, shape constants) or a config-determined
+/// constant evaluation - fixed, absorbed from the trusted table. A value that
+/// differs is witness- or challenge-dependent (claimed evaluations, Merkle
+/// digests, grind witnesses) - varying, read from the proof section. Samples,
+/// checks and grinds are never fixed.
+///
+/// This replaces the old two-run blinding diff: with settlement blinding off two
+/// production runs are byte-identical, but a seed perturbation changes every
+/// challenge (zeta, alphas, query indices) so every witness-dependent value
+/// moves while the framing labels - derived from config, not from the
+/// transcript - stay put.
+///
+/// Panics if the twins differ in shape: that would mean the seed leaked into a
+/// control decision (grind length, phase order), which the sink design forbids.
+#[must_use]
+pub fn twin_delegate_fixed(
+    program_a: &SemProgram,
+    program_b: &SemProgram,
+    marks: &[(String, usize)],
+) -> Vec<Option<Vec<u32>>> {
+    assert_eq!(
+        program_a.len(),
+        program_b.len(),
+        "twin programs differ in length: seed perturbed a control decision"
+    );
+    let delegate = marks
+        .iter()
+        .find(|(n, _)| n == "before_delegate")
+        .map_or(program_a.len(), |(_, at)| *at);
+    let structural = structural_batch_fixed(program_a, marks);
+    structural
+        .into_iter()
+        .enumerate()
+        .map(|(i, slot)| {
+            if i < delegate {
+                return slot;
+            }
+            if program_a[i] != program_b[i] {
+                return None;
+            }
+            match &program_a[i] {
+                SemEvent::ObserveBase { value } => Some(vec![*value]),
+                SemEvent::ObserveBytes { bytes } => Some(
+                    bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .copied()
+                        .map(u32::from_le_bytes)
+                        .collect(),
+                ),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// The twin-composed settlement run: prove and verify under seed 0 (the
+/// production transcript whose proof the bundle ships), prove a second
+/// settlement under `TWIN_SEED` purely as a classification oracle, and return
+/// the merged fixed/varying split alongside seed 0's doc, replay output,
+/// program and round starts.
+///
+/// Cost: two settlement proofs per call - the same cost the pre-blinding-off
+/// design paid for its two-run diff. The node pays this once per block.
+#[allow(clippy::type_complexity)]
+pub fn composed_run_twin(
+    pis: &[F],
+    rc: &RecursionCircuit,
+    params: &p3_whir::parameters::ProtocolParameters,
+    log_max_lde: usize,
+    rate: usize,
+) -> Result<
+    (
+        serde_json::Value,
+        ReplayOut,
+        SemProgram,
+        Vec<Option<Vec<u32>>>,
+        Vec<usize>,
+    ),
+    Box<dyn Error>,
+> {
+    let mut rounds_a = Vec::new();
+    let mut starts_a = Vec::new();
+    let (doc, out, program_a) =
+        composed_run_with_seed(pis, rc, params, log_max_lde, rate, 0, &mut rounds_a, &mut starts_a)?;
+    let mut rounds_b = Vec::new();
+    let mut starts_b = Vec::new();
+    let (_doc_b, _out_b, program_b) = composed_run_with_seed(
+        pis,
+        rc,
+        params,
+        log_max_lde,
+        rate,
+        TWIN_SEED,
+        &mut rounds_b,
+        &mut starts_b,
+    )?;
+    assert_eq!(starts_a, starts_b, "twin round starts differ");
+    let fixed_raw = twin_delegate_fixed(&program_a, &program_b, &out.phase_marks);
+    let fixed = reclassify_zero_runs(&program_a, fixed_raw);
+    Ok((doc, out, program_a, fixed, starts_a))
+}
+
 /// Per-claim run schedule for one composed round: for each opening claim,
 /// the alternating [`is_constant`, words] runs of its transcript region,
 /// derived from the sink phase offsets and the fixed classification. This is
@@ -602,16 +810,28 @@ fn claim_run_schedule(
 /// the last claim every fixed run is framing (batching, then one sumcheck
 /// separator per sumcheck: initial, each intermediate round, terminal).
 ///
-/// Returns the concatenated little-endian hex of the kept words and the
-/// per-run word counts, so the contract can slice them into its schedule
-/// structs by position.
+/// Returns the concatenated little-endian hex of the kept words plus the
+/// per-category word counts: segments before the claims (split at dropped
+/// events), one total per claim, and the post-claim segments (batching first,
+/// then one sumcheck separator per sumcheck). The contract slices the hex by
+/// these counts in phase order.
+#[derive(Debug)]
+pub(crate) struct FramingTable {
+    pub hex: String,
+    pub pre_claims: Vec<usize>,
+    pub claim_framings: Vec<usize>,
+    pub batching: usize,
+    pub seps: Vec<usize>,
+}
+
 fn round_framing_table(
     program: &SemProgram,
     fixed: &[Option<Vec<u32>>],
     start: usize,
     end: usize,
     phase_offsets: &[usize],
-) -> (String, Vec<usize>) {
+    claim_widths: &[usize],
+) -> FramingTable {
     // phase_offsets = [claims_start, claim_end_0, ..., claim_end_{n-1}].
     // Classify each fixed EVENT as framing or constant-eval, then emit the
     // framing events in program order as contiguous segments. A fixed event is
@@ -624,74 +844,159 @@ fn round_framing_table(
     // the next claim's framing; the event-level test splits them correctly).
     let claims_start = *phase_offsets.first().unwrap_or(&start);
     let last_claim_end = *phase_offsets.last().unwrap_or(&start);
-    // Per-claim framing prefix length in events: leading fixed events of the
-    // claim before its first varying event.
     let is_fixed_ev = |i: usize| {
         matches!(
             program[i],
             SemEvent::ObserveBase { .. } | SemEvent::ObserveBytes { .. }
         ) && fixed[i].is_some()
     };
+    let event_words = |i: usize| fixed[i].as_ref().map_or(1, std::vec::Vec::len);
+    // Per-claim framing length in WORDS: the claim region holds exactly
+    // 4 * width words of evaluations (the contract reads them from calldata
+    // via bound_evals, whether the eval is seed-varying or a seed-invariant
+    // constant riding the same wire slot); everything else in the region is
+    // framing absorbed from the trusted table. A fixed eval adjacent to the
+    // leading fixed run must NOT be counted as framing or it is absorbed
+    // twice - once from the table, once from calldata - shifting the
+    // transcript and failing the first grind check.
     let mut framing_prefix: Vec<usize> = Vec::new();
-    for w in phase_offsets.windows(2) {
+    for (c, w) in phase_offsets.windows(2).enumerate() {
         let (a, b) = (w[0], w[1]);
-        let mut n = 0usize;
+        let mut region_words = 0usize;
         let mut i = a;
-        while i < b && is_fixed_ev(i) {
-            n += 1;
+        while i < b {
+            region_words += event_words(i);
             i += 1;
         }
-        framing_prefix.push(n);
+        let evals_words = 4 * claim_widths.get(c).copied().unwrap_or(0);
+        assert!(
+            region_words >= evals_words,
+            "claim {}: region {} words < eval {} words",
+            c,
+            region_words,
+            evals_words
+        );
+        framing_prefix.push(region_words - evals_words);
     }
     // Claim index for a position: the c with phase_offsets[c] <= i < offsets[c+1].
     let claim_of = |i: usize| -> Option<usize> {
         (0..framing_prefix.len()).find(|&c| i >= phase_offsets[c] && i < phase_offsets[c + 1])
     };
+    // Category of a kept event: Pre (before the claims), Claim(c) (inside
+    // claim c's framing prefix), or Post (after the last claim). Adjacent kept
+    // events in the same category accumulate into one bucket; a dropped event
+    // or a category change closes the bucket. Pre and Post buckets stay split
+    // (the contract walks them as separate absorb calls); per-claim buckets
+    // are one total each regardless of splits, because the contract absorbs
+    // each claim's framing as a single block before that claim's evals.
+    enum Cat {
+        Pre,
+        Claim(usize),
+        Post,
+    }
     let mut bytes: Vec<u8> = Vec::new();
-    let mut lens: Vec<usize> = Vec::new();
-    let mut seg = 0usize;
+    let mut pre_claims: Vec<usize> = Vec::new();
+    let mut claim_framings: Vec<usize> = vec![0; framing_prefix.len()];
+    let mut post: Vec<usize> = Vec::new();
+    // Per-claim walk state: words of framing consumed, and whether a varying
+    // event has closed the claim's framing prefix.
+    let mut framing_used: Vec<usize> = vec![0; framing_prefix.len()];
+    let mut seen_varying: Vec<bool> = vec![false; framing_prefix.len()];
+    // Current open bucket: (category, words). Claim buckets never close early.
+    let mut open: Option<(Cat, usize)> = None;
+    let close = |open: &mut Option<(Cat, usize)>, pre: &mut Vec<usize>, post: &mut Vec<usize>| {
+        if let Some((cat, w)) = open.take() {
+            match cat {
+                Cat::Pre => pre.push(w),
+                Cat::Post => post.push(w),
+                Cat::Claim(_) => {}
+            }
+        }
+    };
     let mut i = start;
     while i < end {
         if !is_fixed_ev(i) {
-            if seg > 0 {
-                lens.push(seg);
-                seg = 0;
+            if let Some(c) = claim_of(i) {
+                seen_varying[c] = true;
             }
+            close(&mut open, &mut pre_claims, &mut post);
             i += 1;
             continue;
         }
         let words = fixed[i].as_ref().map_or(1, std::vec::Vec::len);
-        let keep = if i < claims_start || i >= last_claim_end {
-            true
+        let cat = if i < claims_start {
+            Some(Cat::Pre)
+        } else if i >= last_claim_end {
+            Some(Cat::Post)
         } else if let Some(c) = claim_of(i) {
-            // Offset within the claim, in events.
-            let mut off = 0usize;
-            let mut k = phase_offsets[c];
-            while k < i {
-                off += 1;
-                k += 1;
+            // Framing iff inside the claim's leading fixed prefix, measured in
+            // words (see framing_prefix). Once a varying event has been seen
+            // in the claim, later fixed events are constant evaluations.
+            if seen_varying[c] {
+                None
+            } else if framing_used[c] < framing_prefix[c] {
+                Some(Cat::Claim(c))
+            } else {
+                None
             }
-            off < framing_prefix[c]
         } else {
-            false
+            None
         };
-        if keep {
-            if let Some(ws) = &fixed[i] {
-                for w in ws {
-                    bytes.extend(w.to_le_bytes());
+        match cat {
+            Some(Cat::Claim(c)) => {
+                assert!(
+                    framing_used[c] + words <= framing_prefix[c],
+                    "claim {}: framing cut lands mid-event ({} + {} > {})",
+                    c,
+                    framing_used[c],
+                    words,
+                    framing_prefix[c]
+                );
+                if let Some(ws) = &fixed[i] {
+                    for w in ws {
+                        bytes.extend(w.to_le_bytes());
+                    }
+                }
+                // Claim framing absorbs as one block per claim: total the
+                // words, no segment splits. Close any open pre/post bucket.
+                close(&mut open, &mut pre_claims, &mut post);
+                framing_used[c] += words;
+                claim_framings[c] += words;
+            }
+            Some(cat) => {
+                if let Some(ws) = &fixed[i] {
+                    for w in ws {
+                        bytes.extend(w.to_le_bytes());
+                    }
+                }
+                match (&mut open, &cat) {
+                    (Some((Cat::Pre, w0)), Cat::Pre) => *w0 += words,
+                    (Some((Cat::Post, w0)), Cat::Post) => *w0 += words,
+                    _ => {
+                        close(&mut open, &mut pre_claims, &mut post);
+                        open = Some((cat, words));
+                    }
                 }
             }
-            seg += words;
-        } else if seg > 0 {
-            lens.push(seg);
-            seg = 0;
+            None => close(&mut open, &mut pre_claims, &mut post),
         }
         i += 1;
     }
-    if seg > 0 {
-        lens.push(seg);
+    close(&mut open, &mut pre_claims, &mut post);
+    for c in 0..framing_prefix.len() {
+        assert_eq!(
+            claim_framings[c], framing_prefix[c],
+            "claim {}: framing emitted {} words, expected {}",
+            c, claim_framings[c], framing_prefix[c]
+        );
     }
-    (hex(&bytes), lens)
+    FramingTable {
+        hex: hex(&bytes),
+        pre_claims,
+        claim_framings,
+        batching: *post.first().unwrap_or(&0),
+        seps: post.iter().skip(1).copied().collect(),
+    }
 }
 
 /// The full alternating run schedule of one round region: every maximal run
@@ -871,38 +1176,35 @@ fn round_framing_tables(
             let claim_offsets = &all[..(claims + 1).min(all.len())];
             let st = starts[r];
             let en = starts.get(r + 1).copied().unwrap_or(program.len());
-            let (hexbytes, lens) = round_framing_table(program, fixed, st, en, claim_offsets);
-            // The per-claim framings are the claim run schedules' leading
-            // constant-run lengths; they appear contiguously in `lens`.
+            let widths: Vec<usize> = rd["walk"]["claim_widths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let ft = round_framing_table(program, fixed, st, en, claim_offsets, &widths);
+            // Cross-check: the per-claim framings must match the claim run
+            // schedules' leading constant-run lengths (the contract consumes
+            // both views and they must agree).
             let claim_framing: Vec<usize> = claim_schedules[r]
                 .iter()
-                .map(|runs| {
-                    runs.first()
-                        .map_or(0, |run| if run[0] == 1 { run[1] } else { 0 })
+                .zip(widths.iter())
+                .map(|(runs, w)| {
+                    let region: usize = runs.iter().map(|run| run[1]).sum();
+                    region - 4 * w
                 })
                 .collect();
-            let mut p = 0usize;
-            'find: while p + claim_framing.len() <= lens.len() {
-                for k in 0..claim_framing.len() {
-                    if lens[p + k] != claim_framing[k] {
-                        p += 1;
-                        continue 'find;
-                    }
-                }
-                break;
-            }
-            // One framing block per virtual claim (OOD sample): the runs
-            // before the first concrete claim interleave with the virtual
-            // claims' point draws, so they must stay separate.
-            let pre_claims: Vec<usize> = lens[..p].to_vec();
-            let batching = lens[p + claim_framing.len()];
-            let seps = lens[p + claim_framing.len() + 1..].to_vec();
+            assert_eq!(
+                claim_framing, ft.claim_framings,
+                "round {r}: framing-table claim totals disagree with claim run schedules"
+            );
+            let _ = claims;
             json!({
-                "hex": hexbytes,
-                "pre_claims": pre_claims,
-                "claim_framings": claim_framing,
-                "batching": batching,
-                "seps": seps,
+                "hex": ft.hex,
+                "pre_claims": ft.pre_claims,
+                "claim_framings": ft.claim_framings,
+                "batching": ft.batching,
+                "seps": ft.seps,
             })
         })
         .collect()
@@ -925,10 +1227,9 @@ fn round_framing_tables(
 /// statement limbs, constraint identity, framing tables) so the operator
 /// can pin or archive it.
 ///
-/// Cost note: two settlement proofs per call (classification needs two
-/// observations). The sequencer's native verification is a third run.
-/// Accepted for now - correctness first, proof-count optimization is
-/// explicitly deferred.
+/// Cost note (D-092 batch 89): one settlement proof per call. With settlement
+/// blinding off the classification no longer needs a second observation - the
+/// fixed/varying split is structural (see `structural_batch_fixed`).
 pub fn settlement_bundle(
     rc: &RecursionCircuit,
     statement: &[F],
@@ -956,36 +1257,20 @@ pub fn settlement_bundle_with_blob(
         .and_then(|v| v.parse().ok())
         .unwrap_or(crate::block::BLOCK_LOG_MAX_LDE);
     let params = settlement_params_for(lde, rate);
-    let mut rounds_a = Vec::new();
-    let mut starts_a = Vec::new();
-    let (_doc_a, _out_a, program_a) = composed_run_with(
-        statement,
-        rc,
-        &params,
-        lde,
-        rate,
-        &mut rounds_a,
-        &mut starts_a,
-    )?;
-    let mut rounds_b = Vec::new();
-    let mut starts_b = Vec::new();
-    let (doc, out, program_b) = composed_run_with(
-        statement,
-        rc,
-        &params,
-        lde,
-        rate,
-        &mut rounds_b,
-        &mut starts_b,
-    )?;
-    let (fixed_raw, _varying_raw) = classify_observations(&[program_a, program_b.clone()]);
-    let fixed = reclassify_zero_runs(&program_b, fixed_raw);
+    // D-092 batch 89: settlement blinding is off, so two production runs are
+    // byte-identical and a same-run diff classifies nothing. The delegate-region
+    // split comes from a seed-twin pair instead: the same settlement proven
+    // twice under two Fiat-Shamir initial states, so every witness-dependent
+    // value moves while keccak framing labels stay put (see twin_delegate_fixed).
+    // The batch region stays structural. The bundle ships seed 0's proof.
+    let (doc, out, program, fixed, starts) =
+        composed_run_twin(statement, rc, &params, lde, rate)?;
     let (jj, blob) = build_vectors_doc(
         doc,
         &out,
-        &program_b,
+        &program,
         &fixed,
-        &starts_b,
+        &starts,
         Some(statement),
         Vec::new(),
     )?;

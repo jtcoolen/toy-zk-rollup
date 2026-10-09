@@ -73,7 +73,7 @@ contract RecursionChainV8AttributionTest is Test {
         emit log_named_uint("batch transcript", p.profileData(1));
         emit log_named_uint("constraint identity", p.profileData(6));
         emit log_named_uint("round decode (all)", p.profileData(7));
-        for (uint256 r; r < 5; ++r) {
+        for (uint256 r; r < 4; ++r) {
             uint256 base = 10 + r * 32;
             emit log_named_uint("-- initial", p.profileData(base + 0));
             emit log_named_uint("   verifyRound", p.profileData(base + 1));

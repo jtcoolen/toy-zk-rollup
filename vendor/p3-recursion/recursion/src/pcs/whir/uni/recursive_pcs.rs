@@ -358,14 +358,14 @@ impl<F: p3_field::Field> Recursive<F> for () {
 /// No WHIR variant in this adapter splits off random codewords.
 const NO_RANDOM_OPENED_VALUES: &[Vec<Vec<Vec<Target>>>] = &[];
 
-impl<SC, Dft, MT, Comm, L, const DIGEST_ELEMS: usize>
+impl<SC, Dft, MT, Comm, L, const DIGEST_ELEMS: usize, const ZK: bool>
     RecursivePcs<
         SC,
         (),
         WhirUniProofTargets<Val<SC>, SC::Challenge, MT, DIGEST_ELEMS>,
         Comm,
         TwoAdicMultiplicativeCoset<Val<SC>>,
-    > for WhirUniPcs<SC::Challenge, Val<SC>, Dft, MT, SC::Challenger, L>
+    > for WhirUniPcs<SC::Challenge, Val<SC>, Dft, MT, SC::Challenger, L, ZK>
 where
     SC: StarkGenericConfig,
     Val<SC>: TwoAdicField + PrimeField64 + Ord,

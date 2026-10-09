@@ -57,7 +57,9 @@ contract BatchTranscriptTest is Test {
         assertEq(w.cursor.witnesses, b.witnessLen, "witness payload not fully read");
 
         string memory j = vm.readFile(JSON);
-        assertEq(w.samples.length, 716, "sample pool size");
+        // D-092 batch 89: the settlement layer is non-ZK (no ZK blinding draws)
+        // and the frame is 4 rounds, so the pool shrank from 716.
+        assertEq(w.samples.length, 504, "sample pool size");
         assertEqSamples(w, POOL_LOOKUP_ALPHA, j, ".lookup_alpha", "lookup alpha");
         assertEqSamples(w, POOL_BETA, j, ".beta", "beta");
         assertEqSamples(w, POOL_CONSTRAINT_ALPHA, j, ".constraint_alpha", "constraint alpha");
@@ -66,12 +68,14 @@ contract BatchTranscriptTest is Test {
 
     /// The commitment absorbs land where the phases put them: main, preprocessed (the
     /// trusted-setup digest carried as a constant - the OP_CONST_COMMITMENT op),
-    /// permutation, quotient, random. Pinning the first five digests proves the constant
+    /// permutation, quotient, then the round commitments. D-092 batch 89: the
+    /// settlement layer is non-ZK - commitments.random is null and no random
+    /// digest is absorbed. Pinning the first five digests proves the constant
     /// commitment is absorbed at the right site, not merely present somewhere.
     function test_commitment_absorbs_in_phase_order() public view {
         SemanticBlob.Blob memory b = SemanticBlob.load(BLOB);
         SemanticBlob.Walk memory w = SemanticBlob.walk(b, false, true);
-        assertEq(w.digests.length, 22, "digest count: 21 proof + 1 trusted setup");
+        assertEq(w.digests.length, 15, "digest count: 14 proof + 1 trusted setup");
 
         string memory j = vm.readFile(JSON);
         assertEq(toHex(w.digests[0]), vm.parseJsonString(j, ".commitments.main"), "main");
@@ -86,7 +90,9 @@ contract BatchTranscriptTest is Test {
         assertEq(
             toHex(w.digests[3]), vm.parseJsonString(j, ".commitments.quotient_chunks"), "quotient"
         );
-        assertEq(toHex(w.digests[4]), vm.parseJsonString(j, ".commitments.random"), "random");
+        // Non-ZK: there is no fifth pinned digest - the old slot held the random
+        // commitment (JSON null now). The count assertion above proves it is gone.
+        assertTrue(vm.keyExists(j, ".commitments.random"), "random key present");
     }
 
     /// The bus layout recomputed on-chain (D-063): prefix[i] = alpha + (i + 1) * beta^W,

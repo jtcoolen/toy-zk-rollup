@@ -132,15 +132,16 @@ library ChunkVerifier {
         return encode(c);
     }
 
-    /// quotient_phase: the quotient-chunk commitment, then the randomization one.
-    function stepQuotient(bytes memory carry, bytes32 quotientDigest, bytes32 randomDigest)
+    /// quotient_phase: the quotient-chunk commitment, then the randomization
+    /// one when the PCS hides (D-092 batch 89: false for the non-ZK settlement).
+    function stepQuotient(bytes memory carry, bytes32 quotientDigest, bytes32 randomDigest, bool hasRand)
         internal pure returns (bytes memory)
     {
         Chunk memory c = decode(carry);
         _expect(c.phase, PHASE_PERMUTATION);
         BatchTranscript.State memory s;
         s.sponge = c.sponge;
-        BatchTranscript.quotientPhase(s, quotientDigest, randomDigest);
+        BatchTranscript.quotientPhase(s, quotientDigest, randomDigest, hasRand);
         c.sponge = s.sponge;
         c.phase = PHASE_QUOTIENT;
         return encode(c);

@@ -264,7 +264,7 @@ contract WhirVerifier is IWhirVerifier {
         BatchCfg memory cfg;
         (cfg, co) = _decodeBatchCfg(proof, co);
         BatchPrf memory prf;
-        (prf, po) = _decodeBatchPrf(proof, po);
+        (prf, po) = _decodeBatchPrf(proof, po, cfg.hasRand);
         _checkStatement(prf.pvBytes, statement);
 
         // --- post-opening check: the LogUp terminal sum ---------------------------
@@ -287,7 +287,7 @@ contract WhirVerifier is IWhirVerifier {
             BatchTranscript.lookupPhase(s, cfg.lookupPowBits, prf.lookupPow);
         uint256 constraintAlpha =
             BatchTranscript.permutationPhase(s, prf.permDigest, prf.terminals);
-        BatchTranscript.quotientPhase(s, prf.quotDigest, prf.randDigest);
+        BatchTranscript.quotientPhase(s, prf.quotDigest, prf.randDigest, cfg.hasRand);
         uint256 zeta = BatchTranscript.oodPhase(s, cfg.oodPowBits, prf.oodPow);
 
         // Hand the sponge to the WHIR core: the batch layer delegates to the PCS
@@ -297,7 +297,8 @@ contract WhirVerifier is IWhirVerifier {
 
         // --- CONFIG: schedule + per opening round -------------------------------
         // The constraint identity (D-076) needs each round's bound evaluations
-        // after the walk: keep them (rounds 1..4; round 0 is the random round).
+        // after the walk: keep them (one section per opening round; the
+        // identity walk consumes them by role: main, quotient, pre, perm).
         uint256[][] memory boundEvalsOf;
         (co, boundEvalsOf) = _runRounds(proof, co, po, t, stm);
 
@@ -358,6 +359,8 @@ contract WhirVerifier is IWhirVerifier {
         bytes32 preDigest;
         uint256 lookupPowBits;
         uint256 oodPowBits;
+        /// D-092 batch 89: the batch carries a ZK randomization commitment.
+        bool hasRand;
     }
 
     /// The batch layer's varying absorbs from PROOF.
@@ -385,10 +388,11 @@ contract WhirVerifier is IWhirVerifier {
         (c.preDigest, no) = _raw32(m, no);
         (c.lookupPowBits, no) = _word(m, no);
         (c.oodPowBits, no) = _word(m, no);
+        { uint256 hr; (hr, no) = _word(m, no); c.hasRand = hr != 0; }
         if (no != end) revert ProofTooShort();
     }
 
-    function _decodeBatchPrf(bytes calldata m, uint256 off)
+    function _decodeBatchPrf(bytes calldata m, uint256 off, bool hasRand)
         private
         pure
         returns (BatchPrf memory p, uint256 no)
@@ -402,7 +406,11 @@ contract WhirVerifier is IWhirVerifier {
         (p.permDigest, no) = _raw32(m, no);
         (p.terminals, no) = _raw32Arr(m, no);
         (p.quotDigest, no) = _raw32(m, no);
-        (p.randDigest, no) = _raw32(m, no);
+        // randDigest is present exactly when the batch hides (cfg.hasRand);
+        // the caller passes the flag in via _decodeBatchPrf's hasRand arg.
+        if (hasRand) {
+            (p.randDigest, no) = _raw32(m, no);
+        }
         (p.oodPow, no) = _word(m, no);
         if (no != end) revert ProofTooShort();
         // The proof section repeats the round count as a sanity anchor; skip it
@@ -1307,7 +1315,7 @@ contract WhirVerifier is IWhirVerifier {
 
     /// The constraint identity on the satellite (batch 48). Pack the CIDNTY
     /// frame - [magic, zeta, constraintAlpha, lookupAlpha, beta, terminals,
-    /// statement, raw CONFIG CONSTRAINTS bytes, bound evals for rounds 1..4]
+    /// statement, raw CONFIG CONSTRAINTS bytes, bound evals for every opening round]
     /// - and staticcall TerminalWeight. The satellite parses the CONFIG
     /// section itself (node programs stay in ITS calldata, read in place),
     /// rebuilds every opened value, and checks fold * inv_vanishing ==
@@ -1351,7 +1359,8 @@ contract WhirVerifier is IWhirVerifier {
             c := add(c, 32)
             calldatacopy(c, add(proof.offset, mul(cfgWord, 4)), mul(cfgWords, 4))
             c := add(c, mul(cfgWords, 4))
-            for { let r := 1 } lt(r, 5) { r := add(r, 1) } {
+            let nr := mload(boundEvalsOf)
+            for { let r := 0 } lt(r, nr) { r := add(r, 1) } {
                 let arr := mload(add(add(boundEvalsOf, 32), mul(r, 32)))
                 let bl := mload(arr)
                 mstore(c, bl)

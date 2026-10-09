@@ -319,7 +319,7 @@ where
 /// cryptographically secure, which is why the seed is never a caller-supplied
 /// constant: a fixed mask seed leaks every secret the mask was meant to hide.
 #[derive(Debug)]
-pub struct WhirUniPcs<EF, F, Dft, MT, Challenger, L> {
+pub struct WhirUniPcs<EF, F, Dft, MT, Challenger, L, const ZK: bool = true> {
     /// WHIR protocol parameters shared by every commitment.
     pub protocol_params: ProtocolParameters,
     /// First-round folding factor, extracted from `protocol_params`.
@@ -341,8 +341,8 @@ pub struct WhirUniPcs<EF, F, Dft, MT, Challenger, L> {
     _marker: PhantomData<(EF, F, L)>,
 }
 
-impl<EF, F, Dft: Clone, MT: Clone, Challenger: Clone, L> Clone
-    for WhirUniPcs<EF, F, Dft, MT, Challenger, L>
+impl<EF, F, Dft: Clone, MT: Clone, Challenger: Clone, L, const ZK: bool> Clone
+    for WhirUniPcs<EF, F, Dft, MT, Challenger, L, ZK>
 {
     /// Cloning forks the masking stream by drawing a fresh seed from the source
     /// RNG, so the clone and the original never produce the same masks.
@@ -364,7 +364,7 @@ impl<EF, F, Dft: Clone, MT: Clone, Challenger: Clone, L> Clone
     }
 }
 
-impl<EF, F, Dft, MT, Challenger, L> WhirUniPcs<EF, F, Dft, MT, Challenger, L>
+impl<EF, F, Dft, MT, Challenger, L, const ZK: bool> WhirUniPcs<EF, F, Dft, MT, Challenger, L, ZK>
 where
     F: TwoAdicField + PrimeField64 + Ord,
     EF: ExtensionField<F> + TwoAdicField,
@@ -539,7 +539,13 @@ where
         let width = coeffs.width();
         assert!(
             domain.size() >= coeffs.height(),
-            "requested domain is smaller than the committed matrix"
+            "requested domain is smaller than the committed matrix (idx={idx} dom={} mat_h={} mat_w={} ZK={ZK} commit_dom={:?} n_mats={} preprocessed={})",
+            domain.size(),
+            coeffs.height(),
+            width,
+            prover_data.domains.get(idx).map(|d| d.size()),
+            prover_data.coeffs.len(),
+            prover_data.preprocessed,
         );
         let mut values = coeffs.values.clone();
         values.resize(domain.size() * width, F::ZERO);
@@ -785,8 +791,8 @@ where
     }
 }
 
-impl<EF, F, Dft, MT, Challenger, L> p3_commit::Pcs<EF, Challenger>
-    for WhirUniPcs<EF, F, Dft, MT, Challenger, L>
+impl<EF, F, Dft, MT, Challenger, L, const ZK: bool> p3_commit::Pcs<EF, Challenger>
+    for WhirUniPcs<EF, F, Dft, MT, Challenger, L, ZK>
 where
     F: TwoAdicField + PrimeField64 + Ord,
     EF: ExtensionField<F> + TwoAdicField,
@@ -837,6 +843,18 @@ where
         // rows rather than after them.
         let evaluations: Vec<_> = evaluations.into_iter().collect();
         let mats: Vec<RowMajorMatrix<F>> = evaluations.iter().map(|(_, m)| m.clone()).collect();
+        if !ZK {
+            // D-092 batch 89: unmasked commitment. The caller declared the
+            // natural (undoubled) domain; commit the trace as-is.
+            let mut domains = Vec::new();
+            let mut coeffs = Vec::new();
+            for (domain, mat) in evaluations {
+                debug_assert_eq!(mat.height(), domain.size());
+                coeffs.push(self.dft.coset_idft_batch(mat, domain.shift()));
+                domains.push(domain);
+            }
+            return self.commit_coefficient_matrices(domains, coeffs);
+        }
         // The mask's random subspace must dominate everything the proof will
         // reveal about this commitment: the out-of-domain openings plus every
         // WHIR query against the folded codeword. The arity is read on the
@@ -926,8 +944,8 @@ where
     }
 }
 
-impl<EF, F, Dft, MT, Challenger, L> p3_commit::UnivariateStarkPcs<EF, Challenger>
-    for WhirUniPcs<EF, F, Dft, MT, Challenger, L>
+impl<EF, F, Dft, MT, Challenger, L, const ZK: bool> p3_commit::UnivariateStarkPcs<EF, Challenger>
+    for WhirUniPcs<EF, F, Dft, MT, Challenger, L, ZK>
 where
     F: TwoAdicField + PrimeField64 + Ord,
     EF: ExtensionField<F> + TwoAdicField,
@@ -946,7 +964,7 @@ where
 {
     type EvaluationsOnDomain<'a> = RowMajorMatrix<F>;
 
-    const ZK: bool = true;
+    const ZK: bool = ZK;
 
     fn log_max_trace_height(&self) -> usize {
         self.log_max_lde_height
@@ -979,6 +997,15 @@ where
         let mut domains = Vec::new();
         let mut coeffs = Vec::new();
         for (domain, mat) in evaluations {
+            if !ZK {
+                // D-092 batch 89: unmasked mode. The caller declares the natural
+                // (undoubled) domain and hands the trace at that exact height;
+                // there is no doubling to match, so commit as-is.
+                debug_assert_eq!(mat.height(), domain.size());
+                coeffs.push(self.dft.coset_idft_batch(mat, domain.shift()));
+                domains.push(domain);
+                continue;
+            }
             let width = mat.width();
             let padded = {
                 let mut m = mat.with_zero_cols(width);
@@ -1007,6 +1034,9 @@ where
         &self,
         domains: impl IntoIterator<Item = Self::Domain>,
     ) -> Result<Option<(Self::Commitment, Self::ProverData)>, Self::ProverError> {
+        if !ZK {
+            return Ok(None);
+        }
         let domains: Vec<_> = domains.into_iter().collect();
         let probe: Vec<RowMajorMatrix<F>> = domains
             .iter()
@@ -1064,6 +1094,19 @@ where
         evaluations: impl IntoIterator<Item = (Self::Domain, RowMajorMatrix<F>)>,
         num_chunks: usize,
     ) -> Result<Vec<RowMajorMatrix<F>>, Self::ProverError> {
+        if !ZK {
+            // No hiding to preserve: the chunk mask exists only to randomise
+            // individual chunk openings, and its compensation keeps the
+            // recomposed quotient identical either way. Still convert each
+            // chunk from evaluations to coefficients - commit_ldes treats its
+            // input as coefficients - but skip the mask entirely. This also
+            // allows num_chunks == 1, which is what a low-degree quotient
+            // yields without the ZK doubling.
+            return Ok(evaluations
+                .into_iter()
+                .map(|(domain, m)| self.dft.coset_idft_batch(m, domain.shift()))
+                .collect());
+        }
         assert!(
             num_chunks > 1,
             "num_chunks must be > 1 to preserve hiding (got {num_chunks})"
@@ -1260,7 +1303,7 @@ where
     }
 }
 
-impl<EF, F, Dft, MT, Challenger, L> WhirUniPcs<EF, F, Dft, MT, Challenger, L>
+impl<EF, F, Dft, MT, Challenger, L, const ZK: bool> WhirUniPcs<EF, F, Dft, MT, Challenger, L, ZK>
 where
     F: TwoAdicField + PrimeField64 + Ord,
     EF: ExtensionField<F> + TwoAdicField,

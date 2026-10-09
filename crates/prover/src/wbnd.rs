@@ -712,6 +712,10 @@ fn encode_bundle_impl(
         // are config, not proof.
         m.word(0);
         m.word(0);
+        // D-092 batch 89: whether the batch carries a ZK randomization
+        // commitment. The settlement layer is non-ZK, so this is 0 and the
+        // proof section omits the randomization digest entirely.
+        m.word(if batch.rand_digest.is_some() { 1 } else { 0 });
         let batch_cfg = m.take();
         cfg.push(batch_cfg.len() as u32);
         cfg.extend_from_slice(&batch_cfg);
@@ -765,7 +769,9 @@ fn encode_bundle_impl(
             m.raw(t);
         }
         m.raw(batch.quot_digest.as_deref().expect("quot digest"));
-        m.raw(batch.rand_digest.as_deref().expect("rand digest"));
+        if let Some(rd) = batch.rand_digest.as_deref() {
+            m.raw(rd);
+        }
         m.word(batch.ood_pow);
         let batch_prf = m.take();
         prf.push(batch_prf.len() as u32);

@@ -89,11 +89,21 @@ mod zk_guard {
     // does not widen the root namespace for a guard nobody calls.
     use p3_commit::UnivariateStarkPcs as _;
 
+    // D-092 batch 89: the settlement layer is deliberately NON-ZK. Its trace
+    // is the rc circuit's witness, and every cell of that witness is a
+    // deterministic function of public data - the client proof (itself ZK, so
+    // its openings are public-safe by construction) and the block statement
+    // (public by design). Blinding it would hide nothing while doubling the
+    // committed height, the grind bits, and the query count of the one proof
+    // that lands on-chain. The invariant that makes this safe is the assert
+    // below: the layer that DOES hold secrets - the client transfer trace
+    // (sk_d, rho, psi) - is proven ZK and re-verified in-circuit with its R
+    // commitment and masked openings.
     const _: () = assert!(
-        <crate::whir::Config as p3_uni_stark::StarkGenericConfig>::Pcs::ZK,
-        "the settlement (Keccak) layer must run HVZK blinding: its proof is the one
-         that lands on-chain, so an unblinded trace opening publishes witness
-         combinations to the whole network"
+        !<crate::whir::Config as p3_uni_stark::StarkGenericConfig>::Pcs::ZK,
+        "the settlement (Keccak) layer must be NON-ZK: its witness is derived
+         entirely from the ZK client proof and the public block statement, so
+         blinding only inflates the on-chain proof"
     );
 
     const _: () = assert!(

@@ -83,7 +83,7 @@ pub type Dft = Radix2DitParallel<F>;
 ///
 /// Implements `UnivariateStarkPcs`, so it drops into `p3_uni_stark::{prove, verify}`
 /// unchanged: switching from FRI to WHIR is a PCS substitution, not a prover rewrite.
-pub type Pcs = WhirUniPcs<Challenge, F, Dft, Mmcs, Challenger, PrefixProver<F, Challenge>>;
+pub type Pcs = WhirUniPcs<Challenge, F, Dft, Mmcs, Challenger, PrefixProver<F, Challenge>, false>;
 
 /// The full settlement STARK configuration.
 pub type Config = StarkConfig<Pcs, Challenge, Challenger>;
@@ -169,6 +169,11 @@ pub fn folding_factor_final() -> usize {
 /// (23 bits at 25), the largest commitment stacks at exactly
 /// `log_max_lde + 2`, so that is the arity the budget is read off.
 pub const ZK_ARITY_SLACK: usize = 2;
+
+/// Arity slack for a NON-ZK commitment: no doubling, but the stacked width
+/// still contributes one variable on top of the trace height (D-092 batch 89:
+/// the settlement layer dropped blinding; the client-proof layer keeps `+2`).
+pub const NON_ZK_ARITY_SLACK: usize = 1;
 
 /// D-092 batch 78: soundness regime env override. "udr" | "capacity" |
 /// default "johnson". CapacityBound claims the same bits at ~half the queries

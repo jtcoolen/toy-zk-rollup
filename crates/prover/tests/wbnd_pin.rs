@@ -93,6 +93,11 @@ fn regenerate_committed_bundles() {
             "block_composed_flat.json",
             "block_composed_bundle.bin",
         ),
+        (
+            "composed_vectors.json",
+            "composed_flat.json",
+            "composed_bundle.bin",
+        ),
     ] {
         let jj: Value = serde_json::from_slice(&read_vec(src)).expect("composed vectors json");
         let bin = read_vec(&src.replace(".json", ".bin"));

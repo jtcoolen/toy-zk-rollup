@@ -279,7 +279,7 @@ contract WhirVerifierV8P {
         BatchCfg memory cfg;
         (cfg, co) = _decodeBatchCfg(proof, co);
         BatchPrf memory prf;
-        (prf, po) = _decodeBatchPrf(proof, po);
+        (prf, po) = _decodeBatchPrf(proof, po, cfg.hasRand);
         _checkStatement(prf.pvBytes, statement);
         acc[0] += _g - gasleft();
         _logr("decode done gasleft ", gasleft());
@@ -305,7 +305,7 @@ contract WhirVerifierV8P {
             BatchTranscript.lookupPhase(s, cfg.lookupPowBits, prf.lookupPow);
         uint256 constraintAlpha =
             BatchTranscript.permutationPhase(s, prf.permDigest, prf.terminals);
-        BatchTranscript.quotientPhase(s, prf.quotDigest, prf.randDigest);
+        BatchTranscript.quotientPhase(s, prf.quotDigest, prf.randDigest, cfg.hasRand);
         uint256 zeta = BatchTranscript.oodPhase(s, cfg.oodPowBits, prf.oodPow);
         acc[1] += _g - gasleft();
         _logr("batch transcript done gasleft ", gasleft());
@@ -388,6 +388,7 @@ contract WhirVerifierV8P {
         bytes32 preDigest;
         uint256 lookupPowBits;
         uint256 oodPowBits;
+        bool hasRand;
     }
 
     /// The batch layer's varying absorbs from PROOF.
@@ -415,10 +416,11 @@ contract WhirVerifierV8P {
         (c.preDigest, no) = _raw32(m, no);
         (c.lookupPowBits, no) = _word(m, no);
         (c.oodPowBits, no) = _word(m, no);
+        { uint256 hr; (hr, no) = _word(m, no); c.hasRand = hr != 0; }
         if (no != end) revert ProofTooShort();
     }
 
-    function _decodeBatchPrf(bytes calldata m, uint256 off)
+    function _decodeBatchPrf(bytes calldata m, uint256 off, bool hasRand)
         private
         pure
         returns (BatchPrf memory p, uint256 no)
@@ -432,7 +434,9 @@ contract WhirVerifierV8P {
         (p.permDigest, no) = _raw32(m, no);
         (p.terminals, no) = _raw32Arr(m, no);
         (p.quotDigest, no) = _raw32(m, no);
-        (p.randDigest, no) = _raw32(m, no);
+        if (hasRand) {
+            (p.randDigest, no) = _raw32(m, no);
+        }
         (p.oodPow, no) = _word(m, no);
         if (no != end) revert ProofTooShort();
         // The proof section repeats the round count as a sanity anchor; skip it
@@ -1412,7 +1416,8 @@ contract WhirVerifierV8P {
             c := add(c, 32)
             calldatacopy(c, add(proof.offset, mul(cfgWord, 4)), mul(cfgWords, 4))
             c := add(c, mul(cfgWords, 4))
-            for { let r := 1 } lt(r, 5) { r := add(r, 1) } {
+            let nr := mload(boundEvalsOf)
+            for { let r := 0 } lt(r, nr) { r := add(r, 1) } {
                 let arr := mload(add(add(boundEvalsOf, 32), mul(r, 32)))
                 let bl := mload(arr)
                 mstore(c, bl)

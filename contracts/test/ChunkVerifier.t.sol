@@ -36,7 +36,8 @@ contract ChunkVerifierTest is Test {
         bytes32 mainDigest = bytes32(_slice(b.raw, b.varOff, 32));
         bytes32 permDigest = bytes32(_slice(b.raw, b.varOff + 32, 32));
         bytes32 quotDigest = bytes32(_slice(b.raw, b.varOff + 160, 32));
-        bytes32 randDigest = bytes32(_slice(b.raw, b.varOff + 192, 32));
+        // D-092 batch 89: settlement blinding is off - no rand digest on the wire.
+        bytes32 randDigest = bytes32(0);
 
         uint256 numInstances = vm.parseJsonUint(j, ".num_instances");
         uint256[] memory terminals = new uint256[](numInstances);
@@ -59,7 +60,7 @@ contract ChunkVerifierTest is Test {
         assertEq(ChunkVerifier.phaseOf(carry), ChunkVerifier.PHASE_LOOKUP);
         carry = ChunkVerifier.stepPermutation(carry, permDigest, terminals);
         assertEq(ChunkVerifier.phaseOf(carry), ChunkVerifier.PHASE_PERMUTATION);
-        carry = ChunkVerifier.stepQuotient(carry, quotDigest, randDigest);
+        carry = ChunkVerifier.stepQuotient(carry, quotDigest, randDigest, false);
         assertEq(ChunkVerifier.phaseOf(carry), ChunkVerifier.PHASE_QUOTIENT);
         carry = ChunkVerifier.stepOod(carry, 0, oodPow);
         assertEq(ChunkVerifier.phaseOf(carry), ChunkVerifier.PHASE_OOD);

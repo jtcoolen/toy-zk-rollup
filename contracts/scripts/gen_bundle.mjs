@@ -253,6 +253,9 @@ const cfg = [];
     // both sites (the witnesses are pinned to zero); the bits are config, not proof.
     pushWord(lookupPowBits);
     pushWord(oodPowBits);
+    // D-092 batch 89: does the batch carry a ZK randomization commitment?
+    // The settlement layer is non-ZK: 0, and the proof omits the digest.
+    pushWord(randDigest ? 1 : 0);
   });
   cfg.push(batchCfg.length, ...batchCfg);
 
@@ -306,7 +309,7 @@ const prf = [];
     pushWord(terminals.length);
     for (const t of terminals) pushRaw(t);
     pushRaw(quotDigest);
-    pushRaw(randDigest);
+    if (randDigest) pushRaw(randDigest);
     pushWord(oodPow);
   });
   prf.push(batchPrf.length, ...batchPrf);

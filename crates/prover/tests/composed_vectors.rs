@@ -34,14 +34,14 @@ use std::path::PathBuf;
 
 use serde_json::json;
 
-use prover::semantic_blob::classify_observations;
 use prover::semantic_trace::SemChallenger;
 use prover::F;
 
-use prover::composed_export::{
-    composed_run, composed_run_with, export_and_write, reclassify_zero_runs,
+use prover::composed_export::{composed_run_twin, export_and_write};
+use prover::settlement_replay::{
+    fib_recursion, hex, settlement_params, settlement_params_for, Challenge, SemPcs,
 };
-use prover::settlement_replay::{hex, settlement_params_for, Challenge, SemPcs};
+use prover::whir_recursion::LOG_MAX_LDE;
 
 use pq_hash::{Poseidon2Commitment, Poseidon2Shielded};
 use prover::block::{block_statement, build_multi_transfer_circuit, ChildProof, TransferShape};
@@ -51,60 +51,43 @@ use prover::whir_recursion::InnerWhirConfig;
 use shielded::keys::derive_spend_pk;
 use shielded::{Note, NullifierMap};
 
-// The ZK PCS type flag guards the randomization round: with ZK on, round 0 is
-// the randomization commitment and there are five opening rounds; without it
-// the five-round shape pin would already be wrong. Checked at compile time - a
-// const context rejects a false value, so this cannot rot into dead runtime code.
-const _: bool = <SemPcs as p3_commit::UnivariateStarkPcs<Challenge, SemChallenger>>::ZK;
+// D-092 batch 89: settlement blinding is OFF. The settlement proof (the STARK
+// of the rc circuit that ShieldedPool verifies) is fully deterministic - no
+// randomization round, no blinding rows. The client transfer proof keeps its
+// ZK layer (InnerWhirConfig pins ZK = true in crate::whir); only the outer
+// layer drops it. Checked at compile time so the shape pins cannot rot.
+const _: bool =
+    !<SemPcs as p3_commit::UnivariateStarkPcs<Challenge, SemChallenger>>::ZK;
 
 /// The linchpin: prove, verify natively, replay the batch phases with the shared WHIR
 /// walk in the delegate, and require the combined programs to agree (asserted inside
 /// `one_run`). Then export the per-round statements and the composed blob for Solidity.
 ///
-/// Two runs, same circuit and config, each re-masking: classifying them splits the
-/// settlement event stream into config-fixed absorbs (the contract regenerates them
-/// from the schedule) and proof-dependent absorbs (read from calldata). Both runs are
-/// verified against the native run, so the blob and every exported value describe one
-/// proof - the same-run discipline of D-059.
+/// D-092 batch 89: with settlement blinding off a second run is byte-identical and
+/// classifies nothing, so the fixed/varying split is structural (see
+/// `structural_batch_fixed`): batch-region constants (seed, degree, public values,
+/// preprocessed digest) ride in the bundle's constant section; everything else -
+/// including the whole delegate region - is proof data read from calldata.
 #[test]
 #[ignore = "proves the settlement batch twice (~12s); regenerates composed_vectors.{json,bin}"]
 fn composed_program_equality_and_export() {
-    let mut rounds_a = Vec::new();
-    let mut starts_a = Vec::new();
-    let (_doc_a, _out_a, program_a) =
-        composed_run(&mut rounds_a, &mut starts_a).expect("composed run A");
-
-    let mut rounds_b = Vec::new();
-    let mut starts_b = Vec::new();
-    let (doc, out, program_b) = composed_run(&mut rounds_b, &mut starts_b).expect("composed run B");
-    assert_eq!(
-        program_a.len(),
-        program_b.len(),
-        "runs disagree on program length"
-    );
-    assert_eq!(starts_a, starts_b, "runs disagree on round boundaries");
-
-    let (fixed_raw, varying_raw) = classify_observations(&[program_a, program_b.clone()]);
-    // Proof-data zeros: a config-fixed run whose every word is zero is not a
-    // framing constant but a structurally-zero extension element (a high
-    // final_poly coefficient, or a zero column of a claim's evaluations) that
-    // happens to be zero in both sampled runs. The contract reads proof data
-    // from calldata uniformly; leaving these in the trusted constant table
-    // would force the final-poly absorb to interleave constant and calldata
-    // words (Vx12 Cx4 Vx12 Cx4 ...), which no scalar schedule expresses.
-    // Reclassifying them as varying moves the zeros into the proof payload, so
-    // every framing run is a nonzero shape constant and final_poly is read
-    // whole from calldata. Framing constants are keccak-derived or fixed
-    // labels and are never all-zero; the small-shape guard already treats an
-    // isolated fixed zero as a bug (check_no_ambiguous_zeros).
-    let fixed = reclassify_zero_runs(&program_b, fixed_raw);
-    let _ = varying_raw;
+    let (pis, rc) = fib_recursion();
+    let params = settlement_params();
+    // D-092 batch 89: the fixed/varying split comes from a seed-twin pair (see
+    // composed_run_twin): the same settlement proven under two Fiat-Shamir
+    // initial states. Witness-dependent values move between seeds (varying);
+    // keccak framing labels and shape constants do not (fixed). The batch
+    // region stays structural, and all-zero fixed runs are reclassified as
+    // proof data inside the twin (structurally-zero extension elements are not
+    // framing constants).
+    let (doc, out, program, fixed, starts) =
+        composed_run_twin(&pis, &rc, &params, LOG_MAX_LDE, 1).expect("composed twin");
     export_and_write(
         doc,
         &out,
-        &program_b,
+        &program,
         &fixed,
-        &starts_b,
+        &starts,
         "composed_vectors",
         None,
         vec![],
@@ -122,16 +105,17 @@ fn composed_artifact_shape_is_pinned() {
         return;
     };
     let doc: serde_json::Value = serde_json::from_str(&text).expect("valid json");
-    assert_eq!(doc["num_rounds"].as_u64().unwrap(), 5);
+    // D-092 batch 89 canonical env (WHIR_INNER_RATE=3 WHIR_RATE_FINAL=4): the
+    // fib settlement folds at blowup 16, so the opening schedule is four rounds,
+    // not the five the rate-2 vectors carried. Round 1 is the per-instance column
+    // split (8 matrices); the others open the six instance commitments.
     let rounds = doc["rounds"].as_array().unwrap();
-    // Measured settlement shapes: round 2 is the per-instance column split (32
-    // matrices); the others open the six instance commitments; rounds 1 and 4 open
-    // the two-row instances at two points.
+    assert_eq!(doc["num_rounds"].as_u64().unwrap(), 4);
     let matrix_counts: Vec<u64> = rounds
         .iter()
         .map(|r| r["matrices"].as_array().unwrap().len() as u64)
         .collect();
-    assert_eq!(matrix_counts, vec![6, 6, 32, 6, 6]);
+    assert_eq!(matrix_counts, vec![6, 8, 6, 6]);
     let point_counts: Vec<Vec<u64>> = rounds
         .iter()
         .map(|r| {
@@ -143,9 +127,12 @@ fn composed_artifact_shape_is_pinned() {
                 .collect()
         })
         .collect();
-    assert!(point_counts[0].iter().all(|&n| n == 1));
-    assert!(point_counts[2].iter().all(|&n| n == 1));
-    assert!(point_counts[4].iter().all(|&n| n == 2));
+    assert_eq!(point_counts, vec![
+        vec![1, 1, 2, 2, 1, 1],
+        vec![1, 1, 1, 1, 1, 1, 1, 1],
+        vec![1, 1, 2, 2, 1, 1],
+        vec![2, 2, 2, 2, 2, 2],
+    ]);
     // Every round carries a completed walk: the terminal phase closed with a claim.
     for r in rounds {
         assert!(r["walk"]["terminal"]["claimed_after_final"].is_array());
@@ -255,45 +242,23 @@ fn block_program_equality_and_export() -> Result<(), Box<dyn Error>> {
 
     let params = settlement_params_for(prover::block::BLOCK_LOG_MAX_LDE, 1);
 
-    let mut rounds_a = Vec::new();
-    let mut starts_a = Vec::new();
-    let (_doc_a, _out_a, program_a) = composed_run_with(
+    // Seed-twin classification (see composed_run_twin): framing constants ride
+    // in the bundle's constant section, witness data on the wire.
+    let (doc, out, program, fixed, starts) = composed_run_twin(
         &pis,
         &rc,
         &params,
         prover::block::BLOCK_LOG_MAX_LDE,
         1,
-        &mut rounds_a,
-        &mut starts_a,
     )?;
 
-    let mut rounds_b = Vec::new();
-    let mut starts_b = Vec::new();
-    let (doc, out, program_b) = composed_run_with(
-        &pis,
-        &rc,
-        &params,
-        prover::block::BLOCK_LOG_MAX_LDE,
-        1,
-        &mut rounds_b,
-        &mut starts_b,
-    )?;
-    assert_eq!(
-        program_a.len(),
-        program_b.len(),
-        "runs disagree on program length"
-    );
-    assert_eq!(starts_a, starts_b, "runs disagree on round boundaries");
-
-    let (fixed_raw, _varying_raw) = classify_observations(&[program_a, program_b.clone()]);
-    let fixed = reclassify_zero_runs(&program_b, fixed_raw);
     let extras = write_block_genesis(note, out_note, &pis)?;
     export_and_write(
         doc,
         &out,
-        &program_b,
+        &program,
         &fixed,
-        &starts_b,
+        &starts,
         "block_composed_vectors",
         Some(&pis),
         extras,

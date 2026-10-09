@@ -212,10 +212,6 @@ contract WhirComposedTest is Test {
         _runRound(_flat(), 3);
     }
 
-    function test_composed_round4_matches_the_prover() public view {
-        _runRound(_flat(), 4);
-    }
-
     /// The per-round flat arrays the intermediate loop walks, with cursors.
     struct RoundCtx {
         string j;

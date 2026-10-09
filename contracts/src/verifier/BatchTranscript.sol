@@ -128,14 +128,18 @@ library BatchTranscript {
         constraintAlpha = drawExt(s.sponge);
     }
 
-    /// quotient_phase: the quotient-chunk commitment, then the randomization commitment
-    /// (present exactly when the PCS hides, which the settlement WHIR always does).
-    function quotientPhase(State memory s, bytes32 quotientDigest, bytes32 randomDigest)
+    /// quotient_phase: the quotient-chunk commitment, then the randomization
+    /// commitment when the PCS hides. D-092 batch 89: the settlement layer is
+    /// non-ZK (its witness is public-derived), so hasRand is false and the
+    /// randomization digest is absent from both the wire and the transcript.
+    function quotientPhase(State memory s, bytes32 quotientDigest, bytes32 randomDigest, bool hasRand)
         internal
         pure
     {
         s.sponge.observeHashU8Digest(quotientDigest);
-        s.sponge.observeHashU8Digest(randomDigest);
+        if (hasRand) {
+            s.sponge.observeHashU8Digest(randomDigest);
+        }
     }
 
     /// ood_phase: check the grind, then draw zeta.

@@ -3612,3 +3612,176 @@ only in the client trace); rc/settlement layer drops blinding: no trace
 doubling (commit 2^17 not 2^18), ZK_ARITY_SLACK 2->1, no R commitment round.
 Plan: const-generic ZK flag on vendored WhirUniPcs; SemPcs/settlement Pcs
 instantiated false; Solidity verifier skips R absorption + R opening.
+
+## Batch 89 (in progress) - NON-ZK SETTLEMENT LAYER (user-directed)
+
+Invariant (user): client transfer proof stays ZK; the rc circuit's in-circuit
+verifier verifies that ZK client proof (R commitment + masked openings stay
+handled in-circuit). Only the SETTLEMENT proof (STARK of the rc circuit, the
+one ShieldedPool verifies) drops blinding: its witness is derived from the
+client proof (public-safe by construction) + public block statement.
+
+Surgery: const-generic <const ZK: bool = true> on vendored WhirUniPcs.
+- commit(): skip interleave + hiding-budget when !ZK (arity extra 1->0)
+- get_opt_randomization_poly_commitment: Ok(None) when !ZK
+- batch-stark follows SC::Pcs::ZK everywhere (prover.rs:155/174/222/241,
+  verifier/mod.rs:636, transcript gates on Option<Com>) - no patch needed
+- settlement_replay reads ::ZK generically (:394/:457/:499)
+- whir.rs::Pcs + settlement_replay::SemPcs instantiate ZK=false
+- ZK_ARITY_SLACK 2->1 at settlement
+- Solidity: gate randDigest observe + wire field + R OOD opening on flag
+
+NEXT AFTER THIS (user): COMB RECURSION - spine of constant-size rc proofs,
+rung i verifies rung i-1 + client proof i (or a small batch), final proof
+stays ~300KB while client-proof count scales linearly. Target: many client
+proofs under the 300KB final-proof budget.
+
+### Batch 89 progress — non-ZK settlement PCS: two latent bugs found and fixed
+
+The const-generic `ZK=false` on `WhirUniPcs` exposed two places where the vendored
+PCS doubled unconditionally, assuming the ZK interleave:
+
+1. **`commit_preprocessing`** (uni/pcs.rs): applied `with_zero_cols` (height-doubling)
+   regardless of ZK. In ZK mode the caller hands (domain 2N, matrix N) so the doubling
+   lands on 2N; in non-ZK mode the caller hands (domain N, matrix N) and the doubling
+   overshot to 2N — later `evaluations_on_domain` requests (domain N, matrix 2N) tripped
+   the `domain.size() >= coeffs.height()` assert. Fix: skip the zero-pad when `!ZK`,
+   commit as-is. (The assert was debug-only before; the instrumented message now carries
+   idx/dom/mat_h/commit_dom/preprocessed — keep it.)
+
+2. **`get_quotient_ldes`** (uni/pcs.rs): the `!ZK` passthrough returned the chunk
+   *evaluations*, but `commit_ldes` → `commit_quotient_coefficient_matrices` treats its
+   input as *coefficients* (the ZK path returns coefficients after masking). The proof
+   generated fine but the native verifier rejected it with
+   `OodEvaluationMismatch { index: Some(0) }`. Fix: the `!ZK` path now runs
+   `coset_idft_batch` per chunk (evaluations → coefficients) and skips the mask.
+
+Both fixes are no-ops when `ZK=true` (guarded by the const-generic), so the client/inner
+layers and all existing vectors are untouched.
+
+Status: census at pow 24 now proves + verifies natively; canonical-env census running.
+
+### Batch 89 progress — the classifier had to go structural (two-run diff is dead)
+
+With settlement blinding off, two `composed_run_with` calls over the SAME circuit and
+statement produce byte-identical programs, so `classify_observations` marks every
+position fixed. The batch digests then emit as kind 6 (trusted constants) and the wbnd
+walk — which reads main/perm/quot digests only from kind-2 events — panicked with
+`main digest` at wbnd.rs. A perturbed-pis twin run cannot rescue the diff either: the
+rc circuit's AIR constrains the statement fold to equal `pis`, so perturbed public
+inputs make the witness unsatisfiable and the replay's opening re-check fails.
+
+The fix: the fixed/varying split was never a property of a run pair — it is a property
+of the protocol. `structural_batch_fixed` (composed_export.rs) derives it from the
+phase marks (END positions; phase of a site = first mark whose end exceeds it, matching
+the walk's `phase_of`):
+
+* `ObserveBase` before the end of `main_phase` → fixed (domain seed, claimed degree
+  bits, the statement's public values — all fixed per block, and the bundle is per
+  block).
+* The single `ObserveBytes` inside `preprocessed_phase` → fixed (trusted-setup cap).
+* Everything else in the batch region → varying: main/perm/quot digests, permutation
+  terminals, grind witnesses.
+* The whole delegate region → varying. With blinding off the round regions absorb only
+  client-proof-dependent values (the framing constants that used to classify fixed
+  were keccak-derived from… the same deterministic transcript, but they are now
+  indistinguishable from proof data without a second sample; the conservative call is
+  all-varying). The claim schedules and framing tables degrade to single varying runs —
+  the contract is data-driven on those tables, so the wire grows slightly but the
+  bundle stays correct. Refinement (twin with a fresh CLIENT proof — same statement,
+  different blinding at the inner layer — would restore the fixed framing runs) is
+  deferred until the wire size demands it.
+
+Call sites rewired to ONE settlement proof + `structural_batch_fixed` +
+`reclassify_zero_runs` (kept as the safety net for structurally-zero extension words):
+`settlement_bundle_with_blob` (the node's production path — proving cost halved),
+`composed_vectors` (both tests), `batch_stark_vectors` (RUNS const deleted). The
+compile-time pin flipped to `!<SemPcs as …>::ZK`.
+
+Solidity fixture tests: the rand digest is gone from the wire (no randomization round),
+so `BatchTranscriptNative`/`VerifierGas`/`ChunkVerifier` slice it as `bytes32(0)` with
+`hasRand=false` (the phase helpers ignore the value when the flag is false).
+
+`hvzk_blinding.rs` rewritten for the split invariant, Fibonacci-free (a counter AIR):
+settlement proof carries NO blinding and two proofs of one statement are byte-identical
+(the determinism the classifier rests on); the inner layer still blinds freshly per
+proof; the recursion path builds over a blinded base and settles unblinded.
+
+Census at pow 24 after the fix: final proof 484,028 B raw (client proof inflated to
+323,812 B by the pow-24 floor; rc pads to 2^18 at this shape). Canonical-env numbers
+below.
+
+
+### Batch 89 FINAL — identity frame goes 4-round; gas 70.1M → 58.6M
+
+The ZK-off settlement has 4 WHIR rounds, not 5 (matrix_counts [6,8,6,6]). Two Solidity
+sites still hardcoded the old 5-round shape and reverted with
+`BadIdentityFrame(2, 4, p)` (custom error 0xedadecd8):
+
+* `TerminalWeight.sol` — the CIDNTY parse pinned `nr != 5` and parsed bound-eval
+  lists for rounds 1..4 *before* CONFIG. Fixed by making the frame data-driven on
+  `nr`: bound-evals parse moved after CONFIG (so `nr` is known), the walk runs
+  `for round in 0..nr`, and the satellite claim-layout role schedule shifted with the
+  round count — r0=main openings, r1=quotient, r2=preprocessed, r3=permutation (was
+  r1..r4). Role mapping verified empirically against the block instance claim widths.
+* `WhirVerifier.sol` `_callIdentity` — assembly pack loop now iterates `0..nr`.
+
+Round-hardcoded tests: `WhirComposed.t.sol` round-4 fixture deleted (canonical is
+4 rounds 0..3); `RecursionChainV8Attribution.t.sol` profiling loop 5→4.
+
+`gen_bundle.mjs` was stale for the batch-89 wire grammar (no `hasRand` word,
+unconditional rand digest) — patched to mirror `wbnd.rs` (push `rand_digest?1:0` in
+batchCfg; conditional raw digest in batchPrf).
+
+Fresh canonical-env vectors: composed (program 16875, blob 69046, bundle 1,400,748 B),
+block (program 24080, blob 98590, bundle 2,196,868 B), v8 chain bundle **265,176 B**
+(config 179,668 B, 8 chunks).
+
+**Result: `test_gas_v8` PASSES at 58,621,885 gas** (from 70,119,870 at batch 88),
+wire 265,176 B (< 300 KB target met). The identity-frame fix alone cut ~11.5M gas by
+parsing one fewer round of bound evals and the corrected claim layout.
+
+Remaining to 30M: circuit-size diet (client trace width, horner packing, client
+LOG_MAX_LDE over-provisioning) — census in progress.
+
+
+---
+
+## Batch 89 — completion: full vector regeneration + legacy test alignment (Oct 9)
+
+**Standing instruction (user, Oct 9): always run tests in RELEASE mode**
+(`cargo test --release -p prover`). Debug proving is ~10x slower and the grind
+retry loops dominate wall time.
+
+All settlement-family vectors regenerated together under the canonical env
+(WHIR_INNER_RATE=3 WHIR_RATE_FINAL=4 WHIR_POW_FLOOR=28 WHIR_INNER_POW_FLOOR=29):
+
+* `batch_stark_vectors.{json,bin}` — ZK-off shape: `is_zk:false`,
+  `commitments.random:null`, 4 opening rounds, degree_bits [9,8,14,12,12,0]
+  (non-ZK drops blinding columns → instance 5 degree falls to 0).
+* `composed_{vectors,flat,bundle}` + `block_composed_{vectors,flat,bundle}` —
+  regenerated via the **Rust encoder** (`wbnd_pin::regenerate_committed_bundles`,
+  extended to cover the composed pair). The mjs generators are superseded and
+  write a stale version byte (4); the Rust encoder stamps v5.
+* v5/v6/v7/v8 chain bundles + configs + chunks + sidecars — all fresh. v6/v7
+  now emit 6 config chunks (was 8); stale chunk_6/chunk_7 files linger on disk
+  but nothing reads them (tests slice from the config bin + sidecar chunk_lens).
+
+Test alignment to the new canonical shape:
+
+* `BatchTranscript.t.sol` — pool 716→504 samples, digests 22→15 (14 proof +
+  1 trusted setup; random commitment gone), random-commitment pin replaced by
+  a keyExists check.
+* `batch_stark_vectors.rs` pin — `is_zk` must be false; `commitments.random`
+  must be null; degree_bits may be 0 (constant-degree instance under non-ZK).
+* `WhirVerifier.t.sol` — stale terminal claim constant updated to the new
+  derived value (5145738483257368734721048007920492166929493615645799605964670266337445019648).
+* `WhirVerifierP.sol` (v5 probe fork) — identity walk made 4-round data-driven:
+  `roundArities.length != 4`, role r (1..4) reads frame round r-1.
+* `WhirVerifierV8P.sol` (v8 probe fork) — `_callIdentity` loop was hardcoded
+  `r := 1; lt(r, 5)`; now `nr := mload(boundEvalsOf); r := 0; lt(r, nr)`
+  (mirrors the production fix).
+
+**Suites: forge 173/173 PASS (35 s). cargo (release, canonical env): running.**
+
+Gas/wire unchanged this round: v8 wire 265,176 B, `test_gas_v8` 58,621,885.
