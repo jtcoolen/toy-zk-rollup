@@ -127,6 +127,13 @@ contract WhirVerifier is IWhirVerifier {
     /// The STATEMENT section's matrix walk ran past the section's end.
     error BadStatementSection();
 
+    /// M-04: a proof-supplied extension element has a lane >= p. The transcript
+    /// absorbs lanes reduced mod p while KoalaBearExt4 add/sub carry across
+    /// lanes, so a non-canonical lane changes arithmetic without changing the
+    /// transcript: two byte strings verifying as one proof (audit
+    /// toy-zk-rollup-crypto-audit-report-2026-10-09, M-04).
+    error NonCanonicalExt();
+
     /// The terminal-weight frame magic: ASCII "TWIGHT", matching TerminalWeight.
     uint256 private constant TERMINAL_MAGIC = 0x5457_4947_4854;
 
@@ -1332,7 +1339,7 @@ contract WhirVerifier is IWhirVerifier {
         uint256 n;
         (n, no) = _word(d, off);
         out = new uint256[](n);
-        assembly {
+        assembly ("memory-safe") {
             let dst := add(out, 32)
             let srcBase := add(d.offset, mul(no, 4))
             let PAD_MASK := sub(shl(128, 1), 1)
@@ -1341,6 +1348,10 @@ contract WhirVerifier is IWhirVerifier {
                 if and(w, PAD_MASK) {
                     mstore(0, 0)
                     revert(0, 0)
+                }
+                if or(or(iszero(lt(shr(224, w), 0x7f000001)), iszero(lt(and(shr(192, w), 0xffffffff), 0x7f000001))), or(iszero(lt(and(shr(160, w), 0xffffffff), 0x7f000001)), iszero(lt(and(shr(128, w), 0xffffffff), 0x7f000001)))) {
+                    mstore(0, 0x5642384000000000000000000000000000000000000000000000000000000000) // NonCanonicalExt()
+                    revert(0, 4)
                 }
                 mstore(add(dst, mul(i, 32)), w)
             }
@@ -1365,11 +1376,16 @@ contract WhirVerifier is IWhirVerifier {
             // word at bits 224..128; the low 128 bits are zero by layout.
             uint256 n16 = nBytes / 16;
             out = new uint256[](n16);
-            assembly {
+            assembly ("memory-safe") {
                 let dst := add(out, 32)
                 let srcBase := add(d.offset, mul(no, 4))
                 for { let i := 0 } lt(i, n16) { i := add(i, 1) } {
-                    mstore(add(dst, mul(i, 32)), shl(128, shr(128, calldataload(add(srcBase, mul(i, 16))))))
+                    let w := shl(128, shr(128, calldataload(add(srcBase, mul(i, 16)))))
+                    if or(or(iszero(lt(shr(224, w), 0x7f000001)), iszero(lt(and(shr(192, w), 0xffffffff), 0x7f000001))), or(iszero(lt(and(shr(160, w), 0xffffffff), 0x7f000001)), iszero(lt(and(shr(128, w), 0xffffffff), 0x7f000001)))) {
+                        mstore(0, 0x5642384000000000000000000000000000000000000000000000000000000000) // NonCanonicalExt()
+                        revert(0, 4)
+                    }
+                    mstore(add(dst, mul(i, 32)), w)
                 }
             }
             no += nBytes / 4;
@@ -1377,7 +1393,7 @@ contract WhirVerifier is IWhirVerifier {
         }
         uint256 n = nBytes / 32;
         out = new uint256[](n);
-        assembly {
+        assembly ("memory-safe") {
             let dst := add(out, 32)
             let srcBase := add(d.offset, mul(no, 4))
             let PAD_MASK := sub(shl(128, 1), 1)
@@ -1386,6 +1402,10 @@ contract WhirVerifier is IWhirVerifier {
                 if and(w, PAD_MASK) {
                     mstore(0, 0)
                     revert(0, 0)
+                }
+                if or(or(iszero(lt(shr(224, w), 0x7f000001)), iszero(lt(and(shr(192, w), 0xffffffff), 0x7f000001))), or(iszero(lt(and(shr(160, w), 0xffffffff), 0x7f000001)), iszero(lt(and(shr(128, w), 0xffffffff), 0x7f000001)))) {
+                    mstore(0, 0x5642384000000000000000000000000000000000000000000000000000000000) // NonCanonicalExt()
+                    revert(0, 4)
                 }
                 mstore(add(dst, mul(i, 32)), w)
             }

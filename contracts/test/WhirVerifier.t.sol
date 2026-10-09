@@ -170,6 +170,35 @@ contract WhirVerifierTest is Test {
         verifier.verify(statement, b);
     }
 
+    // M-04 regression: proof-supplied extension elements must have canonical
+    // lanes (< p). The transcript absorbs lanes mod p while KoalaBearExt4
+    // add/sub carry across lanes, so a lane >= p changes arithmetic without
+    // changing the transcript - proof malleability. Terminal 0's packed word
+    // starts at byte 133440 of composed_bundle.bin (limb 0 at bits 224..248).
+    function test_verify_rejects_noncanonical_terminal_lane() public {
+        bytes memory b = _bundle();
+        // Add p to limb 0 of terminal 0: 1094973264 + 2130706433 = 0x498e_7f71
+        // -> 0x498e_7f71 + 0x7f00_0001 = 0xc88e_7f72, written BE.
+        b[133440] = hex"c8";
+        b[133441] = hex"8e";
+        b[133442] = hex"7f";
+        b[133443] = hex"72";
+        vm.expectRevert(WhirVerifier.NonCanonicalExt.selector);
+        verifier.verify(statement, b);
+    }
+
+    /// Same rule on the _extArr path: round 0's first bound evaluation starts
+    /// at byte 133712 (limb 0 = 0x245b0a0c); adding p gives 0xa35b0a0d.
+    function test_verify_rejects_noncanonical_bound_eval_lane() public {
+        bytes memory b = _bundle();
+        b[133712] = hex"a3";
+        b[133713] = hex"5b";
+        b[133714] = hex"0a";
+        b[133715] = hex"0d";
+        vm.expectRevert(WhirVerifier.NonCanonicalExt.selector);
+        verifier.verify(statement, b);
+    }
+
     /// No satellite, no verifier: the constructor refuses a zero address and
     /// an address with no code, so a deployment can never pin nothing.
     function test_constructor_requires_a_pinned_satellite() public {
