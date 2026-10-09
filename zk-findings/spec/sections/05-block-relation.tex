@@ -9,7 +9,7 @@ assembled per call by \code{build\_multi\_transfer\_circuit}
 \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}block.rs:416-615}; it carries the Poseidon2, recompose and
 statement tables only \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}block.rs:23-30} and is proven under
 the Keccak settlement configuration by \code{settle\_block\_circuit}
-\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}block.rs:769-811}. This section states the relation that
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}block.rs:769-812}. This section states the relation that
 construction enforces, the fold (D-089), the exported statement layout, and its
 decoding on L1. Field and limb notation follows Section~\ref{sec:primitives}; the
 per-transfer statement $x$ is the one of Section~\ref{subsec:transfer-stmt}.
@@ -53,8 +53,9 @@ $\varphi(x)$      & $x[16\sigma+64,\ 16\sigma+68)$ & $\varphi$                  
 \end{tabularx}
 \end{center}
 Each 16-limb slice is extracted bounds-checked, as an error rather than a panic
-or short read.
+or short read; the fee slice is read the same way.
 \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}block.rs:635-650}
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}block.rs:540-544}
 \end{definition}
 
 Every offset in Def.~\ref{def:block-proj}, and $\ell(s)$ itself, is a function of
@@ -104,7 +105,7 @@ The call allocates, in this order: per-instance AIR public-value targets as
 circuit public-input slots, the proof targets, and the common-data targets, the
 latter including the child's preprocessed commitment as public-input cap entries.
 \src{vendor/\allowbreak{}p3-recursion/\allowbreak{}recursion/\allowbreak{}src/\allowbreak{}public\_inputs.rs:738-746}
-\src{vendor/\allowbreak{}p3-recursion/\allowbreak{}recursion/\allowbreak{}src/\allowbreak{}types/\allowbreak{}proof.rs:166-176}
+\src{vendor/\allowbreak{}p3-recursion/\allowbreak{}recursion/\allowbreak{}src/\allowbreak{}types/\allowbreak{}proof.rs:167-177}
 \src{vendor/\allowbreak{}p3-recursion/\allowbreak{}recursion/\allowbreak{}src/\allowbreak{}pcs/\allowbreak{}fri/\allowbreak{}targets.rs:1072-1080}
 The block packs the corresponding values in the same order (AIR public values,
 proof values, common data) and assigns them as the runner's public inputs.
@@ -121,18 +122,19 @@ Every value the block derives from child $c$ (fold input, chain limbs, fees) is
 read from $\tau_c$. \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}block.rs:537-549}
 \end{definition}
 
-Each child's in-circuit verification instantiates a fresh circuit challenger and
-absorbs, in order: the batch-shape domain-separator seed, each instance's extended
+Each child's in-circuit verification instantiates a fresh circuit challenger and,
+in order: observes the batch-shape domain-separator seed, each instance's extended
 degree bits (as constants), the trace commitment, every instance's public values
-(including $\tau_c$), the child's preprocessed commitment if present, then the
-lookup challenges, permutation commitment, lookup terminals, $\alpha$, the
-quotient commitment, the randomization commitment, and $\zeta$.
+(including $\tau_c$), and the child's preprocessed commitment if present; samples
+the lookup challenges; observes the permutation commitment (if any) and every
+present lookup terminal; samples $\alpha$; observes the quotient commitment and
+the randomization commitment (if any); and samples $\zeta$.
 \src{vendor/\allowbreak{}p3-recursion/\allowbreak{}recursion/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}batch\_stark.rs:1204-1279}
 Each child carries its own private-data replay keyed on the op ids its
 verification allocated; the replays are applied per child and never merged.
 \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}block.rs:437-440,559-564,597-607}
 The remainder of the in-circuit verifier, and its soundness, is the subject of
-Section~6 (see also \finding{V-08}).
+Section~\ref{subsec:ps-recursion} (see also \finding{V-08}).
 
 \paragraph{Child verifying key.}
 The child's preprocessed-commitment targets are public-input slots filled from
@@ -140,13 +142,18 @@ $V_c$'s common data \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak
 provides a helper that constrains these targets to a fixed constant
 (\code{constrain\_trusted\_preprocessing})
 \src{vendor/\allowbreak{}p3-recursion/\allowbreak{}recursion/\allowbreak{}src/\allowbreak{}backend/\allowbreak{}whir.rs:1619-1640}, but
-\code{build\_multi\_transfer\_circuit} does not invoke it, and the settlement
-verifier assigns an empty public vector to every primitive table, checking only
-the statement table against the caller's statement.
+\code{build\_multi\_transfer\_circuit} does not invoke it. The settlement
+verifier assigns an empty public vector to every primitive table (Const,
+Public, ALU), the retained relation's fixed values to every other non-primitive
+table, and the caller's statement only to the statement table; the Public table
+AIR itself has no constraints. No public-input slot of the block circuit is
+therefore compared with an externally supplied value.
 \src{vendor/\allowbreak{}p3-recursion/\allowbreak{}circuit-prover/\allowbreak{}src/\allowbreak{}batch\_stark\_prover.rs:2757-2803}
-The child preprocessed commitment is therefore a prover-assigned value bound only
-by in-circuit constraints, not pinned to a canonical transfer verifying key
-\finding{V-06}.
+\src{vendor/\allowbreak{}p3-recursion/\allowbreak{}circuit/\allowbreak{}src/\allowbreak{}ops/\allowbreak{}op.rs:233-238}
+\src{vendor/\allowbreak{}p3-recursion/\allowbreak{}circuit-prover/\allowbreak{}src/\allowbreak{}air/\allowbreak{}public\_air.rs:14-16}
+The child preprocessed commitment is therefore a prover-assigned value that the
+in-circuit verifier consumes but does not constrain to a canonical transfer
+verifying key \finding{V-06}.
 
 %---------------------------------------------------------------------------
 \subsection{The block relation}
@@ -243,7 +250,7 @@ That gadget absorbs eight base elements per permutation row, packed four per $\K
 lane; the first row starts a fresh chain; a short final chunk takes the missing
 lane coefficients from the previous row's output (overwrite mode); the output is
 the two rate lanes of the last row.
-\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}commitment\_gadget.rs:289-361}
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}commitment\_gadget.rs:289-367}
 Since $\Sigma_{c-1}$ is exactly one rate block, each child costs
 $1+\lceil |x_c|/8 \rceil$ permutations ($14$ for $|x_c|=100$).
 \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}commitment\_gadget.rs:378-381}
@@ -266,7 +273,8 @@ in-circuit sponge gadget \finding{V-07}.
 $\Sigma_n$ is exported with \code{export\_digest\_limbs}: each of the eight base
 coefficients is bit-decomposed to $31$ bits and emitted as a low $16$-bit and a
 high $15$-bit limb, giving $L(\Sigma_n)$ (Def.~\ref{def:limbs} and the digest limb
-export of Section~\ref{subsec:digest-enc}).
+export of Section~\ref{subsec:digest-enc}, including its caveat that a 31-bit
+decomposition also admits $w_i+p$ when $w_i < 2^{31}-p$).
 \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}commitment\_gadget.rs:401-431}
 \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}block.rs:567-573}
 The native encoder \code{digest\_to\_limbs} produces the same sixteen limbs from
@@ -328,6 +336,9 @@ The header limbs are created with \code{define\_const}, so they are entries of t
 block circuit's constant table rather than prover-supplied values, and are not
 placed in the public-input vector.
 \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}block.rs:456-476}
+The Const table constrains each main-trace value to equal a preprocessed
+(committed) column, so the header is part of the block circuit's preprocessing.
+\src{vendor/\allowbreak{}p3-recursion/\allowbreak{}circuit-prover/\allowbreak{}src/\allowbreak{}air/\allowbreak{}const\_air.rs:9-18}
 The native reconstruction \code{block\_statement} (used by the node driver, the
 vector generators and tests) emits the same layout from the same
 \code{shape\_header} function, after checking $|x_c| = \ell(s_c)$ and that the
@@ -339,7 +350,7 @@ The values $(k_c,m_c)$ are taken from the client-supplied shapes
 \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}block.rs:467}. No constraint relates a shape to its child; the
 only (build-time) check is $|x_c|=\ell(s_c)$ \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}block.rs:480-488}, and by
 (\ref{eq:block-len}) and Def.~\ref{def:block-proj} both that check and every
-projection (B2)--(B5) consume depend on $k_c+m_c$ alone. The individual split in
+projection that (B2)--(B5) consume depend on $k_c+m_c$ alone. The individual split in
 the header is therefore bound to the child only through its sum
 \finding{L-05}.
 
@@ -361,14 +372,14 @@ i.e.\ $\beta_0$ is the most significant byte.
 \end{definition}
 
 \begin{property}[Round trip with the prover encoding]
-For a digest $d\in\F^8$ with canonical words $w_i<2^{31}$, the byte string
+For a digest $d\in\F^8$ with canonical words $w_i<p$, the byte string
 $\beta_0\cdots\beta_{31}$ that \code{digestFromLimbs} assigns to $L(d)$ is
 $\code{elements\_to\_digest}(d)=\mathrm{LE32}(w_0)\|\cdots\|\mathrm{LE32}(w_7)$:
 limb $2i$ of $L(d)$ is $w_i \bmod 2^{16}$, whose two bytes are bytes $4i,4i+1$ of
 $\mathrm{LE32}(w_i)$, and limb $2i+1$ is $\lfloor w_i/2^{16}\rfloor$, whose two
 bytes are bytes $4i+2,4i+3$. Equivalently $D$ is the inverse of $\limbs$
 (Def.~\ref{def:limbs}) on $32$-byte strings, read big-endian.
-\src{contracts/\allowbreak{}src/\allowbreak{}LimbCodec.sol:22-31}
+\src{contracts/\allowbreak{}src/\allowbreak{}LimbCodec.sol:22-26,41-44}
 \src{crates/\allowbreak{}pq-hash/\allowbreak{}src/\allowbreak{}poseidon.rs:157-163}
 \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}block.rs:292-305}
 \end{property}
@@ -385,7 +396,7 @@ The \code{u64FromLimbs} documentation states that the top limb holds $14$ bits a
 the range is $2^{62}$ \src{contracts/\allowbreak{}src/\allowbreak{}LimbCodec.sol:50-51}; the code bounds every
 limb, including the top one, only by \code{0xffff}. The $14$-bit top-limb bound is
 enforced inside the transfer relation's amount range checks
-\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}transfer.rs:117-123,155-166}, so on L1 it holds only to the
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}transfer.rs:115-123,152-172,529-531}, so on L1 it holds only to the
 extent that (B1) verifies that relation (Section~\ref{subsec:block-child}).
 \end{specdelta}
 
@@ -419,14 +430,14 @@ $\code{nullifierBefore}=\code{currentNullifierRoot}$ before storing
 \code{rootAfter} and \code{nullifierAfter}.
 \src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:144-166}
 The verifier's binding of $S$ to the proof, including how limb values are compared
-to the proof's statement words, is specified in Section~7.
+to the proof's statement words, is specified in Section~\ref{subsec:sv-statement}.
 
 \begin{specdelta}[Header split is not read on L1]
 Comments state that the contract ``re-derives the same split from the statement's
 own length'' \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}block.rs:463-466} and ``reads the split from
 the proof'' \src{contracts/\allowbreak{}src/\allowbreak{}BlockStatement.sol:26-29}. The enforced behaviour
-is that \code{decode} reads only $n=S[0]$, skips $S[1..2n]$ without inspecting
-them, and constrains the statement only through $|S| = 81+6n$, which is
+is that \code{decode} reads only $n=S[0]$, skips $S[1],\dots,S[2n]$ without
+inspecting them, and constrains the statement only through $|S| = 81+6n$, which is
 independent of every $(k_c,m_c)$.
 \src{contracts/\allowbreak{}src/\allowbreak{}BlockStatement.sol:85-90}
 Together with the in-circuit header binding of Section~\ref{subsec:block-stmt}, the split
@@ -460,7 +471,7 @@ is checked only by its sum \finding{L-05}.
 $\code{BLOCK\_CAP\_HEIGHT}=0$, registering the shared Poseidon2, recompose and
 statement tables (the latter from the circuit's export schema) and returning the
 proof together with the settlement verifier.
-\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}block.rs:769-811}
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}block.rs:769-812}
 \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}block.rs:155}
 The driver value $\code{BLOCK\_LOG\_MAX\_LDE}=25$ is documented as measured for
 fan-in $2$; fan-in $1$ settles at $24$.

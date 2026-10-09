@@ -2,17 +2,18 @@
 \label{sec:settlement}
 
 The L1 component that holds the rollup state is \code{ShieldedPool}
-\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:63}. It stores a block counter and two
-32-byte roots, delegates every validity question to an injected verifier, and
-records the roots that a verified block statement names. It derives no root
-itself, holds no nullifier set and no note data.
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:63}. It stores a block counter, two
+32-byte roots and a fee-recipient address, delegates proof verification to an
+injected verifier, checks root continuity itself, and records the roots that a
+verified block statement names. It derives no root itself, holds no nullifier
+set and no note data.
 \src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:7-26,57-62}
 This section states the state it holds, the transition \code{applyBlock}
 enforces (in execution order), the event it emits, the fee path, the
 deployment performed by \code{Deploy.s.sol}, and the calldata and transaction the
 node sends to reach it. The statement vector $S$ and its decoding are those of
 Def.~\ref{def:block-stmt} and Def.~\ref{def:block-decode}; the verifier's
-binding of $S$ to the proof is specified in Section~7.
+binding of $S$ to the proof is specified in Section~\ref{sec:settlement-verifier}.
 
 %---------------------------------------------------------------------------
 \subsection{Contract state}
@@ -144,7 +145,7 @@ call, so no step's effect persists unless all steps succeed.
 \end{center}
 \end{definition}
 
-The guard portion of the function, verbatim:
+The guard portion of the function (comments and blank lines omitted):
 \begin{Verbatim}[fontsize=\small]
 if (!verifier.verify(statement, proof)) revert NotVerified();
 BlockStatement.Block memory block_ = statement.decode();
@@ -176,9 +177,10 @@ and on success the post-state is
 \end{equation}
 \src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:144-179}
 \src{contracts/\allowbreak{}src/\allowbreak{}BlockStatement.sol:79-112}
-No other input, state variable or environment value (\code{msg.sender},
-\code{tx.origin}, \code{block.chainid}, \code{address(this)},
-\code{block.number}, \code{msg.value}) enters the relation.
+Apart from whatever $V$ reads internally, no other input, state variable or
+environment value (\code{msg.sender}, \code{tx.origin}, \code{block.chainid},
+\code{address(this)}, \code{block.number}, \code{msg.value}) enters the
+relation.
 \end{definition}
 
 \begin{property}[Decoded but unused fields]
@@ -187,9 +189,12 @@ Of the decoded \code{Block}, \code{numTransfers} and
 \code{statementRoot} $=D_0(S)$ are not read by \code{applyBlock}, and
 \code{totalFee} is used only as an event argument.
 \src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:149-178}
-The header limbs $S[1],\dots,S[2n]$ are never read on L1
-(Def.~\ref{def:block-decode}). The fold root is therefore constrained on L1
-only through \eqref{eq:settle-v} \finding{L-04}.
+The header limbs $S[1],\dots,S[2n]$ are not read by \code{decode} or
+\code{applyBlock} (Def.~\ref{def:block-decode}); on L1 they, like the fold
+root, are compared only by the verifier's statement check inside step 1
+\src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifier.sol:268,426-440}.
+The fold root is therefore constrained on L1 only through \eqref{eq:settle-v}
+\finding{L-04}.
 \end{property}
 
 \begin{property}[Caller]
@@ -229,8 +234,8 @@ statement that is malformed (fails \eqref{eq:settle-d}) or stale (fails
 executed. The ordering is documented as deliberate.
 \src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:137-145}
 The node submits each settlement with a gas ceiling of $2\cdot 10^{10}$,
-described as matching the dev-chain configuration because the verifier's cost
-is data-dependent.
+documented as matching the dev-chain runs, with the note that the verifier's
+cost is data-dependent.
 \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}settlement.rs:28-31}
 \end{property}
 
@@ -295,7 +300,9 @@ $f$ is documented as the recipient of ``collected fees''
 \src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:88-89}. By Property~\ref{prop:pool-writes}
 and Property~\ref{prop:apply-fee}, no function of the contract accepts value
 and \code{applyBlock} credits nothing, so no code path of the system funds the
-balance that \code{withdrawFees} pays out; the shielded fee $\varphi$ of each
+balance that \code{withdrawFees} pays out (a nonzero balance can arise only from
+value delivered without a call, e.g.\ to a \code{SELFDESTRUCT} beneficiary or to an
+address funded before deployment); the shielded fee $\varphi$ of each
 transfer has no on-chain counterpart in this contract \finding{I-04}.
 \end{specdelta}
 
@@ -339,16 +346,17 @@ $31337$ and the dev chain's default funded key.
 \begin{property}[Verifier instance]
 \label{prop:deploy-verifier}
 The constructor of \code{WhirVerifier} rejects a zero or code-less
-\code{terminalWeight} and pins its address and code hash, which are re-checked
-before every satellite call.
+\code{terminalWeight} and pins its address (immutable) and code hash; the code
+hash is re-checked before every satellite call.
 \src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifier.sol:116-132,895}
 It takes no configuration argument; \code{verify} decodes the CONFIG section
 from the caller-supplied bundle $\pi$.
-\src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifier.sol:209-213,262-266}
+\src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifier.sol:209-213,259-265}
 The script does not deploy \code{WhirVerifierV6}, whose constructor pins a
 CONFIG digest and length
 \src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifierV6.sol:41-47,61-75}; consequently
-the pool's immutable $V$ is the bare engine. See Section~7 and
+the pool's immutable $V$ is the bare engine. See
+Section~\ref{sec:settlement-verifier} and
 \finding{V-01}.
 \end{property}
 
@@ -432,8 +440,8 @@ Field & Value & Source \\
 and no \code{value}, \code{nonce}, fee or \code{chainId} field; signing and the
 remaining fields are left to the RPC endpoint, and the node holds no key.
 \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}settlement.rs:10-17,198-216}
-On a dev chain the \code{from} account is an unlocked account of the node
-(\code{anvil}).
+On a dev chain the \code{from} account is an account unlocked on the RPC
+endpoint (\code{anvil}).
 \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}settlement.rs:12-17}
 \end{definition}
 
@@ -443,7 +451,8 @@ After the send, the sender polls \code{eth\_getTransactionReceipt} with a
 $2$\,s sleep between polls. A non-null receipt with
 \code{status} $=$ \code{"0x1"} returns the hash; any other status (absent
 status read as \code{"0x0"}) returns \code{Reverted}. The $600$\,s deadline is
-evaluated only after a poll that returned a null receipt.
+evaluated only after a poll that returned a null receipt; a transport or
+JSON-RPC error on any poll returns that error immediately.
 \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}settlement.rs:148-156,218-250}
 The HTTP client is \code{reqwest::Client::new()} with no request timeout
 configured, and \code{settle} is awaited inline by the node's single command
@@ -460,9 +469,11 @@ The node reads the manifest from \code{NODE\_MANIFEST} (default
 \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:125-126}; the \code{Manifest} type
 deserializes only \code{pool} and \code{deployer}, so the \code{chainId} the
 script writes is not consulted
-\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}settlement.rs:70-77}. A pending
-$(S,\pi)$ is cleared only on success and is retained on any error.
-\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:464-476}
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}settlement.rs:70-77}. The node keeps a
+single pending $(S,\pi)$: \code{settle} clears it only on success and leaves it
+in place on any error, and the next produced block overwrites it whether or
+not it was settled.
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:268,444-459,464-476}
 \end{property}
 
 \begin{specdelta}[Settlement-side documentation]

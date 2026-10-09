@@ -114,7 +114,8 @@ The configuration these rows are keyed by has \code{challenger: false} and
 chained to the previous row's output only on a row without \code{new\_start}
 \src{vendor/p3-recursion/poseidon2-circuit-air/src/air.rs:843-845,1150-1161}.
 The via-ALU decomposition used for the short-final-chunk completion constrains
-only $\sum_i c_i e_i = y$ over $\K$, without confining each $c_i$ to $\F$
+only $\sum_i c_i e_i = y$ over $\K$ ($e_i$ the basis of $\K$ over $\F$), without
+confining each $c_i$ to $\F$
 \src{vendor/p3-recursion/circuit/src/builder/circuit\_builder.rs:1938-1946,1981-1983}.
 Consequently $\Hp^{\mathrm{c}}$ does not bind its input as the native $\Hp$
 does (initial capacity and short-final-chunk handling) \finding{V-07}. The
@@ -141,8 +142,8 @@ bits, and each bit vector recombined into a low 16-bit and a high 15-bit limb,
 giving 16 limbs. \src{crates/prover/src/commitment\_gadget.rs:417-431}
 \end{definition}
 
-Selection is the affine map $\mathsf{sel}(c,x,y)=y+c\cdot(x-y)$, one
-\code{mul\_add} row per $\K$ element
+Selection is the affine map $\mathsf{sel}(c,x,y)=y+c\cdot(x-y)$, computed per
+$\K$ element by a \code{sub} and a \code{mul\_add}
 \src{vendor/p3-recursion/circuit/src/builder/circuit\_builder.rs:1021-1036};
 it equals $x$ if $c=1$ and $y$ if $c=0$. Every selector used below is either a
 boolean-constrained bit \src{crates/prover/src/transfer.rs:742-753} or, in

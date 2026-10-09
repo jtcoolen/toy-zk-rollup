@@ -197,7 +197,8 @@ $\mathsf{nf}$ is a function of $(\mathsf{sk}_d, \rho)$ only: it does not
 depend on $v$, $\psi$, $\mathsf{pk}_d$ or the note's position in the
 commitment tree \src{crates/shielded/src/note.rs:125-127}. Two notes with the
 same $(\mathsf{sk}_d,\rho)$ therefore share a nullifier; for output notes
-$\rho$ is constrained in-circuit only by its 16-bit limb range checks
+$\rho$ is a free private input, bound into $\mathsf{cm}$ but otherwise
+constrained in-circuit only by its 16-bit limb range checks
 (Table~\ref{tab:ss-circuit-notes}). See \finding{M-08}.
 \end{property}
 
@@ -268,7 +269,7 @@ leaf range $[s,e)$ at height $h$
 \end{equation}
 \src{crates/shielded/src/tree.rs:223-235}
 and $\mathsf{root} = N(0, n, D)$ \src{crates/shielded/src/tree.rs:214-216}.
-\code{append} assigns index $n$ and refuses when $n = 2^D$
+\code{append} assigns index $n$ and panics (assertion) when $n = 2^D$
 \src{crates/shielded/src/tree.rs:202-210}.
 \end{definition}
 
@@ -305,9 +306,16 @@ over the supplied sibling list without checking $|\sigma| = D$
 \label{def:ss-frontier}
 The append witness is a frontier $(f_0,\dots,f_{D-1};\ b_0,\dots,b_{D-1})$ with
 $b_h \in \{0,1\}$ and implied count $n = \sum_h b_h 2^h$
-\src{crates/prover/src/commitment\_gadget.rs:144-174}. For $b_h = 1$, $f_h$ is
-the root of the complete $2^h$-leaf block ending at the last leaf; slots with
-$b_h = 0$ are unused \src{crates/prover/src/commitment\_gadget.rs:144-148}. Its
+\src{crates/prover/src/commitment\_gadget.rs:144-174}. In the honest frontier
+built by replaying appends, for $b_h = 1$ the slot $f_h$ holds the root of the
+complete $2^h$-leaf block of leaves
+$[\,s_h,\ s_h + 2^h)$ with $s_h = \sum_{j > h} b_j 2^j$
+\src{crates/prover/src/commitment\_gadget.rs:214-252}; the type comment's
+``ending at the last leaf'' holds only for the lowest set bit
+\src{crates/prover/src/commitment\_gadget.rs:146-147}. Slots with $b_h = 0$ are
+unused; the comment says they hold the zero digest, but after a carry the old
+digest is left in place
+\src{crates/prover/src/commitment\_gadget.rs:148,225-229}. Its
 root is
 \begin{equation}
   \label{eq:ss-frontier-fold}
@@ -368,7 +376,7 @@ The settlement contract never folds the commitment tree. It stores
 \code{currentRoot}, requires the block's \code{rootBefore} to equal it, and then
 stores the proof-attested \code{rootAfter}
 \src{contracts/src/ShieldedPool.sol:9-23,73-74,152-154,165}. The genesis root is
-a constructor argument \src{contracts/src/ShieldedPool.sol:108-113,133}.
+a constructor argument \src{contracts/src/ShieldedPool.sol:108-112,126,133}.
 \end{property}
 
 %----------------------------------------------------------------------
@@ -524,13 +532,16 @@ selects the pinned constant
 EMPTY_NULLIFIER_ROOT =
   0x83265b7a2c40cc6eca237b6016b764606335cd0c6ff0732470e20a484d5a7329
 \end{Verbatim}
-documented as the Poseidon2 $E_{96}$; the golden-vector generator derives
-\code{nullifier\_before\_hex} from an empty
-\code{NullifierMap<Poseidon2Commitment>} and the vector file carries the same
-bytes \src{crates/prover/tests/golden\_vectors.rs:413,495}
+documented as the Poseidon2 $E_{96}$. It equals the $E_{96}$ of
+Definition~\ref{def:ss-smt} under \code{Poseidon2Commitment}, i.e.\ the
+\code{empty\_root} of an empty \code{NullifierMap<Poseidon2Commitment>}
+\src{crates/shielded/src/nullifier\_tree.rs:128-140,187-189} (checked by
+recomputation with the workspace crates); the golden-vector generator derives
+\code{nullifier\_before\_hex} from such an empty map and the vector file carries
+the same bytes \src{crates/prover/tests/golden\_vectors.rs:413,495}
 \src{contracts/test/vectors/block\_vectors.json:4}. The constructor comment
 still describes a depth-256 Keccak empty root
-\src{contracts/src/ShieldedPool.sol:114-117} (\finding{I-02}).
+\src{contracts/src/ShieldedPool.sol:114-118} (\finding{I-02}).
 \end{property}
 
 %----------------------------------------------------------------------
