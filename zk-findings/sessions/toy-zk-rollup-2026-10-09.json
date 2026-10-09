@@ -74,14 +74,17 @@
     "Whether SPHINCS+ spend authorization is meant to be enforced by the proof or only by the node.",
     "Whether the settlement (non-ZK since a54c197) proof witnesses any secret material."
   ],
-  "route_dispositions": [],
-  "open_findings": [
+  "route_dispositions": [
     {
-      "id": "F-01",
-      "status": "candidate",
-      "summary": "WhirVerifier takes the circuit description (CONFIG: preprocessed digest, degree bits, WHIR schedules, constraint programs) from the caller-supplied bundle and never pins it; applyBlock is permissionless; any party can prove an arbitrary circuit whose public values form a block statement and rewrite both pool roots.",
-      "owner_skill": "onchain-verifier-auditor"
-    },
+      "skill": "crypto-audit-context",
+      "status": "observation",
+      "summary": "Context, trust boundaries and critical paths recorded.",
+      "evidence_refs": [
+        "zk-findings/sessions/toy-zk-rollup-2026-10-09.json"
+      ]
+    }
+  ],
+  "open_findings": [
     {
       "id": "F-02",
       "status": "confirmed_by_experiment",
@@ -101,11 +104,28 @@
       "owner_skill": "onchain-verifier-auditor"
     }
   ],
-  "verified_findings": [],
-  "fp_check_verdicts": [],
+  "verified_findings": [
+    {
+      "id": "F-01",
+      "severity": "Critical",
+      "summary": "Settlement verifier accepts proofs of any circuit (CONFIG not pinned) and applyBlock is permissionless: arbitrary caller rewrites both pool roots."
+    }
+  ],
+  "fp_check_verdicts": [
+    {
+      "id": "F-01",
+      "verdict": "TRUE POSITIVE",
+      "rationale": "Trigger: caller-supplied CONFIG in WhirVerifier.verify (WhirVerifier.sol:21-26,264-268,283-318); no pin in WhirVerifier or ShieldedPool; Deploy.s.sol deploys unpinned verifier. Impact: state corruption / soundness. PoC: crates/prover/tests/poc_audit_f01.rs (poc_f01_forged_settlement_proof_for_arbitrary_roots ... ok) + contracts/test/audit/PocF01ForgedBlock.t.sol (2/2 PASS)."
+    }
+  ],
   "artifacts": {
     "reports": [],
-    "pocs": [],
+    "pocs": [
+      "crates/prover/tests/poc_audit_f01.rs",
+      "contracts/test/audit/PocF01ForgedBlock.t.sol",
+      "contracts/test/vectors/audit/poc_f01_forged_bundle.bin",
+      "contracts/test/vectors/audit/poc_f01_forged_block.json"
+    ],
     "index_refs": []
   },
   "remediation_verifications": [],
@@ -115,7 +135,7 @@
     "crypto-fp-check every surviving candidate; PoCs for High/Critical.",
     "Write LaTeX specification and report."
   ],
-  "updated_at": "2026-10-09T14:20:00Z",
+  "updated_at": "2026-10-09T14:45:00Z",
   "extensions": {
     "methodology": "zkcrypto-audit (github.com/Yue-Zhou1/zkcrypto-audit), staged flow router->context->spec-delta->domain->fp-check->report->zkbugs-index",
     "head_commit": "a54c1976b875f73beafa3aeab5521866ed971399"
