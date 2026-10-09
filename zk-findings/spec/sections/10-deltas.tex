@@ -1,0 +1,480 @@
+\section{Specification deltas (documentation vs enforced code)}
+\label{sec:deltas}
+\sloppy
+
+This section collects the places where the repository's own prose (the
+top-level README, module and contract doc comments, deployment-script
+comments, and the vendored-patch record) states a property that differs from
+the one the code enforces. Each item gives (i) the documentation location,
+(ii) the code location, and (iii) which of the two the client intends to be
+authoritative, judged only from evidence inside the repository (the decision
+log and migration notes under \code{.scratch/\allowbreak{}pq-shielded-rollup/\allowbreak{}}, in-code
+rationale, and compile-time guards). Where the repository records no intent,
+the item says so. Everywhere else in this document the \emph{code} is the
+specification; the items below mark where a reader of the documentation alone
+would form a different model. Several deltas were already noted locally in
+earlier sections; this section consolidates them. The umbrella informational
+finding is \finding{I-02}.
+
+%----------------------------------------------------------------------
+\subsection{Summary}
+\label{subsec:deltas-summary}
+
+{\small
+\begin{longtable}{@{}>{\raggedright\arraybackslash}p{0.4cm}>{\raggedright\arraybackslash}p{2.6cm}>{\raggedright\arraybackslash}p{4.2cm}>{\raggedright\arraybackslash}p{4.9cm}>{\raggedright\arraybackslash}p{1.9cm}@{}}
+\toprule
+\# & Topic & Documentation states & Code enforces & Intended \\
+\midrule
+\endhead
+1 & Shielded and commitment hashes
+  & SHA3-256 for $\mathsf{pk}_d$ and $\mathsf{nf}$; Keccak-256 for
+    $\mathsf{cm}$ and for the nullifier tree
+  & Poseidon2 ($\Hp$, $\Cp$) for $\mathsf{pk}_d$, $\mathsf{nf}$,
+    $\mathsf{cm}$, the note tree and the nullifier tree; documented
+    $\sim$96-bit sponge margin
+  & Code \\
+2 & Caller of \code{applyBlock}
+  & an ``operator set allowed to call \code{applyBlock}''
+  & no caller restriction of any kind
+  & Not recorded \\
+3 & Empty nullifier root
+  & computed at deploy: Keccak chain, depth 256
+  & pinned Poseidon2 constant, depth 96; no hashing at deploy
+  & Code \\
+4 & Vendored \code{p3-recursion} patch record
+  & one file (\code{pcs.rs}); ``\code{ZK} false$\to$true''; ``evaluation
+    truncation''; a pristine upstream copy in-tree
+  & five changed code files; \code{ZK} is a const generic defaulting to
+    \code{true}; no truncation; no pristine copy
+  & Code \\
+5 & Security level
+  & ``$\sim$128-bit''; ``the 128-bit target''
+  & \code{SECURITY\_LEVEL = 96}; level, regime, folding, rate, grinding and
+    LDE are environment-overridable in library code
+  & Code (96) \\
+6 & \code{WhirVerifier} wire-format header
+  & STATEMENT ``not consumed here''; eq-points carried in PROOF
+  & STATEMENT supplies the initial constraint's opening points; the
+    eq-points blob is gone from the wire
+  & Code \\
+7 & Fees on settlement
+  & ``roots + fees move''; the chain verifies ``fee accounting''
+  & fee total decoded and emitted only; no payable entry point
+  & Not recorded \\
+\bottomrule
+\end{longtable}
+}
+
+%----------------------------------------------------------------------
+\subsection{Hash instantiation of the shielded and commitment layers}
+\label{subsec:delta-hash}
+
+\begin{specdelta}[SHA3-256 / Keccak-256 in prose, Poseidon2 in code]
+\label{delta:hash}
+\textbf{Documentation.} The README states that ``nullifiers are SHA3-256''
+\src{README.md:11-12}, labels the wallet column ``SHA3-256 nullifiers''
+\src{README.md:23}, defines the note commitment as
+``\code{Keccak-256(DOMAIN || value || rho || psi || pk\_d)}'', calls the
+nullifier map ``a \textbf{Keccak-256} map'' and the nullifiers ``SHA3-256 over
+\code{(DOMAIN || sk\_d || rho)}'' \src{README.md:31-38}, and describes
+\code{crates/\allowbreak{}pq-hash} as ``SHA3-256 note/nullifier hashing''
+\src{README.md:60}. The \code{pq-hash} layering table assigns SHA3-256 to the
+shielded layer and Keccak-256 to the nullifier tree
+\src{crates/\allowbreak{}pq-hash/\allowbreak{}src/\allowbreak{}lib.rs:16-21}, and the crate preamble names
+\code{Sha3\_256Shielded} as the shielded hasher
+\src{crates/\allowbreak{}pq-hash/\allowbreak{}src/\allowbreak{}lib.rs:11-12}. The note methods describe the
+commitment as Keccak-256 and the nullifier as SHA3-256
+\src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}note.rs:104-106,118-120}. The prover's layering
+diagrams describe the shielded layer as SHA3-256 computed in-circuit on
+Keccak-f[1600] rows with the \code{0x06} pad byte
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}config.rs:16-18}
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir.rs:30-31}.
+
+\textbf{Code.} With $\Hp$ the Poseidon2 byte hash and $\Cp$ the Poseidon2
+two-to-one compression of Section~\ref{sec:primitives}, the enforced
+relations are
+\begin{align}
+  \mathsf{pk}_d &= \Hp\big(\code{DOMAIN\_PK}\,\|\,\mathsf{sk}_d\big)
+     & &\text{\src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}keys.rs:40-42}}\\
+  \mathsf{nf} &= \Hp\big(\code{DOMAIN\_NULLIFIER}\,\|\,\mathsf{sk}_d\,\|\,\rho\big)
+     & &\text{\src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}note.rs:125-126}}\\
+  \mathsf{cm} &= \Hp\big(\code{DOMAIN\_NOTE}\,\|\,\mathrm{LE64}(v)\,\|\,\rho\,\|\,\psi\,\|\,\mathsf{pk}_d\big)
+     & &\text{\src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}note.rs:108-111}}\\
+  E_0 &= 0^{32},\qquad E_h = \Cp(E_{h-1},E_{h-1})\quad(1\le h\le 96)
+     & &\text{\src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}nullifier\_tree.rs:129-134}}
+\end{align}
+where the shielded hasher is \code{Poseidon2Shielded}, whose
+\code{hash\_to\_digest}(\textit{dom}, \textit{parts}) is the commitment byte
+hash of $\textit{dom}\,\|\,\textit{parts}$ with no length prefixes
+\src{crates/\allowbreak{}pq-hash/\allowbreak{}src/\allowbreak{}shielded.rs:98-104}, and \code{hash\_pair} of
+\code{Poseidon2Commitment} is $\Cp$ \src{crates/\allowbreak{}pq-hash/\allowbreak{}src/\allowbreak{}poseidon.rs:240-242}.
+These hashers are the ones instantiated at every production site: the node's
+committed tree and nullifier map \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}state.rs:48,50,110-111},
+the wallet wasm \src{crates/\allowbreak{}wallet-wasm/\allowbreak{}src/\allowbreak{}lib.rs:347,520,533,536}, and the
+native client prover \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}client.rs:166,204}. In-circuit,
+$\mathsf{nf}$ and $\mathsf{cm}$ are Poseidon2 sponge evaluations
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}transfer.rs:456,580}, and the transfer module states
+that SHA3-256 and Keccak-f[1600] are absent from the circuit
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}transfer.rs:30-43}. \code{Sha3\_256Shielded} and
+\code{Keccak256Commitment} remain exported
+\src{crates/\allowbreak{}pq-hash/\allowbreak{}src/\allowbreak{}lib.rs:55,62} but are referenced only from test code
+(e.g.\ \src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}nullifier\_tree.rs:361-364}); the
+\code{prover::sha3\_block} module is declared
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}lib.rs:56} and referenced by no other module.
+Keccak-256 remains the hash of the \emph{settlement} layer's Merkle tree and
+Fiat--Shamir transcript only \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}config.rs:66-90}
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir.rs:77}.
+
+\textbf{Margin.} The shielded hasher's documentation records the collision
+bound as the Poseidon2 sponge's ``$\sim$96-bit classical margin at this
+width'', not SHA3's \src{crates/\allowbreak{}pq-hash/\allowbreak{}src/\allowbreak{}shielded.rs:82-85}, and the
+nullifier-tree address is the low 96 bits of $\mathsf{nf}$
+\src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}nullifier\_tree.rs:56-64}. The crate-level statement
+of ``the same 128-bit collision security'' \src{crates/\allowbreak{}pq-hash/\allowbreak{}src/\allowbreak{}lib.rs:23-28}
+compares Keccak-256 with SHA3-256 and no longer describes the shielded layer.
+
+\textbf{Intended: code.} The migration record cites the directive ``no sha3,
+only poseidon2'' and lists the SHA3/Keccak removals as consensus-critical
+\src{.scratch/\allowbreak{}pq-shielded-rollup/\allowbreak{}verifier-redesign.md:3456-3478}; the code
+records operator acceptance of the reduced margin
+\src{crates/\allowbreak{}pq-hash/\allowbreak{}src/\allowbreak{}shielded.rs:85}
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}nullifier\_gadget.rs:17-18}
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}transfer.rs:41-43}. Related enforcement gaps are
+catalogued as \finding{V-07} (in-circuit sponge) and \finding{M-09}
+(nullifier address width).
+\end{specdelta}
+
+%----------------------------------------------------------------------
+\subsection{Who may settle}
+\label{subsec:delta-operator}
+
+\begin{specdelta}[No operator set on \code{applyBlock}]
+\label{delta:operator}
+\textbf{Documentation.} The README's trust statement lists ``the operator set
+allowed to call \code{applyBlock}'' among the things the chain trusts
+\src{README.md:160-162}.
+
+\textbf{Code.} \code{applyBlock} is declared \code{external} with no modifier
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:144}; the contract stores no operator,
+role or allow-list (its state is \code{verifier}, \code{blockNumber},
+\code{currentRoot}, \code{currentNullifierRoot}, \code{feeRecipient})
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:68-89}, and the only \code{msg.sender}
+comparison in the contract guards \code{withdrawFees}
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:183}. The enforced relation is, for any
+caller,
+\begin{align}
+  \code{applyBlock}(s,\pi)\ \text{succeeds} \iff\;
+   & \code{verifier.verify}(s,\pi)=\mathsf{true} \notag\\
+   & \wedge\; \mathsf{rootBefore}(s)=\code{currentRoot} \notag\\
+   & \wedge\; \mathsf{nullifierBefore}(s)=\code{currentNullifierRoot}
+\end{align}
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:145-157}
+after which $(\code{currentRoot},\code{currentNullifierRoot}) \leftarrow
+(\mathsf{rootAfter}(s),\mathsf{nullifierAfter}(s))$ and \code{blockNumber} is
+incremented \src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:165-170}. The contract's own
+trust-model text treats the prover and sequencer as untrusted and gates every
+transition solely on a verified proof
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:51-55}, which matches the code; the node's
+settlement sender submits from a configured unlocked account and registers no
+operator \src{.scratch/\allowbreak{}pq-shielded-rollup/\allowbreak{}decisions.md:1342-1355}.
+
+\textbf{Intended: not recorded.} No decision-log entry or code path introduces
+an operator set; the README sentence is the only occurrence. This
+specification takes the enforced relation above (permissionless settlement)
+as normative. Consequences are catalogued in \finding{V-01}, \finding{H-01}
+and \finding{M-01}.
+\end{specdelta}
+
+%----------------------------------------------------------------------
+\subsection{Genesis nullifier root}
+\label{subsec:delta-empty-root}
+
+\begin{specdelta}[Keccak depth-256 computed root in prose, Poseidon2 depth-96 constant in code]
+\label{delta:empty-root}
+\textbf{Documentation.} The constructor documentation states that passing
+\code{bytes32(0)} makes the contract compute ``the prover's empty-map root
+itself (depth 256, empty leaf zero, \code{empty[h] = keccak(empty[h-1] ||
+empty[h-1])} \ldots{} $\sim$256 keccak at deploy)''
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:114-118}. The deployment script says
+\code{bytes32(0)} ``makes ShieldedPool compute the empty sparse-tree root
+itself; the genesis file may pin one explicitly''
+\src{contracts/\allowbreak{}script/\allowbreak{}Deploy.s.sol:42-43}. The nullifier-tree module
+documentation describes full 256-bit addressing, 256 levels, and a path through
+bits $0,\dots,255$ \src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}nullifier\_tree.rs:14-22,45-47}.
+
+\textbf{Code.} The contract pins
+\begin{align*}
+  \code{EMPTY\_NULLIFIER\_ROOT} = {}&\code{0x83265b7a2c40cc6eca237b6016b76460}\\
+                                    &\code{\phantom{0x}6335cd0c6ff0732470e20a484d5a7329}
+\end{align*}
+(one 32-byte word, printed in two halves)
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:85-86}, documented in the same file as
+the Poseidon2 empty-subtree chain at \code{NULLIFIER\_TREE\_DEPTH = 96}
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:79-84}. The constructor performs no
+hashing:
+\begin{equation}
+  \code{currentNullifierRoot} =
+  \begin{cases}
+    \code{EMPTY\_NULLIFIER\_ROOT} & \code{genesisNullifierRoot\_} = 0^{256}\\
+    \code{genesisNullifierRoot\_} & \text{otherwise}
+  \end{cases}
+\end{equation}
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:134-135}
+The deployment script passes \code{bytes32(0)} unconditionally
+\src{contracts/\allowbreak{}script/\allowbreak{}Deploy.s.sol:44} and reads only
+\code{.genesis\_root\_hex} from the genesis file
+\src{contracts/\allowbreak{}script/\allowbreak{}Deploy.s.sol:32}; no nullifier-root field is consulted.
+On the Rust side \code{NULLIFIER\_TREE\_DEPTH = 96}
+\src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}nullifier\_tree.rs:64}, the empty-map root is $E_{96}$
+of Delta~\ref{delta:hash}, and two nullifiers agreeing on the low 96 address
+bits are treated as the same address
+\src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}nullifier\_tree.rs:56-63,79-83}. The pinned constant
+equals the \code{nullifier\_before\_hex} of the committed block vector
+\src{contracts/\allowbreak{}test/\allowbreak{}vectors/\allowbreak{}block\_vectors.json:4}.
+
+\textbf{Intended: code.} The migration record states ``nullifier tree:
+Keccak $\to$ Poseidon2, depth 256 $\to$ 96'' and
+``\code{\_emptyNullifierRoot()} keccak loop deleted;
+\code{EMPTY\_NULLIFIER\_ROOT} constant \ldots{} pinned''
+\src{.scratch/\allowbreak{}pq-shielded-rollup/\allowbreak{}verifier-redesign.md:3469-3477}. The
+constructor comment and the deployment-script comment predate that change.
+The 96-bit address width is the subject of \finding{M-09}.
+\end{specdelta}
+
+%----------------------------------------------------------------------
+\subsection{Vendored recursion tree}
+\label{subsec:delta-vendor}
+
+\begin{specdelta}[\code{PATCHES.md} under-reports and mis-describes the vendored diff]
+\label{delta:vendor}
+\textbf{Documentation.} \code{vendor/\allowbreak{}p3-recursion/\allowbreak{}PATCHES.md} records the
+upstream revision \code{8f9876efb26cff0f4b837555b478f043c4314240}
+\src{vendor/\allowbreak{}p3-recursion/\allowbreak{}PATCHES.md:3-4}, states that a pristine copy is kept
+at \code{.scratch/\allowbreak{}vendor/\allowbreak{}p3-recursion-pristine} from which the complete diff
+is reproducible \src{vendor/\allowbreak{}p3-recursion/\allowbreak{}PATCHES.md:17-22}, and lists a single
+patch: \code{recursion/\allowbreak{}src/\allowbreak{}pcs/\allowbreak{}whir/\allowbreak{}uni/\allowbreak{}pcs.rs}, ``\code{const ZK: bool =
+false} $\to$ \code{true}; hiding-aware \code{commit}, \code{commit\_preprocessing},
+\code{get\_opt\_randomization\_poly\_commitment}, and evaluation truncation''
+\src{vendor/\allowbreak{}p3-recursion/\allowbreak{}PATCHES.md:35-37}. It cites decision-log entries
+D-046 and D-051 for the rationale \src{vendor/\allowbreak{}p3-recursion/\allowbreak{}PATCHES.md:13,59}.
+
+\textbf{Code.} A recursive comparison of the vendored tree with a clean
+checkout of the upstream repository at the recorded revision (excluding
+\code{.git} and \code{target}) yields exactly the following differences
+besides \code{PATCHES.md} and the \code{.cargo-ok} marker:
+
+{\small
+\begin{longtable}{@{}>{\raggedright\arraybackslash}p{4.6cm}>{\raggedright\arraybackslash}p{10.4cm}@{}}
+\toprule
+File & Change \\
+\midrule
+\endhead
+\code{recursion/\allowbreak{}Cargo.toml}
+  & \code{rand} gains the \code{sys\_rng} feature and a \code{spin} dependency
+    is added \src{vendor/\allowbreak{}p3-recursion/\allowbreak{}recursion/\allowbreak{}Cargo.toml:45-54}; the masking
+    RNG is seeded from OS entropy
+    \src{vendor/\allowbreak{}p3-recursion/\allowbreak{}recursion/\allowbreak{}src/\allowbreak{}pcs/\allowbreak{}whir/\allowbreak{}uni/\allowbreak{}pcs.rs:419-422}. \\
+\code{recursion/\allowbreak{}src/\allowbreak{}backend/\allowbreak{}whir.rs}
+  & upstream rejects inputs with \code{config.is\_zk() != 0} (``supports only
+    non-ZK STARK inputs'') at two sites; both checks are removed, the
+    surrounding code following directly at
+    \src{vendor/\allowbreak{}p3-recursion/\allowbreak{}recursion/\allowbreak{}src/\allowbreak{}backend/\allowbreak{}whir.rs:562-565,643-647}. \\
+\code{recursion/\allowbreak{}src/\allowbreak{}input\_contract/\allowbreak{}whir.rs}
+  & test only: \code{whir\_config(8)} becomes \code{whir\_config(9)} to match
+    the masked stacked arity
+    \src{vendor/\allowbreak{}p3-recursion/\allowbreak{}recursion/\allowbreak{}src/\allowbreak{}input\_contract/\allowbreak{}whir.rs:1257-1260}. \\
+\code{recursion/\allowbreak{}src/\allowbreak{}pcs/\allowbreak{}whir/\allowbreak{}uni/\allowbreak{}pcs.rs}
+  & \code{ZK} becomes a const generic of \code{WhirUniPcs} with default
+    \code{true} \src{vendor/\allowbreak{}p3-recursion/\allowbreak{}recursion/\allowbreak{}src/\allowbreak{}pcs/\allowbreak{}whir/\allowbreak{}uni/\allowbreak{}pcs.rs:322},
+    forwarded by \code{const ZK: bool = ZK}
+    \src{vendor/\allowbreak{}p3-recursion/\allowbreak{}recursion/\allowbreak{}src/\allowbreak{}pcs/\allowbreak{}whir/\allowbreak{}uni/\allowbreak{}pcs.rs:967} (upstream:
+    \code{const ZK: bool = false}); hiding-aware commit/open paths are gated
+    on it. \\
+\code{recursion/\allowbreak{}src/\allowbreak{}pcs/\allowbreak{}whir/\allowbreak{}uni/\allowbreak{}recursive\_pcs.rs}
+  & the \code{RecursivePcs} impl is generalised over \code{const ZK: bool}
+    \src{vendor/\allowbreak{}p3-recursion/\allowbreak{}recursion/\allowbreak{}src/\allowbreak{}pcs/\allowbreak{}whir/\allowbreak{}uni/\allowbreak{}recursive\_pcs.rs:361-368}. \\
+\bottomrule
+\end{longtable}
+}
+
+No evaluation truncation exists: \code{evaluations\_on\_domain} asserts
+$|\mathit{domain}| \ge$ the committed height and zero-pads the coefficients
+before the coset DFT
+\src{vendor/\allowbreak{}p3-recursion/\allowbreak{}recursion/\allowbreak{}src/\allowbreak{}pcs/\allowbreak{}whir/\allowbreak{}uni/\allowbreak{}pcs.rs:538-554}. The
+directory \code{.scratch/\allowbreak{}vendor/\allowbreak{}} does not exist in the working tree. The
+decision log has no D-046 or D-051 entry; D-046 is only mentioned in passing
+\src{.scratch/\allowbreak{}pq-shielded-rollup/\allowbreak{}decisions.md:170,369}. The ``false$\to$true''
+description matches only the \emph{default}: the workspace instantiates the
+settlement PCS with \code{ZK = false}
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir.rs:86}
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}settlement\_replay.rs:87} and the inner (client-proof)
+PCS with the default \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir\_recursion.rs:106-113}, and
+pins both choices with compile-time assertions
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}lib.rs:102-113}. The item-2 analysis in
+\code{PATCHES.md} cites line numbers that still hold
+\src{vendor/\allowbreak{}p3-recursion/\allowbreak{}recursion/\allowbreak{}src/\allowbreak{}pcs/\allowbreak{}whir/\allowbreak{}uni/\allowbreak{}recursive\_pcs.rs:384}
+\src{vendor/\allowbreak{}p3-recursion/\allowbreak{}recursion/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}batch\_stark.rs:1528}.
+
+\textbf{Intended: code.} The tree that builds is the vendored one, and the
+non-ZK settlement layer is a recorded, deliberate choice
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}lib.rs:92-101}; \code{PATCHES.md} was not updated with
+the later changes. The removed upstream ZK guard and the hiding claims are
+the subject of \finding{L-07} and \finding{M-07}; the non-ZK settlement
+witness is the subject of \finding{M-10}.
+\end{specdelta}
+
+%----------------------------------------------------------------------
+\subsection{Security level and configuration knobs}
+\label{subsec:delta-security}
+
+\begin{specdelta}[``128-bit'' in prose, 96-bit target in code, overridable at run time]
+\label{delta:security}
+\textbf{Documentation.} \code{config.rs} states that the degree-5 challenge
+field gives ``$\sim$128-bit conjecturable security''
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}config.rs:28-30,46-50}. The \code{whir.rs} module
+header states that ``\code{SECURITY\_LEVEL} is set directly to the 128-bit
+target'' \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir.rs:43-46}.
+
+\textbf{Code.} The degree-5 FRI \code{Config} of \code{config.rs} is used only
+by the test-gated \code{spike} module \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}lib.rs:64-65}
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}spike.rs:18}; the deployed path takes only $\F$, the
+Keccak Merkle MMCS and the Keccak challenger from it
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir.rs:60,346-350}. The settlement challenge field is
+the degree-4 binomial extension $\K$ \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir.rs:70}, and
+\begin{equation}
+  \code{SECURITY\_LEVEL} = 96
+  \qquad\text{\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir.rs:120}}
+\end{equation}
+with an in-code derivation that 128 bits exceeds the structural ceiling on
+this field \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir.rs:97-119}; the recursion layer is tied
+to the same constant \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir\_recursion.rs:118-123}.
+
+The following environment variables are read by library code (not under
+\code{cfg(test)} or a feature) whenever a configuration is built:
+
+{\small
+\begin{longtable}{@{}>{\raggedright\arraybackslash}p{4.4cm}>{\raggedright\arraybackslash}p{5.4cm}>{\raggedright\arraybackslash}p{5.2cm}@{}}
+\toprule
+Variable & Effect & Source \\
+\midrule
+\endhead
+\code{WHIR\_SECURITY\_LEVEL} & replaces the 96-bit target, settlement and inner;
+  parsed as \code{usize}, no bound
+  & \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir.rs:126-131,211}
+    \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir\_recursion.rs:212} \\
+\code{WHIR\_SOUNDNESS\_REGIME} & \code{udr}/\code{capacity}/Johnson (default)
+  & \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir.rs:182-188} \\
+\code{WHIR\_INNER\_SOUNDNESS\_REGIME} & same, inner layer
+  & \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir\_recursion.rs:186-193} \\
+\code{WHIR\_FOLDING\_FINAL} & settlement folding factor $\in\{4,8\}$
+  & \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir.rs:147-153} \\
+\code{WHIR\_INNER\_RATE} & inner starting rate $\in\{1,2,3\}$
+  & \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir\_recursion.rs:314-318} \\
+\code{WHIR\_POW\_FLOOR}, \code{WHIR\_INNER\_POW\_FLOOR} & grinding floor
+  & \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}settlement\_replay.rs:151-154}
+    \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir\_recursion.rs:345-348} \\
+\code{WHIR\_FINAL\_LDE} & settlement LDE height
+  & \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}composed\_export.rs:1255-1258} \\
+\bottomrule
+\end{longtable}
+}
+
+The node reaches these on its settlement path
+(\code{settlement\_bundle} \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:453}
+$\to$ \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}composed\_export.rs:1237,1259}
+$\to$ \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}settlement\_replay.rs:180}
+$\to$ \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir.rs:209-211}). The grinding-budget search
+bound uses the constant rather than the overridden value
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir.rs:276}. On-chain, the WHIR schedule is read from
+the bundle's CONFIG section rather than fixed by the deployed contract
+(Delta~\ref{delta:whirhdr}), so the deployed verifier does not itself fix the
+level a settled proof attains \finding{V-01}.
+
+\textbf{Intended: code (96 bits, fixed).} The 96-bit rationale is explicit
+\src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir.rs:97-120}, and the overrides are documented as
+experiment-only (``shipping below 96 bits is a protocol decision, never a
+default'') \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}whir.rs:122-125,178-181}, yet they are
+compiled into the production path; see \finding{I-01}.
+\end{specdelta}
+
+%----------------------------------------------------------------------
+\subsection{Settlement-verifier header}
+\label{subsec:delta-whirhdr}
+
+\begin{specdelta}[STATEMENT section described as unconsumed]
+\label{delta:whirhdr}
+\textbf{Documentation.} The \code{WhirVerifier} header describes the bundle
+as CONFIG, PROOF and ``STATEMENT (audit surface, not consumed here)''
+\src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifier.sol:15-17}; lists among PROOF
+contents ``the zeta-derived eq\_points (D-072 phase 1)''
+\src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifier.sol:26-29}; states that every domain
+point is ``recomputed here, never read from the proof''
+\src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifier.sol:31-35}; and states that CONFIG is
+deploy-time data that ``a deployment should pin''
+\src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifier.sol:22-25}. An inline comment repeats
+``zeta-derived, proof-supplied, D-072 phase 1''
+\src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifier.sol:494-498}.
+
+\textbf{Code.} \code{verify} locates the STATEMENT section from its u32
+little-endian word count after PROOF and bounds-checks it
+\src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifier.sol:244-257}; every opening round
+receives it \src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifier.sol:465-470} and sets the
+initial WHIR constraint to mode~2 over that slice
+\src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifier.sol:503-513}; the raw slice is copied
+into the \code{TerminalWeight} call frame
+\src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifier.sol:826-840}, which derives the
+initial constraint's equality groups from the opening points it contains
+\src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}TerminalWeight.sol:38-40,108-125}. The per-round
+eq-points blob is no longer on the wire
+\src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifier.sol:1101-1102}. Hence STATEMENT is
+consumed: it supplies the opening points of each round's initial constraint.
+The deployed verifier holds no CONFIG digest (its only pin is the satellite
+code hash \src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifier.sol:122,131,895}); a
+CONFIG-pinning wrapper exists as \code{WhirVerifierV6}
+\src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifierV6.sol:44,63}, but the deployment
+script constructs \code{WhirVerifier} and passes it to the pool
+\src{contracts/\allowbreak{}script/\allowbreak{}Deploy.s.sol:41,45}.
+
+\textbf{Intended: code.} The D-086 step~C comments at the consuming sites
+describe the current behaviour
+\src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifier.sol:503-506,827-830,1101-1102}; the
+header predates them. The opening points so supplied are not related to the
+transcript's out-of-domain challenge, which is \finding{V-02}; the unpinned
+CONFIG is \finding{V-01}.
+\end{specdelta}
+
+%----------------------------------------------------------------------
+\subsection{Fees}
+\label{subsec:delta-fees}
+
+\begin{specdelta}[Fees described as moving on settlement]
+\label{delta:fees}
+\textbf{Documentation.} The README diagram says ``roots + fees move'' on
+\code{applyBlock} \src{README.md:23-26}, and the security model lists ``fee
+accounting'' among what the chain verifies \src{README.md:157-159}.
+
+\textbf{Code.} \code{ShieldedPool} declares no \code{payable} function,
+\code{receive} or \code{fallback} \src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:63-190}.
+The block fee is decoded as $\sum_i \mathsf{fee}_i$ over the per-transfer fee
+limbs \src{contracts/\allowbreak{}src/\allowbreak{}BlockStatement.sol:104-107} and is only emitted in
+\code{BlockApplied} \src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:171-178};
+\code{withdrawFees} forwards whatever balance the contract holds
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:182-189}. The contract's own documentation
+says it does not check fees \src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:59-62}.
+
+\textbf{Intended: not recorded.} See \finding{I-04}.
+\end{specdelta}
+
+%----------------------------------------------------------------------
+\subsection{Pointer to the findings}
+
+The deltas above are documentation defects in their own right, but several of
+them mark exactly the places where the enforced relation is weaker than the
+documented one. The security consequences of these deltas, and of the
+enforcement gaps noted throughout Sections~\ref{sec:overview}--\ref{sec:application},
+are catalogued in the audit report under \code{zk-findings/\allowbreak{}reports/\allowbreak{}}: findings
+\finding{V-01}--\finding{V-08} (Critical), \finding{H-01}--\finding{H-03}
+(High), and \finding{M-01}--\finding{M-11} (Medium), with the low-severity and
+informational items (including \finding{I-01}, \finding{I-02} and
+\finding{I-04} cited here) listed alongside them. This specification states
+what the code enforces; the report states what that permits.

@@ -1,0 +1,637 @@
+\section{The deployed Solidity settlement verifier}
+\label{sec:settlement-verifier}
+% Local line-breaking slack for long \code/\src runs; \fussy at section end.
+\sloppy
+
+This section states what the on-chain settlement verifier enforces when the pool
+calls \code{verify(statement, proof)}. The deployment script creates the
+\code{TerminalWeight} satellite first and then the bare \code{WhirVerifier}
+engine with the satellite's address; the pool is constructed with that engine
+\src{contracts/\allowbreak{}script/\allowbreak{}Deploy.s.sol:40-45}, and \code{applyBlock} accepts a block
+only if \code{verify} returns \code{true} \src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:144-145}.
+The engine replays the batch-STARK transcript of \S\ref{subsec:ps-transcript},
+then one WHIR opening argument per commitment round on the same Keccak sponge,
+then the constraint identity of Definition~\ref{def:ps-air-check}.
+
+\paragraph{Conventions.}
+Unless a directory is given, \code{.sol} files cited below are under
+\code{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}}; \code{KeccakChallenger.sol} is under
+\code{contracts/\allowbreak{}lib/\allowbreak{}sol-whir-p3/\allowbreak{}transcript/\allowbreak{}} and \code{KoalaBearExt4.sol} under
+\code{contracts/\allowbreak{}lib/\allowbreak{}sol-whir-p3/\allowbreak{}field/\allowbreak{}}. Field, packing, Montgomery map
+$\mathsf{mont}(v) = v\cdot 2^{32} \bmod p$ and the Keccak sponge are those of
+Section~\ref{sec:primitives}. We write $\mathsf{Obs}_{\F}(w)$ for absorbing one
+wire word $w<p$ (four little-endian bytes, \code{observeBase}),
+$\mathsf{Obs}_{\K}(a)$ for absorbing a packed $\K$ element as four words
+$\mathsf{mont}(c_k \bmod p)$ (\code{observeExt4Mont}, which reduces each lane modulo
+$p$ before converting) \src{KeccakChallenger.sol:154-179},
+$\mathsf{Obs}_{32}(h)$ for appending a 32-byte digest verbatim
+\src{KeccakChallenger.sol:181-183,\allowbreak{}1292-1304} \src{WhirVerifierCore.sol:113-115},
+$\mathsf{Draw}_{\K}$ for four \code{sampleBase} draws packed limb~0 first
+\src{BatchTranscript.sol:195-201} \src{SumcheckCore.sol:222-231},
+$\mathsf{Bits}_b$ for \code{sampleBits}$(b)$, and $\mathsf{Grind}_b(w)$ for
+\code{checkWitness}$(b,w)$. $\omega_k$ denotes the $k$-th entry of the
+two-adic generator table ($k \le 24$, reverting otherwise)
+\src{WhirVerifier.sol:142-196}.
+
+The verifier is a function of its two arguments, the immutable satellite address
+and the satellite's code; it reads no storage and binds neither the calling pool
+nor the chain \src{WhirVerifier.sol:117-132,\allowbreak{}209-214} (see \finding{M-01}).
+
+%---------------------------------------------------------------------------
+\subsection{Wire format}
+\label{subsec:sv-wire}
+
+\begin{definition}[Bundle]
+\label{def:sv-bundle}
+The \code{proof} argument $\pi$ is a byte string read in place from calldata.
+All counts are u32 little-endian (``words''); a ``word offset'' $o$ denotes byte
+$4o$ of $\pi$ \src{WhirVerifier.sol:1115-1121}.
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l l X@{}}
+\toprule
+Bytes & Field & Enforced \\
+\midrule
+$[0,4)$ & magic & equals ASCII \code{WBND} (\code{0x57424E44}) \src{WhirVerifier.sol:61,\allowbreak{}228,\allowbreak{}233} \\
+$4$ & version $v$ & $v \in \{5,7,8\}$; only byte $4$ is read, bytes $5$--$7$ are ignored \src{WhirVerifier.sol:229,\allowbreak{}242} \\
+$[8,12)$ & $c$ = CONFIG word count & u32 LE \src{WhirVerifier.sol:230,\allowbreak{}235} \\
+$[12,16)$ & $f$ = PROOF word count & u32 LE \src{WhirVerifier.sol:231,\allowbreak{}236} \\
+$[16, 16{+}4c)$ & CONFIG & word offsets $[4, 4{+}c)$ \src{WhirVerifier.sol:261} \\
+$[16{+}4c, 16{+}4c{+}4f)$ & PROOF & word offsets $[4{+}c, 4{+}c{+}f)$ \src{WhirVerifier.sol:262} \\
+$[16{+}4(c{+}f), +4)$ & $s$ = STATEMENT word count & u32 LE \src{WhirVerifier.sol:246-254} \\
+$[20{+}4(c{+}f), +4s)$ & STATEMENT & byte slice handed to the satellite \src{WhirVerifier.sol:255} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+The only length rules are, in order,
+\begin{align}
+  |\pi| \ge 16,\qquad |\pi| \ge 20 + 4(c+f),\qquad |\pi| \ge 20 + 4(c+f) + 4s
+\end{align}
+\src{WhirVerifier.sol:219,\allowbreak{}243,\allowbreak{}257}; trailing bytes are permitted.
+\end{definition}
+
+\begin{definition}[Item encodings]
+\label{def:sv-items}
+Section decoders are cursor-driven readers over $\pi$
+\src{WhirVerifier.sol:1115-1285}:
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l X@{}}
+\toprule
+Reader & Layout and checks \\
+\midrule
+\code{\_word} & one u32 LE \\
+\code{\_arr} & count $n$, then $n$ u32 LE words \src{WhirVerifier.sol:1123-1145} \\
+\code{\_blob} & byte count $n$, then $n$ bytes padded to a word boundary \src{WhirVerifier.sol:1148-1167} \\
+\code{\_blob32} & byte count, which must equal $32$, then one digest \src{WhirVerifier.sol:1170-1182} \\
+\code{\_blobArr32} & byte count $n$, then $\lfloor n/32\rfloor$ digests \src{WhirVerifier.sol:1186-1203} \\
+\code{\_raw32} & one 32-byte item, no prefix \src{WhirVerifier.sol:1206-1215} \\
+\code{\_raw32Arr} & count $n$, then $n$ packed $\K$ words; reverts if any low-128-bit padding is nonzero \src{WhirVerifier.sol:1218-1240} \\
+\code{\_extArr} & byte count with bit~31 as an in-band flag: set $\Rightarrow$ 16 bytes per element (four big-endian u32 lanes, lifted to bits 224..128); clear $\Rightarrow$ 32 bytes per element, padding must be zero \src{WhirVerifier.sol:1243-1285} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+Lanes of packed $\K$ words are not range-checked against $p$ by these readers
+\finding{M-04}. The version byte selects nothing: the compact-limb (v7) and
+pruned-path (v8) layouts are selected per array by the bit-31 flags
+\src{WhirVerifier.sol:1048-1061,\allowbreak{}1250-1253}.
+\end{definition}
+
+\begin{definition}[CONFIG grammar]
+\label{def:sv-config}
+Starting at word offset $4$:
+\begin{enumerate}
+\item \emph{Batch prefix:} length $L$, then \code{seedBytes} (blob),
+  \code{degreeBytes} (blob), \code{preDigest} (raw32), \code{lookupPowBits},
+  \code{oodPowBits}, \code{hasRand}; the cursor must land exactly $L$ words after
+  the length word \src{WhirVerifier.sol:378-393}.
+\item $R$ = number of opening rounds; an array \code{round\_starts} that is skipped
+  \src{WhirVerifier.sol:336-340}.
+\item $R$ round schedules $\Sigma_r$, each the fields of \code{RoundCfg} in order:
+  $M$=\code{nInter}, \code{claimPerm}, \code{framingHex}, \code{framingPre},
+  \code{framingClaim}, \code{framingBatching}, \code{framingSeps},
+  \code{claimWidths}, $k_0$=\code{numVariables}, \code{startingPowBits},
+  \code{commitmentOodSamples}, \code{schedPowBits}, \code{schedFoldPowBits},
+  \code{schedNumQueries}, \code{schedOodSamples}, \code{schedLogFolded},
+  \code{schedLogInvRate}, \code{finalPowBits}, \code{finalFoldPowBits},
+  \code{finalNumQueries}, \code{finalLogFolded}, \code{finalLogInvRate},
+  \code{params}, \code{rowsIsBase} \src{WhirVerifier.sol:923-948,\allowbreak{}989-1019}.
+  \code{commitmentOodSamples}, \code{schedLogInvRate} and \code{finalLogInvRate}
+  are decoded and not consumed.
+\item word count $c_s$, then $c_s$ words of CONSTRAINTS
+  (Definition~\ref{def:sv-cs}) \src{WhirVerifier.sol:313-318}.
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[PROOF grammar]
+\label{def:sv-proof}
+Starting at word offset $4+c$:
+\begin{enumerate}
+\item \emph{Batch prefix:} length $L$, then \code{mainDigest} (raw32),
+  \code{pvBytes} (blob), \code{lookupPow}, \code{permDigest} (raw32),
+  \code{terminals} (\code{\_raw32Arr}), \code{quotDigest} (raw32),
+  \code{randDigest} (raw32, present iff \code{hasRand}), \code{oodPow}; the cursor
+  must land exactly $L$ words after the length word; one further word (a round
+  count) is skipped \src{WhirVerifier.sol:395-419}.
+\item $R$ round blocks, each: \code{batchCommitment} (\code{\_blob32});
+  \code{boundEvals}, \code{initOodAnswers}, \code{initScA}, \code{initScInf}
+  (\code{\_extArr}); \code{initScPow} (\code{\_arr}); intermediate rows (limb count,
+  then that many u32 LE canonical limbs); intermediate paths (byte count with
+  bit~31 = pruned flag, the digests, then \code{prunedLens} if pruned);
+  \code{roundCommitments} (\code{\_blobArr32}); \code{oodAnswers} (\code{\_extArr});
+  \code{oodAnswerLens}, \code{powWitnesses} (\code{\_arr}); \code{scA}, \code{scInf}
+  (\code{\_extArr}); \code{scPow}, \code{scLens}, \code{scPowLens} (\code{\_arr});
+  \code{finalPoly} (\code{\_extArr}); \code{finalPowWitness}; final rows; final
+  paths; \code{finalScA}, \code{finalScInf} (\code{\_extArr}); \code{finalScPow}
+  (\code{\_arr}) \src{WhirVerifier.sol:951-987,\allowbreak{}1021-1103}.
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[STATEMENT grammar]
+\label{def:sv-stm}
+Byte-packed, parsed only on the satellite: u32 $R'$; per round u32
+$n_{\mathrm{mats}}$; per matrix u32 \code{log\_size}, u32 \code{width}, u32
+$n_{\mathrm{pts}}$; per point a u32 length word followed by one 32-byte packed
+$\K$ element $z$. The point is read at matrix offset $16 + 36q$; the length word
+is not checked; the consumed round index must be $< R'$ and the slice must lie
+inside the satellite frame \src{TerminalWeight.sol:120-138,\allowbreak{}186-188,\allowbreak{}205-218}.
+\end{definition}
+
+\begin{property}[What fixes each section]
+\label{prop:sv-sections}
+The header counts $c$ and $f$ locate PROOF and STATEMENT only. The two
+length-prefixed batch prefixes are self-checked; the round schedules, round
+blocks and CONSTRAINTS are read at cursor positions that are not compared with
+$4+c$ or $4+c+f$, and individual reads are \code{calldataload}s at computed
+offsets \src{WhirVerifier.sol:261-318,\allowbreak{}328-349}. CONFIG is read from the caller's
+bundle and is not compared with any value held by the deployed contract: the
+engine has no CONFIG digest, and the wrapper that pins
+$\Hk(\text{CONFIG})$ (\code{WhirVerifierV6}, constructor check
+\src{WhirVerifierV6.sol:61-76}) is not the deployed contract
+\src{contracts/\allowbreak{}script/\allowbreak{}Deploy.s.sol:40-45} \finding{V-01}. STATEMENT is neither
+absorbed into the transcript nor pinned.
+\end{property}
+
+%---------------------------------------------------------------------------
+\subsection{Statement binding and terminal pre-check}
+\label{subsec:sv-statement}
+
+Let $(\mathit{pv}_i)_{i<n}$ be the u32 LE words of \code{pvBytes}, $n =
+\lfloor|\code{pvBytes}|/4\rfloor$, and $(\mathit{st}_i)$ the caller's
+\code{uint256} statement. \code{\_checkStatement} enforces
+\begin{align}
+  |\mathit{st}| = n, \qquad
+  (\mathit{st}_i \cdot R) \bmod p \;=\; \mathit{pv}_i \quad (i<n),
+  \qquad R = 2^{32} \bmod p = \code{33554430}
+  \label{eq:sv-stm}
+\end{align}
+\src{WhirVerifier.sol:426-444}. The comparison is on residues modulo $p$, so
+every $\mathit{st}_i' \equiv \mathit{st}_i \pmod p$ passes \finding{M-03}.
+\begin{Verbatim}[fontsize=\small]
+for (uint256 i; i < pvCount; ++i) {
+    ...
+    if (mulmod(statement[i], MONTGOMERY_R, FIELD_P) != _swapBytes(v)) {
+        revert StatementMismatch(i);
+    }
+}
+\end{Verbatim}
+
+Before the transcript, the proof-supplied LogUp terminals
+$\tau_0,\dots,\tau_{T-1}$ (packed $\K$) must satisfy
+\begin{align}
+  \textstyle\bigoplus_{t<T} \tau_t \;=\; 0
+\end{align}
+where $\oplus$ is \code{KoalaBearExt4.add} \src{WhirVerifier.sol:276-280}
+\src{KoalaBearExt4.sol:33-51}. $T$ is the length of the PROOF array and is not
+fixed by CONFIG \finding{V-05}; on non-canonical lanes $\oplus$ differs from
+addition in $\K$ (Property~\ref{prop:ext-lanes}, \finding{M-04}).
+
+%---------------------------------------------------------------------------
+\subsection{Batch transcript}
+\label{subsec:sv-batch}
+
+One sponge $\mathcal{S}$ runs the whole verification
+\src{WhirVerifier.sol:283-296}. The batch layer
+\src{BatchTranscript.sol:77-153} performs, in order:
+\begin{enumerate}
+\item[S0.] \textbf{Seed and degrees} (CONFIG). $\mathsf{Obs}_{\F}$ of every word of
+  \code{seedBytes}, then of every word of \code{degreeBytes}; each word must be
+  $<p$ \src{BatchTranscript.sol:77-84,\allowbreak{}208-218} \src{KeccakChallenger.sol:32-41}.
+\item[S1.] \textbf{Main} (PROOF). $\mathsf{Obs}_{32}(\code{mainDigest})$, then
+  $\mathsf{Obs}_{\F}(\mathit{pv}_i)$ for all $i$ \src{BatchTranscript.sol:87-93}.
+\item[S2.] \textbf{Preprocessed} (CONFIG). $\mathsf{Obs}_{32}(\code{preDigest})$,
+  unconditionally \src{BatchTranscript.sol:99-101}.
+\item[S3.] \textbf{Lookup.} If \code{lookupPowBits}$=0$ then \code{lookupPow}
+  must be $0$ and nothing is absorbed; otherwise
+  $\mathsf{Grind}_{\code{lookupPowBits}}(\code{lookupPow})$ must accept. Then
+  $\alpha_L \gets \mathsf{Draw}_{\K}$, $\beta \gets \mathsf{Draw}_{\K}$
+  \src{BatchTranscript.sol:107-115,\allowbreak{}177-192}.
+\item[S4.] \textbf{Permutation} (PROOF). $\mathsf{Obs}_{32}(\code{permDigest})$,
+  $\mathsf{Obs}_{\K}(\tau_t)$ for $t<T$, then $\alpha \gets \mathsf{Draw}_{\K}$
+  \src{BatchTranscript.sol:119-129} \src{SumcheckCore.sol:80-92}.
+\item[S5.] \textbf{Quotient} (PROOF). $\mathsf{Obs}_{32}(\code{quotDigest})$, then
+  $\mathsf{Obs}_{32}(\code{randDigest})$ iff \code{hasRand}
+  \src{BatchTranscript.sol:135-143}.
+\item[S6.] \textbf{OOD point.} Grind step as in S3 with \code{oodPowBits},
+  \code{oodPow}; then $\zeta \gets \mathsf{Draw}_{\K}$
+  \src{BatchTranscript.sol:146-153}.
+\end{enumerate}
+S0--S6 correspond to T0--T7 of \S\ref{subsec:ps-transcript}. Only the
+randomisation digest is conditional; S2, S3 and S4 run regardless of whether the
+shape has preprocessed columns or lookups. The engine then hands $\mathcal{S}$ to
+the WHIR core without reseeding \src{WhirVerifier.sol:295-296}. The challenges
+$(\alpha_L, \beta, \alpha, \zeta)$ are consumed only by the constraint identity
+(\S\ref{subsec:sv-cidnty}).
+
+%---------------------------------------------------------------------------
+\subsection{WHIR opening rounds}
+\label{subsec:sv-whir}
+
+For $r = 0,\dots,R-1$ the engine decodes $\Sigma_r$ and the $r$-th round block and
+runs one opening \src{WhirVerifier.sol:341-348,\allowbreak{}465-517}. Each opening starts its
+own claim; only $\mathcal{S}$ is continuous. \code{framingHex} is a byte string of
+pre-encoded wire words (``framing''); \emph{absorb $n$ framing words} appends the
+next $4n$ bytes of it verbatim, reverting if it is exhausted, with no range
+check \src{WhirVerifierCore.sol:75-88} \src{KeccakChallenger.sol:113-145}. No
+check requires the framing to be fully consumed.
+
+\begin{definition}[Sumcheck replay]
+\label{def:sv-sumcheck}
+$\mathsf{SC}_b(\sigma; (a_j,h_j)_{j<n}; (w_j))$ requires $|h| = |a| = n$ and
+$|w| = n$ if $b>0$, $|w|=0$ otherwise; then for each $j$:
+$\mathsf{Obs}_{\K}(a_j)$, $\mathsf{Obs}_{\K}(h_j)$, if $b>0$ $\mathsf{Grind}_b(w_j)$ must
+accept, $r_j \gets \mathsf{Draw}_{\K}$, and
+\begin{align}
+  \sigma \;\gets\; a_j(1-r_j) + (\sigma - a_j)\, r_j + h_j\, r_j (r_j - 1).
+\end{align}
+It returns $(\sigma, (r_j)_{j<n})$ \src{SumcheckCore.sol:108-149,\allowbreak{}165-216}. The
+round count $n$ is the length of the proof arrays.
+\end{definition}
+
+\begin{definition}[Opened row, leaf and fold]
+\label{def:sv-open}
+A row of $2^m$ elements of $\K$ (or of $\F$ when \code{rowsIsBase}) arrives as u32
+LE canonical limbs $v_t$, four per $\K$ element; each must satisfy $v_t<p$. Its
+leaf is
+\begin{align}
+  \lambda \;=\; \Hk\big(\mathsf{le}_{32}(\mathsf{mont}(v_0)) \,\|\, \cdots \,\|\,
+  \mathsf{le}_{32}(\mathsf{mont}(v_{L-1}))\big)
+\end{align}
+\src{WhirVerifierCore.sol:1047-1122} \src{TerminalWeight.sol:576-615}. A path of
+depth $\ell$ for index $\iota$ with siblings $s_0,\dots,s_{\ell-1}$ authenticates
+against root $C$ iff $x_\ell = C$ where $x_0=\lambda$ and
+$x_{j+1} = \Hk(s_j \| x_j)$ if bit $j$ of $\iota$ is set, else
+$\Hk(x_j \| s_j)$ \src{StarkMerkle.sol:125-167}. The fold at
+$\mathbf{u} = (u_0,\dots,u_{m-1})$ is the multilinear evaluation with $u_0$ binding
+the most significant index bit:
+\begin{align}
+  \mathsf{Fold}(e,\mathbf{u}) \;=\; \sum_{b \in \{0,1\}^m} e_{b}
+  \prod_{t<m} \big(b_t u_t + (1-b_t)(1-u_t)\big),
+  \qquad b = (b_0,\dots,b_{m-1}) \text{ MSB first}
+\end{align}
+\src{StirOpenings.sol:175-192} \src{KoalaBearExt4.sol:212-243}.
+\end{definition}
+
+\paragraph{Initial phase} \src{WhirVerifierCore.sol:259-331}. Inputs: virtual
+answers $y_0,\dots,y_{m_0-1}$ (\code{initOodAnswers}), bound evaluations
+$\mathbf{b}$ (\code{boundEvals}), widths $(w_c)$ and permutation $\pi$ from
+$\Sigma_r$.
+\begin{enumerate}
+\item For $i<m_0$: absorb \code{framingPre}$[i]$ framing words,
+  $v_i \gets \mathsf{Draw}_{\K}$, $\mathsf{Obs}_{\K}(y_i)$.
+\item For each claim $c$: absorb \code{framingClaim}$[c]$ framing words, then
+  $\mathsf{Obs}_{\K}$ of its $w_c$ evaluations; reverts if they do not fit in
+  $\mathbf{b}$. No opening point is absorbed.
+\item Absorb \code{framingBatching} framing words; $\gamma_0 \gets \mathsf{Draw}_{\K}$.
+\item With $N = |\mathbf{b}|$ and $\pi$ mapping placement order to proof order,
+  \begin{align}
+    \sigma_0 \;=\; \sum_{k<N} b_{\pi(k)}\,\gamma_0^{k} \;+\; \sum_{i<m_0} y_i\,\gamma_0^{N+i}.
+  \end{align}
+\item Absorb \code{framingSeps}$[0]$ framing words; then, with
+  $b^{\mathrm{sc}}_0 = \code{startingPowBits}$,
+  \begin{align}
+    (\sigma_0', \mathbf{r}^{(0)}) \;=\; \mathsf{SC}_{b^{\mathrm{sc}}_0}\big(\sigma_0;\
+    \code{initScA},\code{initScInf};\ \code{initScPow}\big).
+  \end{align}
+\end{enumerate}
+$m_0$, $|\mathbf{b}|$ and the sumcheck length are proof array lengths;
+$m_0$ is bounded only by $|\code{framingPre}|$ and $\sum_c w_c = N$ is not
+enforced \finding{M-05}. The opening points of the claims are not inputs here;
+they enter only the terminal weight (Definition~\ref{def:sv-weight}).
+
+\paragraph{Intermediate round $i<M$} \src{WhirVerifierCore.sol:675-828}
+\src{WhirVerifier.sol:552-637}. Schedule from $\Sigma_r$: OOD count $m_i$,
+query PoW bits $b^{\mathrm q}_i$, query count $Q_i$, depth $\ell_i$
+(\code{schedLogFolded}), sumcheck PoW bits $b^{\mathrm{sc}}_i$, arity
+$k_{i+1} = \code{params}[4i]$. Let $C_i$ be \code{roundCommitments}$[i]$,
+$C_{-1}$ the round block's \code{batchCommitment}, and $\mathbf{u} =
+\mathbf{r}^{(i)}$ the previous sumcheck randomness.
+\begin{enumerate}
+\item Shape checks before any absorb: $b^{\mathrm q}_i = 0 \Rightarrow$ witness
+  $=0$; $|\mathbf{y}_i| = m_i$; row element count $=2^{|\mathbf{u}|}$; limbs per
+  row $\in\{2^{|\mathbf u|}, 4\cdot 2^{|\mathbf u|}\}$
+  \src{WhirVerifierCore.sol:685-707}. The row-buffer length compared there is
+  computed by the engine as $Q_i$ times the row width
+  \src{WhirVerifier.sol:583-585}.
+\item $\mathsf{Obs}_{32}(C_i)$; for $j<m_i$: $z_{i,j} \gets \mathsf{Draw}_{\K}$,
+  $\mathsf{Obs}_{\K}(y_{i,j})$.
+\item $\mathsf{Grind}_{b^{\mathrm q}_i}(\cdot)$ must accept.
+\item $\iota_{i,q} \gets \mathsf{Bits}_{\ell_i}$ for $q<Q_i$.
+\item $\gamma_{i+1} \gets \mathsf{Draw}_{\K}$. For each $q$, the opened row
+  $e_{i,q}$ authenticates at $\iota_{i,q}$ with depth $\ell_i$ against
+  $C_{i-1}$, and $f_{i,q} = \mathsf{Fold}(e_{i,q}, \mathbf u)$. Then
+  \begin{align}
+    \sigma_{i+1} \;=\; \sigma_i' + \sum_{j<m_i} y_{i,j}\,\gamma_{i+1}^{1+j}
+    + \sum_{q<Q_i} f_{i,q}\,\gamma_{i+1}^{1+m_i+q}.
+  \end{align}
+\item Absorb \code{framingSeps}$[1+i]$ framing words;
+  $(\sigma_{i+1}', \mathbf r^{(i+1)}) = \mathsf{SC}_{b^{\mathrm{sc}}_i}(\sigma_{i+1};
+  \ldots)$ on the round's slices of \code{scA}, \code{scInf}, \code{scPow}, whose
+  lengths are \code{scLens}$[i]$, \code{scPowLens}$[i]$.
+\end{enumerate}
+In step 5, when \code{prunedLens}$[i] \ne 0$ (a v8 pruned path stream), the
+engine requires
+$2^{|\mathbf u|} = 16$, $|\mathbf u| = 4$ and calldata rows, draws $\gamma_{i+1}$,
+and delegates the row decode, leaves, folds, the sum $\sigma_{i+1}$ and the
+authentication of all $(\iota_{i,q}, \lambda_{i,q})$ to the satellite's
+\code{QFOLD} frame in one call \src{WhirVerifierCore.sol:749-761,\allowbreak{}592-646}; the
+transcript order is unchanged because the query loop absorbs nothing. Without a
+pruned stream each query is authenticated on its own path, then $\gamma_{i+1}$ is
+drawn \src{WhirVerifierCore.sol:762-814}. The \code{QFOLD} walk sorts the indices,
+keeps one leaf per distinct index, consumes boundary siblings from the stream
+level by level, and requires the stream to be consumed exactly, a single
+remaining node, and that node equal to $C_{i-1}$
+\src{TerminalWeight.sol:648-737}; the folds of all $Q_i$ queries, including
+repeated indices, enter $\sigma_{i+1}$ \src{TerminalWeight.sol:637-647}. Rows of
+repeated indices other than the retained one are not compared with it
+\finding{V-04}. The commitment $C_{-1}$ that round $0$ opens against is taken from
+the round block and is not compared with \code{mainDigest}, \code{quotDigest},
+\code{preDigest} or \code{permDigest} absorbed in S1--S5
+\src{WhirVerifier.sol:567-568,\allowbreak{}670} \finding{V-03}.
+
+\paragraph{Final phase} \src{WhirVerifierCore.sol:938-1040}
+\src{WhirVerifier.sol:653-699}. Schedule: PoW bits $b^{\mathrm q}_\star$, query
+count $Q_\star$, depth $\ell_\star$, sumcheck PoW bits $b^{\mathrm{sc}}_\star$.
+Let $C_\star = C_{M-1}$ ($C_{-1}$ if $M=0$), $\mathbf u = \mathbf r^{(M)}$, and
+$\phi = (\phi_0,\dots,\phi_{d-1})$ = \code{finalPoly}.
+\begin{enumerate}
+\item Shape checks as above; final rows are always extension rows and their limb
+  count must equal $Q_\star \cdot 4 \cdot 2^{|\mathbf u|}$
+  \src{WhirVerifierCore.sol:945-966} \src{WhirVerifier.sol:676-680}.
+\item $\mathsf{Obs}_{\K}(\phi_j)$ for $j<d$; $\mathsf{Grind}_{b^{\mathrm q}_\star}$
+  must accept; $\iota_q \gets \mathsf{Bits}_{\ell_\star}$ for $q<Q_\star$.
+\item $x_q = \omega_{\ell_\star}^{\iota_q}$ (computed, not read)
+  \src{WhirVerifierCore.sol:987-992} \src{WhirVerifier.sol:685}. Each row
+  authenticates against $C_\star$ on its own path, and
+  \begin{align}
+    \mathsf{Fold}(e_q, \mathbf u) \;=\; \sum_{j<d} \phi_j\, x_q^{\,j}
+  \end{align}
+  (Horner) \src{WhirVerifierCore.sol:998-1026} \src{StirOpenings.sol:201-207}.
+  These claims are checked directly and not batched into the running claim.
+\item Absorb \code{framingSeps}$[1+M]$ framing words;
+  $(\sigma_\star, \mathbf r^\star) = \mathsf{SC}_{b^{\mathrm{sc}}_\star}(\sigma_M';
+  \code{finalScA},\code{finalScInf};\code{finalScPow})$.
+\end{enumerate}
+$d$ and $|\mathbf r^\star|$ are proof array lengths, tied to each other by the
+terminal identity below \finding{M-05}.
+
+%---------------------------------------------------------------------------
+\subsection{Terminal identity}
+\label{subsec:sv-terminal}
+
+\begin{definition}[Constraint weights]
+\label{def:sv-weight}
+Round $r$ yields $M+1$ weight descriptors \src{WhirVerifier.sol:501-513,\allowbreak{}619-632}.
+For a descriptor with arity $k$, challenge $\gamma$, shift $\varepsilon$, equality
+values $E_0,\dots,E_{G-1}$ and selection points $x_0,\dots,x_{Q-1}$,
+\begin{align}
+  w(\boldsymbol\rho) \;=\; \gamma^{\varepsilon}\Big(\sum_{g<G}\gamma^{g} E_g(\boldsymbol\rho)
+  \;+\; \gamma^{G}\sum_{q<Q} \gamma^{q}\, \mathsf{Sel}(\boldsymbol\rho, x_q)\Big),
+  \qquad
+  \mathsf{Sel}(\boldsymbol\rho, x) = \prod_{t<k}\big(\rho_{k-1-t}(x^{2^t}-1)+1\big)
+\end{align}
+\src{WhirGadgets.sol:618-767,\allowbreak{}525-587}, with
+$\mathrm{eq}(\mathbf p,\mathbf q) = \prod_t (1 + 2p_tq_t - p_t - q_t)$ and
+$\mathsf{exp}_k(v) = (v^{2^{k-1}},\dots,v^2,v)$ \src{WhirGadgets.sol:119-167}.
+\begin{itemize}
+\item \emph{Initial} ($\varepsilon=0$, $\gamma=\gamma_0$, $k = k_0$, $Q=0$). The
+  satellite derives the equality groups from round $r$ of STATEMENT and the
+  virtual points \src{TerminalWeight.sol:125-203,\allowbreak{}1357-1368}. Matrices are placed
+  as in Definition~\ref{def:ps-layout}: arity $a = \max(\code{log\_size}, 4)$,
+  required $a \le k_0$; stable sort ascending, walked in reverse; each column takes
+  slot index $s = \mathrm{bitrev}_{k_0-a}(o \gg a)$ with $o$ advancing by $2^a$
+  per column. Groups are emitted per matrix, per point $z$, per column; for such a
+  group, with $c_t = z^{2^{a-1-t}}$,
+  \begin{align}
+    E(\boldsymbol\rho) \;=\; \prod_{t<a}\frac{1-\rho_t+\rho_t c_t}{1+c_t}
+    \;\cdot \prod_{j<k_0-a} \big[\mathrm{bit}_{k_0-a-1-j}(s)\,?\,\rho_{a+j} : 1-\rho_{a+j}\big],
+  \end{align}
+  i.e.\ $\mathrm{eq}(\boldsymbol\rho, (X(z), \mathrm{bits}(s)))$ with the
+  bridge point $X(z)$ of Definition~\ref{def:ps-bridge}
+  \src{WhirGadgets.sol:203-337}. The $m_0$ virtual groups follow with
+  $E = \mathrm{eq}(\boldsymbol\rho, \mathsf{exp}_{k_0}(v_i))$.
+\item \emph{Round $i<M$} ($\varepsilon = 1$, $\gamma = \gamma_{i+1}$,
+  $k = k_{i+1}$): $E_j = \mathrm{eq}(\cdot, \mathsf{exp}_{k}(z_{i,j}))$ and
+  $x_q = \omega_{\ell_i}^{\iota_{i,q}}$ lifted to $\K$.
+\end{itemize}
+\end{definition}
+
+\begin{property}[Terminal identity]
+\label{prop:sv-terminal}
+Let $\mathbf r^{\mathrm{all}} = \mathbf r^{(0)} \| \mathbf r^{(1)} \| \cdots \|
+\mathbf r^{(M)} \| \mathbf r^\star$ and let $\boldsymbol\rho_c$ be its last $k_c$
+entries (reverting if $k_c > |\mathbf r^{\mathrm{all}}|$). The engine requires
+\begin{align}
+  \sigma_\star \;=\; \Big(\sum_{c=0}^{M} w_c(\boldsymbol\rho_c)\Big) \cdot
+  \mathsf{Fold}(\phi, \mathbf r^\star), \qquad |\phi| = 2^{|\mathbf r^\star|},
+\end{align}
+where the weight and $\mathsf{Fold}(\phi,\cdot)$ are computed by the satellite's
+\code{TWIGHT} frame and the equality is evaluated in the engine
+\src{WhirVerifier.sol:701-726} \src{TerminalWeight.sol:1370-1371}
+\src{WhirGadgets.sol:782-806} \src{KoalaBearExt4.sol:217-219}.
+\end{property}
+
+\begin{Verbatim}[fontsize=\small]
+uint256[] memory allR = _concat(allRandomness, closing);
+(uint256 weight, uint256 value) =
+    _terminalWeight(allR, constraints, finalPoly, closing);
+uint256 expected = KoalaBearExt4.mul(weight, value);
+if (foldedClaim != expected) revert TerminalClaimMismatch(expected, foldedClaim);
+\end{Verbatim}
+
+The query points $x_q$ are derived from transcript indices. The opening points $z$
+in the initial weight are read from STATEMENT and are not compared with $\zeta$
+or $\zeta\,\omega_{\ell}$, nor bound by the transcript \finding{V-02}.
+
+%---------------------------------------------------------------------------
+\subsection{Constraint identity}
+\label{subsec:sv-cidnty}
+
+After all $R$ openings the engine sends the \code{CIDNTY} frame
+\begin{align}
+  \big[\zeta,\ \alpha,\ \alpha_L,\ \beta,\ (\tau_t)_{t<T},\ (\mathit{st}_i)_i,\
+  \text{CONSTRAINTS},\ (\mathbf b^{(r)})_{r<R}\big]
+\end{align}
+to the satellite, where $\mathbf b^{(r)}$ is the
+\code{boundEvals} array of opening $r$ \src{WhirVerifier.sol:302-318,\allowbreak{}1324-1381};
+the satellite reverts on any mismatch \src{TerminalWeight.sol:998-1194}.
+
+\begin{definition}[CONSTRAINTS section]
+\label{def:sv-cs}
+u32 LE words: instance count $n$; statement instance $\kappa$; per instance $i$:
+widths $(w_i, w_i^{\mathrm{pre}}, w_i^{\mathrm{aux}})$, flags
+\code{hasMainNext}, \code{hasPreNext}, a skipped constraint count, a node program
+(word count, then 12-byte nodes $[\mathrm{op}, x, y]$), base and extension
+constants, roots $(\varrho_g)_{g<K_i}$, trace $\ell_i$, a skipped shift,
+$\mathit{is}_i$ (inverse shift), $\mathit{hi}_i$ (\code{traceHInv}), chunk count
+$L_i$ and per chunk $(\ell_{i,j}, \text{skipped}, \mathit{is}_{i,j})$, and
+$\mathit{invD}_{i,\cdot}$; then $W$ (\code{maxMsgW}), bus ids per instance,
+\code{hasTerminal} per instance, $n_r$ and per-round arity arrays $A^{(r)}$. The
+parse must end exactly at $c_s$ words and the frame exactly after $n_r$ bound
+sections \src{TerminalWeight.sol:1015-1097}.
+\end{definition}
+
+\begin{definition}[Opened values]
+\label{def:sv-opened}
+With $s_a(z) = \prod_{t<a}(1+z^{2^t})$ \src{TerminalWeight.sol:907-915} and
+$\zeta_i' = \zeta\cdot\omega_{\ell_i}$ \src{TerminalWeight.sol:1100-1103}, the
+bound sections are read by role: $r=0$ main, $r=1$ quotient, $r=2$ preprocessed,
+$r\ge 3$ permutation \src{TerminalWeight.sol:794-861,\allowbreak{}1139-1175}.
+\begin{itemize}
+\item Main ($r=0$) and preprocessed ($r=2$): per instance one claim at $\zeta$ and,
+  if the corresponding \code{Next} flag is set, one at $\zeta_i'$, each of width
+  $w_i$ (resp.\ $w_i^{\mathrm{pre}}$) and arity $A^{(r)}_i$; values
+  $s_{a}(z)\cdot b$.
+\item Quotient ($r=1$): $L_i$ claims of width $4$ at $\zeta$, arity $A^{(1)}_j$
+  indexed by the global claim index $j$; chunk value
+  $q_{i,j} = \sum_{k<4} X^k\, s_a(\zeta)\, b_k$.
+\item Permutation ($r\ge3$): per instance claims at $\zeta$ and $\zeta_i'$ of width
+  $4w_i^{\mathrm{aux}}$, recombined in groups of four as for the quotient.
+\item Challenges: per bus id $\mathit{id}$ of instance $i$,
+  $(\alpha_L + (\mathit{id}+1)\,\beta^{\max(W,1)},\ \beta)$
+  \src{TerminalWeight.sol:1122-1134}.
+\item Terminals: the $t$-th instance with \code{hasTerminal} receives $\tau_t$;
+  no check requires all $T$ terminals to be consumed
+  \src{TerminalWeight.sol:1114-1121} \finding{V-05}.
+\item Public values of instance $\kappa$: the caller's words $\mathit{st}_x$,
+  lifted as $\mathit{st}_x \ll 224$ (low 32 bits) \src{TerminalWeight.sol:1135-1137}
+  \src{ConstraintIdentity.sol:250-254}; with \eqref{eq:sv-stm} this admits the
+  aliasing of \finding{M-03}.
+\end{itemize}
+\end{definition}
+
+\begin{property}[Constraint identity]
+\label{prop:sv-cidnty}
+For each instance $i<n$, with $u = \zeta\cdot \mathit{is}_i$ and
+$Z = u^{2^{\ell_i}} - 1$, selectors $\mathit{isFirst} = Z/(u-1)$,
+$\mathit{isLast} = Z/(u-\mathit{hi}_i)$, $\mathit{isTransition} = u - \mathit{hi}_i$
+\src{ConstraintIdentity.sol:119-133}; constraint fold
+$\mathsf F_i = \sum_{g<K_i}\alpha^{K_i-1-g}\, C_{i,\varrho_g}$ (Horner over the
+roots, the DAG evaluated on the opened values and selectors)
+\src{ConstraintIdentity.sol:138-272}; and
+\begin{align}
+  \mathsf Q_i \;=\; \sum_{j<L_i} q_{i,j}\cdot \mathit{invD}_{i,j}\cdot
+  \prod_{j'\ne j}\Big(\big(\zeta\cdot \mathit{is}_{i,j'}\big)^{2^{\ell_{i,j'}}} - 1\Big)
+\end{align}
+\src{ConstraintIdentity.sol:276-310}, the satellite requires
+\begin{align}
+  \mathsf F_i \cdot Z^{-1} \;=\; \mathsf Q_i
+\end{align}
+and reverts with \code{ConstraintIdentityMismatch}$(i)$ otherwise
+\src{TerminalWeight.sol:1177-1187}. Inversion of $0$ reverts
+\src{KoalaBearExt4.sol:96-97}.
+\end{property}
+
+This is Definition~\ref{def:ps-air-check} with the Lagrange factors' denominators
+$\mathit{invD}$ and all domain constants supplied by CONSTRAINTS (CONFIG,
+\finding{V-01}). The bound evaluations it consumes are the values the WHIR
+openings proved at the STATEMENT points, while the identity scales them at $\zeta$
+and $\zeta_i'$ \finding{V-02}; the trace, quotient, preprocessed and permutation
+roles are assigned by round index, and the roots those rounds opened against are
+the per-round \code{batchCommitment}s \finding{V-03}.
+
+%---------------------------------------------------------------------------
+\subsection{The satellite and its pin}
+\label{subsec:sv-satellite}
+
+\code{TerminalWeight} dispatches on the first calldata word: \code{QFOLD},
+\code{MROOTS}, \code{CIDNTY}, else \code{TWIGHT}, which must match its magic and
+end exactly at \code{calldatasize} \src{TerminalWeight.sol:1200-1355}. The engine
+stores the satellite's address and code hash at construction (rejecting empty
+code) and re-checks \code{codehash} before every call, both in the engine and in
+the core's \code{QFOLD} path \src{WhirVerifier.sol:126-132,\allowbreak{}888-916}
+\src{WhirVerifierCore.sol:652-673}. A satellite revert is bubbled. For
+\code{TWIGHT} the final equality is evaluated in the engine; for \code{QFOLD} the
+Merkle comparison is inside the satellite and its returned sum is used as
+$\sigma_{i+1}$; for \code{CIDNTY} the satellite's return is the verdict. The
+engine never builds an \code{MROOTS} frame.
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l X@{}}
+\toprule
+Source & Values \\
+\midrule
+CONFIG (caller bundle) & seed and degree words, \code{preDigest}, PoW bits, \code{hasRand}, $R$, every $\Sigma_r$ (query and OOD counts, depths, arities, framing words, widths, \code{claimPerm}), CONSTRAINTS (programs, domain constants, $\mathit{invD}$, role layout) \finding{V-01} \\
+STATEMENT (caller bundle) & WHIR opening points and matrix shapes of every initial weight \finding{V-02} \\
+PROOF & digests, public values, terminals and their count \finding{V-05}, round roots incl.\ \code{batchCommitment} \finding{V-03}, evaluations, OOD answers, sumcheck messages and their counts, rows, paths, \code{finalPoly} \finding{M-05} \\
+Derived in contract & $\alpha_L,\beta,\alpha,\zeta$; virtual and OOD points; $\gamma_r$; sumcheck randomness; query indices; $x_q = \omega_\ell^{\iota}$ \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+%---------------------------------------------------------------------------
+\subsection{Spec deltas}
+\label{subsec:sv-deltas}
+
+\begin{specdelta}[STATEMENT is consumed]
+\label{delta:sv-stm}
+The engine header calls STATEMENT an ``audit surface, not consumed here''
+\src{WhirVerifier.sol:16-17}; it is the sole source of the initial-weight opening
+points \src{WhirVerifier.sol:510-513} \src{TerminalWeight.sol:125-203}. The header
+also states that every domain point is recomputed and none is read from the proof
+\src{WhirVerifier.sol:31-35}; that holds for query points only \finding{V-02}.
+\end{specdelta}
+
+\begin{specdelta}[Wire description]
+\label{delta:sv-wire}
+The header describes a ``16-byte header followed by three word sections'' under
+``v3'' and the version error is documented as ``not version 3''
+\src{WhirVerifier.sol:13-19,\allowbreak{}62-63}; the code accepts $\{5,7,8\}$, reads one byte of
+version, and places a u32 STATEMENT count between PROOF and STATEMENT
+\src{WhirVerifier.sol:242-257}.
+\end{specdelta}
+
+\begin{specdelta}[CONFIG pin]
+\label{delta:sv-pin}
+``A deployment should pin \code{keccak256(configSection)}''
+\src{WhirVerifier.sol:23-25}, the preprocessed digest is described as a
+``deployment constant'' \src{BatchTranscript.sol:95-98}, and the unchecked framing
+absorb is justified by the \code{WhirVerifierV6} digest
+\src{WhirVerifierCore.sol:80-86}; the deployed engine is the unwrapped
+\code{WhirVerifier} \src{contracts/\allowbreak{}script/\allowbreak{}Deploy.s.sol:40-45} \finding{V-01}.
+\end{specdelta}
+
+\begin{specdelta}[Satellite trust statement]
+\label{delta:sv-trust}
+The engine and satellite state that a faulty satellite ``can only make
+verification FAIL'' \src{WhirVerifier.sol:97-100} \src{TerminalWeight.sol:49-55};
+this describes \code{TWIGHT} only. \code{QFOLD} and \code{CIDNTY} results are
+accepted as returned, so the code-hash pin is what fixes them
+(\S\ref{subsec:sv-satellite}). The \code{\_callSatellite} comment names the
+\code{MROOTS} walk as a caller \src{WhirVerifier.sol:881-887}; no engine path
+builds that frame.
+\end{specdelta}
+
+\begin{specdelta}[Minor]
+\label{delta:sv-minor}
+\code{TerminalWeight.MONT} is commented as $2^{31} \bmod p$ while its value
+\code{0x01FFFFFE} is $2^{32} \bmod p$ \src{TerminalWeight.sol:67-68}.
+\code{StirOpenings} documents per-query paths as the verification strategy
+\src{StirOpenings.sol:59-67}; intermediate rounds of v8 bundles use the pruned
+walk. \code{BatchTranscript.lookupPair} has no caller; the lookup challenge pairs
+are recomputed in \code{CIDNTY} \src{BatchTranscript.sol:155-172}
+\src{TerminalWeight.sol:1122-1134}.
+\end{specdelta}
+
+\fussy

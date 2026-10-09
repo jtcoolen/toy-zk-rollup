@@ -1,0 +1,481 @@
+\section{The settlement contract}
+\label{sec:settlement}
+
+The L1 component that holds the rollup state is \code{ShieldedPool}
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:63}. It stores a block counter and two
+32-byte roots, delegates every validity question to an injected verifier, and
+records the roots that a verified block statement names. It derives no root
+itself, holds no nullifier set and no note data.
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:7-26,57-62}
+This section states the state it holds, the transition \code{applyBlock}
+enforces (in execution order), the event it emits, the fee path, the
+deployment performed by \code{Deploy.s.sol}, and the calldata and transaction the
+node sends to reach it. The statement vector $S$ and its decoding are those of
+Def.~\ref{def:block-stmt} and Def.~\ref{def:block-decode}; the verifier's
+binding of $S$ to the proof is specified in Section~7.
+
+%---------------------------------------------------------------------------
+\subsection{Contract state}
+\label{subsec:pool-state}
+
+\begin{definition}[Pool state]
+\label{def:pool-state}
+A \code{ShieldedPool} instance at address $A$ on a chain with identifier
+$\chi$ is the tuple
+\[
+  \mathcal{P} \;=\; \big(\, V,\ f \;;\ N,\ R,\ R^{\mathsf{nf}} \,\big),
+\]
+with the following components.
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l l l l X@{}}
+\toprule
+Symbol & Solidity name & Type & Kind & Written by \\
+\midrule
+$V$ & \code{verifier} & \code{IWhirVerifier} & \code{immutable} & constructor only \src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:68,131} \\
+$f$ & \code{feeRecipient} & \code{address} & storage & constructor only \src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:89,132} \\
+$N$ & \code{blockNumber} & \code{uint256} & storage & \code{applyBlock} (initially $0$) \src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:71,168-170} \\
+$R$ & \code{currentRoot} & \code{bytes32} & storage & constructor, \code{applyBlock} \src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:74,133,165} \\
+$R^{\mathsf{nf}}$ & \code{currentNullifierRoot} & \code{bytes32} & storage & constructor, \code{applyBlock} \src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:77,134-135,166} \\
+$E^{\mathsf{nf}}$ & \code{EMPTY\_NULLIFIER\_ROOT} & \code{bytes32} & \code{constant} & --- \src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:85-86} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+All five state variables and the constant are \code{public}, so each has an
+auto-generated getter. The view selectors for $N$, $R$, $R^{\mathsf{nf}}$
+are pinned off-chain as \code{0x57e871e7}, \code{0xfdab463d},
+\code{0x222d1bed}. \src{contracts/\allowbreak{}test/\allowbreak{}SelectorPins.t.sol:14-18}
+\end{definition}
+
+\begin{property}[Write surface]
+\label{prop:pool-writes}
+Besides the constructor, the contract declares exactly two external
+functions, \code{applyBlock} and \code{withdrawFees}
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:144,182}. Only \code{applyBlock} writes
+$(N,R,R^{\mathsf{nf}})$; nothing writes $f$ after construction, and $V$ is
+immutable. There is no owner, no pause, no upgrade path and no proxy. No
+function is \code{payable}, and there is no \code{receive} or \code{fallback}
+function. \src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:63-190}
+\end{property}
+
+%---------------------------------------------------------------------------
+\subsection{Construction}
+\label{subsec:pool-ctor}
+
+\begin{definition}[Constructor]
+\label{def:pool-ctor}
+\code{constructor}$(V, f, r_0, r^{\mathsf{nf}}_0)$ enforces
+$V \ne 0$ and $f \ne 0$ (string reverts), then sets
+\begin{align}
+  R &:= r_0, \\
+  R^{\mathsf{nf}} &:= \begin{cases} E^{\mathsf{nf}} & \text{if } r^{\mathsf{nf}}_0 = 0^{32},\\
+                                  r^{\mathsf{nf}}_0 & \text{otherwise,}\end{cases}
+\end{align}
+and leaves $N = 0$.
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:123-136}
+No check is applied to $r_0$ or to a nonzero $r^{\mathsf{nf}}_0$, and $V$ is not
+checked to have code. A wrong genesis pair is not rejected at construction; it
+makes every block whose statement was witnessed against the true genesis fail
+the continuity checks of Def.~\ref{def:apply-block}.
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:120-122}
+\end{definition}
+
+\begin{specdelta}[Empty nullifier root]
+\label{delta:pool-empty-nf}
+The constant is
+\begin{Verbatim}[fontsize=\small]
+EMPTY_NULLIFIER_ROOT =
+  0x83265b7a2c40cc6eca237b6016b764606335cd0c6ff0732470e20a484d5a7329
+\end{Verbatim}
+documented as the Poseidon2 empty-subtree chain at depth
+$\code{NULLIFIER\_TREE\_DEPTH}=96$
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:79-86}
+\src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}nullifier\_tree.rs:64}, and it equals the
+\code{nullifier\_before\_hex} of the settled-block vector
+\src{contracts/\allowbreak{}test/\allowbreak{}vectors/\allowbreak{}block\_vectors.json:4}
+(see Section~\ref{subsec:ss-constants}). The constructor documentation instead
+states that a zero argument makes the contract \emph{compute} a depth-256
+Keccak empty root at deploy time
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:114-118}; the code performs no hashing and
+selects the pinned constant \src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:134-135}
+\finding{I-02}.
+\end{specdelta}
+
+%---------------------------------------------------------------------------
+\subsection{\code{applyBlock}: the state transition}
+\label{subsec:pool-apply}
+
+\begin{definition}[\code{applyBlock}]
+\label{def:apply-block}
+\code{applyBlock(uint256[] calldata S, bytes calldata }$\pi$\code{)} is
+\code{external}, non-\code{payable}, and has no caller restriction.
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:144}
+It executes the following steps in order; any failing step reverts the whole
+call, so no step's effect persists unless all steps succeed.
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}r X l@{}}
+\toprule
+\# & Step & Source \\
+\midrule
+1 & $b := V.\code{verify}(S,\pi)$. The interface declares \code{verify}
+    \code{view}, so the call is a static call; a revert inside $V$ propagates.
+    If $b=\code{false}$, revert \code{NotVerified()}.
+  & \src{ShieldedPool.sol:145} \src{IWhirVerifier.sol:21-23} \\
+2 & $B := \code{decode}(S)$ after copying $S$ from calldata to memory; all
+    checks of Def.~\ref{def:block-decode} apply (string reverts).
+  & \src{ShieldedPool.sol:147-149} \\
+3 & require $B.\code{rootBefore} = R$, else revert
+    \code{RootMismatch}$(R,\ B.\code{rootBefore})$.
+  & \src{ShieldedPool.sol:152-154} \\
+4 & require $B.\code{nullifierBefore} = R^{\mathsf{nf}}$, else revert
+    \code{NullifierRootMismatch}$(R^{\mathsf{nf}},\ B.\code{nullifierBefore})$.
+  & \src{ShieldedPool.sol:155-157} \\
+5 & $R := B.\code{rootAfter}$;\ $R^{\mathsf{nf}} := B.\code{nullifierAfter}$.
+  & \src{ShieldedPool.sol:165-166} \\
+6 & $N := N+1$ (in an \code{unchecked} block).
+  & \src{ShieldedPool.sol:168-170} \\
+7 & emit \code{BlockApplied}$(N, B.\code{rootBefore}, B.\code{rootAfter},
+    B.\code{nullifierBefore}, B.\code{nullifierAfter}, B.\code{totalFee})$
+    with the incremented $N$.
+  & \src{ShieldedPool.sol:171-178} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+\end{definition}
+
+The guard portion of the function, verbatim:
+\begin{Verbatim}[fontsize=\small]
+if (!verifier.verify(statement, proof)) revert NotVerified();
+BlockStatement.Block memory block_ = statement.decode();
+if (block_.rootBefore != currentRoot) {
+    revert RootMismatch(currentRoot, block_.rootBefore);
+}
+if (block_.nullifierBefore != currentNullifierRoot) {
+    revert NullifierRootMismatch(currentNullifierRoot, block_.nullifierBefore);
+}
+\end{Verbatim}
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:145-157}
+
+Writing $D_j(S) = \code{digestFromLimbs}(S,\ 1+2n+16j)$ for $j=0,\dots,4$
+(Def.~\ref{def:digest-from-limbs}), the enforced relation is:
+
+\begin{definition}[Settlement relation]
+\label{def:settle-rel}
+For a pool state $(V,f;N,R,R^{\mathsf{nf}})$, \code{applyBlock}$(S,\pi)$
+succeeds if and only if
+\begin{align}
+  &V.\code{verify}(S,\pi) = \code{true} \text{ (without reverting)}, \label{eq:settle-v}\\
+  &\code{decode}(S) \text{ succeeds, i.e. } 1\le S[0]=n\le 2^{16}-1,\ |S| = 81+6n,
+     \text{ all decoded limbs } \le \code{0xffff}, \label{eq:settle-d}\\
+  &D_1(S) = R \quad\text{and}\quad D_3(S) = R^{\mathsf{nf}}, \label{eq:settle-c}
+\end{align}
+and on success the post-state is
+\begin{equation}
+  (N,\ R,\ R^{\mathsf{nf}}) \;\mapsto\; (N+1,\ D_2(S),\ D_4(S)).
+\end{equation}
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:144-179}
+\src{contracts/\allowbreak{}src/\allowbreak{}BlockStatement.sol:79-112}
+No other input, state variable or environment value (\code{msg.sender},
+\code{tx.origin}, \code{block.chainid}, \code{address(this)},
+\code{block.number}, \code{msg.value}) enters the relation.
+\end{definition}
+
+\begin{property}[Decoded but unused fields]
+\label{prop:apply-unused}
+Of the decoded \code{Block}, \code{numTransfers} and
+\code{statementRoot} $=D_0(S)$ are not read by \code{applyBlock}, and
+\code{totalFee} is used only as an event argument.
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:149-178}
+The header limbs $S[1],\dots,S[2n]$ are never read on L1
+(Def.~\ref{def:block-decode}). The fold root is therefore constrained on L1
+only through \eqref{eq:settle-v} \finding{L-04}.
+\end{property}
+
+\begin{property}[Caller]
+\label{prop:apply-caller}
+\code{applyBlock} contains no \code{msg.sender} comparison, modifier or
+allow-list; every account may call it, and the only gate is
+\eqref{eq:settle-v}--\eqref{eq:settle-c}.
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:144-179}
+The adequacy of this gate is examined in \finding{H-01}.
+\end{property}
+
+\begin{property}[Statement context]
+\label{prop:apply-context}
+The statement layout (Def.~\ref{def:block-stmt}) carries the transfer count,
+the shape header, the fold root, the four chain endpoints and the fees, and
+no chain identifier, pool address, block height or other per-deployment value.
+\src{contracts/\allowbreak{}src/\allowbreak{}BlockStatement.sol:11-15,79-112}
+The only binding between a pair $(S,\pi)$ and a particular pool instance is
+\eqref{eq:settle-c}, i.e.\ equality of $D_1(S), D_3(S)$ with that instance's
+current roots \finding{M-01}.
+\end{property}
+
+\begin{property}[Re-submission on the same instance]
+\label{prop:apply-resubmit}
+After $(S,\pi)$ has been applied, $R = D_2(S)$ and $R^{\mathsf{nf}} = D_4(S)$.
+A second \code{applyBlock}$(S,\pi)$ on the same instance passes
+\eqref{eq:settle-c} only if $D_2(S)=D_1(S)$ and $D_4(S)=D_3(S)$, i.e.\ only for a
+block that leaves both roots unchanged.
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:152-157,165-166}
+\end{property}
+
+\begin{property}[Check order and cost]
+\label{prop:apply-order}
+Steps 2--4, which read only $S$ and two storage slots, run after step 1. A
+statement that is malformed (fails \eqref{eq:settle-d}) or stale (fails
+\eqref{eq:settle-c}) is therefore rejected only after the verifier has
+executed. The ordering is documented as deliberate.
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:137-145}
+The node submits each settlement with a gas ceiling of $2\cdot 10^{10}$,
+described as matching the dev-chain configuration because the verifier's cost
+is data-dependent.
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}settlement.rs:28-31}
+\end{property}
+
+\begin{property}[Fee handling in the transition]
+\label{prop:apply-fee}
+$\code{totalFee} = \sum_{c=1}^{n}\code{u64FromLimbs}(S,\ 81+2n+4(c-1))$ is
+accumulated in checked \code{uint256} arithmetic
+\src{contracts/\allowbreak{}src/\allowbreak{}BlockStatement.sol:104-107}; \code{applyBlock} moves no
+value and credits no account with it, it only emits it.
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:171-178}
+The contract does not check fee correctness; it relies on the transfer
+relation's value conservation.
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:59-62}
+\end{property}
+
+%---------------------------------------------------------------------------
+\subsection{The \code{BlockApplied} event}
+\label{subsec:pool-event}
+
+\begin{definition}[Event]
+\label{def:pool-event}
+\begin{Verbatim}[fontsize=\small]
+event BlockApplied(
+    uint256 indexed blockNumber,
+    bytes32 rootBefore, bytes32 rootAfter,
+    bytes32 nullifierRootBefore, bytes32 nullifierRootAfter,
+    uint256 fee);
+\end{Verbatim}
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:91-99}
+The log has topic$_0$ = the event signature hash, topic$_1 = N$ (the
+post-increment value, so the first applied block logs $1$), and five data
+words $D_1(S), D_2(S), D_3(S), D_4(S), \code{totalFee}$.
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:168-178}
+\end{definition}
+
+\begin{property}[Event content]
+\label{prop:pool-event-content}
+The event omits the fold root $D_0(S)$, the transfer count $n$, the shape
+header, the per-transfer fees, and the submitting account. Neither the event
+nor $S$ carries per-transfer nullifiers or output commitments: on L1 these
+appear only as absorbed into the fold root (Def.~\ref{def:block-fold})
+\finding{L-04}.
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:91-99,171-178}
+\src{contracts/\allowbreak{}src/\allowbreak{}BlockStatement.sol:17-24}
+\end{property}
+
+%---------------------------------------------------------------------------
+\subsection{\code{withdrawFees}}
+\label{subsec:pool-fees}
+
+\begin{definition}[\code{withdrawFees}]
+\label{def:withdraw-fees}
+\code{withdrawFees()} requires $\code{msg.sender} = f$, else reverts
+\code{NotFeeRecipient()}; with $a := \code{address(this).balance}$, if $a>0$ it
+performs \code{f.call\{value: a\}("")} and requires success.
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:181-189}
+\end{definition}
+
+\begin{specdelta}[Fee accrual]
+\label{delta:pool-fees}
+$f$ is documented as the recipient of ``collected fees''
+\src{contracts/\allowbreak{}src/\allowbreak{}ShieldedPool.sol:88-89}. By Property~\ref{prop:pool-writes}
+and Property~\ref{prop:apply-fee}, no function of the contract accepts value
+and \code{applyBlock} credits nothing, so no code path of the system funds the
+balance that \code{withdrawFees} pays out; the shielded fee $\varphi$ of each
+transfer has no on-chain counterpart in this contract \finding{I-04}.
+\end{specdelta}
+
+%---------------------------------------------------------------------------
+\subsection{Deployment}
+\label{subsec:pool-deploy}
+
+\begin{definition}[Deployment script]
+\label{def:deploy}
+\code{Deploy.run()} performs, in order:
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}r X l@{}}
+\toprule
+\# & Action & Source \\
+\midrule
+1 & Read the genesis file named by \code{GENESIS\_FILE}, defaulting to
+    \code{test/vectors/block\_genesis.json}; $r_0 :=$ its
+    \code{.genesis\_root\_hex} as \code{bytes32}.
+  & \src{Deploy.s.sol:28-32} \\
+2 & $\mathit{dep} := \code{msg.sender}$ of the script (the broadcast account).
+  & \src{Deploy.s.sol:34-36} \\
+3 & Broadcast \code{new TerminalWeight()} $=T$.
+  & \src{Deploy.s.sol:37-40} \\
+4 & Broadcast \code{new WhirVerifier}$(T)$ $=W$.
+  & \src{Deploy.s.sol:41} \\
+5 & Broadcast \code{new ShieldedPool}$(W,\ \mathit{dep},\ r_0,\ 0^{32})$, so
+    $f=\mathit{dep}$ and $R^{\mathsf{nf}} = E^{\mathsf{nf}}$.
+  & \src{Deploy.s.sol:42-46} \\
+6 & Write \code{deployments/local.json} with keys \code{verifier},
+    \code{terminalWeight}, \code{pool}, \code{deployer}, \code{chainId}.
+  & \src{Deploy.s.sol:48-57} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+The documented invocation targets an \code{anvil} chain with chain id
+$31337$ and the dev chain's default funded key.
+\src{contracts/\allowbreak{}script/\allowbreak{}Deploy.s.sol:4-6}
+\end{definition}
+
+\begin{property}[Verifier instance]
+\label{prop:deploy-verifier}
+The constructor of \code{WhirVerifier} rejects a zero or code-less
+\code{terminalWeight} and pins its address and code hash, which are re-checked
+before every satellite call.
+\src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifier.sol:116-132,895}
+It takes no configuration argument; \code{verify} decodes the CONFIG section
+from the caller-supplied bundle $\pi$.
+\src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifier.sol:209-213,262-266}
+The script does not deploy \code{WhirVerifierV6}, whose constructor pins a
+CONFIG digest and length
+\src{contracts/\allowbreak{}src/\allowbreak{}verifier/\allowbreak{}WhirVerifierV6.sol:41-47,61-75}; consequently
+the pool's immutable $V$ is the bare engine. See Section~7 and
+\finding{V-01}.
+\end{property}
+
+\begin{specdelta}[Explicit genesis nullifier root]
+The script comments that ``the genesis file may pin one explicitly''; the code
+passes the literal $0^{32}$ and reads no nullifier root from the genesis
+file. \src{contracts/\allowbreak{}script/\allowbreak{}Deploy.s.sol:42-45}
+\end{specdelta}
+
+%---------------------------------------------------------------------------
+\subsection{Settlement calldata}
+\label{subsec:pool-calldata}
+
+The node constructs the call by hand.
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}settlement.rs:1-8}
+
+\begin{definition}[Word encodings]
+\label{def:settle-enc}
+For $x \in [0,2^{64})$, $\mathsf{w}(x)\in\{0,1\}^{256}$ is the 32-byte big-endian
+word with the top 24 bytes zero
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}settlement.rs:93-98}. For a sequence
+$s = (s_0,\dots,s_{L-1})$ of \code{u64} and a byte string $b$:
+\begin{align}
+  \mathsf{arr}(s) &= \mathsf{w}(L)\,\|\,\mathsf{w}(s_0)\,\|\cdots\|\,\mathsf{w}(s_{L-1}),
+  \\
+  \mathsf{byt}(b) &= \mathsf{w}(|b|)\,\|\,b\,\|\,0^{8\rho},\qquad
+  \rho = (32 - |b| \bmod 32) \bmod 32 .
+\end{align}
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}settlement.rs:100-116}
+\end{definition}
+
+\begin{definition}[\code{applyBlock} calldata]
+\label{def:settle-calldata}
+\begin{equation}
+  \mathsf{cd}(S,\pi) \;=\; \code{0x0cb000b5}\ \|\ \mathsf{w}(\code{0x40})\ \|\
+  \mathsf{w}\big(\code{0x40} + 32(L+1)\big)\ \|\ \mathsf{arr}(S)\ \|\ \mathsf{byt}(\pi),
+  \qquad L = |S|,
+\end{equation}
+of length $4 + 64 + 32(L+1) + 32 + |\pi| + \rho$.
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}settlement.rs:118-133}
+The two head words are the ABI offsets of the two dynamic tails measured from
+the end of the selector; this is the standard ABI encoding of
+\code{(uint256[],bytes)}. The selector is
+$\code{bytes4}(\code{keccak256}(\code{"applyBlock(uint256[],bytes)"}))$, pinned
+by a test that compares it with the EVM's own \code{keccak256}.
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}settlement.rs:24-26}
+\src{contracts/\allowbreak{}test/\allowbreak{}SelectorPins.t.sol:10-12}
+For a block statement, $L = 81+6n$ (Def.~\ref{def:block-stmt}).
+\end{definition}
+
+\begin{property}[Statement words]
+The node takes $S$ as the canonical representatives of the block statement's
+field elements, widened to \code{u64}, and $\pi$ as the settlement bundle
+encoded from the same recursion artifact and statement.
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:444-456}
+Every word of $\mathsf{arr}(S)$ is thus $< p < 2^{32}$; the encoder cannot
+express \code{uint256} values $\ge 2^{64}$, and none are needed.
+\end{property}
+
+%---------------------------------------------------------------------------
+\subsection{Submission}
+\label{subsec:pool-submit}
+
+\begin{definition}[Settlement transaction]
+\label{def:settle-tx}
+\code{SettlementSender::settle}$(S,\pi)$ issues one JSON-RPC
+\code{eth\_sendTransaction} with the object
+\begin{center}
+\small
+\begin{tabular}{@{}l l l@{}}
+\toprule
+Field & Value & Source \\
+\midrule
+\code{from} & manifest \code{deployer} & \src{settlement.rs:201} \\
+\code{to} & manifest \code{pool} & \src{settlement.rs:202} \\
+\code{data} & \code{0x}\,$\|$\,hex$(\mathsf{cd}(S,\pi))$ & \src{settlement.rs:199,203} \\
+\code{gas} & \code{0x4a817c800} $= 2\cdot 10^{10}$ & \src{settlement.rs:31,204} \\
+\bottomrule
+\end{tabular}
+\end{center}
+and no \code{value}, \code{nonce}, fee or \code{chainId} field; signing and the
+remaining fields are left to the RPC endpoint, and the node holds no key.
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}settlement.rs:10-17,198-216}
+On a dev chain the \code{from} account is an unlocked account of the node
+(\code{anvil}).
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}settlement.rs:12-17}
+\end{definition}
+
+\begin{definition}[Receipt wait]
+\label{def:settle-wait}
+After the send, the sender polls \code{eth\_getTransactionReceipt} with a
+$2$\,s sleep between polls. A non-null receipt with
+\code{status} $=$ \code{"0x1"} returns the hash; any other status (absent
+status read as \code{"0x0"}) returns \code{Reverted}. The $600$\,s deadline is
+evaluated only after a poll that returned a null receipt.
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}settlement.rs:148-156,218-250}
+The HTTP client is \code{reqwest::Client::new()} with no request timeout
+configured, and \code{settle} is awaited inline by the node's single command
+actor, which processes commands sequentially.
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}settlement.rs:150}
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:464-476,507-509,780-781}
+See \finding{I-05}.
+\end{definition}
+
+\begin{property}[Manifest and retention]
+The node reads the manifest from \code{NODE\_MANIFEST} (default
+\code{contracts/deployments/local.json}) and the RPC URL from
+\code{NODE\_RPC\_URL} (default \code{http://127.0.0.1:8545})
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:125-126}; the \code{Manifest} type
+deserializes only \code{pool} and \code{deployer}, so the \code{chainId} the
+script writes is not consulted
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}settlement.rs:70-77}. A pending
+$(S,\pi)$ is cleared only on success and is retained on any error.
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:464-476}
+\end{property}
+
+\begin{specdelta}[Settlement-side documentation]
+\label{delta:settle-docs}
+(i) \code{Manifest.pool} is documented as ``the \code{ShieldedPool} proxy
+address'' and the manifest as written by \code{contracts/scripts/deploy\_local.mjs}
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}settlement.rs:72,80-81}; the deployment
+deploys no proxy and is \code{Deploy.s.sol}, and no \code{deploy\_local.mjs}
+exists under \code{contracts/scripts}.
+\src{contracts/\allowbreak{}script/\allowbreak{}Deploy.s.sol:13,45}
+(ii) The \code{settle} documentation states that re-sending a block whose first
+attempt landed ``would double-apply nullifiers''
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}settlement.rs:190-193}; by
+Property~\ref{prop:apply-resubmit}, the contract rejects such a re-send at
+step 3 or 4 unless the block leaves both roots unchanged.
+\end{specdelta}

@@ -1,0 +1,540 @@
+\section{The application layer: node, spend authorization, custody}
+\label{sec:application}
+% Local line-breaking slack for long \code/\src runs; \fussy at section end.
+\sloppy
+
+This section specifies what the off-chain components enforce around the
+transfer relation of Section~\ref{sec:transfer}: the byte string a spend
+authorization signs (Section~\ref{subsec:app-msg}), the signature scheme that
+signs it (Section~\ref{subsec:app-slh}), the node's HTTP admission path and the
+in-process mempool admission (Sections~\ref{subsec:app-wire}--\ref{subsec:app-seq}),
+the bearer-token access control in front of every route
+(Section~\ref{subsec:app-token}), and the password vault that holds a wallet's
+secrets (Section~\ref{subsec:app-vault}). None of these checks is re-executed by
+the transfer circuit, the block circuit or the settlement contract of
+Section~\ref{sec:settlement}; they hold only for traffic that passes through
+this node.
+
+Notation. A transfer's public statement is the tuple
+\[
+  x \;=\; \big(N_1,\dots,N_k;\ C_1,\dots,C_m;\ rt,\ rt',\ R_{\mathsf{before}},\ R_{\mathsf{after}};\ \mathit{fee}\big)
+\]
+of \code{TransferPublic} \src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}transfer.rs:\allowbreak{}151-176}, with
+each $N_i, C_j, rt, rt', R_{\mathsf{before}}, R_{\mathsf{after}}$ a raw
+32-byte digest and $\mathit{fee}\in[0,2^{64})$. It is the same tuple whose
+limb flattening is the statement of Section~\ref{subsec:transfer-stmt}.
+$\mathrm{LE}_{w}(v)$ is the $w$-bit little-endian encoding of $v$ and $\|$ is
+byte concatenation.
+
+%---------------------------------------------------------------------------
+\subsection{The spend-authorization message}
+\label{subsec:app-msg}
+
+\begin{definition}[Signed message]
+\label{def:app-msg}
+Let $\mathsf{DOM}$ be the 23 ASCII bytes \code{pq-rollup/spend-auth/v1}
+(\code{DOMAIN\_TX}) \src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}signing.rs:\allowbreak{}35} and
+$\mathsf{MAXC}=1024$ (\code{MAX\_\allowbreak{}COUNT\_\allowbreak{}PER\_\allowbreak{}FIELD})
+\src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}signing.rs:\allowbreak{}42}. \code{encode\_\allowbreak{}statement} is defined
+iff $k\le\mathsf{MAXC}$ and $m\le\mathsf{MAXC}$, otherwise it returns
+\code{EncodeError::\allowbreak{}TooLarge} \src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}signing.rs:\allowbreak{}78-80}. When
+defined,
+\begin{align}
+  M(x) \;=\; {}& \mathsf{DOM}\ \|\ \mathrm{LE}_{32}(k)\ \|\ N_1\|\cdots\|N_k\ \|\ \mathrm{LE}_{32}(m)\ \|\ C_1\|\cdots\|C_m \nonumber\\
+         & \|\ rt\ \|\ rt'\ \|\ R_{\mathsf{before}}\ \|\ R_{\mathsf{after}}\ \|\ \mathrm{LE}_{64}(\mathit{fee}),
+  \label{eq:app-msg}
+\end{align}
+emitted in exactly this order \src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}signing.rs:\allowbreak{}84-97}. The
+counts are written by \code{push\_count} as \code{(len as u32).to\_\allowbreak{}le\_\allowbreak{}bytes()}
+\src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}signing.rs:\allowbreak{}112-114}; the bound above makes the cast
+lossless.
+\end{definition}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l l l X@{}}
+\toprule
+Field & Byte offset & Length & Source \\
+\midrule
+$\mathsf{DOM}$ & $0$ & $23$ & \src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}signing.rs:\allowbreak{}84} \\
+$\mathrm{LE}_{32}(k)$ & $23$ & $4$ & \src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}signing.rs:\allowbreak{}85} \\
+$N_i$, $i=1..k$ & $27+32(i-1)$ & $32$ & \src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}signing.rs:\allowbreak{}86-88} \\
+$\mathrm{LE}_{32}(m)$ & $27+32k$ & $4$ & \src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}signing.rs:\allowbreak{}89} \\
+$C_j$, $j=1..m$ & $31+32k+32(j-1)$ & $32$ & \src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}signing.rs:\allowbreak{}90-92} \\
+$rt$ & $31+32(k+m)$ & $32$ & \src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}signing.rs:\allowbreak{}93} \\
+$rt'$ & $63+32(k+m)$ & $32$ & \src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}signing.rs:\allowbreak{}94} \\
+$R_{\mathsf{before}}$ & $95+32(k+m)$ & $32$ & \src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}signing.rs:\allowbreak{}95} \\
+$R_{\mathsf{after}}$ & $127+32(k+m)$ & $32$ & \src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}signing.rs:\allowbreak{}96} \\
+$\mathrm{LE}_{64}(\mathit{fee})$ & $159+32(k+m)$ & $8$ & \src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}signing.rs:\allowbreak{}97} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Hence $|M(x)| = 167 + 32(k+m)$ bytes; $231$ for one input and one output.
+(The inline test comment ``domain(24)'' is off by one; the assertion itself
+uses \code{DOMAIN\_\allowbreak{}TX.len()} \src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}signing.rs:\allowbreak{}159-160}.)
+
+\begin{property}[Injectivity]
+\label{prop:app-msg-inj}
+On its domain ($k,m\le 1024$), $x\mapsto M(x)$ is injective: $\mathsf{DOM}$
+has fixed length, each variable-length list is preceded by its exact count,
+every list element is exactly 32 bytes, and the trailing
+$4\cdot 32+8=136$ bytes are fixed-width, so a parser recovers $(k, N_\ast, m,
+C_\ast, rt, rt', R_{\mathsf{before}}, R_{\mathsf{after}}, \mathit{fee})$
+uniquely and $|M(x)|$ determines $k+m$.
+\src{crates/\allowbreak{}shielded/\allowbreak{}src/\allowbreak{}signing.rs:\allowbreak{}77-99}
+\end{property}
+
+\paragraph{What $M$ does not contain.} $M(x)$ carries no chain identifier,
+pool address or other deployment context \finding{M-01}; it does not contain
+the verifying key that signs it, the note owner key $pk_d$, the proof, or the
+limb statement of Section~\ref{subsec:transfer-stmt}. The node module states
+that it cannot relate a revealed verifying key to a note's $pk_d$
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}tx.rs:\allowbreak{}21-28} \finding{M-02}. $M$ is the only input to the
+signature; the envelope type pairs it with a key and a signature and nothing
+else \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}tx.rs:\allowbreak{}94-101,\allowbreak{}117-131}.
+
+%---------------------------------------------------------------------------
+\subsection{SLH-DSA instantiation}
+\label{subsec:app-slh}
+
+\begin{definition}[Spend-authorization scheme]
+\label{def:app-slh}
+\code{SphincsPlusAuth} is the \code{SpendAuth} implementation with
+\code{PublicKey = VerifyingKey<\allowbreak{}Sha2\_\allowbreak{}128f>},
+\code{SecretKey = SigningKey<\allowbreak{}Sha2\_\allowbreak{}128f>} and
+\code{Signature = Signature<\allowbreak{}Sha2\_\allowbreak{}128f>}
+\src{crates/\allowbreak{}pq-sign/\allowbreak{}src/\allowbreak{}spend\_auth.rs:\allowbreak{}89-96}, from the pre-release crate
+\code{slh-dsa 0.2.0-rc.5} \src{Cargo.toml:\allowbreak{}42}. Its operations are:
+\begin{itemize}
+  \item[$\bullet$] $\mathsf{KeyGen}(\rho)$: \code{SigningKey::\allowbreak{}new(rng)} and its verifying key
+        \src{crates/\allowbreak{}pq-sign/\allowbreak{}src/\allowbreak{}spend\_auth.rs:\allowbreak{}98-104};
+  \item[$\bullet$] $\mathsf{Sign}(sk, M)$: the \code{Signer} trait
+        \src{crates/\allowbreak{}pq-sign/\allowbreak{}src/\allowbreak{}spend\_auth.rs:\allowbreak{}106-110}, which in the crate calls
+        the context variant with $\mathit{ctx}=\varepsilon$ and no randomizer
+        \src{slh-dsa-0.2.0-rc.5/\allowbreak{}src/\allowbreak{}signing\_key.rs:\allowbreak{}244-253};
+  \item[$\bullet$] $\mathsf{Verify}(vk, M, \sigma)$: the \code{Verifier} trait, mapped to
+        \code{InvalidSignature} on failure
+        \src{crates/\allowbreak{}pq-sign/\allowbreak{}src/\allowbreak{}spend\_auth.rs:\allowbreak{}112-119}, which in the crate
+        verifies with $\mathit{ctx}=\varepsilon$
+        \src{slh-dsa-0.2.0-rc.5/\allowbreak{}src/\allowbreak{}verifying\_key.rs:\allowbreak{}178-188};
+  \item[$\bullet$] parsing: \code{VerifyingKey::\allowbreak{}try\_\allowbreak{}from} and
+        \code{Signature::\allowbreak{}try\_\allowbreak{}from}, each requiring the exact length, mapped to
+        \code{Malformed} \src{crates/\allowbreak{}pq-sign/\allowbreak{}src/\allowbreak{}spend\_auth.rs:\allowbreak{}125-135}
+        \src{slh-dsa-0.2.0-rc.5/\allowbreak{}src/\allowbreak{}verifying\_key.rs:\allowbreak{}164-175}
+        \src{slh-dsa-0.2.0-rc.5/\allowbreak{}src/\allowbreak{}signature\_encoding.rs:\allowbreak{}77-80}.
+\end{itemize}
+\end{definition}
+
+The message actually processed by the internal FIPS~205 routines is the
+pure-mode framing
+\begin{equation}
+  M' \;=\; \mathtt{0x00}\ \|\ \mathtt{0x00}\ \|\ M(x)
+  \qquad(\text{domain byte } 0,\ |\mathit{ctx}|=0,\ \mathit{ctx}=\varepsilon)
+\end{equation}
+on both sides \src{slh-dsa-0.2.0-rc.5/\allowbreak{}src/\allowbreak{}signing\_key.rs:\allowbreak{}190-200}
+\src{slh-dsa-0.2.0-rc.5/\allowbreak{}src/\allowbreak{}verifying\_key.rs:\allowbreak{}108-119}. Signing is
+deterministic: with no randomizer supplied, $\mathit{opt\_rand}$ defaults to
+$\mathsf{PK.seed}$ \src{slh-dsa-0.2.0-rc.5/\allowbreak{}src/\allowbreak{}signing\_key.rs:\allowbreak{}150-153}, so
+$\sigma$ is a function of $(sk, M)$ only.
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l l X@{}}
+\toprule
+Parameter & \code{Sha2\_128f} & Source \\
+\midrule
+name & SLH-DSA-SHA2-128f & \src{slh-dsa-0.2.0-rc.5/\allowbreak{}src/\allowbreak{}hashes/\allowbreak{}sha2.rs:\allowbreak{}195-198} \\
+$n$, $m$ (bytes) & $16$, $34$ & \src{slh-dsa-0.2.0-rc.5/\allowbreak{}src/\allowbreak{}hashes/\allowbreak{}sha2.rs:\allowbreak{}178} \\
+$h$, $d$, $h'$ & $66$, $22$, $3$ & \src{slh-dsa-0.2.0-rc.5/\allowbreak{}src/\allowbreak{}hashes/\allowbreak{}sha2.rs:\allowbreak{}183-189} \\
+$k$, $a$ & $33$, $6$ & \src{slh-dsa-0.2.0-rc.5/\allowbreak{}src/\allowbreak{}hashes/\allowbreak{}sha2.rs:\allowbreak{}190-194} \\
+$\lg w$, $\mathit{len}$ & $4$, $35$ & \src{slh-dsa-0.2.0-rc.5/\allowbreak{}src/\allowbreak{}wots.rs:\allowbreak{}9-10} \src{slh-dsa-0.2.0-rc.5/\allowbreak{}src/\allowbreak{}hashes/\allowbreak{}sha2.rs:\allowbreak{}179-182} \\
+$|vk|$ & $32$ ($\mathsf{PK.seed}\|\mathsf{PK.root}$) & \src{slh-dsa-0.2.0-rc.5/\allowbreak{}src/\allowbreak{}verifying\_key.rs:\allowbreak{}224-226} \\
+$|sk|$ & $64$ ($\mathsf{SK.seed}\|\mathsf{SK.prf}\|vk$) & \src{slh-dsa-0.2.0-rc.5/\allowbreak{}src/\allowbreak{}signing\_key.rs:\allowbreak{}330-332} \\
+$|\sigma|$ & $17088$ & \src{slh-dsa-0.2.0-rc.5/\allowbreak{}src/\allowbreak{}signature\_encoding.rs:\allowbreak{}175-177} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+The signature length is consistent with
+$|\sigma| = n + k(1+a)n + (h + d\cdot\mathit{len})n = 16+3696+13376$.
+
+\begin{specdelta}[Size and cost statements]
+\label{delta:app-slh-sizes}
+Comments state an ``8KB'' signature \src{crates/\allowbreak{}pq-sign/\allowbreak{}src/\allowbreak{}lib.rs:\allowbreak{}21-24}
+\src{crates/\allowbreak{}pq-sign/\allowbreak{}src/\allowbreak{}spend\_auth.rs:\allowbreak{}214}
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}87-89}, a ``64 bytes'' verifying key
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}wire.rs:\allowbreak{}42}, and that \code{f} ``verifies $\sim$16x
+faster than \code{s}'' \src{crates/\allowbreak{}pq-sign/\allowbreak{}src/\allowbreak{}lib.rs:\allowbreak{}21}. The enforced sizes
+are $|\sigma|=17088$ and $|vk|=32$. The \code{128s} set in the same crate has
+$d=7$, $k=14$, $a=12$ \src{slh-dsa-0.2.0-rc.5/\allowbreak{}src/\allowbreak{}hashes/\allowbreak{}sha2.rs:\allowbreak{}155-175}, i.e.\
+fewer hypertree layers to recompute at verification than the $d=22$ of
+\code{128f}; the stated rationale does not follow from the parameters
+\finding{L-08}. The size test only pins $7000<|\sigma|<20000$
+\src{crates/\allowbreak{}pq-sign/\allowbreak{}src/\allowbreak{}spend\_auth.rs:\allowbreak{}218-219}.
+\end{specdelta}
+
+\paragraph{Where the scheme is verified.} $\mathsf{Verify}$ is called only
+natively, from \code{ShieldedTransfer::\allowbreak{}verify\_\allowbreak{}signature}
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}tx.rs:\allowbreak{}127-131} (and the wallet's local pre-check). No
+circuit of Sections~\ref{sec:transfer}--\ref{sec:block} and no contract of
+Section~\ref{sec:settlement} evaluates it, and the verifying key is whatever
+the envelope carries \finding{M-02}.
+
+\paragraph{Key lifetime in the wallet.} A wallet vault holds exactly one
+SLH-DSA secret key, generated at vault creation
+\src{crates/\allowbreak{}wallet-wasm/\allowbreak{}src/\allowbreak{}lib.rs:\allowbreak{}298-310}; a password change re-seals the
+same keys \src{crates/\allowbreak{}wallet-wasm/\allowbreak{}src/\allowbreak{}lib.rs:\allowbreak{}320-332}; and every
+\code{TransferWire} the wallet emits carries
+$vk=\mathsf{PK}(sk)$ of that key, hex-encoded, beside $M(x)$'s fields
+\src{crates/\allowbreak{}wallet-wasm/\allowbreak{}src/\allowbreak{}lib.rs:\allowbreak{}424-430,\allowbreak{}464-476}. The 32-byte $vk$ is
+therefore constant across all submissions from one vault.
+
+%---------------------------------------------------------------------------
+\subsection{The transfer wire format and \code{/v1/transfer} admission}
+\label{subsec:app-wire}
+
+\begin{definition}[Wire DTO]
+\label{def:app-wire}
+\code{TransferWire} is a JSON object with fields
+\code{nullifiers}, \code{outputs} (arrays of hex strings), \code{root},
+\code{root\_after}, \code{nullifier\_\allowbreak{}root\_\allowbreak{}before},
+\code{nullifier\_\allowbreak{}root\_\allowbreak{}after} (hex strings), \code{fee} (JSON integer,
+\code{u64}), \code{verifying\_\allowbreak{}key} and \code{signature} (hex strings)
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}wire.rs:\allowbreak{}26-46}. It derives \code{Deserialize} without
+\code{deny\_\allowbreak{}unknown\_\allowbreak{}fields}, so extra members are ignored. It carries no
+proof and no limb statement \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}wire.rs:\allowbreak{}8-12}.
+\end{definition}
+
+\begin{definition}[\code{/v1/transfer} admission predicate]
+\label{def:app-admit-http}
+A \code{POST /v1/transfer} request with body $w$ is evaluated in this order;
+the first failing step determines the response.
+\begin{enumerate}
+  \item[(W0)] Guard: a valid bearer token with role $\ge$ \code{Submitter}
+        (Def.~\ref{def:app-token-verify}), then the rate limiter
+        \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}auth.rs:\allowbreak{}283} \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}543-581}.
+        Independently, an outer layer caps the body at $2^{20}$ bytes
+        \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}90,\allowbreak{}737-739}, and the handler's axum
+        \code{Json} extractor must deserialize it as \code{TransferWire}
+        \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}619}.
+  \item[(W1)] $k\ge 1$ and $m\ge 1$ \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}wire.rs:\allowbreak{}71-73}.
+  \item[(W2)] Each of $N_i$, $C_j$, $rt$, $rt'$, $R_{\mathsf{before}}$,
+        $R_{\mathsf{after}}$ is a string of exactly 64 ASCII hex digits
+        (\code{is\_\allowbreak{}ascii\_\allowbreak{}hexdigit}, either case), decoded to 32 bytes
+        \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}wire.rs:\allowbreak{}49-61,\allowbreak{}74-94}.
+  \item[(W3)] \code{verifying\_\allowbreak{}key} hex-decodes and the result has length
+        exactly $32$ \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}wire.rs:\allowbreak{}106-109}.
+  \item[(W4)] \code{signature} hex-decodes and the result has length exactly
+        $17088$ \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}wire.rs:\allowbreak{}110-113}.
+  \item[(W5)] $M(x)$ is defined, i.e.\ $k,m\le 1024$
+        \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}tx.rs:\allowbreak{}117-119,\allowbreak{}127-128}.
+  \item[(W6)] $\mathsf{Verify}(vk, M(x), \sigma)=1$ with $vk$ and $\sigma$ from
+        the same request \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}wire.rs:\allowbreak{}114-120}
+        \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}tx.rs:\allowbreak{}129-130}.
+  \item[(W7)] Committed-state check, executed on the actor
+        \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}631-641,\allowbreak{}490-502}:
+        \code{check\_admit} against the committed roots
+        \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}state.rs:\allowbreak{}197-199}, i.e.\ in order
+        \begin{align}
+          rt &= \mathrm{root}(\mathcal{T}) \label{eq:app-w7a}\\
+          R_{\mathsf{before}} &= \mathrm{root}(\mathcal{N}) \label{eq:app-w7b}\\
+          \forall i\le k:\ N_i &\notin \mathcal{N} \label{eq:app-w7c}
+        \end{align}
+        where $\mathcal{T}$ is the committed commitment tree and $\mathcal{N}$
+        the committed nullifier map \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}state.rs:\allowbreak{}224-248}.
+\end{enumerate}
+If (W0)--(W7) all hold the response is \code{501 Not Implemented}
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}643-648}; the transfer is not enqueued and no
+state changes.
+\end{definition}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l l X@{}}
+\toprule
+Failing step & Status & Body / source \\
+\midrule
+(W0) path routed but token missing, malformed, bad MAC, unknown role & 401 & \code{token rejected} \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}548-573} \\
+(W0) token expired & 401 & \code{token rejected} \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}561} \\
+(W0) role below \code{Submitter} & 403 & \code{token rejected} \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}562} \\
+(W0) rate limit & 429 & \code{rate limited} \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}575-579} \\
+(W1)--(W6) & 422 & \code{envelope rejected: <\allowbreak{}TxError>} \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}620-630} \\
+(W7) & 422 & \code{state rejected: <\allowbreak{}StateError>} \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}649-656} \\
+all pass & 501 & fixed text \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}643-648} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+In (W1)--(W5) the error variant is not descriptive of the cause: any
+\code{to\_public} failure and any hex-decoding failure of the key or signature
+is reported as \code{TxError::\allowbreak{}TooLarge}, and a key or signature of the wrong
+length as \code{TxError::\allowbreak{}BadSignature}
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}wire.rs:\allowbreak{}105-113}. In (W7) the \code{StateError} text
+distinguishes a stale tree root, a stale nullifier root, and an already-spent
+nullifier \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}state.rs:\allowbreak{}78-101}.
+
+\begin{property}[What \code{/v1/transfer} does not check]
+\label{prop:app-http-gaps}
+The predicate of Def.~\ref{def:app-admit-http} does not constrain $rt'$ or
+$R_{\mathsf{after}}$ (they enter only $M(x)$), does not require the $N_i$ to
+be pairwise distinct, does not check value conservation, verifies no proof,
+and takes $vk$ from the request without relating it to any note,
+$pk_d$ or registered identity \finding{M-02}. Because (W6) accepts any
+self-generated key and (W7) evaluates \eqref{eq:app-w7c} only after
+\eqref{eq:app-w7a}--\eqref{eq:app-w7b} hold against roots that
+\code{/v1/roots} publishes \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}591-600}, the
+response to a \code{Submitter} reveals membership of chosen nullifiers in
+$\mathcal{N}$ \finding{I-06}.
+\end{property}
+
+\begin{specdelta}[Wire-format comments]
+\label{delta:app-wire}
+The module comment says hex is lowercase and that a malformed field is a 400
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}wire.rs:\allowbreak{}4-6}; the enforced check accepts either case
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}wire.rs:\allowbreak{}50}, and the handler answers 422
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}625}.
+\end{specdelta}
+
+%---------------------------------------------------------------------------
+\subsection{In-process mempool admission}
+\label{subsec:app-seq}
+
+The only path that enqueues a transfer is \code{Sequencer::\allowbreak{}submit}, called
+from the Admin-only demo endpoint (\code{/v1/demo/transfer}) after an
+in-process proof \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}403-412}
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}auth.rs:\allowbreak{}290}. Its argument
+\code{ClientTransferProof} carries six independently supplied components: a verifier
+object, a proof, a limb statement, a shape, a \code{TransferPublic}, and an
+envelope \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}sequencer.rs:\allowbreak{}62-75}.
+
+\begin{definition}[Mempool admission]
+\label{def:app-admit-seq}
+\code{submit}$(t)$ succeeds iff, in order,
+\begin{enumerate}
+  \item[(S1)] $\mathsf{Verify}(t.\mathit{envelope}.vk,\ M(t.\mathit{envelope}.\mathit{public}),\ t.\mathit{envelope}.\sigma)=1$
+        \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}sequencer.rs:\allowbreak{}332};
+  \item[(S2)] \code{check\_\allowbreak{}admit\_\allowbreak{}against}$(t.\mathit{public}, \mathrm{root}(\mathcal{T}^{\mathsf{pend}}), \mathrm{root}(\mathcal{N}^{\mathsf{pend}}))$,
+        i.e.\ \eqref{eq:app-w7a}--\eqref{eq:app-w7b} with the pending
+        projections' roots in place of the committed ones, while
+        \eqref{eq:app-w7c} is still evaluated against the committed map
+        $\mathcal{N}$ \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}state.rs:\allowbreak{}242-246}
+        \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}sequencer.rs:\allowbreak{}337-341};
+  \item[(S3)] $t.\mathit{verifier}.\mathsf{verify}(t.\mathit{proof}, t.\mathit{statement})$
+        \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}sequencer.rs:\allowbreak{}342-345};
+  \item[(S4)] each $N_i$ of $t.\mathit{public}$ inserts freshly into
+        $\mathcal{N}^{\mathsf{pend}}$ \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}sequencer.rs:\allowbreak{}346-356};
+\end{enumerate}
+after which the $C_j$ are appended to $\mathcal{T}^{\mathsf{pend}}$ and $t$ is
+queued \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}sequencer.rs:\allowbreak{}361-365}.
+\end{definition}
+
+\begin{property}[Bindings not enforced at admission]
+\label{prop:app-seq-gaps}
+\code{submit} compares none of $t.\mathit{envelope}.\mathit{public}$,
+$t.\mathit{public}$ and $t.\mathit{statement}$ with one another, and does not
+check $t.\mathit{shape}$ against $t.\mathit{statement}$
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}sequencer.rs:\allowbreak{}331-366}. The verifier object in (S3) is
+supplied with the transfer \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}sequencer.rs:\allowbreak{}63-64}
+\finding{V-06}. The shape/length check
+$|t.\mathit{statement}| = \code{shape.statement\_\allowbreak{}len()}$ is first applied in
+\code{block\_\allowbreak{}statement} \src{crates/\allowbreak{}prover/\allowbreak{}src/\allowbreak{}block.rs:\allowbreak{}334-342}, during
+\code{produce\_\allowbreak{}block}, after the batch has been drained from the mempool
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}sequencer.rs:\allowbreak{}387-390} \finding{M-06}. In the shipped
+binary the three components are produced together from one proving run
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}391-411}, using fixture spend keys
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}281-289} \finding{I-03}.
+\end{property}
+
+The demo endpoint additionally requires
+$\mathit{out\_value}+\mathit{fee}\le\mathrm{val}(\text{input})$ (saturating)
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}361-366}. When a block is applied, \code{apply}
+re-checks per transfer that the $N_i$ are unspent and pairwise distinct and
+that $R_{\mathsf{after}}$ and $rt'$ equal the roots the insertions and appends
+produce, before mutating \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}state.rs:\allowbreak{}271-322}.
+
+%---------------------------------------------------------------------------
+\subsection{Bearer tokens and access control}
+\label{subsec:app-token}
+
+\begin{definition}[Token]
+\label{def:app-token}
+Roles are bytes $\mathsf{ReadOnly}=0 < \mathsf{Submitter}=1 <
+\mathsf{Admin}=2$ \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}auth.rs:\allowbreak{}56-65}. For signing key $K$,
+role $r$ and expiry $e\in[0,2^{64})$ (Unix seconds),
+\begin{align}
+  P &= r\ \|\ \mathrm{LE}_{64}(e) \qquad (|P|=9) \\
+  \tau &= \mathrm{HMAC\text{-}SHA256}(K, P) \qquad (|\tau|=32)\\
+  \mathsf{tok} &= \mathsf{b64u}(P)\ \|\ \text{``.''}\ \|\ \mathsf{b64u}(\tau)
+\end{align}
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}auth.rs:\allowbreak{}175-179,\allowbreak{}236-253}, where $\mathsf{b64u}$ is the
+RFC~4648, Section~5 alphabet without padding
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}auth.rs:\allowbreak{}306-324}. A token is therefore $12+1+43=56$
+characters. Issuance is deterministic in $(K,r,e)$.
+\end{definition}
+
+\begin{definition}[Token verification]
+\label{def:app-token-verify}
+$\mathsf{Verify}_K(\mathsf{tok}, t_{\mathrm{now}})$ returns a role iff, in
+order \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}auth.rs:\allowbreak{}190-211}:
+\begin{enumerate}
+  \item[(T1)] $\mathsf{tok}$ splits at its first ``.'' into $(s_P, s_\tau)$;
+  \item[(T2)] both halves decode under $\mathsf{b64u}^{-1}$
+        (Def.~\ref{def:app-b64});
+  \item[(T3)] $\mathrm{ct\_eq}(\tau', \mathrm{HMAC}(K,P'))$, with
+        \code{subtle}'s slice comparison (which returns false on a length
+        mismatch before comparing contents);
+  \item[(T4)] $|P'| = 9$;
+  \item[(T5)] $P'_0\in\{0,1,2\}$;
+  \item[(T6)] $t_{\mathrm{now}} \le \mathrm{LE}_{64}^{-1}(P'_{1..8})$.
+\end{enumerate}
+\code{verify\_for} additionally requires $r\ge r_{\mathsf{req}}$
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}auth.rs:\allowbreak{}219-234}.
+\end{definition}
+
+\begin{definition}[Decoder]
+\label{def:app-b64}
+$\mathsf{b64u}^{-1}(s)$ rejects $|s|\equiv 1 \pmod 4$ and any symbol outside
+the alphabet; it decodes groups of 4 symbols to 3 bytes, a final group of 3
+symbols to 2 bytes, and a final group of 2 symbols to 1 byte
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}auth.rs:\allowbreak{}332-373}. The low-order bits of the last symbol
+of a partial final group (2 bits for 3 symbols, 4 bits for 2 symbols) are
+discarded without being required to be zero
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}auth.rs:\allowbreak{}351-359}, so $\mathsf{b64u}^{-1}$ is not
+injective; the 43-symbol MAC field ends in a 3-symbol group, giving four
+accepted spellings of each token \finding{L-03}.
+\end{definition}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l l l X@{}}
+\toprule
+Path & Method & Required role & Handler / source \\
+\midrule
+\code{/health} & GET & ReadOnly & snapshot JSON \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}727} \\
+\code{/metrics} & GET & ReadOnly & Prometheus text \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}728} \\
+\code{/v1/state} & GET & ReadOnly & same handler as \code{/health} \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}729} \\
+\code{/v1/roots} & GET & ReadOnly & committed $\mathrm{root}(\mathcal{T}), \mathrm{root}(\mathcal{N})$ \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}730} \\
+\code{/v1/transfer} & POST & Submitter & Def.~\ref{def:app-admit-http} \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}731} \\
+\code{/v1/demo/transfer} & POST & Admin & in-process prove and submit \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}732} \\
+\code{/v1/block/produce} & POST & Admin & drain mempool, prove block \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}733} \\
+\code{/v1/block/settle} & POST & Admin & send L1 transaction \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}734} \\
+\code{/v1/admin/rotate-key} & --- & Admin & listed in the ACL, no route \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}auth.rs:\allowbreak{}292} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+Roles per path are from \code{Acl::\allowbreak{}default\_\allowbreak{}policy}, matched by exact string
+equality on the URI path \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}auth.rs:\allowbreak{}270-302}.
+
+\begin{definition}[Guard]
+\label{def:app-guard}
+The guard is installed with \code{route\_layer}
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}735}, so it runs only for requests that match a
+route; others receive the router's default 404 without authentication. For a
+matched route with path $\pi$ it (G1) looks up $r_{\mathsf{req}} =
+\mathrm{ACL}(\pi)$, answering 404 if absent; (G2) requires an
+\code{Authorization} header that is visible ASCII and begins with the exact
+prefix \code{Bearer }; (G3) runs \code{verify\_for} with the current Unix
+time; (G4) charges one cell to the keyed rate limiter under the key
+formed by the role's \code{Debug} name, one space, and the path
+(e.g.\ \code{Submitter /v1/transfer}), answering 429 when exhausted
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}543-581}. The limiter quota is 20 per second
+with burst 40 per key \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}765-767}. Requests
+rejected in (G1)--(G3) are not charged. The key is shared by every token
+holder of the same role on the same path \finding{M-11}. CORS allows the
+configured origins, methods GET and POST, and headers \code{Authorization}
+and \code{Content-Type} \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}717-725}.
+\end{definition}
+
+\paragraph{Key and issuance.} $K$ is read from \code{NODE\_\allowbreak{}TOKEN\_\allowbreak{}KEY\_\allowbreak{}FILE}
+(regular file, mode without group/other bits, non-empty) or else from hex in
+\code{NODE\_\allowbreak{}TOKEN\_\allowbreak{}KEY} (at least 16 bytes)
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}138-157}
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}keystore.rs:\allowbreak{}120-133}; \code{TokenSigner::\allowbreak{}new} accepts any
+length \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}auth.rs:\allowbreak{}165-168}. The \code{token} subcommand
+issues $e = t_{\mathrm{now}} + \mathit{ttl}$ with default role \code{admin}
+and default $\mathit{ttl}=86400$, with no upper bound on $\mathit{ttl}$
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}837-853} \finding{L-03}.
+
+\begin{specdelta}[Token lifetime and ACL]
+\label{delta:app-token}
+The module comment gives a default lifetime of one hour
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}auth.rs:\allowbreak{}41-43}; the shipped issuer defaults to 24 hours
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}main.rs:\allowbreak{}839-840}. The ACL comment presents
+\code{/v1/admin/rotate-key} as key management
+\src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}auth.rs:\allowbreak{}291-292}; no handler exists, and revocation is
+only by restarting with a new $K$.
+\end{specdelta}
+
+%---------------------------------------------------------------------------
+\subsection{Custody: the password vault}
+\label{subsec:app-vault}
+
+\begin{definition}[Seal]
+\label{def:app-seal}
+Constants: $|\mathit{key}|=32$, $|\mathit{salt}|=16$, $|\mathit{nonce}|=12$,
+\code{VAULT\_\allowbreak{}VERSION}$=1$ \src{crates/\allowbreak{}vault/\allowbreak{}src/\allowbreak{}lib.rs:\allowbreak{}69-73,\allowbreak{}166}. The KDF is
+Argon2id, version \code{0x13}, $m=65536$ KiB, $t=3$, $p=1$, output 32 bytes,
+validated at compile time \src{crates/\allowbreak{}vault/\allowbreak{}src/\allowbreak{}lib.rs:\allowbreak{}82-112}.
+$\mathsf{Seal}(\mathit{pw}, \mathit{pt}, \mathit{max})$ requires
+$|\mathit{pt}|\le\mathit{max}$, draws $\mathit{salt}$ then $\mathit{nonce}$
+from the caller's RNG, and outputs
+\begin{align}
+  \mathit{key} &= \mathrm{Argon2id}(\mathit{pw}, \mathit{salt}) \\
+  \mathit{ct} &= \mathrm{AES\text{-}256\text{-}GCM}.\mathrm{Enc}(\mathit{key}, \mathit{nonce}, \mathit{pt};\ \mathit{ad}=\varepsilon) = c\ \|\ T,\quad |T|=16
+\end{align}
+as $(\mathit{ver}=1, \mathit{salt}, \mathit{nonce}, \mathit{ct})$
+\src{crates/\allowbreak{}vault/\allowbreak{}src/\allowbreak{}lib.rs:\allowbreak{}211-255}. No associated data is passed, so the
+version byte and length fields are not authenticated by the tag.
+\end{definition}
+
+\begin{definition}[Open]
+\label{def:app-open}
+$\mathsf{Open}(\mathit{pw})$ requires, in order, $\mathit{ver}=1$,
+$|\mathit{salt}|\ge 16$, $|\mathit{nonce}|\ge 12$; derives $\mathit{key}$;
+requires $|\mathit{nonce}|=12$ (else a \code{Kdf} error); and returns the
+plaintext iff GCM decryption succeeds, else \code{WrongPassword}
+\src{crates/\allowbreak{}vault/\allowbreak{}src/\allowbreak{}lib.rs:\allowbreak{}269-288}.
+\end{definition}
+
+\begin{definition}[Serialized vault]
+\label{def:app-vault-bytes}
+\code{to\_bytes} emits
+\begin{equation}
+  \mathit{ver}\ \|\ \mathrm{LE}_8(|\mathit{salt}|)\ \|\ \mathit{salt}\ \|\ \mathrm{LE}_8(|\mathit{nonce}|)\ \|\ \mathit{nonce}\ \|\ \mathrm{LE}_{32}(|\mathit{ct}|)\ \|\ \mathit{ct},
+\end{equation}
+refusing lengths that do not fit their prefix
+\src{crates/\allowbreak{}vault/\allowbreak{}src/\allowbreak{}lib.rs:\allowbreak{}308-326}; for a sealed vault this is
+$35 + |\mathit{pt}| + 16$ bytes. \code{from\_bytes} requires total length
+$\ge 35$, then reads the version, the salt-length byte, the salt (via a
+bounds-checked \code{read\_slice}), the nonce-length byte at the current
+offset, the nonce, four ciphertext-length bytes at the current offset, and
+the ciphertext \src{crates/\allowbreak{}vault/\allowbreak{}src/\allowbreak{}lib.rs:\allowbreak{}334-358,\allowbreak{}362-370}. It does not
+check the version (deferred to $\mathsf{Open}$) and accepts trailing bytes
+after $\mathit{ct}$. The nonce-length byte and the four length bytes are read
+by direct indexing, which is not bounds-checked when a declared length
+consumes the remaining input \src{crates/\allowbreak{}vault/\allowbreak{}src/\allowbreak{}lib.rs:\allowbreak{}344,\allowbreak{}347-349}
+\finding{L-01}.
+\end{definition}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l l X@{}}
+\toprule
+Consumer & Plaintext & Entropy for $\mathit{salt},\mathit{nonce}$ \\
+\midrule
+node keystore & caller bytes & OS CSPRNG (\code{SysRng}) \src{crates/\allowbreak{}node/\allowbreak{}src/\allowbreak{}keystore.rs:\allowbreak{}57-65} \\
+wallet (wasm) & $\mathtt{0x01}\ \|\ sk_d\,(32)\ \|\ sk_{\mathsf{SLH}}\,(64)$, $97$ bytes, cap $4096$ & \code{StdRng} seeded from exactly 32 caller-supplied bytes, the same stream that generated $sk_d$ and $sk_{\mathsf{SLH}}$ \src{crates/\allowbreak{}wallet-wasm/\allowbreak{}src/\allowbreak{}lib.rs:\allowbreak{}217-228,\allowbreak{}261-267,\allowbreak{}298-318} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+On unlock the wallet requires the opened payload to be exactly 97 bytes with
+leading version byte \code{0x01} \src{crates/\allowbreak{}wallet-wasm/\allowbreak{}src/\allowbreak{}lib.rs:\allowbreak{}278-292},
+and parses $sk_{\mathsf{SLH}}$ with \code{SigningKey::\allowbreak{}try\_\allowbreak{}from}, which
+re-parses the embedded $vk$ \src{crates/\allowbreak{}wallet-wasm/\allowbreak{}src/\allowbreak{}lib.rs:\allowbreak{}427-428}
+\src{slh-dsa-0.2.0-rc.5/\allowbreak{}src/\allowbreak{}signing\_key.rs:\allowbreak{}226-240}. The wallet signs
+$M(x)$ from \code{shielded::\allowbreak{}encode\_\allowbreak{}statement}, the same function the node
+uses (Def.~\ref{def:app-msg}) \src{crates/\allowbreak{}wallet-wasm/\allowbreak{}src/\allowbreak{}lib.rs:\allowbreak{}424-430}.
+
+\fussy

@@ -7,9 +7,13 @@ $m$ outputs. The whole relation is laid into a builder by
 \code{constrain\_transfer} \src{crates/prover/src/transfer.rs:358-537}; the
 stand-alone client circuit wraps it with the Poseidon2 permutation and
 recompose tables enabled, exports the returned expressions as the statement,
-and witnesses it \src{crates/prover/src/transfer.rs:645-701}. The block circuit
-reuses the same function unchanged inside a larger builder
-\src{crates/prover/src/transfer.rs:328-334}. Everything below is read from the
+and witnesses it \src{crates/prover/src/transfer.rs:645-701}. The function's
+documentation describes reuse inside a larger (block) builder
+\src{crates/prover/src/transfer.rs:328-334}, but in the current source its only
+caller is \code{build\_transfer\_circuit}
+\src{crates/prover/src/transfer.rs:664}; the block circuit instead re-verifies
+client transfer proofs recursively and reads their statements
+\src{crates/prover/src/block.rs:400-419}. Everything below is read from the
 constraints the code emits; the module-level description of the relation
 \src{crates/prover/src/transfer.rs:1-62} is used only where the code agrees
 with it. Hash and encoding notation ($\Hp$, $\Cp$, $\limbs$, $L$) is that of
@@ -81,13 +85,15 @@ $(l_0,l_1,r_0,r_1)$, and the two rate outputs returned.
 
 \begin{definition}[Sponge gadget $\Hp^{\mathrm{c}}$]
 $\Hp^{\mathrm{c}}(x)$ for a limb vector $x$ is \code{p2\_sponge\_limbs}: $x$ is cut into
-chunks of $8$ base elements; each chunk is recomposed into the two rate slots
-and absorbed by one permutation row. The first row has \code{new\_start} set and
-supplies only the two rate slots; later rows chain the capacity through the
-table. In a short final chunk a partially filled rate slot is completed with
-base coefficients decomposed from the previous row's output, and a wholly
-empty rate slot is left unsupplied. The output is the last row's two rate
-elements; $\Hp^{\mathrm{c}}(\varepsilon)=(0,0)$.
+chunks of $8$ base elements; each chunk is recomposed (ALU \code{mul\_add}
+chain) into the rate slots it fills and absorbed by one permutation row. The
+first row has \code{new\_start} set and supplies only the rate slots; later rows
+leave the capacity unsupplied. In a short final chunk a partially filled rate
+slot is completed with the coefficients that
+\code{decompose\_ext\_to\_base\_coeffs\_via\_alu} returns for the previous row's
+output (zero if there is no previous row), and a wholly empty rate slot is left
+unsupplied. The output is the last row's two rate elements;
+$\Hp^{\mathrm{c}}(\varepsilon)=(0,0)$.
 \src{crates/prover/src/commitment\_gadget.rs:306-367}
 The framed form $\Hp^{\mathrm{c}}(D;\,p_1,\dots)$ is $\Hp^{\mathrm{c}}(\limbs(D)\,\|\,p_1\,\|\cdots)$
 (\code{p2\_framed}).
@@ -100,13 +106,19 @@ constraint applies only to challenger sponge rows (a challenger-only table, or
 the trusted challenger-start selector of a shared table); on a table that also
 carries caller-supplied rows a \code{new\_start} row's capacity is whatever the
 caller fed it
-\src{vendor/p3-recursion/poseidon2-circuit-air/src/air.rs:119-128,1166-1185}.
-The configuration these rows are keyed by has \code{challenger: false}
+\src{vendor/p3-recursion/poseidon2-circuit-air/src/air.rs:119-128,1163-1185}.
+The configuration these rows are keyed by has \code{challenger: false} and
+\code{shared: false}
 \src{vendor/p3-recursion/circuit/src/ops/poseidon2\_perm/config.rs:135-145}
-\src{crates/prover/src/commitment\_gadget.rs:69}. Consequently
-$\Hp^{\mathrm{c}}$ does not bind its input as the native $\Hp$ does (initial
-capacity and short-final-chunk handling) \finding{V-07}. The preimage lengths
-used by this relation are:
+\src{crates/prover/src/commitment\_gadget.rs:69}. An unsupplied input limb is
+chained to the previous row's output only on a row without \code{new\_start}
+\src{vendor/p3-recursion/poseidon2-circuit-air/src/air.rs:843-845,1150-1161}.
+The via-ALU decomposition used for the short-final-chunk completion constrains
+only $\sum_i c_i e_i = y$ over $\K$, without confining each $c_i$ to $\F$
+\src{vendor/p3-recursion/circuit/src/builder/circuit\_builder.rs:1938-1946,1981-1983}.
+Consequently $\Hp^{\mathrm{c}}$ does not bind its input as the native $\Hp$
+does (initial capacity and short-final-chunk handling) \finding{V-07}. The
+preimage lengths used by this relation are:
 
 \begin{center}
 \small
@@ -129,9 +141,12 @@ bits, and each bit vector recombined into a low 16-bit and a high 15-bit limb,
 giving 16 limbs. \src{crates/prover/src/commitment\_gadget.rs:417-431}
 \end{definition}
 
-Selection is $\mathsf{sel}(c,x,y)=x$ if $c=1$ and $y$ if $c=0$, with $c$
-boolean-constrained at the call site
-\src{crates/prover/src/transfer.rs:742-753}.
+Selection is the affine map $\mathsf{sel}(c,x,y)=y+c\cdot(x-y)$, one
+\code{mul\_add} row per $\K$ element
+\src{vendor/p3-recursion/circuit/src/builder/circuit\_builder.rs:1021-1036};
+it equals $x$ if $c=1$ and $y$ if $c=0$. Every selector used below is either a
+boolean-constrained bit \src{crates/prover/src/transfer.rs:742-753} or, in
+$\mathsf{Append}$, a product $\kappa_h(1-b_h)$ of such bits.
 
 \begin{definition}[Path fold]
 For $x\in\K^2$, constants $s_0,\dots,s_{n-1}\in\K^2$ and boolean expressions
@@ -178,7 +193,7 @@ Three kinds of data enter the circuit.
 built and therefore part of the circuit description: $\langle rt\rangle$,
 $\langle R_{\mathsf{before}}\rangle$, $\langle R_{\mathsf{after}}\rangle$, $\limbs(rt)$,
 $\limbs(rt')$, $\limbs(R_{\mathsf{before}})$, $\limbs(R_{\mathsf{after}})$
-\src{crates/prover/src/transfer.rs:390-410,492,499,513-527};
+\src{crates/prover/src/transfer.rs:390-398,405-410,444,492,499,513-527,561-564};
 each input's membership siblings $s_i$
 \src{crates/prover/src/transfer.rs:727-734}; each output's recipient key
 limbs $\limbs(\mathit{pk}'_j)$ \src{crates/prover/src/transfer.rs:573-579};
@@ -305,12 +320,16 @@ constraints. \src{crates/prover/src/transfer.rs:366-383}
 \end{definition}
 
 \paragraph{Emission order.} Constraints are laid in the order: for each input
-$i=1..k$ in spend order, T1 (secrets, amount), T2, T3, T4, T5 (nullifier,
-absence against $R_{i-1}$, insertion, export of $L(N_i)$); then for each output
-$j=1..m$ in output order, T1, T6 (commitment, export of $L(C_j)$, append);
-then the root exports, the $R_k$ pin, the fee range check, and T7.
+$i=1..k$ in spend order, T1 (secrets, amount), T2 (with the export $L(P_i)$),
+T3, T4, T5 (nullifier; export of $L(N_i)$ and its address bits; absence fold;
+insertion fold; pin of the absence root to $R_{i-1}$; a second export of
+$L(N_i)$ for the statement); then for each output $j=1..m$ in output order, T1,
+T6 (commitment, export of $L(C_j)$, append); then $\limbs(rt)$, $L(T_m)$ with
+its pin to $\limbs(rt')$, the $R_k$ pin, $\limbs(R_{\mathsf{before}})$ and
+$\limbs(R_{\mathsf{after}})$, the fee limbs with their range check, and T7.
 \src{crates/prover/src/transfer.rs:413-534}
 \src{crates/prover/src/transfer.rs:565-597}
+\src{crates/prover/src/nullifier\_gadget.rs:262-290}
 Because $R_{i-1}$ is the previous spend's insertion output, the order of
 nullifiers within a transfer is part of the relation.
 \src{crates/prover/src/transfer.rs:385-389}
@@ -346,7 +365,9 @@ $\varphi$ & $16(k+m+4)$ & 4 & private fee limbs (T1 ranges) \src{crates/prover/s
 \end{tabularx}
 \end{center}
 
-The statement length is therefore $|x| = 16(k+m+4)+4$: $100$ for one input and
+The statement length is therefore $|x| = 16(k+m+4)+4$, the same formula and
+offsets the block circuit uses to locate a child's fields
+\src{crates/prover/src/block.rs:163-215}: $100$ for one input and
 one output (consistent with the ``100-limb transfer'' the block fold is costed
 against \src{crates/prover/src/commitment\_gadget.rs:380-381}) and $132$ for
 two-in/two-out. The fee value is fixed by the statement: the exported
@@ -426,17 +447,19 @@ Two comments still describe the nullifier map as Keccak:
 \src{crates/prover/src/commitment\_gadget.rs:15-16} and the proving entry point's
 list of non-primitive operations \src{crates/prover/src/transfer.rs:904-906}.
 The enforced map fold is $\Cp^{\mathrm{c}}$ on the same Poseidon2 table as the
-note tree \src{crates/prover/src/nullifier\_gadget.rs:203-231}, and only the
-Poseidon2 and recompose tables are enabled for the client circuit
-\src{crates/prover/src/transfer.rs:657-661}.
+note tree \src{crates/prover/src/nullifier\_gadget.rs:203-231}, and besides the
+statement export the client circuit enables only the Poseidon2 and recompose
+tables \src{crates/prover/src/transfer.rs:657-661,677}.
 \end{specdelta}
 
 \begin{specdelta}[Digest export is canonical]
 The export comment states that each 31-bit coefficient decomposition admits one
 non-canonical witness \src{crates/prover/src/commitment\_gadget.rs:408-412}.
-The vendored \code{decompose\_to\_bits} additionally pins every full-width
-($31$-bit for $\F$) chunk below $p$
-\src{vendor/p3-recursion/circuit/src/builder/circuit\_builder.rs:1435-1449}, so
+The vendored \code{decompose\_to\_bits} equates each coefficient with a sum of
+boolean-constrained bits (so the coefficient lies in $\F$) and additionally pins
+every full-width ($31$-bit for $\F$) chunk below $p$
+\src{vendor/p3-recursion/circuit/src/builder/circuit\_builder.rs:1435-1449,1555-1569};
+together with the weighted-sum constraint of the coefficient decomposition,
 $L(y)$ is the unique canonical limb vector of $y$.
 \end{specdelta}
 

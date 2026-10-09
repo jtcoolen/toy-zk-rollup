@@ -1,0 +1,580 @@
+\section{Proof system: WHIR PCS, batch-STARK, recursion}
+\label{sec:proof-system}
+
+This section states what the proving stack enforces underneath the application
+relations: the WHIR-backed univariate polynomial commitment scheme (vendored and
+locally patched), the batch-STARK verifier transcript, the recursion relation that
+the in-circuit verifier proves, and the circuit-prover table AIRs that carry it.
+Everything below is read from the code; module comments are used only where the
+code agrees with them, and disagreements are collected in
+\S\ref{subsec:ps-deltas}.
+
+The stack has three layers.
+\begin{enumerate}
+\item \emph{Inner layer.} Client transfer and block circuits are proven under
+  \code{InnerWhirConfig}: a width-16 Poseidon2 duplex challenger, a Poseidon2
+  field-native Merkle tree with 8-element digests, and \code{WhirUniPcs} with its
+  const generic \code{ZK} left at its default \code{true}
+  \src{crates/prover/src/whir\_recursion.rs:84-116}
+  \src{vendor/p3-recursion/recursion/src/pcs/whir/uni/pcs.rs:322}.
+\item \emph{Recursion circuit.} A circuit over $\K$ that re-runs the inner
+  batch-STARK (or uni-STARK) verifier with WHIR openings, Merkle paths and the
+  Poseidon2 challenger realised as non-primitive tables
+  \src{crates/prover/src/whir\_recursion.rs:522-598,735-818}.
+\item \emph{Settlement layer.} The recursion circuit is proven once more under a
+  Keccak-256 challenger and Keccak Merkle tree with \code{ZK = false}
+  \src{crates/prover/src/whir.rs:77,86-89} \src{crates/prover/src/config.rs:66-78};
+  this is the proof the on-chain verifier replays.
+\end{enumerate}
+
+\paragraph{Notation.}
+$\F$ is KoalaBear and $\K = \F[X]/(X^4-3)$ with $d = [\K:\F] = 4$
+\src{crates/prover/src/whir.rs:64-70}. $k$ is the WHIR folding factor and
+$z = [\code{ZK}] \in \{0,1\}$. For a two-adic coset $D = s\langle\omega\rangle$
+of size $n$ write $Z_D(X) = X^n - s^n$ (unnormalised) and
+$v_D(X) = (X/s)^n - 1$ (normalised), so $Z_D = s^n\, v_D$. The natural domain
+of size $n$ is the subgroup itself, $s = 1$
+\src{vendor/p3-recursion/recursion/src/pcs/whir/uni/pcs.rs:819-822}.
+$\mathrm{iDFT}_D(M)$ is the column-wise coset interpolation of an
+$n\times w$ evaluation matrix $M$ on $D$, returning ascending coefficients.
+
+%---------------------------------------------------------------------------
+\subsection{Instantiations and parameters}
+\label{subsec:ps-params}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l X X@{}}
+\toprule
+Item & Settlement layer (\code{crate::whir}) & Inner layer (\code{InnerWhirConfig}) \\
+\midrule
+PCS type & \code{WhirUniPcs<..., PrefixProver, false>} \src{whir.rs:86} &
+  \code{WhirUniPcs<..., PrefixProver>} (\code{ZK} default \code{true}) \src{whir\_recursion.rs:106-113} \\
+Challenger & \code{SerializingChallenger32<F, HashChallenger<u8, Keccak256Hash, 32>>} \src{whir.rs:77} &
+  \code{DuplexChallenger<F, Poseidon2KoalaBear<16>, 16, 8>} \src{whir\_recursion.rs:84,103} \\
+MMCS & Keccak-256 leaf hash, $\mathrm{keccak}(l\,\|\,r)$ compression, 32-byte digest \src{config.rs:66-78} &
+  Poseidon2 sponge (16/8/8) + truncated-permutation 2-to-1, 8-element digest \src{whir\_recursion.rs:87-116} \\
+\code{security\_level} & \code{security\_level()}: env \code{WHIR\_SECURITY\_LEVEL}, default $96$ \src{whir.rs:120-131} &
+  same function \src{whir\_recursion.rs:212} \\
+Folding factor $k$ & \code{Constant(folding\_factor\_final())}: env \code{WHIR\_FOLDING\_FINAL}$\in\{4,8\}$, default $4$ \src{whir.rs:137-153,214} &
+  \code{Constant(4)} \src{whir\_recursion.rs:126,215} \\
+Soundness regime & env \code{WHIR\_SOUNDNESS\_REGIME}, default \code{JohnsonBound} \src{whir.rs:182-188,215} &
+  env \code{WHIR\_INNER\_SOUNDNESS\_REGIME}, default \code{JohnsonBound} \src{whir\_recursion.rs:185-194,216} \\
+\code{starting\_log\_inv\_rate} & $1$ (callers may pass a rate) \src{whir.rs:216,332-342} &
+  env \code{WHIR\_INNER\_RATE}$\in\{1,2,3\}$, default $1$ \src{whir\_recursion.rs:314-318} \\
+\code{round\_log\_inv\_rates} & empty (schedule derived per commit) \src{whir.rs:213} & empty \src{whir\_recursion.rs:214} \\
+\code{pow\_bits} & $\mathsf{PoW}(n+2, r)$ \src{whir.rs:337} &
+  $\max(\mathsf{PoW}(n+2,r), \min(\text{floor},30))$, floor from env \code{WHIR\_INNER\_POW\_FLOOR} or \code{WHIR\_POW\_FLOOR} \src{whir\_recursion.rs:336-353} \\
+$\log$ max LDE / cap & per call / per call \src{whir.rs:317,348} & $22$ / $0$ \src{whir\_recursion.rs:135,138} \\
+Lookup / OOD PoW bits & $0$ / $0$ (\code{StarkConfig::new}) \src{whir.rs:350} & $0$ / $0$ (trait default) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+File paths: \code{whir.rs}, \code{config.rs} and \code{whir\_recursion.rs} are under
+\code{crates/prover/src/}. The inner-layer PoW defaults are the
+\code{StarkGenericConfig} trait defaults, which \code{InnerWhirConfig} does not
+override (p3-uni-stark 0.8.0 \src{config.rs:78-98}); \code{StarkConfig::new}
+sets both to $0$ (p3-uni-stark 0.8.0 \src{config.rs:120-127}).
+
+All security-relevant parameters above that are marked ``env'' are read from the
+process environment in library code \finding{I-01}. The semantic settlement
+configuration used by the replay/exporter builds the same PCS type with
+\code{ZK = false} \src{crates/prover/src/settlement\_replay.rs:87-89} and adds
+one further knob, \code{WHIR\_POW\_FLOOR} \src{settlement\_replay.rs:144-156}.
+
+\begin{definition}[Grinding budget $\mathsf{PoW}(n, r)$]
+\label{def:ps-pow}
+For arity $n$ and starting log inverse rate $r$,
+\code{required\_pow\_bits\_with} iterates $a = n, n-1, \dots, 0$ and, for each
+$a$, $b = 0, 1, \dots, 95$; it returns \code{max\_pow\_bits()} of the first
+schedule $\code{WhirConfig::new}(a, \mathsf{params}[\code{pow\_bits}=b,
+\code{starting\_log\_inv\_rate}=r])$ that builds
+\src{crates/prover/src/whir.rs:267-300}. The inner loop bound is the constant
+\code{SECURITY\_LEVEL} $=96$, while the schedule's target is
+\code{security\_level()} (env-overridable)
+\src{whir.rs:276,211}. The settlement config evaluates it at
+$n = \log\text{max LDE} + \code{ZK\_ARITY\_SLACK}$ with
+$\code{ZK\_ARITY\_SLACK}=2$ \src{whir.rs:171,337}; the semantic/export
+parameters evaluate it at $n + \code{NON\_ZK\_ARITY\_SLACK}$ with value $1$
+and then apply $\max(\cdot,\code{WHIR\_POW\_FLOOR})$
+\src{crates/prover/src/settlement\_replay.rs:164-182}
+\src{whir.rs:176}.
+\end{definition}
+
+%---------------------------------------------------------------------------
+\subsection{WHIR univariate PCS: encoding}
+\label{subsec:ps-encoding}
+
+\code{p3-whir} commits multilinear polynomials. The adapter
+\code{WhirUniPcs} commits each univariate column by its coefficient vector, read
+as the hypercube evaluations of a multilinear, and stacks all columns of one
+commitment into a single multilinear \src{vendor/p3-recursion/recursion/src/pcs/whir/uni/pcs.rs:1-11}.
+\code{new} rejects any folding factor that is not \code{FoldingFactor::Constant}
+\src{pcs.rs:395-404}.
+
+\begin{definition}[Padded arity and stacked arity]
+\label{def:ps-stack}
+A committed coefficient matrix of height $2^{n}$ and width $w$ has padded arity
+$a = \max(n, k)$ \src{vendor/p3-recursion/recursion/src/pcs/whir/uni/plan.rs:76-82}.
+A commitment over matrices $(2^{n_t}, w_t)_t$ has stacked arity
+\begin{align}
+  m \;=\; \Big\lceil \log_2 \sum_{t:\,w_t>0} w_t \, 2^{a_t} \Big\rceil,
+  \qquad m = 0 \text{ if the sum is } 0,
+\end{align}
+computed with checked arithmetic (shift, product, sum and next-power-of-two
+overflows are errors) \src{plan.rs:85-111}.
+\end{definition}
+
+\begin{definition}[Stacked layout]
+\label{def:ps-layout}
+Tables are stably sorted by padded arity ascending and placed in reverse order,
+so the largest tables take the lowest offsets and, among equal arities, the
+later-indexed table is placed first. Each column claims one contiguous slot of
+$2^{a}$ points at the running offset $o$; its selector has $m - a$ bits and index
+$\mathrm{bitrev}_{m-a}(o \gg a)$ \src{plan.rs:176-245}. Under the
+\code{PrefixProver} layout the selector bits are appended \emph{after} the local
+point, big-endian \src{plan.rs:9-21,146-154}. A column $c(X)=\sum_{j<2^n} c_j X^j$
+becomes the multilinear $f_c$ on $\{0,1\}^{a}$ with $f_c(b) = c_{\mathrm{int}(b)}$,
+zero-extended from $2^n$ to $2^a$ points; the commit path transposes each
+coefficient matrix so that one \code{Table} row is one polynomial
+\src{pcs.rs:489-493} \src{plan.rs:67-75}.
+\end{definition}
+
+\begin{definition}[Univariate-to-multilinear bridge]
+\label{def:ps-bridge}
+For $\zeta \in \K$ and arity $a$, let
+$Y = (\zeta^{2^{a-1}}, \dots, \zeta^{2}, \zeta)$ (big-endian)
+\src{p3-multilinear-util-0.8.0/src/point.rs:322-334}, and set
+\begin{align}
+  X_i \;=\; \frac{Y_i}{1+Y_i}, \qquad
+  s_a(\zeta) \;=\; \prod_{i<a} (1+Y_i) \;=\; \sum_{j<2^a} \zeta^{j}.
+\end{align}
+Then for every column, $c(\zeta) = s_a(\zeta)\cdot f_c(X)$
+\src{vendor/p3-recursion/recursion/src/pcs/whir/uni/bridge.rs:1-21}. The native
+routine asserts $1+Y_i \ne 0$ for every $i$ before inverting
+\src{bridge.rs:41-58}; the circuit routine computes the same
+$(X, s_a)$ with $a-1$ squarings and $a$ divisions \src{bridge.rs:65-87}.
+\end{definition}
+
+%---------------------------------------------------------------------------
+\subsection{WHIR univariate PCS: commit}
+\label{subsec:ps-commit}
+
+All commitments funnel into \code{commit\_coefficient\_matrices\_as}, which
+builds the stacked witness, runs the WHIR commit under
+$\code{WhirConfig}(m, \mathsf{params})$, and directs the WHIR-internal root
+absorption into a discarded clone of the challenger prototype; the STARK layer
+absorbs the commitment itself \src{pcs.rs:479-523}.
+
+\begin{definition}[Non-hiding commitment, $\code{ZK}=\code{false}$]
+\label{def:ps-commit0}
+Given pairs $(D_t, M_t)$ with $|D_t| = \mathrm{height}(M_t)$:
+\begin{align}
+  \mathsf{Commit}^{0}\big((D_t,M_t)_t\big) \;=\;
+  \mathsf{WHIR.Commit}_{m}\Big(\mathsf{Stack}\big(\mathrm{iDFT}_{D_t}(M_t)\big)_t\Big).
+\end{align}
+The trace, the preprocessed matrices and the quotient chunks are all committed
+this way, with no randomness added; no randomisation commitment is produced
+(\code{get\_opt\_randomization\_poly\_commitment} returns \code{None}); and a
+single quotient chunk is permitted
+\src{pcs.rs:846-857,1000-1008,1037-1039,1097-1109}.
+\end{definition}
+
+\begin{definition}[Hiding commitment, $\code{ZK}=\code{true}$]
+\label{def:ps-commit1}
+The masking stream is a \code{StdRng} seeded from the OS entropy source at
+construction; each commitment forks a fresh stream, and \code{Clone} forks the
+stream rather than copying it \src{pcs.rs:353-364,419-430}.
+\begin{enumerate}
+\item \emph{Trace.} The caller passes an $N\times w$ matrix $M$ with the doubled
+  domain $D$, $|D| = 2N$. The adapter forms $M' \in \F^{2N\times w}$ with
+  $M'[2r] = M[r]$ and $M'[2r+1] \leftarrow_{\$} \F^{w}$ (by appending $w$ random
+  columns and reinterpreting at width $w$) and commits
+  $\mathrm{iDFT}_{D}(M')$ \src{pcs.rs:883-897}. Since the even rows of $D$ form
+  the coset $s\langle\omega_N\rangle$, the committed column is
+  $T' = \hat T + (X^N - s^N)\,\rho$ with $\deg \hat T < N$ the interpolant of the
+  real rows and $\deg\rho < N$ fixed by the random rows ($s=1$ for natural
+  domains).
+\item \emph{Preprocessed.} Same interleave with \emph{zero} rows in place of
+  random rows; the prover data is tagged public \src{pcs.rs:993-1020}.
+\item \emph{Randomisation $R$.} For each requested domain $D_i$, a uniformly
+  random coefficient matrix $R_i \in \F^{|D_i|\times d}$, committed directly as
+  coefficients (no interleave) \src{pcs.rs:1033-1074}.
+\item \emph{Quotient chunks.} Let the chunks $q_1,\dots,q_L$ live on cosets $D_i$
+  of size $h$ and shift $\sigma_i$, width $w$. The adapter requires $L > 1$
+  (assertion) and $h\cdot w \ge d$ \src{pcs.rs:1110-1145}. With
+  $c_i = 1/\prod_{j\ne i} v_{D_j}(\sigma_i)$ \src{pcs.rs:1413-1428}, it samples
+  $T_1,\dots,T_{L-1}$ uniformly with $\deg T_i < h$ and sets
+  \begin{align}
+    T_L \;=\; -\sum_{i<L} \frac{c_i\,\sigma_i^{h}}{c_L\,\sigma_L^{h}}\; T_i ,
+    \qquad\text{so that}\qquad \sum_{i\le L} c_i\, \sigma_i^{h}\, T_i = 0,
+  \end{align}
+  \src{pcs.rs:1169-1191}. Each chunk is replaced by
+  \begin{align}
+    q_i' \;=\; \mathrm{iDFT}_{D_i}(q_i) \;+\; (X^{h} - \sigma_i^{h})\, T_i,
+    \qquad \deg q_i' < 2h,
+  \end{align}
+  \src{pcs.rs:1193-1217}, and committed through the coefficient path with
+  unit-shift placeholder domains of height $2h$ \src{pcs.rs:566-578,1228-1233}.
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[Hiding-budget predicate]
+\label{def:ps-budget}
+Let $Q(m)$ be the total query count of $\code{WhirConfig}(m,\mathsf{params})$
+(sum over rounds plus the terminal round), falling back to
+\code{security\_level} if no schedule builds \src{pcs.rs:1377-1388}. The check is
+\begin{align}
+  \mathsf{HB}(\mathit{cells}, \mathit{pts}, m) \;:\Longleftrightarrow\;
+  2\big(d\cdot\max(\mathit{pts},1) + Q(m)\big) \;\le\; \mathit{cells}
+\end{align}
+\src{pcs.rs:1323-1350}. It is evaluated once per commitment batch: for the trace
+with $\mathit{cells} = \sum_t N_t w_t$, $\mathit{pts}=2$ and $m$ read at log height
+$+1$ \src{pcs.rs:862-882}; for $R$ with $\mathit{cells} = \sum_i |D_i|\, d$,
+$\mathit{pts}=1$ \src{pcs.rs:1045-1060}. The quotient path checks only
+$h\cdot w \ge d$ \src{pcs.rs:1134-1145}. The budget is pooled over the batch and
+no per-column or per-table bound is enforced \finding{M-07}.
+\end{definition}
+
+\begin{property}[Single-use private openings]
+\label{prop:ps-single-use}
+\code{open\_with\_preprocessing} asserts, for every round, that the prover data's
+\code{preprocessed} tag equals ``this round is the preprocessed round'', and
+returns \code{AlreadyOpened} if a non-preprocessed prover data was opened before;
+the flag is an \code{AtomicBool} shared across clones \src{pcs.rs:124-130,1241-1265}.
+This is a prover-side discipline; the verifier has no counterpart.
+\end{property}
+
+%---------------------------------------------------------------------------
+\subsection{WHIR univariate PCS: open and verify}
+\label{subsec:ps-open}
+
+\begin{definition}[Opening schedule]
+\label{def:ps-schedule}
+For one commitment with matrix shapes $(n_t, w_t)_t$ and opening points
+$(Z_t)_t$, every column of matrix $t$ is opened at every $\zeta \in Z_t$; each
+pair $(t,\zeta)$ is one batch naming all $w_t$ columns, at the substituted point
+$X^{(t,\zeta)}$ with scale $s_{a_t}(\zeta)$ of Definition~\ref{def:ps-bridge}.
+Batches are ordered matrix-major, then point \src{pcs.rs:253-313}.
+The prover reports the true univariate values $c(\zeta)$ (Horner on the stored
+coefficients) and one WHIR argument per commitment, all on the caller's
+challenger in commitment order \src{pcs.rs:586-637}.
+\end{definition}
+
+\begin{definition}[Verification]
+\label{def:ps-verify}
+Given commitments with per-matrix $(D_t, ((\zeta, v_{t,\zeta}))_{\zeta})$ and a
+proof $\pi = (\pi_r)_r$, \code{verify\_rounds} enforces, in order
+\src{pcs.rs:662-791}:
+\begin{enumerate}
+\item $|\pi| = $ number of commitments \src{pcs.rs:671-676};
+\item for \emph{every} round, before the challenger is touched: each matrix has
+  at least one point and all claim vectors of a matrix have equal length $w_t$;
+  $m$ is computed from $(\log|D_t|, w_t)$; the round parameters and the proof's
+  WHIR context validate against $\code{WhirConfig}(m)$ \src{pcs.rs:678-716};
+\item for each round $r$ in order: $\mathsf{WHIR.VerifyAt}(C_r, \pi_r,
+  \mathsf{schedule}, (X^{(t,\zeta)}))$ on the shared challenger, which does not
+  absorb $C_r$ and returns bound multilinear values $b_{t,\zeta} \in \K^{w_t}$
+  \src{pcs.rs:641-646,746-760};
+\item for every batch and column $j$:
+  \begin{align}
+    b_{t,\zeta}[j]\cdot s_{a_t}(\zeta) \;=\; v_{t,\zeta}[j]
+  \end{align}
+  \src{pcs.rs:762-787}.
+\end{enumerate}
+The claimed values are compared as supplied; nothing is truncated or re-joined
+in the hiding variant \src{pcs.rs:1267-1303}. The per-matrix shapes are
+\emph{not} authenticated by the commitment (distinct shape vectors can share a
+stacked arity); the caller must fix them, which the batch-STARK verifier does from
+AIR widths and degree bits \src{pcs.rs:648-660}.
+\end{definition}
+
+In-circuit, the WHIR PCS sets \code{PRE\_OBSERVES\_OPENED\_VALUES = false}, so the
+generic STARK verifier does not pre-absorb opened values on its behalf
+\src{vendor/p3-recursion/recursion/src/pcs/whir/uni/recursive\_pcs.rs:381-384},
+and the bridge check is emitted as
+$\code{connect}(b\cdot s_a(\zeta), v)$ per column
+\src{vendor/p3-recursion/recursion/src/pcs/whir/uni/circuit.rs:393-416}.
+Merkle openings of WHIR queries are checked by the Poseidon2 Merkle-path
+lowering; on the binary path that lowering emits path rows with
+\code{mmcs\_index\_sum} unset and a \code{new\_start} first row
+\src{vendor/p3-recursion/circuit/src/ops/mmcs.rs:116-160}, and the resulting rows
+bind neither the leaf digest nor the direction bits \finding{V-08}.
+
+%---------------------------------------------------------------------------
+\subsection{Batch-STARK transcript}
+\label{subsec:ps-transcript}
+
+The native verifier transcript is \code{BatchVerifierTranscript} of the
+crates.io dependency \code{p3-batch-stark 0.8.0} \src{Cargo.toml:103}; the
+settlement replay drives it phase by phase and is the specification the Solidity
+transcript is written from \src{crates/prover/src/settlement\_replay.rs:429-620}.
+The in-circuit verifier \code{verify\_batch\_circuit} mirrors it
+\src{vendor/p3-recursion/recursion/src/verifier/batch\_stark.rs:1204-1550}. Below,
+``native'' citations are to \code{p3-batch-stark-0.8.0/src/transcript.rs} and
+``circuit'' citations to \code{batch\_stark.rs}. Let $e_i$ be the extended degree
+bits of instance $i$ and $b_i = e_i - z$.
+
+\begin{enumerate}
+\item[T0.] \textbf{Seed.} Absorb a domain-separator seed derived from
+  \code{BatchShape} $=$ (trace widths, public-value counts, preprocessed widths,
+  has-preprocessed, number of lookup instances, lookup PoW bits,
+  has-randomisation $=z$, OOD PoW bits); the separator binds the protocol
+  name/version, the step pattern, the instance count, and every trace and
+  preprocessed width. Native \src{transcript.rs:408-432,773-780}; circuit
+  \src{batch\_stark.rs:1207-1221}; replay \src{settlement\_replay.rs:507-522}.
+\item[T1.] \textbf{Instance bindings.} For each $i$, observe
+  $\iota(e_i) \in \K$ (the base-field integer embedded in $\K$). Native
+  \src{transcript.rs:789-796}; circuit, as circuit constants
+  \src{batch\_stark.rs:1222-1226}.
+\item[T2.] \textbf{Main.} Observe the main-trace commitment, then each instance's
+  public values. Native \src{transcript.rs:805-815}; circuit
+  \src{batch\_stark.rs:1228-1234}.
+\item[T3.] \textbf{Preprocessed.} If present, observe the global preprocessed
+  commitment. Native \src{transcript.rs:818-823}; circuit
+  \src{batch\_stark.rs:1235-1237}.
+\item[T4.] \textbf{Lookup challenges.} If any instance has lookups:
+  proof-of-work step at \code{lookup\_pow\_bits} (at $0$ bits nothing is absorbed
+  and the witness must equal $0$), then sample $\alpha_L, \beta \in \K$; with no
+  lookups, no step exists and a supplied witness is rejected. Native
+  \src{transcript.rs:833-896}; circuit \src{batch\_stark.rs:1251-1256,1714-1721}.
+  The per-lookup challenge pair is $(\alpha_L + (\mathit{bus}+1)\gamma,\ \beta)$
+  with $\gamma = \beta^{W}$, $W$ the widest message, global buses deduplicated by
+  name and local buses fresh \src{batch\_stark.rs:1723-1777}.
+\item[T5.] \textbf{Permutation.} If present, observe the permutation commitment,
+  then every present lookup terminal (in $\K$); sample the constraint-folding
+  challenge $\alpha \in \K$. Native \src{transcript.rs:909-923}; circuit
+  \src{batch\_stark.rs:1258-1267}.
+\item[T6.] \textbf{Quotient.} Observe the quotient-chunk commitment, then the
+  randomisation commitment if $z=1$. Native \src{transcript.rs:926-933}; circuit
+  \src{batch\_stark.rs:1269-1277}.
+\item[T7.] \textbf{OOD point.} Proof-of-work step at \code{ood\_pow\_bits} (same
+  zero-bit rule as T4), then sample $\zeta \in \K$. Native
+  \src{transcript.rs:941-964}; circuit \src{batch\_stark.rs:1278-1279}.
+\item[T8.] \textbf{Opening argument.} One WHIR argument per commitment round on the
+  same challenger, rounds in the order of Table~\ref{tab:ps-rounds}, bracketed as
+  the \code{OPENING\_ARGUMENT} sub-protocol natively \src{transcript.rs:975-981};
+  circuit \src{batch\_stark.rs:1294-1550}.
+\item[T9.] \textbf{Constraint identity} per instance (Definition~\ref{def:ps-air-check}).
+\item[T10.] \textbf{Terminal sum.} $\sum_i \tau_i = 0$ over all present terminals.
+  Circuit \src{batch\_stark.rs:1685-1687}
+  \src{vendor/p3-recursion/recursion/src/traits/recursive.rs:91-98}; replay
+  \src{settlement\_replay.rs:616-620}.
+\end{enumerate}
+
+The circuit replays no proof-of-work step for T4 or T7 and therefore rejects any
+configuration with non-zero lookup or OOD PoW bits \src{batch\_stark.rs:1195-1202};
+both deployed configurations use $0$ (\S\ref{subsec:ps-params}). The native
+settlement replay additionally checks \code{check\_multiplicity\_height\_bound}
+before the transcript \src{settlement\_replay.rs:497-498}; no counterpart of that
+check appears in the vendored recursion verifier.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\linewidth}{@{}l l X l@{}}
+\toprule
+Round & Present when & Matrices, domain & Points \\
+\midrule
+$R$ & $z=1$ & one per instance, extended domain $2^{e_i}$ & $\zeta$ \\
+Trace & always & one per instance, extended domain $2^{e_i}$ & $\zeta$; $\zeta g_i$ if next row opened \\
+Quotient & always & $2^{\ell_i+z}$ chunks per instance, natural domain of size $|D_{i,j}|\cdot 2^{z}$ & $\zeta$ \\
+Preprocessed & has prep.\ commitment & one per prep.\ matrix, natural domain $2^{e_i}$ & $\zeta$; $\zeta g_i$ if next row opened \\
+Permutation & any lookups & one per lookup instance, extended domain $2^{e_i}$ & $\zeta$, $\zeta g_i$ \\
+\bottomrule
+\end{tabularx}
+\caption{Commitment rounds of T8, in order. $g_i$ is the generator of the base
+trace domain $H_i$ of size $2^{b_i}$. Circuit
+\src{batch\_stark.rs:1294-1520}; native
+\code{commitments\_with\_opening\_points} \src{settlement\_replay.rs:559-569}.}
+\label{tab:ps-rounds}
+\end{table}
+
+Before the transcript starts the circuit fixes the proof shape: degree bits are
+bounds-checked \src{batch\_stark.rs:974-987}; terminal presence must equal the AIR's
+own \code{declares\_interactions} (not the prover-supplied lookup list)
+\src{batch\_stark.rs:1097-1105}; each instance has exactly $2^{\ell_i+z}$ quotient
+chunks of length $d$, and a randomisation opening of length $d$ when present,
+where $\ell_i$ is recomputed from the AIR \src{batch\_stark.rs:1107-1145}; and the
+commitment count equals $[R] + 2 + [\text{prep}] + [\text{perm}]$
+\src{batch\_stark.rs:1180-1189}. Flattened permutation openings must have length
+$(|\Lambda_i|+1)\cdot d$ (or $0$) and are recombined into $\K$ by the basis
+$\{e_k\}$ \src{batch\_stark.rs:1574-1623}.
+
+\begin{definition}[Per-instance constraint identity]
+\label{def:ps-air-check}
+For instance $i$ let $H_i$ be the natural domain of size $2^{b_i}$, let
+$\mathcal{Q}_i$ be the coset of size $2^{b_i+\ell_i+z}$ disjoint from the extended
+domain, split into chunks $D_{i,1},\dots,D_{i,L_i}$, $L_i = 2^{\ell_i+z}$
+\src{batch\_stark.rs:1357-1373}. With opened chunk values
+$u_{i,j} \in \K^{d}$, set $q_{i,j}(\zeta) = \sum_{k<d} e_k\, u_{i,j}[k]$ and
+\begin{align}
+  \Lambda_{i,j}(\zeta) \;=\; \prod_{j'\ne j}
+     \frac{v_{D_{i,j'}}(\zeta)}{v_{D_{i,j'}}(\mathrm{first}(D_{i,j}))},
+  \qquad
+  \mathsf{Q}_i(\zeta) \;=\; \sum_{j} \Lambda_{i,j}(\zeta)\, q_{i,j}(\zeta)
+\end{align}
+\src{vendor/p3-recursion/recursion/src/verifier/quotient.rs:60-87,294-349}.
+Let $C_0,\dots,C_{K-1}$ be the AIR's constraints (including the LogUp
+constraints under the T4 challenges and the instance's terminal), evaluated at
+the opened trace, preprocessed, permutation, periodic and public values with the
+selectors of $H_i$ at $\zeta$, and folded in Horner order
+$\mathsf{F}_i = \sum_{k<K} \alpha^{K-1-k} C_k(\zeta)$ (recurrence
+$\mathit{acc} \leftarrow \mathit{acc}\cdot\alpha + C_k$, base-field constraints
+first, then extension-field constraints)
+\src{vendor/p3-recursion/recursion/src/traits/air.rs:183-209}. The circuit enforces
+\begin{align}
+  \mathsf{F}_i \cdot Z_{H_i}(\zeta)^{-1} \;=\; \mathsf{Q}_i(\zeta)
+\end{align}
+by \code{connect} \src{batch\_stark.rs:1552-1683}.
+\end{definition}
+
+%---------------------------------------------------------------------------
+\subsection{Recursion relation}
+\label{subsec:ps-recursion}
+
+\begin{definition}[Child verifying data]
+\label{def:ps-vk}
+A child batch proof is checked against
+$\mathsf{vk}_c = (\mathcal{A}_c, \mathbf{e}_c, \Lambda_c, \mathsf{pk}_c, P_c)$:
+the table AIRs $\mathcal{A}_c$ with their packing, the extended degree bits
+$\mathbf{e}_c$, the lookup contexts $\Lambda_c$, the statement-table position
+$\mathsf{pk}_c$, and the global preprocessed commitment $P_c$.
+\end{definition}
+
+\begin{definition}[Recursion relation]
+\label{def:ps-rrc}
+\begin{align}
+  R_{\mathsf{rc}} \;=\; \Big\{\, \big(S_{\mathsf{rc}};\ (\pi_c, S_c, P_c, \mathsf{aux}_c)_c\big) \;:\;
+  \forall c\;\; \mathsf{BatchVerify}^{\mathsf{WHIR}}_{\mathsf{vk}_c}(\pi_c, S_c) = 1
+  \ \wedge\ S_{\mathsf{rc}} = \mathsf{Export}\big((S_c)_c\big) \Big\}
+\end{align}
+where $\mathsf{BatchVerify}^{\mathsf{WHIR}}$ is T0--T10 with the WHIR checks of
+Definition~\ref{def:ps-verify} over the inner (Poseidon2, $z=1$) configuration,
+and $\mathsf{aux}_c$ collects Merkle siblings and WHIR proof data supplied as
+private inputs \src{crates/prover/src/whir\_recursion.rs:796-811}.
+\end{definition}
+
+How each component of $\mathsf{vk}_c$ is fixed in the circuit:
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l X@{}}
+\toprule
+Component & Enforced status \\
+\midrule
+$\mathcal{A}_c$, packing & Rebuilt from the retained \code{CircuitVerifier} descriptor, not from the proof; circuit structure \src{batch\_stark.rs:524-580,717-787} \\
+$\mathbf{e}_c$ & Taken from the proof at build time, bounds-checked, absorbed as circuit constants \src{batch\_stark.rs:974-987,1222-1226} \\
+$\Lambda_c$ & From the retained descriptor's common data (the trusted path passes \code{rebuild\_lookups = false}) \src{batch\_stark.rs:784,853-866} \\
+$\mathsf{pk}_c$ & \code{statement\_layout().table\_instance()} of the descriptor \src{whir\_recursion.rs:746-750} \src{crates/prover/src/block.rs:490-493} \\
+$P_c$ & Allocated as recursion-circuit public-input targets (\code{alloc\_public\_input\_array}) \src{vendor/p3-recursion/recursion/src/types/proof.rs:167-177} \src{vendor/p3-recursion/recursion/src/pcs/fri/targets.rs:1071-1079}; the backend's \code{constrain\_trusted\_preprocessing} \src{vendor/p3-recursion/recursion/src/backend/whir.rs:1619-1640} is not called by \code{build\_batch\_recursion\_circuit} or the block builder, so $P_c$ is not pinned \finding{V-06} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\code{verify\_trusted\_p3\_batch\_proof\_circuit} also runs
+\code{verifier.verify(proof, statement)} natively before allocating anything
+\src{batch\_stark.rs:761-763}; that is a prover-side precondition, not part of
+the proven relation. The uni-STARK entry point (\code{build\_recursion\_circuit})
+is the analogous relation for a single \code{p3\_uni\_stark} proof with no
+preprocessed commitment \src{crates/prover/src/whir\_recursion.rs:522-583}.
+
+\paragraph{Export.} $\mathsf{Export}$ installs a list of circuit targets as the
+statement via \code{set\_statement\_exports}:
+\begin{itemize}
+\item uni-STARK child: the child's AIR public-value targets
+  \src{whir\_recursion.rs:572-577};
+\item batch child: the AIR public-value targets of the child's statement-table
+  instance \src{whir\_recursion.rs:782-790};
+\item block: shape-header constants, the statement fold, the four endpoint
+  digests and the per-child fee limbs, as stated in the block relation
+  \src{crates/prover/src/block.rs:440-592}.
+\end{itemize}
+
+\paragraph{Settlement wrap.} The witnessed recursion circuit is proven under the
+settlement configuration with the shared-challenger Poseidon2 table, the
+recompose table with coefficient lookups, and the statement table registered
+\src{crates/prover/src/whir\_recursion.rs:677-699}. The settlement statement is
+the statement table's public values, i.e.\ $S_{\mathsf{rc}}$
+(Table~\ref{tab:ps-airs}, Statement row). With $z=0$ at this layer the
+settlement openings are unmasked (Definition~\ref{def:ps-commit0}); hiding of
+inner witnesses rests on the inner layer's $z=1$ commitments.
+
+%---------------------------------------------------------------------------
+\subsection{Circuit-prover table AIRs}
+\label{subsec:ps-airs}
+
+All tables communicate through the global \code{WitnessChecks} bus with tuples
+$(\mathit{idx}, v_0,\dots,v_{d-1})$ and preprocessed (signed) multiplicities.
+Paths are relative to \code{vendor/p3-recursion/circuit-prover/src/air/} unless
+stated.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\linewidth}{@{}l X X@{}}
+\toprule
+Table & Enforced local constraints & Bus interaction(s) \\
+\midrule
+Public & none \src{public\_air.rs:14-16,202-229} & per lane $(\mathit{idx}, v)$, multiplicity from preprocessing \\
+Const & $v_j = \mathit{prep}_j$ for $j<d$ \src{const\_air.rs:160-180} & $(\mathit{idx}, v)$, preprocessed multiplicity \\
+ALU & with $\mathit{act} = -\mathit{mult}_a$ and $s_{\mathsf{mul}} = \mathit{act} - s_{\mathsf{bool}} - s_{\mathsf{muladd}} - s_{\mathsf{horner}} - s_{\mathsf{add}}$: ADD $s_{\mathsf{add}}(a+b-o)=0$; MUL $s_{\mathsf{mul}}(ab-o)=0$; BOOL $s_{\mathsf{bool}}a_0(a_0-1)=0$, $s_{\mathsf{bool}}a_{j\ge1}=0$; MULADD $s_{\mathsf{muladd}}(ab+c-o)=0$; HORNER $s'_{\mathsf{horner}}(o\,b'+c'-a'-o')=0$ plus packed $K$-step variants and a zero chain-head seed \src{alu\_air.rs:885-1066} & $a,b,c,o$ per lane and packed Horner operands \src{alu\_air.rs:1070-1157} \\
+Recompose & none \src{recompose\_air.rs:1-6,157-205} & $(\mathit{idx}_{\mathsf{out}}, v_0,\dots,v_{d-1})$; with coefficient lookups also $(\mathit{idx}_{\mathsf{c},i}, v_i, 0,\dots,0)$ for each $i<d$ \\
+Statement & $\mathit{act}\,(v_j - \mathit{pv}_j) = 0$, $(1-\mathit{act})\,v_j = 0$ \src{statement\_air.rs:86-104} & $(\mathit{idx}_j, v_j, 0,\dots,0)$, multiplicity $-\mathit{act}$ \src{statement\_air.rs:106-113} \\
+Poseidon2 & upstream Poseidon2 permutation AIR, sponge chaining, Merkle-path chaining, MMCS leaf-index accumulator \src{vendor/p3-recursion/poseidon2-circuit-air/src/air.rs:27-35} & input/output limbs per CTL flags; Merkle binding \finding{V-08} \\
+\bottomrule
+\end{tabularx}
+\caption{Table AIRs of the recursion circuit, one row each.}
+\label{tab:ps-airs}
+\end{table}
+
+The interleave that realises the trace mask of Definition~\ref{def:ps-commit1} is
+short enough to quote \src{vendor/p3-recursion/recursion/src/pcs/whir/uni/pcs.rs:886-894}:
+\begin{Verbatim}[fontsize=\small]
+for (domain, mat) in evaluations {
+    let width = mat.width();
+    let masked = {
+        let mut m = mat.with_random_cols(width, &mut rng);
+        m.width = width;
+        m
+    };
+    debug_assert_eq!(masked.height(), domain.size());
+    coeffs.push(self.dft.coset_idft_batch(masked, domain.shift()));
+\end{Verbatim}
+
+%---------------------------------------------------------------------------
+\subsection{Spec deltas}
+\label{subsec:ps-deltas}
+
+\begin{specdelta}[PATCHES.md versus the patched PCS]
+\label{delta:ps-patches}
+\code{PATCHES.md} lists a single change, ``\code{const ZK: bool = false} $\to$
+\code{true}'' with ``evaluation truncation'', and refers to a pristine copy at
+\code{.scratch/vendor/p3-recursion-pristine}
+\src{vendor/p3-recursion/PATCHES.md:15-37}. In the code, \code{ZK} is a const
+generic defaulting to \code{true} that the settlement layer instantiates as
+\code{false} \src{pcs.rs:322,967} \src{crates/prover/src/whir.rs:86}; the
+non-hiding branches and the quotient-chunk mask are not inventoried
+\src{pcs.rs:846-857,1092-1218}; there is no truncation step
+\src{pcs.rs:1267-1272}; and the pristine directory is absent from the
+repository \finding{I-02}. The module header still states that the adapter's
+\code{ZK} is \code{true} \src{pcs.rs:13-16}.
+\end{specdelta}
+
+\begin{specdelta}[Stated security target]
+\label{delta:ps-128}
+The settlement module header says \code{SECURITY\_LEVEL} is ``set directly to
+the 128-bit target'' \src{crates/prover/src/whir.rs:44-46}; the constant is $96$
+and the effective value is the env-overridable \code{security\_level()}
+\src{whir.rs:120-131} \finding{I-01}.
+\end{specdelta}
+
+\begin{specdelta}[Two grinding-budget arities for the settlement layer]
+\label{delta:ps-slack}
+The production settlement config derives $\mathsf{PoW}$ at
+$n+\code{ZK\_ARITY\_SLACK} = n+2$ \src{whir.rs:337}, while the semantic/export
+parameters use $n+\code{NON\_ZK\_ARITY\_SLACK} = n+1$
+\src{settlement\_replay.rs:169-172}; the comment above the latter says
+\code{ZK\_ARITY\_SLACK} \src{settlement\_replay.rs:132-134}. Whether the two
+yield the same \code{pow\_bits} at the deployed sizes was not evaluated here.
+\end{specdelta}
