@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "engagement_id": "toy-zk-rollup-2026-10-09",
-  "phase": "verification_in_progress",
+  "phase": "reporting_in_progress",
   "targets": [
     "contracts/src (ShieldedPool, BlockStatement, LimbCodec, verifier/*)",
     "contracts/lib/sol-whir-p3 (field, transcript)",
@@ -168,73 +168,130 @@
     {
       "id": "V-01",
       "severity": "Critical",
-      "summary": "On-chain settlement verifier is not bound to the block circuit: CONFIG (verifying-key digest, WHIR schedules, constraint programs) is read from the caller-supplied bundle and never pinned; applyBlock is permissionless. PoC: forge test applies a proof of a constraint-free circuit and rewrites both pool roots. (was F-01)"
+      "summary": "On-chain settlement verifier is not bound to the block circuit: CONFIG (verifying-key digest, WHIR schedules, constraint programs) is read from the caller-supplied bundle and never pinned; applyBlock is permissionless. PoC: forge test applies a proof of a constraint-free circuit and rewrites both pool roots. (was F-01)",
+      "report_ref": "zk-findings/reports/toy-zk-rollup-crypto-audit-report-2026-10-09.md#v-01"
     },
     {
       "id": "V-02",
       "severity": "Critical",
-      "summary": "WHIR per-matrix opening points are taken from the bundle STATEMENT section and never tied to the transcript zeta, while the constraint identity is evaluated at zeta. Experiment: an opening point in the real block bundle was changed to z'!=zeta and verify() still returned true. (was F-02)"
+      "summary": "WHIR per-matrix opening points are taken from the bundle STATEMENT section and never tied to the transcript zeta, while the constraint identity is evaluated at zeta. Experiment: an opening point in the real block bundle was changed to z'!=zeta and verify() still returned true. (was F-02)",
+      "report_ref": "zk-findings/reports/toy-zk-rollup-crypto-audit-report-2026-10-09.md#v-02"
     },
     {
       "id": "V-03",
       "severity": "Critical",
-      "summary": "Each opening round's WHIR commitment (root) is read from PROOF and never compared with the trace/quotient/preprocessed/permutation digests absorbed in the batch transcript, so a prover may open freshly-committed (incl. preprocessed/fixed) columns after zeta is known. Structural + honest-bundle + junk-root experiment. (was F-03)"
+      "summary": "Each opening round's WHIR commitment (root) is read from PROOF and never compared with the trace/quotient/preprocessed/permutation digests absorbed in the batch transcript, so a prover may open freshly-committed (incl. preprocessed/fixed) columns after zeta is known. Structural + honest-bundle + junk-root experiment. (was F-03)",
+      "report_ref": "zk-findings/reports/toy-zk-rollup-crypto-audit-report-2026-10-09.md#v-03"
     },
     {
       "id": "V-04",
       "severity": "Critical",
-      "summary": "Pruned QFOLD/MROOTS query walk de-duplicates repeated query indices without checking the duplicate rows agree (p3 rejects InconsistentDuplicateOpenings). Experiment: depth-2 tree with indices [1,1] accepts mismatched rows. (was F-04)"
+      "summary": "Pruned QFOLD/MROOTS query walk de-duplicates repeated query indices without checking the duplicate rows agree (p3 rejects InconsistentDuplicateOpenings). Experiment: depth-2 tree with indices [1,1] accepts mismatched rows. (was F-04)",
+      "report_ref": "zk-findings/reports/toy-zk-rollup-crypto-audit-report-2026-10-09.md#v-04"
     },
     {
       "id": "V-05",
       "severity": "Critical",
-      "summary": "LogUp terminal count is proof-chosen; the terminal-sum check and transcript absorb all terminals but the constraint identity consumes only the first #hasTerminal, with no tIdx==nTerm check, so appended compensating terminals defeat the sum-zero check. Experiment on satellite code. (was F-05)"
+      "summary": "LogUp terminal count is proof-chosen; the terminal-sum check and transcript absorb all terminals but the constraint identity consumes only the first #hasTerminal, with no tIdx==nTerm check, so appended compensating terminals defeat the sum-zero check. Experiment on satellite code. (was F-05)",
+      "report_ref": "zk-findings/reports/toy-zk-rollup-crypto-audit-report-2026-10-09.md#v-05"
     },
     {
       "id": "V-06",
       "severity": "Critical",
-      "summary": "Block circuit verifies child proofs against a client-supplied verifier object and never pins the child preprocessed commitment (child VK) in the recursion circuit; per-transfer data is baked as preprocessed constants, so no canonical child VK exists and a same-shape child of any relation is accepted. Survives a CONFIG pin. (B-01 = C-01)"
+      "summary": "Block circuit verifies child proofs against a client-supplied verifier object and never pins the child preprocessed commitment (child VK) in the recursion circuit; per-transfer data is baked as preprocessed constants, so no canonical child VK exists and a same-shape child of any relation is accepted. Survives a CONFIG pin. (B-01 = C-01)",
+      "report_ref": "zk-findings/reports/toy-zk-rollup-crypto-audit-report-2026-10-09.md#v-06"
     },
     {
       "id": "V-07",
       "severity": "Critical",
-      "summary": "In-circuit Poseidon2 sponge is not a function of its input on the shared D4 table: the chain-start capacity (IV) is unconstrained for ordinary sponge rows and the partial final-chunk carry coefficients are unbound, so nullifiers are malleable and one note can be re-spent without limit. (B-02)"
+      "summary": "In-circuit Poseidon2 sponge is not a function of its input on the shared D4 table: the chain-start capacity (IV) is unconstrained for ordinary sponge rows and the partial final-chunk carry coefficients are unbound, so nullifiers are malleable and one note can be re-spent without limit. (B-02)",
+      "report_ref": "zk-findings/reports/toy-zk-rollup-crypto-audit-report-2026-10-09.md#v-07"
     },
     {
       "id": "V-08",
       "severity": "Critical",
-      "summary": "Binary Merkle paths in the Poseidon2 circuit AIR bind neither the leaf digest nor the direction bits (mmcs_index_sum always None; input-limb sends zeroed on Merkle rows; first path row new_start), making every in-circuit WHIR query/opening check vacuous. Upstream defect, reachable on the WHIR (binary) path. (C-02)"
+      "summary": "Binary Merkle paths in the Poseidon2 circuit AIR bind neither the leaf digest nor the direction bits (mmcs_index_sum always None; input-limb sends zeroed on Merkle rows; first path row new_start), making every in-circuit WHIR query/opening check vacuous. Upstream defect, reachable on the WHIR (binary) path. (C-02)",
+      "report_ref": "zk-findings/reports/toy-zk-rollup-crypto-audit-report-2026-10-09.md#v-08"
     }
   ],
   "fp_check_verdicts": [
     {
       "id": "V-01",
       "verdict": "TRUE POSITIVE",
-      "rationale": "forge PoC applies forged block; 2/2 pass"
+      "rationale": "in-repo forge PoC (2/2 PASS) + prover generator"
     },
     {
       "id": "V-02",
       "verdict": "TRUE POSITIVE",
-      "rationale": "opening point z'!=zeta still verifies on real bundle"
+      "rationale": "executed experiment on real bundle (scratch); port pending"
+    },
+    {
+      "id": "V-03",
+      "verdict": "TRUE POSITIVE (structural+experiment)",
+      "rationale": "no digest comparison; junk root rejected only at Merkle stage"
+    },
+    {
+      "id": "V-04",
+      "verdict": "TRUE POSITIVE",
+      "rationale": "executed depth-2 duplicate-index experiment"
+    },
+    {
+      "id": "V-05",
+      "verdict": "TRUE POSITIVE",
+      "rationale": "executed extra-terminal experiments"
+    },
+    {
+      "id": "V-06",
+      "verdict": "TRUE POSITIVE (structural, PoC pending)",
+      "rationale": "child cap allocated as unconstrained public input; pin never called"
+    },
+    {
+      "id": "V-07",
+      "verdict": "TRUE POSITIVE (structural, PoC pending)",
+      "rationale": "capacity pin gated on challenger rows; ALU recomposition leaves tail free"
+    },
+    {
+      "id": "V-08",
+      "verdict": "TRUE POSITIVE (structural, PoC pending)",
+      "rationale": "input sends zeroed on Merkle rows; index-sum always None; upstream"
+    },
+    {
+      "id": "H-01",
+      "verdict": "TRUE POSITIVE",
+      "rationale": "in-repo forge PoC"
+    },
+    {
+      "id": "M-01",
+      "verdict": "TRUE POSITIVE",
+      "rationale": "in-repo forge PoC"
     }
   ],
   "artifacts": {
-    "reports": [],
-    "pocs": [
-      "crates/prover/tests/poc_audit_f01.rs",
-      "contracts/test/audit/PocF01ForgedBlock.t.sol",
-      "contracts/test/vectors/audit/poc_f01_forged_bundle.bin",
-      "contracts/test/vectors/audit/poc_f01_forged_block.json"
+    "reports": [
+      "zk-findings/reports/toy-zk-rollup-crypto-audit-report-2026-10-09.md"
     ],
-    "index_refs": []
+    "pocs": [
+      "contracts/test/audit/PocD01SettlementAccess.t.sol",
+      "contracts/test/audit/PocF01ForgedBlock.t.sol",
+      "contracts/test/vectors/audit/poc_f01_forged_block.json",
+      "contracts/test/vectors/audit/poc_f01_forged_bundle.bin",
+      "crates/prover/tests/poc_audit_f01.rs"
+    ],
+    "index_refs": [
+      "zkbugs/openvm-org/openvm/GHSA-4w7p-8f9q-f4g2",
+      "zkbugs/succinctlabs/sp1/ghsa-8m24-3cfx-9fjw",
+      "external/gnark/audit-contests/missing-public-instance-binding",
+      "external/risc0/zellic/private-witness-logged"
+    ]
   },
   "remediation_verifications": [],
   "next_steps": [
-    "Write LaTeX spec section-by-section (workflow).",
-    "Write audit report under zk-findings/reports.",
-    "Closeout session."
+    "Compile spec PDF once workflow completes; commit.",
+    "Port scratch experiments V-02..V-05, M-03, M-04 into contracts/test/audit/.",
+    "Execute sketched PoCs for V-06, V-07, V-08 (circuit-level).",
+    "Closeout."
   ],
-  "updated_at": "2026-10-09T15:30:00Z",
+  "updated_at": "2026-10-09T16:40:00Z",
   "extensions": {
     "methodology": "zkcrypto-audit (github.com/Yue-Zhou1/zkcrypto-audit), staged flow router->context->spec-delta->domain->fp-check->report->zkbugs-index",
     "head_commit": "a54c1976b875f73beafa3aeab5521866ed971399",
