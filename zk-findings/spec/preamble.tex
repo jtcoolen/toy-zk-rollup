@@ -21,7 +21,18 @@
 \newcommand{\limbs}{\mathsf{limbs}}
 \newcommand{\code}[1]{\texttt{#1}}
 % Source citations are long monospace paths. \path is fragile inside other
-% macros' arguments, so keep \texttt and instead permit a line break before and
-% after each citation (the overflow came from runs of consecutive citations).
-\newcommand{\src}[1]{\allowbreak{\small\textcolor{gray}{[\texttt{#1}]}}\allowbreak}
+% macros' arguments, so instead walk the token list (expl3) and insert a
+% discretionary break after every / . , - so a citation can wrap inside a
+% table cell or a citation-dense paragraph. \_ (escaped underscore) is a single
+% control-sequence token and is left untouched.
+\ExplSyntaxOn
+\NewDocumentCommand{\src}{m}{
+  \tl_set:Nn \l_tmpa_tl {#1}
+  \tl_replace_all:Nnn \l_tmpa_tl {/} {/\allowbreak}
+  \tl_replace_all:Nnn \l_tmpa_tl {.} {.\allowbreak}
+  \tl_replace_all:Nnn \l_tmpa_tl {,} {,\allowbreak}
+  \tl_replace_all:Nnn \l_tmpa_tl {-} {-\allowbreak}
+  \allowbreak{\small\textcolor{gray}{[\texttt{\tl_use:N \l_tmpa_tl}]}}\allowbreak
+}
+\ExplSyntaxOff
 \newcommand{\finding}[1]{\textbf{[#1]}}
