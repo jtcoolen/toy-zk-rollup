@@ -76,6 +76,21 @@ contract WhirVerifierTest is Test {
         verifier.verify(bad, _bundle());
     }
 
+    /// M-03 regression: a statement word congruent to the proof's public value
+    /// mod p but not canonical (pv + p) must NOT verify. Before the fix the
+    /// bare mulmod comparison accepted it, so one proof verified for many
+    /// statement arrays and the raw non-canonical word reached the constraint
+    /// identity as an AIR public value.
+    function test_verify_rejects_noncanonical_statement_alias() public {
+        uint256[] memory bad = new uint256[](3);
+        bad[0] = 0;
+        bad[1] = 1;
+        // FIELD_P = 2130706433: congruent to 377841674 mod p, not canonical.
+        bad[2] = 377841674 + 2130706433;
+        vm.expectRevert(abi.encodeWithSelector(WhirVerifier.StatementMismatch.selector, 2));
+        verifier.verify(bad, _bundle());
+    }
+
     /// Flipping a bit deep inside the proof section breaks a Merkle root or a
     /// fold, so the walk reverts somewhere in the round replay.
     function test_verify_rejects_tampered_proof() public {

@@ -523,12 +523,21 @@ contract WhirVerifier is IWhirVerifier {
     /// statement". The blob stores them as u32 LE words in Montgomery form -
     /// p3's challenger serializes the internal representation - while the
     /// statement is canonical, so the comparison converts.
+    ///
+    /// M-03: every statement word must be CANONICAL (< p) as well as congruent.
+    /// A congruent-but-non-canonical word (pv + k*p) passes a bare mulmod
+    /// comparison, so one proof would verify against many statement arrays
+    /// (malleability), and the raw word reaches the constraint identity as an
+    /// AIR public value the transcript never absorbed (the satellite packs it
+    /// with shl(224, raw) without reducing). The honest statement is canonical
+    /// by construction, so this only rejects aliases.
     function _checkStatement(bytes memory pvBytes, uint256[] calldata statement) private pure {
         uint256 pvCount = pvBytes.length / 4;
         if (statement.length != pvCount) {
             revert StatementLengthMismatch(pvCount, statement.length);
         }
         for (uint256 i; i < pvCount; ++i) {
+            if (statement[i] >= FIELD_P) revert StatementMismatch(i);
             uint256 v;
             assembly ("memory-safe") {
                 v := shr(224, mload(add(add(pvBytes, 32), mul(i, 4))))

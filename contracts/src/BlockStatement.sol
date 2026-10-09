@@ -86,8 +86,19 @@ library BlockStatement {
         // the fold already covers the child statements they describe, and the
         // length check below pins the header to the statement that ships with
         // it. A header that disagrees with the statement cannot decode.
+        //
+        // M-03: the counts are still RANGE-CHECKED, not skipped. The circuit
+        // exports each one through u16::try_from (crates/prover/src/block.rs,
+        // shape_header), so an honest statement's header limbs are all <=
+        // 0xffff. An unchecked header position is an F_p value the pool never
+        // looks at but the constraint identity consumes raw - pinning the
+        // range removes it as a degree of freedom even for a caller that
+        // skipped the proof check.
         uint256 cursor = 1 + 2 * n;
         require(statement.length == expectedLen(n), "statement length disagrees with header");
+        for (uint256 i = 1; i < cursor; ++i) {
+            require(statement[i] <= type(uint16).max, "shape count out of range");
+        }
 
         block_.numTransfers = n;
         block_.statementRoot = statement.digestFromLimbs(cursor);

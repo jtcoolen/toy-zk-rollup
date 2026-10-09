@@ -151,6 +151,27 @@ contract ShieldedPoolTest is Test {
         assertEq(b.totalFee, fee, "totalFee");
     }
 
+    /// M-03 regression: the shape-count header limbs are u16 in the circuit
+    /// (shape_header uses u16::try_from), so decode must reject an out-of-range
+    /// count instead of skipping it. An unchecked header position is an F_p
+    /// value the pool never reads but the constraint identity consumes raw.
+    function test_decode_rejects_out_of_range_shape_count() public {
+        uint256[] memory bad = new uint256[](statement.length);
+        for (uint256 i; i < statement.length; ++i) {
+            bad[i] = statement[i];
+        }
+        // Position 1 is transfer 0's input count: one past the u16 bound.
+        bad[1] = 0x1_0000;
+        vm.expectRevert("shape count out of range");
+        decoder.decode(bad);
+
+        // Position 2 is transfer 0's output count: a full field element.
+        bad[1] = statement[1];
+        bad[2] = 2130706432;
+        vm.expectRevert("shape count out of range");
+        decoder.decode(bad);
+    }
+
     /// The fold root the decoder reads must be the digest the prover recorded -
     /// the statement own limbs and the native fold agree byte for byte. The
     /// contract cannot open the fold; pinning it against the prover own value
