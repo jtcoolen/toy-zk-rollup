@@ -25,8 +25,10 @@
 //! * The token signing key comes from `NODE_TOKEN_KEY_FILE` (0600 enforced on
 //!   read) or `NODE_TOKEN_KEY` (hex), held in `Zeroizing` and wiped as soon
 //!   as the signer is built.
-//! * Bodies are capped at 1 MiB; requests are rate-limited per role and
-//!   endpoint so a submit flood cannot starve reads.
+//! * Bodies are capped at 1 MiB; requests are rate-limited per client and
+//!   endpoint (M-11: keyed by token fingerprint, or by peer address when
+//!   unauthenticated, with a separate stricter quota for anonymous traffic)
+//!   so one client cannot starve another of a shared role's quota.
 //! * The node holds **no L1 keys**: settlement is `eth_sendTransaction` from
 //!   a configured unlocked sender (D-080). A failed settlement keeps its
 //!   artifact and is never blind-resent.
@@ -46,7 +48,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -54,6 +56,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use governor::{Quota, RateLimiter};
 use nonzero_ext::nonzero;
+use sha2::Digest as _;
 use p3_field::PrimeField32;
 use pq_hash::{Poseidon2Commitment, Poseidon2Shielded};
 use prover::client::{prove_client_transfer, ClientSpec};
@@ -516,14 +519,33 @@ impl Actor {
 // HTTP
 // ---------------------------------------------------------------------------
 
-/// The keyed rate limiter: per role+endpoint, so a submit flood cannot
-/// starve reads. `governor` 0.10 ships no axum layer, so the check is a
-/// hand-rolled call in the guard middleware below.
+/// The keyed rate limiter: per **client** and endpoint (M-11), so one token
+/// holder cannot exhaust the quota of everyone sharing its role, and a
+/// submit flood cannot starve reads. `governor` 0.10 ships no axum layer,
+/// so the check is a hand-rolled call in the guard middleware below.
 type Limiter = RateLimiter<
     String,
     governor::state::keyed::DefaultKeyedStateStore<String>,
     governor::clock::DefaultClock,
 >;
+
+/// M-11: the limiter key is the client identity, not the role. Authenticated
+/// traffic keys on a fingerprint of the bearer token (never the token
+/// itself); unauthenticated traffic keys on the peer address. Two clients
+/// with the same role therefore get independent buckets.
+fn rate_key(token: Option<&str>, peer: Option<std::net::IpAddr>, path: &str) -> String {
+    match token {
+        Some(t) => {
+            let digest = sha2::Sha256::digest(t.as_bytes());
+            let mut fp = String::with_capacity(16);
+            for b in &digest[..8] {
+                fp.push_str(&format!("{b:02x}"));
+            }
+            format!("tok {fp} {path}")
+        }
+        None => format!("ip {} {path}", peer.map_or("?".into(), |p| p.to_string())),
+    }
+}
 
 /// Shared state for every handler: cheap handles, no sequencer.
 #[derive(Clone)]
@@ -533,6 +555,9 @@ struct AppState {
     signer: Arc<TokenSigner>,
     snapshot: Arc<std::sync::RwLock<Snapshot>>,
     limiter: Arc<Limiter>,
+    /// M-11: separate stricter bucket for unauthenticated / failed-auth
+    /// traffic, so anonymous junk cannot hammer the auth path unbounded.
+    anon_limiter: Arc<Limiter>,
     metrics: Arc<metrics_exporter_prometheus::PrometheusHandle>,
 }
 
@@ -540,11 +565,25 @@ struct AppState {
 /// in the policy is a 404 (we do not confirm it exists), and a token below
 /// the required role is a 403. Failures are counted by reason so the
 /// dashboard can tell a flood of junk from an expired operator token.
+///
+/// M-11: the bucket is keyed by client identity (token fingerprint, else
+/// peer IP), never by role — one holder of a role cannot starve the others.
+/// Auth failures are rate-limited too, on a separate stricter bucket, so
+/// unauthenticated junk cannot be replayed unbounded.
 async fn guard(State(st): State<AppState>, req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
     let Some(required) = st.acl.required_role(&path) else {
         return (StatusCode::NOT_FOUND, "no such endpoint").into_response();
     };
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    let bearer = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "));
     let authed = (|| -> Result<Role, (StatusCode, &'static str)> {
         let header = req
             .headers()
@@ -565,14 +604,19 @@ async fn guard(State(st): State<AppState>, req: Request, next: Next) -> Response
                 (status, reason)
             })
     })();
-    let role = match authed {
-        Ok(r) => r,
-        Err((status, reason)) => {
-            ::metrics::counter!(names::AUTH_FAILURES, "reason" => reason).increment(1);
-            return (status, "token rejected").into_response();
+    if let Err((status, reason)) = authed {
+        ::metrics::counter!(names::AUTH_FAILURES, "reason" => reason).increment(1);
+        // M-11: unauthenticated traffic is limited too — on its own
+        // stricter bucket, keyed by peer — so junk cannot be replayed
+        // unbounded against the auth path.
+        let anon_key = rate_key(None, peer, &path);
+        if st.anon_limiter.check_key(&anon_key).is_err() {
+            ::metrics::counter!(names::RATE_LIMITED, "endpoint" => path).increment(1);
+            return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
         }
-    };
-    let key = format!("{role:?} {path}");
+        return (status, "token rejected").into_response();
+    }
+    let key = rate_key(bearer, peer, &path);
     if st.limiter.check_key(&key).is_err() {
         ::metrics::counter!(names::RATE_LIMITED, "endpoint" => path).increment(1);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
@@ -765,12 +809,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let limiter = Arc::new(RateLimiter::keyed(
         Quota::per_second(nonzero!(20u32)).allow_burst(nonzero!(40u32)),
     ));
+    // M-11: anonymous traffic gets its own, stricter quota (per peer).
+    let anon_limiter = Arc::new(RateLimiter::keyed(
+        Quota::per_second(nonzero!(4u32)).allow_burst(nonzero!(8u32)),
+    ));
     let st = AppState {
         tx: cmd_tx,
         acl: Arc::new(Acl::default_policy()),
         signer,
         snapshot: snapshot.clone(),
         limiter,
+        anon_limiter,
         metrics: metrics_handle,
     };
     let app = build_router(st.clone(), &config.cors_origins);
@@ -824,7 +873,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
     tracing::info!(addr = %config.addr, settle = config.settle, "node listening");
-    axum::serve(listener, app)
+    // M-11: ConnectInfo gives the guard a peer address to key anonymous
+    // traffic on.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
@@ -883,4 +937,31 @@ fn write_genesis_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     std::fs::write(&out, serde_json::to_string_pretty(&doc)?)?;
     eprintln!("wrote {out} ({} leaves)", leaves.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rate_key;
+
+    /// M-11 regression: the limiter key is the client identity, not the
+    /// role. Two different tokens get different buckets even on the same
+    /// path; the same token always maps to the same bucket; the token
+    /// itself never appears in the key (it is a fingerprint); anonymous
+    /// traffic keys on the peer address.
+    #[test]
+    fn rate_key_is_per_client_not_per_role() {
+        let ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let other: std::net::IpAddr = "198.51.100.9".parse().unwrap();
+        let a = rate_key(Some("token-aaa"), Some(ip), "/v1/transfer");
+        let b = rate_key(Some("token-bbb"), Some(ip), "/v1/transfer");
+        let a2 = rate_key(Some("token-aaa"), Some(ip), "/v1/transfer");
+        assert_ne!(a, b, "two tokens must not share a bucket");
+        assert_eq!(a, a2, "one token is one bucket");
+        assert!(!a.contains("token-aaa"), "the key is a fingerprint");
+        assert!(a.starts_with("tok "), "authenticated keying");
+        let anon = rate_key(None, Some(ip), "/v1/transfer");
+        let anon2 = rate_key(None, Some(other), "/v1/transfer");
+        assert!(anon.starts_with("ip 203.0.113.7"), "peer keying");
+        assert_ne!(anon, anon2, "two peers must not share a bucket");
+    }
 }
