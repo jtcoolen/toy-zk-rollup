@@ -1,0 +1,111 @@
+{
+  "schema_version": 2,
+  "engagement_id": "toy-zk-rollup-2026-10-09",
+  "phase": "domain_in_progress",
+  "targets": [
+    "contracts/src (ShieldedPool, BlockStatement, LimbCodec, verifier/*)",
+    "contracts/lib/sol-whir-p3 (field, transcript)",
+    "crates/prover (transfer, block, recursion glue, exporters)",
+    "crates/shielded, crates/pq-hash",
+    "vendor/p3-recursion (patched Plonky3-recursion @ 8f9876ef)",
+    "crates/node, crates/pq-sign, crates/vault, crates/wallet-wasm, extension/"
+  ],
+  "trust_boundaries": [
+    {
+      "name": "L1 caller -> ShieldedPool.applyBlock",
+      "assumption": "Any EOA can call applyBlock; the only gate is IWhirVerifier.verify(statement, proof).",
+      "evidence": "contracts/src/ShieldedPool.sol:139 (no access control)"
+    },
+    {
+      "name": "proof bundle -> WhirVerifier.verify",
+      "assumption": "The whole bundle (CONFIG, PROOF, STATEMENT sections) is caller-controlled calldata; soundness requires CONFIG to be pinned to the honest block circuit.",
+      "evidence": "contracts/src/verifier/WhirVerifier.sol:21-26, 209-321"
+    },
+    {
+      "name": "client transfer proof -> block circuit",
+      "assumption": "Child proofs are produced by the wallet (or by the node on the demo path) and re-verified in-circuit with a verifier retained by the node.",
+      "evidence": "crates/prover/src/block.rs:379-620"
+    },
+    {
+      "name": "wallet -> node HTTP API",
+      "assumption": "Submitter-token holders post SPHINCS+ envelopes; admin holds demo prover and settlement.",
+      "evidence": "crates/node/src/main.rs:717-735"
+    },
+    {
+      "name": "node env -> prover soundness parameters",
+      "assumption": "WHIR security level, soundness regime, rates and PoW floors are read from process environment variables in library code.",
+      "evidence": "crates/prover/src/whir.rs:126-189, crates/prover/src/whir_recursion.rs:186,314,345"
+    }
+  ],
+  "critical_paths": [
+    {
+      "id": "CP-1",
+      "name": "On-chain settlement verification",
+      "entry": "ShieldedPool.applyBlock -> WhirVerifier.verify -> TerminalWeight",
+      "risk": "proof forgery / state corruption"
+    },
+    {
+      "id": "CP-2",
+      "name": "Block circuit: in-circuit child verification, root chaining, statement fold",
+      "entry": "crates/prover/src/block.rs:build_multi_transfer_circuit",
+      "risk": "under-constrained state transition"
+    },
+    {
+      "id": "CP-3",
+      "name": "Transfer circuit: ownership, membership, nullifier non-membership, conservation, append",
+      "entry": "crates/prover/src/transfer.rs, nullifier_gadget.rs, commitment_gadget.rs",
+      "risk": "inflation / double spend"
+    },
+    {
+      "id": "CP-4",
+      "name": "Recursive WHIR verifier circuit and ZK patch",
+      "entry": "vendor/p3-recursion/recursion/src/pcs/whir/**",
+      "risk": "recursion soundness / privacy"
+    },
+    {
+      "id": "CP-5",
+      "name": "Node admission, settlement submitter, auth, vault",
+      "entry": "crates/node/src/*, crates/vault, crates/wallet-wasm",
+      "risk": "authorization / key custody"
+    }
+  ],
+  "unresolved_assumptions": [
+    "Which CONFIG digest(s) a production deployment is meant to accept (block circuits differ per shape: n and (nin,nout) per child).",
+    "Whether SPHINCS+ spend authorization is meant to be enforced by the proof or only by the node.",
+    "Whether the settlement (non-ZK since a54c197) proof witnesses any secret material."
+  ],
+  "route_dispositions": [],
+  "open_findings": [
+    {
+      "id": "F-01",
+      "status": "candidate",
+      "summary": "WhirVerifier takes the circuit description (CONFIG: preprocessed digest, degree bits, WHIR schedules, constraint programs) from the caller-supplied bundle and never pins it; applyBlock is permissionless; any party can prove an arbitrary circuit whose public values form a block statement and rewrite both pool roots.",
+      "owner_skill": "onchain-verifier-auditor"
+    },
+    {
+      "id": "F-02",
+      "status": "candidate",
+      "summary": "WHIR opening points (per-matrix zeta / zeta_next) used to build the terminal-weight eq groups are read from the caller-supplied STATEMENT section of the bundle (TerminalWeight.deriveGroupDescs, TerminalWeight.sol:186-192) while the constraint identity rescales the bound evaluations with the transcript zeta (TerminalWeight.sol:1100-1149); no comparison between the two was found. Needs fp-check: if confirmed, the PCS claims are not bound to the DEEP point even with CONFIG pinned.",
+      "owner_skill": "onchain-verifier-auditor"
+    }
+  ],
+  "verified_findings": [],
+  "fp_check_verdicts": [],
+  "artifacts": {
+    "reports": [],
+    "pocs": [],
+    "index_refs": []
+  },
+  "remediation_verifications": [],
+  "next_steps": [
+    "Collect domain auditor contracts (A: Solidity verifier, B: circuits, C: vendored recursion, D: application).",
+    "Run poc_f01 generator and forge PoC.",
+    "crypto-fp-check every surviving candidate; PoCs for High/Critical.",
+    "Write LaTeX specification and report."
+  ],
+  "updated_at": "2026-10-09T13:55:00Z",
+  "extensions": {
+    "methodology": "zkcrypto-audit (github.com/Yue-Zhou1/zkcrypto-audit), staged flow router->context->spec-delta->domain->fp-check->report->zkbugs-index",
+    "head_commit": "a54c1976b875f73beafa3aeab5521866ed971399"
+  }
+}
