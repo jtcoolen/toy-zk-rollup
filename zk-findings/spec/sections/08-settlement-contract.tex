@@ -136,8 +136,8 @@ call, so no step's effect persists unless all steps succeed.
   & \src{ShieldedPool.sol:165-166} \\
 6 & $N := N+1$ (in an \code{unchecked} block).
   & \src{ShieldedPool.sol:168-170} \\
-7 & emit \code{BlockApplied}$(N, B.\code{rootBefore}, B.\code{rootAfter},
-    B.\code{nullifierBefore}, B.\code{nullifierAfter}, B.\code{totalFee})$
+7 & emit \code{BlockApplied}$(N,\allowbreak\ B.\code{rootBefore},\allowbreak\ B.\code{rootAfter},\allowbreak\
+    B.\code{nullifierBefore},\allowbreak\ B.\code{nullifierAfter},\allowbreak\ B.\code{totalFee})$
     with the incremented $N$.
   & \src{ShieldedPool.sol:171-178} \\
 \bottomrule
@@ -257,6 +257,7 @@ relation's value conservation.
 
 \begin{definition}[Event]
 \label{def:pool-event}
+\mbox{}\par\nobreak
 \begin{Verbatim}[fontsize=\small]
 event BlockApplied(
     uint256 indexed blockNumber,
@@ -390,6 +391,7 @@ $s = (s_0,\dots,s_{L-1})$ of \code{u64} and a byte string $b$:
 
 \begin{definition}[\code{applyBlock} calldata]
 \label{def:settle-calldata}
+\mbox{}\par\nobreak
 \begin{equation}
   \mathsf{cd}(S,\pi) \;=\; \code{0x0cb000b5}\ \|\ \mathsf{w}(\code{0x40})\ \|\
   \mathsf{w}\big(\code{0x40} + 32(L+1)\big)\ \|\ \mathsf{arr}(S)\ \|\ \mathsf{byt}(\pi),
