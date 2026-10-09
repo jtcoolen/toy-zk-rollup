@@ -104,6 +104,11 @@ contract TerminalWeight {
     error SiblingCountMismatch(uint256 expected, uint256 got);
     /// @notice The frontier walk did not collapse to a single root.
     error MrootsBadFrontier();
+    /// @notice Two openings share a query index but carry different rows
+    /// (different leaf digests, or different fold values). The reference
+    /// Merkle verifier rejects this (p3-merkle-tree InconsistentDuplicateOpenings);
+    /// silently keeping one would let an unauthenticated row enter the fold.
+    error InconsistentDuplicateOpenings();
 
     /// Derive the mode-2 group descriptors for one opening round.
     ///
@@ -325,10 +330,22 @@ contract TerminalWeight {
                 mstore(add(idxB, mul(j, 32)), ki)
                 mstore(add(digB, mul(j, 32)), kd)
             }
-            // Sorted-unique: duplicate query indices share one node.
+            // Sorted-unique: duplicate query indices share one node - but
+            // only if they open the SAME row. V-04: an equal index with a
+            // different leaf digest is InconsistentDuplicateOpenings (the
+            // reference mmcs check); silently keeping one would let an
+            // unauthenticated row enter the fold.
             let u := 0
             for { let i := 0 } lt(i, nq) { i := add(i, 1) } {
                 let ki := mload(add(idxB, mul(i, 32)))
+                if gt(i, 0) {
+                    if eq(ki, mload(add(idxB, mul(sub(i, 1), 32)))) {
+                        if iszero(eq(mload(add(digB, mul(i, 32))), mload(add(digB, mul(sub(u, 1), 32))))) {
+                            mstore(0, shl(224, 0xa5338969)) // InconsistentDuplicateOpenings()
+                            revert(0, 4)
+                        }
+                    }
+                }
                 if or(iszero(i), iszero(eq(ki, mload(add(idxB, mul(sub(i, 1), 32)))))) {
                     mstore(add(idxB, mul(u, 32)), ki)
                     mstore(add(digB, mul(u, 32)), mload(add(digB, mul(i, 32))))
@@ -646,25 +663,46 @@ contract TerminalWeight {
                 power := emul(power, gamma)
             }
             // --- amortized pruned Merkle walk (identical to _mroots) ---
-            // Insertion sort by index, carrying leaves.
+            // Insertion sort by index, carrying leaves AND fold values (the
+            // fold value was consumed by the dot product above; keeping it
+            // sorted lets the dedup compare it too - V-04).
             for { let i := 1 } lt(i, nq) { i := add(i, 1) } {
                 let ki := mload(add(idxB, mul(i, 32)))
                 let kd := mload(add(digB, mul(i, 32)))
+                let kf := mload(add(foldB, mul(i, 32)))
                 let j := i
                 for { } gt(j, 0) { } {
                     let pj := mload(add(idxB, mul(sub(j, 1), 32)))
                     if iszero(gt(pj, ki)) { break }
                     mstore(add(idxB, mul(j, 32)), pj)
                     mstore(add(digB, mul(j, 32)), mload(add(digB, mul(sub(j, 1), 32))))
+                    mstore(add(foldB, mul(j, 32)), mload(add(foldB, mul(sub(j, 1), 32))))
                     j := sub(j, 1)
                 }
                 mstore(add(idxB, mul(j, 32)), ki)
                 mstore(add(digB, mul(j, 32)), kd)
+                mstore(add(foldB, mul(j, 32)), kf)
             }
-            // Sorted-unique: duplicate query indices share one node.
+            // Sorted-unique: duplicate query indices share one node - but
+            // only if they open the SAME row: same leaf digest AND same fold
+            // value. V-04: an inconsistent duplicate is fatal (the reference
+            // mmcs InconsistentDuplicateOpenings); silently keeping one row
+            // would let the other's fold enter the claim unauthenticated.
             let u := 0
             for { let i := 0 } lt(i, nq) { i := add(i, 1) } {
                 let ki := mload(add(idxB, mul(i, 32)))
+                if gt(i, 0) {
+                    if eq(ki, mload(add(idxB, mul(sub(i, 1), 32)))) {
+                        if iszero(eq(mload(add(digB, mul(i, 32))), mload(add(digB, mul(sub(u, 1), 32))))) {
+                            mstore(0, shl(224, 0xa5338969)) // InconsistentDuplicateOpenings()
+                            revert(0, 4)
+                        }
+                        if iszero(eq(mload(add(foldB, mul(i, 32))), mload(add(foldB, mul(sub(u, 1), 32))))) {
+                            mstore(0, shl(224, 0xa5338969)) // InconsistentDuplicateOpenings()
+                            revert(0, 4)
+                        }
+                    }
+                }
                 if or(iszero(i), iszero(eq(ki, mload(add(idxB, mul(sub(i, 1), 32)))))) {
                     mstore(add(idxB, mul(u, 32)), ki)
                     mstore(add(digB, mul(u, 32)), mload(add(digB, mul(i, 32))))
