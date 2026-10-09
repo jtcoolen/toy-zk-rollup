@@ -109,6 +109,12 @@ contract TerminalWeight {
     /// Merkle verifier rejects this (p3-merkle-tree InconsistentDuplicateOpenings);
     /// silently keeping one would let an unauthenticated row enter the fold.
     error InconsistentDuplicateOpenings();
+    /// @notice The proof's terminal count disagrees with the number of
+    /// instances the CONFIG marks as having a terminal (V-05). The count is
+    /// fixed by the circuit shape; a bundle carrying more or fewer terminals
+    /// is not this circuit's proof, and extra terminals would be prover-chosen
+    /// values shifting every later challenge while the identity ignores them.
+    error TerminalCountMismatch(uint256 expected, uint256 got);
 
     /// Derive the mode-2 group descriptors for one opening round.
     ///
@@ -1113,9 +1119,16 @@ contract TerminalWeight {
             (busIds[i], p) = _leArr(p);
         }
         bool[] memory hasTerminal = new bool[](n);
+        uint256 expectedTerms = 0;
         for (uint256 i; i < n; ++i) {
             hasTerminal[i] = _leWordAt(p) != 0; p += 4;
+            if (hasTerminal[i]) expectedTerms++;
         }
+        // V-05: the terminal count is fixed by the circuit shape (one per
+        // instance with a LogUp terminal). The engine absorbed whatever the
+        // proof carried into the permutation phase, so pin the count here -
+        // CONFIG is the authority and this satellite is codehash-pinned.
+        if (nTerm != expectedTerms) revert TerminalCountMismatch(expectedTerms, nTerm);
         uint256 nr = _leWordAt(p); p += 4;
         if (nr == 0) revert BadIdentityFrame(2, nr, p);
         uint256[][] memory roundArities = new uint256[][](nr);
