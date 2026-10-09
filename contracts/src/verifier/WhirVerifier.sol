@@ -109,6 +109,14 @@ contract WhirVerifier is IWhirVerifier {
     /// line: everything before it is Fiat-Shamir bookkeeping.
     error TerminalClaimMismatch(uint256 expected, uint256 actual);
 
+    /// V-03: a WHIR round's opening root does not equal the commitment digest
+    /// the batch phase absorbed for that round's role (main, quotient,
+    /// preprocessed, permutation). The reference verifier opens the observed
+    /// commitments by construction; here the equality must be enforced or the
+    /// opened polynomials are bound to nothing (audit
+    /// toy-zk-rollup-crypto-audit-report-2026-10-09, V-03).
+    error RoundRootMismatch(uint256 round);
+
     /// The terminal-weight frame magic: ASCII "TWIGHT", matching TerminalWeight.
     uint256 private constant TERMINAL_MAGIC = 0x5457_4947_4854;
 
@@ -300,7 +308,7 @@ contract WhirVerifier is IWhirVerifier {
         // after the walk: keep them (one section per opening round; the
         // identity walk consumes them by role: main, quotient, pre, perm).
         uint256[][] memory boundEvalsOf;
-        (co, boundEvalsOf) = _runRounds(proof, co, po, t, stm);
+        (co, boundEvalsOf) = _runRounds(proof, co, po, t, stm, cfg, prf);
 
         // --- the constraint identity (D-076), on the satellite (batch 48) -------
         // The last layer of verify_batch: per instance, recompute every opened
@@ -330,7 +338,9 @@ contract WhirVerifier is IWhirVerifier {
         uint256 co,
         uint256 po,
         WhirVerifierCore.Transcript memory t,
-        StmRef memory stm
+        StmRef memory stm,
+        BatchCfg memory cfg,
+        BatchPrf memory prf
     ) private view returns (uint256 no, uint256[][] memory boundEvalsOf) {
         uint256 numRounds;
         (numRounds, no) = _word(proof, co);
@@ -343,6 +353,21 @@ contract WhirVerifier is IWhirVerifier {
             (c, no) = _decodeRoundCfg(proof, no);
             RoundPrf memory p;
             (p, po) = _decodeRoundPrf(proof, po);
+            // V-03: the round's opening root must BE the commitment the batch
+            // phase absorbed for this round's role. The identity satellite
+            // hardcodes the same schedule (r0 main, r1 quotient, r2
+            // preprocessed, r3 permutation) when it maps bound evaluations to
+            // opened values, and the honest wire satisfies it exactly; any
+            // other round count has no digest to bind and is rejected by the
+            // identity walk itself.
+            if (numRounds == 4) {
+                bytes32 expected;
+                if (r == 0) { expected = prf.mainDigest; }
+                else if (r == 1) { expected = prf.quotDigest; }
+                else if (r == 2) { expected = cfg.preDigest; }
+                else { expected = prf.permDigest; }
+                if (p.batchCommitment != expected) revert RoundRootMismatch(r);
+            }
             boundEvalsOf[r] = p.boundEvals;
             _runRound(t, c, p, stm, r);
         }

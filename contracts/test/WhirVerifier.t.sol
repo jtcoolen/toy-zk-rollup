@@ -105,6 +105,29 @@ contract WhirVerifierTest is Test {
         verifier.verify(statement, b);
     }
 
+    // V-03 regression: each round's opening root must equal the commitment
+    // digest the batch phase absorbed for that round's role (r0 main,
+    // r1 quotient, r2 preprocessed, r3 permutation). Offsets below are the
+    // digest BYTES of the round's batchCommitment blob in composed_bundle.bin
+    // (u32 length word at 133672 / 308824, digest payload right after).
+    // Before the fix a substituted root was rejected only later, by the
+    // round's own Merkle walk - never against the absorbed digest.
+    function test_verify_rejects_round_root_not_bound_to_digest() public {
+        bytes memory b = _bundle();
+        // Round 0 (main role): flip one digest byte.
+        b[133676] = b[133676] ^ hex"01";
+        vm.expectRevert(abi.encodeWithSelector(WhirVerifier.RoundRootMismatch.selector, 0));
+        verifier.verify(statement, b);
+    }
+
+    function test_verify_rejects_round1_root_not_bound_to_digest() public {
+        bytes memory b = _bundle();
+        // Round 1 (quotient role).
+        b[308828] = b[308828] ^ hex"01";
+        vm.expectRevert(abi.encodeWithSelector(WhirVerifier.RoundRootMismatch.selector, 1));
+        verifier.verify(statement, b);
+    }
+
     /// No satellite, no verifier: the constructor refuses a zero address and
     /// an address with no code, so a deployment can never pin nothing.
     function test_constructor_requires_a_pinned_satellite() public {
