@@ -3785,3 +3785,58 @@ Test alignment to the new canonical shape:
 **Suites: forge 173/173 PASS (35 s). cargo (release, canonical env): running.**
 
 Gas/wire unchanged this round: v8 wire 265,176 B, `test_gas_v8` 58,621,885.
+
+## Batch 90 — AUDIT FIXES: Solidity verifier + pool (audit toy-zk-rollup-crypto-audit-report-2026-10-09)
+
+Audit of a54c197 (branch claude/friendly-wright-zfku6d): 8 Critical / 3 High /
+11 Medium. All contract-side holes fixed on main, one commit each, negative
+test per fix. Check-only changes: no wire/format change, no vector regen.
+
+Verifier (WhirVerifier.sol), commits oldest-first:
+
+* **V-02** (11608fa) — every honest STATEMENT opening point satisfies
+  point[q] == zeta * G_L^q; _checkOpeningPoints rejects others
+  (OpeningPointMismatch). Audit PoC: arbitrary opening points.
+* **V-03** (9a07b2b) — per-round opening root must equal the batch-absorbed
+  commitment digest (RoundRootMismatch), only when numRounds==4.
+* **V-04** (dd57289) — duplicate openings deduped/inconsistent pairs rejected
+  (InconsistentDuplicateOpenings).
+* **V-05** (12cf3b2) — terminal count pinned (TerminalCountMismatch).
+* **M-03** (fbcbe1f) — every STATEMENT word canonical (< p):
+  NonCanonicalStatement. Closes the mod-p aliasing at the statement seam.
+* **M-04** (33cab92) — every proof-supplied ext lane range-checked < p at
+  decode incl. the compact path (NonCanonicalExt).
+* **M-05** (56a6964) — every WHIR shape quantity derived from the CONFIG and
+  asserted against the proof (RoundShapeMismatch(r, field), fields 1-24 in
+  _checkRoundShapes: boundEvals, OOD counts/lengths, pow witnesses, sumcheck
+  lengths, final poly, rows, paths incl. v8 pruned, roundCommitments, CONFIG
+  self-consistency) + PROOF/CONFIG cursor equality checks after decode.
+  Mirrors p3-whir pcs/verifier/mod.rs:247-368.
+* **V-01** (d21b2f8) — CONFIG is the circuit description; the engine now
+  carries immutable CONFIG_DIGEST = keccak256(CONFIG section bytes) and
+  rejects any bundle whose CONFIG differs (ConfigNotPinned) before decoding
+  anything. bytes32(0) = unpinned (tests only). Deploy.s.sol pins the block
+  vectors' digest 0xf9e90586...; e2e_local.sh exports the canonical WHIR env
+  so the node proves under the pinned shape. v6/v8 covered via WhirVerifierV6
+  re-framing. Gas: +~200K (CONFIG keccak); v8 staticcall 40.65M.
+
+Pool (ShieldedPool.sol):
+
+* **H-01** (221abea) — applyBlock operator-gated (isOperator, seeded with
+  feeRecipient, setOperator rotates operator-only, evented). Check order now
+  caller -> decode -> continuity -> verify: cheap checks before the ~100M-gas
+  replay bounds griefing (I-05 half). One scoped forge-lint suppression
+  (missing-events-access-control false positive on the emitted event).
+* **M-01 contract-side** (22a0171) — CHAIN_ID pinned at construction;
+  applyBlock reverts ChainMismatch on a foreign chain. The pool-address half
+  needs the statement schema to carry the binding: circuit-side.
+
+Not fixed here (circuit-side, tracked with V-06..V-08): V-06 child VK free
+witness, V-07 sponge capacity/partial-chunk, V-08 binary Merkle paths
+(upstream-shaped); H-02 append position; H-03 client VK embeds position/pk_d;
+M-06 node pipeline atomicity; M-07 hiding budget pooling; M-08 nullifier not
+position-bound; M-09 absence-fold depth; M-10 non-ZK settlement leakage;
+M-11 rate-limiter keying.
+
+Suite after all fixes: forge 192/192. test_gas_v8 41,651,135 gas (was
+41,135,861 pre-audit; +515K total from V-01..V-05/M-03..M-05 checks).
