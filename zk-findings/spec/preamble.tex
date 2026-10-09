@@ -1,0 +1,23 @@
+% Shared preamble for the extracted specification. Only packages shipped with
+% TinyTeX-1 are used (no tikz, listings, enumitem, algorithm*).
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs,longtable,tabularx,array}
+\usepackage{xcolor}
+\usepackage{fancyvrb}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+
+\newtheorem{definition}{Definition}[section]
+\newtheorem{property}{Property}[section]
+\theoremstyle{remark}
+\newtheorem{specdelta}{Spec delta}[section]
+
+\newcommand{\F}{\mathbb{F}_p}
+\newcommand{\K}{\mathbb{K}}
+\newcommand{\Hp}{H_{\mathsf{P2}}}
+\newcommand{\Cp}{C_{\mathsf{P2}}}
+\newcommand{\Hk}{H_{\mathsf{K}}}
+\newcommand{\limbs}{\mathsf{limbs}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\src}[1]{{\small\textcolor{gray}{[\texttt{#1}]}}}
+\newcommand{\finding}[1]{\textbf{[#1]}}

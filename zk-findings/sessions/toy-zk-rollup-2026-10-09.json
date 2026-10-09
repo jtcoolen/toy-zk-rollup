@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "engagement_id": "toy-zk-rollup-2026-10-09",
-  "phase": "domain_in_progress",
+  "phase": "verification_in_progress",
   "targets": [
     "contracts/src (ShieldedPool, BlockStatement, LimbCodec, verifier/*)",
     "contracts/lib/sol-whir-p3 (field, transcript)",
@@ -76,46 +76,146 @@
   ],
   "route_dispositions": [
     {
-      "skill": "crypto-audit-context",
-      "status": "observation",
-      "summary": "Context, trust boundaries and critical paths recorded.",
+      "skill": "onchain-verifier-auditor",
+      "status": "verified",
+      "summary": "V-01..V-05, M-03..M-05 on deployed WhirVerifier/TerminalWeight/ShieldedPool.",
       "evidence_refs": [
-        "zk-findings/sessions/toy-zk-rollup-2026-10-09.json"
+        "contracts/test/audit/",
+        "scratch/agentA"
+      ]
+    },
+    {
+      "skill": "zk-circuit-auditor",
+      "status": "verified",
+      "summary": "V-06,V-07,H-02,H-03,M-08,M-09 on transfer/block circuits.",
+      "evidence_refs": [
+        "crates/prover/src"
+      ]
+    },
+    {
+      "skill": "fiat-shamir-auditor",
+      "status": "verified",
+      "summary": "V-02,V-03,V-05 transcript binding gaps.",
+      "evidence_refs": [
+        "contracts/src/verifier/BatchTranscript.sol"
+      ]
+    },
+    {
+      "skill": "commitment-scheme-auditor",
+      "status": "verified",
+      "summary": "V-04,V-08 Merkle/opening authentication gaps.",
+      "evidence_refs": [
+        "contracts/src/verifier/StirOpenings.sol",
+        "vendor/p3-recursion"
+      ]
+    },
+    {
+      "skill": "proven-state-transition-auditor",
+      "status": "verified",
+      "summary": "H-01,M-01,M-06,L-04 settlement/liveness/DA.",
+      "evidence_refs": [
+        "contracts/src/ShieldedPool.sol",
+        "crates/node"
+      ]
+    },
+    {
+      "skill": "privacy-protocol-auditor",
+      "status": "verified",
+      "summary": "H-03,M-07,M-08,M-10 linkability/hiding.",
+      "evidence_refs": [
+        "crates/prover/src/transfer.rs"
+      ]
+    },
+    {
+      "skill": "pqc-signature-auditor",
+      "status": "observation",
+      "summary": "M-02 envelope not bound; SLH-DSA params (L-08).",
+      "evidence_refs": [
+        "crates/pq-sign",
+        "crates/node/src/wire.rs"
+      ]
+    },
+    {
+      "skill": "rust-crypto-safety",
+      "status": "observation",
+      "summary": "L-01,L-03,L-06 vault/token/zeroize.",
+      "evidence_refs": [
+        "crates/vault",
+        "crates/node/src/auth.rs"
+      ]
+    },
+    {
+      "skill": "dependency-auditor",
+      "status": "observation",
+      "summary": "L-08 pre-release slh-dsa; deny.toml gaps.",
+      "evidence_refs": [
+        "Cargo.toml",
+        "deny.toml"
+      ]
+    },
+    {
+      "skill": "spec-delta-checker",
+      "status": "observation",
+      "summary": "I-02 doc drift (SHA3 vs Poseidon2, operator set, PATCHES.md).",
+      "evidence_refs": [
+        "README.md",
+        "vendor/p3-recursion/PATCHES.md"
       ]
     }
   ],
-  "open_findings": [
-    {
-      "id": "F-02",
-      "status": "confirmed_by_experiment",
-      "summary": "WHIR opening points (per-matrix zeta / zeta_next) used to build the terminal-weight eq groups are read from the caller-supplied STATEMENT section of the bundle (TerminalWeight.deriveGroupDescs, TerminalWeight.sol:186-192) while the constraint identity rescales the bound evaluations with the transcript zeta (TerminalWeight.sol:1100-1149); no comparison between the two was found. Needs fp-check: if confirmed, the PCS claims are not bound to the DEEP point even with CONFIG pinned. UPDATE: agent A forge experiment (scratch test/agentA/StmPoint.t.sol) - replacing the round-1/2/3 statement-table opening point in block_composed_bundle.bin with z' != zeta still yields verify()==true; the STATEMENT section is never absorbed into the transcript.",
-      "owner_skill": "onchain-verifier-auditor"
-    },
-    {
-      "id": "F-03",
-      "status": "candidate",
-      "summary": "Per-round WHIR batchCommitment (WhirVerifier.sol:~1027) is read from PROOF and never compared with the mainDigest/quotDigest/permDigest absorbed by BatchTranscript (BatchTranscript.sol:91/100/124/139) or the CONFIG preDigest.",
-      "owner_skill": "onchain-verifier-auditor"
-    },
-    {
-      "id": "F-04",
-      "status": "candidate",
-      "summary": "QFOLD/MROOTS pruned query walk (TerminalWeight.sol:329-337, 665-673) dedups repeated query indices without checking the duplicate rows agree; p3-merkle-tree rejects InconsistentDuplicateOpenings (mmcs/mod.rs:563-572).",
-      "owner_skill": "onchain-verifier-auditor"
-    }
-  ],
+  "open_findings": [],
   "verified_findings": [
     {
-      "id": "F-01",
+      "id": "V-01",
       "severity": "Critical",
-      "summary": "Settlement verifier accepts proofs of any circuit (CONFIG not pinned) and applyBlock is permissionless: arbitrary caller rewrites both pool roots."
+      "summary": "On-chain settlement verifier is not bound to the block circuit: CONFIG (verifying-key digest, WHIR schedules, constraint programs) is read from the caller-supplied bundle and never pinned; applyBlock is permissionless. PoC: forge test applies a proof of a constraint-free circuit and rewrites both pool roots. (was F-01)"
+    },
+    {
+      "id": "V-02",
+      "severity": "Critical",
+      "summary": "WHIR per-matrix opening points are taken from the bundle STATEMENT section and never tied to the transcript zeta, while the constraint identity is evaluated at zeta. Experiment: an opening point in the real block bundle was changed to z'!=zeta and verify() still returned true. (was F-02)"
+    },
+    {
+      "id": "V-03",
+      "severity": "Critical",
+      "summary": "Each opening round's WHIR commitment (root) is read from PROOF and never compared with the trace/quotient/preprocessed/permutation digests absorbed in the batch transcript, so a prover may open freshly-committed (incl. preprocessed/fixed) columns after zeta is known. Structural + honest-bundle + junk-root experiment. (was F-03)"
+    },
+    {
+      "id": "V-04",
+      "severity": "Critical",
+      "summary": "Pruned QFOLD/MROOTS query walk de-duplicates repeated query indices without checking the duplicate rows agree (p3 rejects InconsistentDuplicateOpenings). Experiment: depth-2 tree with indices [1,1] accepts mismatched rows. (was F-04)"
+    },
+    {
+      "id": "V-05",
+      "severity": "Critical",
+      "summary": "LogUp terminal count is proof-chosen; the terminal-sum check and transcript absorb all terminals but the constraint identity consumes only the first #hasTerminal, with no tIdx==nTerm check, so appended compensating terminals defeat the sum-zero check. Experiment on satellite code. (was F-05)"
+    },
+    {
+      "id": "V-06",
+      "severity": "Critical",
+      "summary": "Block circuit verifies child proofs against a client-supplied verifier object and never pins the child preprocessed commitment (child VK) in the recursion circuit; per-transfer data is baked as preprocessed constants, so no canonical child VK exists and a same-shape child of any relation is accepted. Survives a CONFIG pin. (B-01 = C-01)"
+    },
+    {
+      "id": "V-07",
+      "severity": "Critical",
+      "summary": "In-circuit Poseidon2 sponge is not a function of its input on the shared D4 table: the chain-start capacity (IV) is unconstrained for ordinary sponge rows and the partial final-chunk carry coefficients are unbound, so nullifiers are malleable and one note can be re-spent without limit. (B-02)"
+    },
+    {
+      "id": "V-08",
+      "severity": "Critical",
+      "summary": "Binary Merkle paths in the Poseidon2 circuit AIR bind neither the leaf digest nor the direction bits (mmcs_index_sum always None; input-limb sends zeroed on Merkle rows; first path row new_start), making every in-circuit WHIR query/opening check vacuous. Upstream defect, reachable on the WHIR (binary) path. (C-02)"
     }
   ],
   "fp_check_verdicts": [
     {
-      "id": "F-01",
+      "id": "V-01",
       "verdict": "TRUE POSITIVE",
-      "rationale": "Trigger: caller-supplied CONFIG in WhirVerifier.verify (WhirVerifier.sol:21-26,264-268,283-318); no pin in WhirVerifier or ShieldedPool; Deploy.s.sol deploys unpinned verifier. Impact: state corruption / soundness. PoC: crates/prover/tests/poc_audit_f01.rs (poc_f01_forged_settlement_proof_for_arbitrary_roots ... ok) + contracts/test/audit/PocF01ForgedBlock.t.sol (2/2 PASS)."
+      "rationale": "forge PoC applies forged block; 2/2 pass"
+    },
+    {
+      "id": "V-02",
+      "verdict": "TRUE POSITIVE",
+      "rationale": "opening point z'!=zeta still verifies on real bundle"
     }
   ],
   "artifacts": {
@@ -130,14 +230,216 @@
   },
   "remediation_verifications": [],
   "next_steps": [
-    "Collect domain auditor contracts (A: Solidity verifier, B: circuits, C: vendored recursion, D: application).",
-    "Run poc_f01 generator and forge PoC.",
-    "crypto-fp-check every surviving candidate; PoCs for High/Critical.",
-    "Write LaTeX specification and report."
+    "Write LaTeX spec section-by-section (workflow).",
+    "Write audit report under zk-findings/reports.",
+    "Closeout session."
   ],
-  "updated_at": "2026-10-09T14:45:00Z",
+  "updated_at": "2026-10-09T15:30:00Z",
   "extensions": {
     "methodology": "zkcrypto-audit (github.com/Yue-Zhou1/zkcrypto-audit), staged flow router->context->spec-delta->domain->fp-check->report->zkbugs-index",
-    "head_commit": "a54c1976b875f73beafa3aeab5521866ed971399"
+    "head_commit": "a54c1976b875f73beafa3aeab5521866ed971399",
+    "consolidated_findings": {
+      "verified": [
+        {
+          "id": "V-01",
+          "severity": "Critical",
+          "summary": "On-chain settlement verifier is not bound to the block circuit: CONFIG (verifying-key digest, WHIR schedules, constraint programs) is read from the caller-supplied bundle and never pinned; applyBlock is permissionless. PoC: forge test applies a proof of a constraint-free circuit and rewrites both pool roots. (was F-01)"
+        },
+        {
+          "id": "V-02",
+          "severity": "Critical",
+          "summary": "WHIR per-matrix opening points are taken from the bundle STATEMENT section and never tied to the transcript zeta, while the constraint identity is evaluated at zeta. Experiment: an opening point in the real block bundle was changed to z'!=zeta and verify() still returned true. (was F-02)"
+        },
+        {
+          "id": "V-03",
+          "severity": "Critical",
+          "summary": "Each opening round's WHIR commitment (root) is read from PROOF and never compared with the trace/quotient/preprocessed/permutation digests absorbed in the batch transcript, so a prover may open freshly-committed (incl. preprocessed/fixed) columns after zeta is known. Structural + honest-bundle + junk-root experiment. (was F-03)"
+        },
+        {
+          "id": "V-04",
+          "severity": "Critical",
+          "summary": "Pruned QFOLD/MROOTS query walk de-duplicates repeated query indices without checking the duplicate rows agree (p3 rejects InconsistentDuplicateOpenings). Experiment: depth-2 tree with indices [1,1] accepts mismatched rows. (was F-04)"
+        },
+        {
+          "id": "V-05",
+          "severity": "Critical",
+          "summary": "LogUp terminal count is proof-chosen; the terminal-sum check and transcript absorb all terminals but the constraint identity consumes only the first #hasTerminal, with no tIdx==nTerm check, so appended compensating terminals defeat the sum-zero check. Experiment on satellite code. (was F-05)"
+        },
+        {
+          "id": "V-06",
+          "severity": "Critical",
+          "summary": "Block circuit verifies child proofs against a client-supplied verifier object and never pins the child preprocessed commitment (child VK) in the recursion circuit; per-transfer data is baked as preprocessed constants, so no canonical child VK exists and a same-shape child of any relation is accepted. Survives a CONFIG pin. (B-01 = C-01)"
+        },
+        {
+          "id": "V-07",
+          "severity": "Critical",
+          "summary": "In-circuit Poseidon2 sponge is not a function of its input on the shared D4 table: the chain-start capacity (IV) is unconstrained for ordinary sponge rows and the partial final-chunk carry coefficients are unbound, so nullifiers are malleable and one note can be re-spent without limit. (B-02)"
+        },
+        {
+          "id": "V-08",
+          "severity": "Critical",
+          "summary": "Binary Merkle paths in the Poseidon2 circuit AIR bind neither the leaf digest nor the direction bits (mmcs_index_sum always None; input-limb sends zeroed on Merkle rows; first path row new_start), making every in-circuit WHIR query/opening check vacuous. Upstream defect, reachable on the WHIR (binary) path. (C-02)"
+        }
+      ],
+      "high": [
+        {
+          "id": "H-01",
+          "severity": "High",
+          "summary": "Permissionless applyBlock plus no on-chain data availability (only roots+fee are emitted; per-transfer nullifiers/commitments and statementRoot never reach L1). A party that settles a block it does not share freezes the pool and the operator node permanently. PoC: forge test, arbitrary sender applies, event carries 5 words. (D01; F-10)"
+        },
+        {
+          "id": "H-02",
+          "severity": "High",
+          "summary": "Output-note append position is a free witness (frontier count/bits unbound; zero leaf == empty leaf), so a prover can append at an arbitrary index and permanently freeze the commitment tree / desync an honest node. (B-03)"
+        },
+        {
+          "id": "H-03",
+          "severity": "High(privacy)",
+          "summary": "Client transfer verifier/VK embeds the spent-note membership siblings (position) and recipient pk_d as preprocessed constants; the unblinded preprocessed commitment handed to the sequencer reveals which note is spent and the recipient. (B-04)"
+        }
+      ],
+      "medium": [
+        {
+          "id": "M-01",
+          "severity": "Medium",
+          "summary": "Cross-pool / cross-chain replay: block statement and spend-auth message carry no chain id or pool address; the same (statement,proof) settles on any pool at the same genesis. PoC: forge test applies one block to two pools. (D05; F-10)"
+        },
+        {
+          "id": "M-02",
+          "severity": "Medium",
+          "summary": "SPHINCS+ spend-authorization envelope is not bound to the note, proof, or identity (verifying key is self-supplied) and is verified only natively, never in-circuit or on-chain; authorization reduces to in-circuit knowledge of sk_d. (B-12 = D02)"
+        },
+        {
+          "id": "M-03",
+          "severity": "Medium",
+          "summary": "Statement aliasing: _checkStatement accepts statement[i] congruent mod p to the proof's public values; unchecked header positions feed the AIR a value chosen after all challenges (ConstraintIdentityMismatch divergence shown). Also one proof verifies for many statement arrays. (F-06)"
+        },
+        {
+          "id": "M-04",
+          "severity": "Medium",
+          "summary": "Proof extension-field elements are not range-checked; the transcript reduces lanes mod p while KoalaBearExt4 add/sub carry across lanes, so two distinct byte strings verify as the same proof (malleability shown) and transcript vs arithmetic disagree. (F-07)"
+        },
+        {
+          "id": "M-05",
+          "severity": "Medium",
+          "summary": "WHIR shape (sumcheck round counts, final-poly length, initial OOD count, bound-eval counts) is taken from proof array lengths rather than CONFIG; several p3 shape checks are absent. (F-08)"
+        },
+        {
+          "id": "M-06",
+          "severity": "Medium",
+          "summary": "Node block pipeline is not atomic: a transient prove/IO/RPC failure drops the drained batch and leaves the projection drifted, wedging the node (single pending-settlement slot, in-memory state). (D04)"
+        },
+        {
+          "id": "M-07",
+          "severity": "Medium(privacy)",
+          "summary": "HVZK budget check is pooled over the batch and does not enforce per-column hiding; tables with fewer rows than D*points leak witness dimensions; native hiding-WHIR not used. (M-01/agent C)"
+        },
+        {
+          "id": "M-08",
+          "severity": "Medium",
+          "summary": "Faerie gold: nullifier nf=H(sk_d||rho) is not position-bound and output rho is a free witness; two notes to a recipient with equal rho share one nullifier, making one unspendable. (B-05)"
+        },
+        {
+          "id": "M-09",
+          "severity": "Medium",
+          "summary": "Nullifier absence fold starts at height 64; any spent nullifier sharing the low-96-bit tail makes a note permanently unspendable (and native NullifierMap mishandles such collisions). (B-06/B-09)"
+        },
+        {
+          "id": "M-10",
+          "severity": "Medium(privacy,unverified)",
+          "summary": "Settlement proof is non-ZK (since a54c197) yet the recursion witness holds child proofs, child preprocessed openings (linear in secrets) and full child statements; leakage not quantified. (B-07)"
+        },
+        {
+          "id": "M-11",
+          "severity": "Medium",
+          "summary": "Shared rate-limiter bucket keyed by (role,path): one low-privilege token holder starves every other client of that role; unauthenticated traffic unlimited. (D06)"
+        }
+      ],
+      "low": [
+        {
+          "id": "L-01",
+          "severity": "Low",
+          "summary": "SealedVault::from_bytes indexes attacker-controlled length fields without bounds checks, panicking on crafted vault bytes. (D07)"
+        },
+        {
+          "id": "L-02",
+          "severity": "Low",
+          "summary": "insecure-stub signing feature lacks the claimed release guard; a --release --features insecure-stub build compiles (unreached today). (D09)"
+        },
+        {
+          "id": "L-03",
+          "severity": "Low",
+          "summary": "Token hygiene: no max TTL / overflow, base64url decoder accepts non-canonical trailing bits (token malleable), 1-byte key-file accepted, no revocation route, deterministic in (role,expiry). (D11)"
+        },
+        {
+          "id": "L-04",
+          "severity": "Low",
+          "summary": "Statement completeness / DA: statementRoot has no L1 consumer; users cannot rebuild the tree or prove inclusion without the sequencer. (B-08/D15)"
+        },
+        {
+          "id": "L-05",
+          "severity": "Low",
+          "summary": "Block header split validated only by sum (shape (2,0) accepted for a (1,1) child); fold_membership path length unchecked. (B-10/B-11)"
+        },
+        {
+          "id": "L-06",
+          "severity": "Low",
+          "summary": "wallet-wasm zeroization gaps (password/vault copies, sk_d arrays); write_private follows a planted <path>.tmp symlink and writes before the target-type check. (D10/D12)"
+        },
+        {
+          "id": "L-07",
+          "severity": "Low",
+          "summary": "R randomization commitment adds no hiding to the trace opening despite the patch doc claim; upstream ZK guard removed without support/tests. (L-01/L-02 agent C)"
+        },
+        {
+          "id": "L-08",
+          "severity": "Low",
+          "summary": "SLH-DSA parameter rationale wrong (128f vs 128s cost, 8KB vs 17KB signature, vk 32 not 64 bytes); slh-dsa 0.2.0-rc.5 is a pre-release with TODO context-processing. (D08/D13)"
+        }
+      ],
+      "info": [
+        {
+          "id": "I-01",
+          "severity": "Info",
+          "summary": "Security-relevant env knobs read in library code: WHIR_SECURITY_LEVEL, *_SOUNDNESS_REGIME, *_POW_FLOOR, WHIR_INNER_RATE, WHIR_FINAL_LDE. (B-13/F-10)"
+        },
+        {
+          "id": "I-02",
+          "severity": "Info",
+          "summary": "Documentation drift: README/comments say SHA3/Keccak notes+nullifiers and an operator set and a keccak depth-256 empty root; code uses Poseidon2 depth-96, permissionless applyBlock. PATCHES.md omits 4 of 5 vendored code changes and misdescribes the ZK patch (no pristine dir, no truncation). (B-13/D20/agent C)"
+        },
+        {
+          "id": "I-03",
+          "severity": "Info",
+          "summary": "Production node binary built with prover 'testkit' feature, so genesis notes are owned by public fixture keys; demo genesis + SPHINCS+ keys are public fixtures. (D21/B-13)"
+        },
+        {
+          "id": "I-04",
+          "severity": "Info",
+          "summary": "Fees are burned in-circuit; the fee-recipient role and withdrawFees are vestigial (no payable path). (D16/F-10)"
+        },
+        {
+          "id": "I-05",
+          "severity": "Info",
+          "summary": "Verification costs ~102M gas, above L1 block limits; GAS_LIMIT=20e9 in the submitter is above every public chain limit; no RPC timeout/TLS, one-receipt finality. (F-10/D17)"
+        },
+        {
+          "id": "I-06",
+          "severity": "Info",
+          "summary": "Spent-nullifier oracle: /v1/transfer reports 'already spent' for any self-signed nullifier, exposing spent-set membership to Submitters. (D19)"
+        },
+        {
+          "id": "I-07",
+          "severity": "Info",
+          "summary": "In-circuit: 0-bit PoW leaves the witness unconstrained (malleability); circuit query-index low-bits vs native rejection-sampling diverge at p-1 (completeness); batch verifier omits check_multiplicity_height_bound. (I-02..I-04 agent C)"
+        }
+      ]
+    },
+    "agent_reports": {
+      "A_solidity_verifier": "F-02..F-11 (STATEMENT points, batchCommitment, QFOLD dup, extra terminals, aliasing, ext range, shape); scratch test/agentA",
+      "B_circuits": "B-01..B-13 (child VK, sponge IV/tail, append position, VK privacy, faerie gold, fold depth)",
+      "C_recursion": "C-01/C-02 criticals, M-01 hiding, PATCHES.md inaccuracy; diff at scratch/agentC/p3-recursion-local.diff",
+      "D_application": "D01..D21 (permissionless settle+DA, envelope binding, pipeline atomicity, replay, rate limiter, vault panic)"
+    }
   }
 }
