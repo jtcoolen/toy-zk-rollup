@@ -40,7 +40,7 @@ contract Deploy is Script {
         // under the same WHIR parameters the vectors were generated with).
         bytes32 configDigest = vm.envOr(
             "CONFIG_DIGEST",
-            bytes32(0xf9e905866cf3a97f9149a84ab19a6d4cc43758814b140499650dfb771876c6e5)
+            bytes32(0x7d61ae57323bdb9c8a4c72178820ecd8a07835699ca5b27fd2fcf29045d96c16)
         );
 
         // The broadcast context comes from the CLI (--private-key or

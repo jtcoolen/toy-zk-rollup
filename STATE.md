@@ -1,14 +1,22 @@
 # STATE — resume pointer
 
-- Current task card: docs/design/v07-poseidon2-sponge-binding.md (status: approved)
-- Task: audit fix V-07 — pin in-circuit Poseidon2 sponge chain start (capacity slots)
-  and base-bound the partial-chunk tail in crates/prover/src/commitment_gadget.rs.
-- Remaining audit findings after V-07: V-08, H-02, H-03 (before V-06), V-06,
-  M-01 (pool-address half), M-06..M-10.
-- Last gate: forge 197/197 @ d5dd132 (M-11); canonical test cmd: plain
-  `cargo test -p prover` (optimized dev profile; NOT --release).
-- Next action: write the failing negative test from the task card's Acceptance
-  section (AIR-level assert_air_rejects on a non-zero-capacity chain start),
-  then implement the fix.
-- After any circuit change: regenerate ALL settlement-family vectors together
-  and update Deploy.s.sol CONFIG_DIGEST, then full forge suite.
+- Done: V-07 (Poseidon2 sponge chain-start pin + coeff-lookup tail) committed;
+  design doc docs/design/v07-poseidon2-sponge-binding.md status: implemented.
+- Next task: H-03 — move membership siblings + recipient pk_d from
+  preprocessed constants to witnesses (prerequisite for V-06). Start by
+  writing docs/design/h03-preprocessed-to-witness.md per AGENTS.md protocol.
+- Remaining audit findings: V-08, H-02, H-03, V-06, M-01 (pool-address half),
+  M-06..M-10.
+- Last gate: forge 197/197; v8 bundle 262,060 B; test_gas_v8 41,653,563.
+  Block CONFIG digest now 0x7d61ae57... (4 pin sites updated).
+- Known pre-existing flakes (NOT regressions): grind PoW at
+  grinding_challenger.rs:304 (~10%/proof) — retry loops mandatory;
+  hvzk_blinding::settlement_proving_is_deterministic fails ~30% at BASELINE
+  too (measured 3/8 without the V-07 change) — grind nonce divergence.
+- Canonical test cmd: plain `cargo test -p prover` (optimized dev; NOT
+  --release — trips proving_keeps_overflow_checks_on). Vector regen needs
+  --release + canonical WHIR_* env (see ledger Batch 89/91).
+- After any circuit change: regenerate ALL settlement-family vectors together,
+  recompute CONFIG digests (cast keccak of bundle[16..16+cfgWords*4]),
+  update pins (Deploy.s.sol, BlockE2E, WhirVerifier, AuditRegression),
+  full forge suite.

@@ -61,6 +61,9 @@ serde_json = "1"
 postcard = "1.1"
 
 [dev-dependencies]
+# Proof-level rejection oracle (V-07 negative tests): classifies debug-build
+# constraint/lookup panics as rejections. Same vendored rev as the recursion tests.
+p3-test-utils = { workspace = true }
 # Used by the golden-vector generator to fingerprint proof bytes with the same
 # Keccak the settlement transcript uses, so the vector's digest is meaningful
 # to the Solidity side.

@@ -3840,3 +3840,77 @@ M-11 rate-limiter keying.
 
 Suite after all fixes: forge 192/192. test_gas_v8 41,651,135 gas (was
 41,135,861 pre-audit; +515K total from V-01..V-05/M-03..M-05 checks).
+
+## Batch 91 - V-07: the Poseidon2 sponge's chain start was free (Critical)
+
+Audit V-07 (friendly-wright-zfku6d, a54c197). Two parts, one root cause:
+`p2_sponge_limbs` fed `None` into every input slot of the first permutation
+row, so the AIR's chain-start pin (which fires only for `shared`/`challenger
+rows, poseidon2-circuit-air/src/air.rs:1152-1183) never constrained the
+capacity slots: a prover picked its own IV. And the partial-chunk tail used
+`..._via_alu` recompose, which ties only `sum(c_i * basis_i)` and leaves
+D-1 free base dims per coefficient - the tail message was not the message.
+
+Impact: one note yields many nullifiers. `nf = H(DOMAIN_NULLIFIER || sk_d
+|| rho)` is computed with the sponge; a free IV forks nf while the
+commitment stays put - self double-spend, no L1 interaction.
+
+Fix (crates/prover/src/commitment_gadget.rs, `p2_sponge_limbs`):
+1. first row: capacity slots pinned to `Some(zero)` - the native sponge's
+   IV, so honest digests do NOT move (verified: commitment_gadget lib
+   tests 8/8 unchanged).
+2. partial-chunk carry + tail: `decompose_ext_to_base_coeffs_with_coeff_
+   lookups` / `recompose_base_coeffs_to_ext_with_coeff_lookups` - each
+   coefficient published as its own row, base-bound.
+`p2_compress` needed nothing: all four slots are already `Some(...)` (the
+right operand occupies the capacity slots). `fold_statement` needed
+nothing: its ALU-decomposed running-digest coeffs are base-embedded consts,
+so the sponge's coeff-lookup recompose accepts them (no
+`CoefficientsNotBaseBound`).
+
+Negative test: crates/prover/tests/v07_sponge_chain_start.rs - proof-level,
+real WHIR verify. Forges the chain-start capacity slots in the Poseidon2
+trace (bump row 0's capacity inputs, re-permute, rewrite the bus witnesses,
+propagate to continuation rows) and asserts rejection; the honest sponge
+proves and verifies. 8/8 pass. Same-constraint-system assertion so the
+rejection cannot be a config artifact.
+
+Consensus ripple: the block circuit's CONFIG moved (it is the only
+settlement-family shape that calls `p2_sponge_limbs`; the rc gadget bakes
+the child's table shapes into its constraint program). Settlement and
+chain CONFIGs unchanged (ffb29fe8, ddd87cbe). New block CONFIG digest:
+0x7d61ae57323bdb9c8a4c72178820ecd8a07835699ca5b27fd2fcf29045d96c16
+(was 0xf9e90586...). Pins updated in Deploy.s.sol, BlockE2E.t.sol,
+WhirVerifier.t.sol, AuditRegression.t.sol. WhirVerifier.t.sol's two
+TerminalClaimMismatch constants moved with the regenerated witness
+(5145738... -> 5632571...) - expected: those tests assert the proof's own
+claimed value is what the fail-closed net reports.
+
+Full regeneration run under the canonical env (WHIR_INNER_RATE=3
+WHIR_RATE_FINAL=4 WHIR_POW_FLOOR=28 WHIR_INNER_POW_FLOOR=29):
+batch_stark_vectors -> composed_program_equality_and_export ->
+block_program_equality_and_export -> constraint_identity -> chain v5/v6/v7
+/v8 -> wbnd_pin. One grind flake (export_chain_bundle, 1 of 4 in the run)
+retried clean.
+
+Sizes/gas after: v8 bundle 262,060 B (was 262,252, -192 B: the coeff table
+replaces ALU rows more compactly than it adds); test_gas_v8 41,653,563
+(was 41,651,135, +2,428). 300 KB target still met; 30M still open.
+
+Suite after V-07: forge 197/197.
+
+Addendum (V-07 verification): `hvzk_blinding::settlement_proving_is_
+deterministic` failed 2/8 runs WITH the V-07 fix - but 3/8 at BASELINE
+(fix stashed). Pre-existing, not a regression: the two proofs differ by a
+2-byte grind-nonce delta at wire offset 866 that cascades through the
+transcript (1,481 differing bytes of 15,034). The test asserts byte
+equality of two in-process proofs; at this pow floor the grind witness
+depends on the full transcript state, and the settlement config's
+schedule search (`required_pow_bits_with`: arity-descending, first
+feasible wins) is deterministic, so the divergence is the same grind
+instability as the challenger panic, just manifesting as a nonce delta
+instead of a failure to find one. Left as-is: tightening it is a separate
+task (the test's own docstring says it guards the fixed/varying
+classification, which is a property of the protocol, not of byte
+equality). Recorded so a future run does not re-investigate it as V-07
+fallout.

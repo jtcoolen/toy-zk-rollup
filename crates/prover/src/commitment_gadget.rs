@@ -319,6 +319,21 @@ pub fn p2_sponge_limbs(
     for (chunk_idx, chunk) in limbs.chunks(rate).enumerate() {
         let is_first = chunk_idx == 0;
         let mut inputs: Vec<Option<ExprId>> = vec![None; 4];
+        if is_first {
+            // Chain start: pin the capacity slots to the zero constant. On an
+            // ordinary (non-challenger) perm table the AIR's chain-start pin
+            // fires only for challenger rows, so an unconstrained capacity
+            // input here is a free witness and one preimage would hash to many
+            // digests (audit V-07: nullifier forkability). A bus-constrained
+            // `Some(zero)` input makes the AIR force capacity == 0 on the
+            // first row, matching the native sponge's zero initial state.
+            // Continuation rows keep `None`: there the AIR's chain constraint
+            // ties capacity to the previous row's output, which is what
+            // overwrite mode needs.
+            for slot in DIGEST_EXT..inputs.len() {
+                inputs[slot] = Some(zero);
+            }
+        }
         for ext_idx in 0..DIGEST_EXT {
             let base_start = ext_idx * EXT_DIM;
             let filled = chunk.len().saturating_sub(base_start).min(EXT_DIM);
@@ -333,15 +348,25 @@ pub fn p2_sponge_limbs(
                     coeffs.push(chunk[base_start + i]);
                 } else if let Some(prev) = prev_rate {
                     // Partial chunk: keep this position's value from the
-                    // previous permutation's output.
-                    let prev_coeffs =
-                        builder.decompose_ext_to_base_coeffs_via_alu::<F>(prev[ext_idx])?;
+                    // previous permutation's output. The coefficients come
+                    // from the coeff-lookup form, which publishes each one as
+                    // a base-field element: the ALU form ties only the
+                    // weighted sum and leaves D-1 dimensions free per
+                    // coefficient, so the carried slot would be re-choosable
+                    // (audit V-07, free partial-chunk tail).
+                    let prev_coeffs = builder
+                        .decompose_ext_to_base_coeffs_with_coeff_lookups::<F>(prev[ext_idx])?;
                     coeffs.push(prev_coeffs[i]);
                 } else {
                     coeffs.push(zero);
                 }
             }
-            inputs[ext_idx] = Some(builder.recompose_base_coeffs_to_ext_via_alu::<F>(&coeffs)?);
+            // Coeff-lookup recompose: publishes every coefficient as a base
+            // element and ties their weighted sum to the result, so what this
+            // row absorbs is exactly the limbs listed above (V-07).
+            inputs[ext_idx] = Some(
+                builder.recompose_base_coeffs_to_ext_with_coeff_lookups::<F>(&coeffs)?,
+            );
         }
 
         let call = PermCall {
