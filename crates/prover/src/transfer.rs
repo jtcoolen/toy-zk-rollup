@@ -78,7 +78,7 @@ use shielded::{Note, Transfer, TransferPublic};
 
 use crate::commitment_gadget::{
     self, append_to_frontier, digest_to_ext, export_digest_limbs, p2_compress, p2_sponge_limbs,
-    AppendParams, DigestExpr, DigestExt, FrontierWitness, DIGEST_LIMBS,
+    AppendParams, DigestExpr, FrontierWitness, DIGEST_EXT, DIGEST_LIMBS,
 };
 use crate::nullifier_gadget::{constrain_nullifier_non_membership, NullifierWitness};
 use crate::whir_recursion::{whir_perm, Challenge, F};
@@ -323,6 +323,29 @@ impl TransferCircuit {
     pub fn statement(&self) -> &[F] {
         &self.statement
     }
+
+    /// H-03: the multiset of preprocessed constant values, sorted and rendered.
+    ///
+    /// Preprocessed columns are committed publicly and unblinded, so every
+    /// value here is visible to whoever receives the verifying key — the
+    /// sequencer, in the client flow. For a fixed circuit *shape* (spend and
+    /// output counts) this multiset must be identical for every transfer:
+    /// anything note-specific (membership siblings, recipient `pk_d`, tree
+    /// roots) belongs in a witness or a statement export, never a constant.
+    #[must_use]
+    pub fn census_consts(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .circuit
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                p3_circuit::Op::Const { val, .. } => Some(format!("{val:?}")),
+                _ => None,
+            })
+            .collect();
+        v.sort();
+        v
+    }
 }
 
 /// Constrain one transfer's five properties into an existing builder.
@@ -387,27 +410,46 @@ pub fn constrain_transfer(
     // nullifier; the final value must equal `public.nullifier_roots.after`.
     // Starting from `before` rather than a fresh constant is what makes the
     // ordering of nullifiers inside a transfer binding.
+    // H-03: the nullifier root is a *witness*, not a constant. Preprocessed
+    // columns are committed publicly and unblinded, and the client hands its
+    // proof machinery to the sequencer - a constant root would tie the
+    // verifying key to one tree state, leaking the map's state per VK and
+    // forcing a VK per transfer. The thread is still proven: each spend's
+    // absence fold is pinned to this value, and the statement exports it, so
+    // the settlement contract checks it against the root it holds.
     let nf_before = digest_to_ext(&Digest32::new(*public.nullifier_roots.before.as_bytes()))
         .ok_or(CircuitBuilderError::InvalidDimension {
             expected: DIGEST_LIMBS,
             actual: 0,
         })?;
-    let mut nf_root: DigestExpr = [
-        builder.define_const(nf_before[0]),
-        builder.define_const(nf_before[1]),
-    ];
+    let nf_start_exprs = builder.alloc_private_inputs(DIGEST_EXT, "nf.root_before");
+    private.push(nf_before[0]);
+    private.push(nf_before[1]);
+    claim_private(builder, nf_start_exprs[0]);
+    claim_private(builder, nf_start_exprs[1]);
+    let nf_start_pin: DigestExpr = [nf_start_exprs[0], nf_start_exprs[1]];
+    let mut nf_root: DigestExpr = nf_start_pin;
 
-    // The published commitment root as extension-field constants: both the
-    // spends' membership folds and the outputs' frontier fold are pinned to
-    // this value, so one digest parse serves all of them. A non-canonical root
-    // (an element at or above the modulus) has no field representation at all,
-    // which is an error, not a silent truncation.
+    // The published commitment root, as a *witness* (H-03 - same reasoning as
+    // the nullifier root above): both the spends' membership folds and the
+    // outputs' frontier fold are pinned to this value, so one digest parse
+    // serves all of them, and the statement exports the same expressions the
+    // pins use - the contract's check of the statement value is what binds it
+    // to the real tree. A non-canonical root (an element at or above the
+    // modulus) has no field representation at all, which is an error, not a
+    // silent truncation.
     let root_ext = digest_to_ext(&Digest32::new(*public.root.as_bytes())).ok_or(
         CircuitBuilderError::InvalidDimension {
             expected: DIGEST_LIMBS,
             actual: 0,
         },
     )?;
+    let root_exprs = builder.alloc_private_inputs(DIGEST_EXT, "tree.root_before");
+    private.push(root_ext[0]);
+    private.push(root_ext[1]);
+    claim_private(builder, root_exprs[0]);
+    claim_private(builder, root_exprs[1]);
+    let root_pin: DigestExpr = [root_exprs[0], root_exprs[1]];
 
     // ---- Inputs: ownership, membership, nullifier -----------------------
     for (spend, nf_witness) in transfer.spends.iter().zip(nullifier_witnesses) {
@@ -441,8 +483,7 @@ pub fn constrain_transfer(
         // LogUp multiplicities.
         let folded = fold_membership_p2(builder, leaf, spend.path, spend.index, private)?;
         for (idx, got) in folded.iter().enumerate() {
-            let want = builder.define_const(root_ext[idx]);
-            let diff = builder.sub(*got, want);
+            let diff = builder.sub(*got, root_pin[idx]);
             builder.assert_zero(diff);
         }
 
@@ -455,7 +496,7 @@ pub fn constrain_transfer(
         // next spend's starting root.
         let nullifier = p2_framed(builder, DOMAIN_NULLIFIER, &[&sk.exprs, &rho.exprs])?;
         let (absent, next_root) =
-            constrain_nullifier_non_membership(builder, &nullifier, nf_witness)?;
+            constrain_nullifier_non_membership(builder, &nullifier, nf_witness, private)?;
         // Arithmetic equality, not `connect`. From the second spend onward
         // `nf_root` is the *previous spend's* fold output — a live witness
         // expression, not a constant — and `connect` aliases witness slots.
@@ -477,7 +518,7 @@ pub fn constrain_transfer(
     let tree_root = constrain_outputs(
         builder,
         transfer,
-        root_ext,
+        &root_pin,
         frontier,
         private,
         &mut statement,
@@ -486,18 +527,30 @@ pub fn constrain_transfer(
 
     // ---- The published roots and the fee ------------------------------
     //
-    // The root *before* is exported as constants: the spends' folds and the
-    // frontier's pin already bind every witness to it, so the statement value
-    // is proven, not supplied.
-    statement.extend(const_limbs(builder, public.root.as_bytes()));
+    // The root *before* is exported from the witness expression the spends'
+    // folds and the frontier's pin already bind to (H-03: a witness, not a
+    // constant - the statement value is proven against the folds, and the
+    // settlement contract checks it against the root it holds).
+    statement.extend(export_digest_limbs(builder, &root_pin)?);
 
     // `root_after` is *computed* above, not supplied: the export lands in the
     // statement, and the statement is what the verifier checks. The published
     // value must equal it or the proof simply does not verify - and the pin
-    // below makes a mismatch fail at build time rather than at verify time.
+    // below makes a mismatch fail when the circuit is witnessed rather than
+    // at verify time. The pin is against a witness of the published value,
+    // not a constant (H-03): the after-root is tree state, and a constant
+    // would leak it into the verifying key.
     let computed_after = export_digest_limbs(builder, &tree_root)?;
-    let want_after = const_limbs(builder, public.root_after.as_bytes());
-    for (got, want) in computed_after.iter().zip(&want_after) {
+    let after_ext = digest_to_ext(&Digest32::new(*public.root_after.as_bytes())).ok_or(
+        CircuitBuilderError::InvalidDimension {
+            expected: DIGEST_LIMBS,
+            actual: 0,
+        },
+    )?;
+    let after_w = builder.alloc_private_inputs(DIGEST_EXT, "tree.root_after");
+    private.push(after_ext[0]);
+    private.push(after_ext[1]);
+    for (got, want) in tree_root.iter().zip(after_w.iter()) {
         let diff = builder.sub(*got, *want);
         builder.assert_zero(diff);
     }
@@ -510,21 +563,26 @@ pub fn constrain_transfer(
     // Both roots are exported. `before` is already pinned as the fold's starting
     // point, but publishing it is what lets the settlement contract chain one
     // transfer's `after` onto the next transfer's `before`.
+    // The threaded nullifier root must land on the published `after` - pinned
+    // against a witness of it, not a constant (H-03), and exported from that
+    // same witness so the contract checks the value the thread was pinned to.
     let nf_after = digest_to_ext(&Digest32::new(*public.nullifier_roots.after.as_bytes()))
         .ok_or(CircuitBuilderError::InvalidDimension {
             expected: DIGEST_LIMBS,
             actual: 0,
         })?;
-    let after: DigestExpr = [
-        builder.define_const(nf_after[0]),
-        builder.define_const(nf_after[1]),
-    ];
+    let after_w = builder.alloc_private_inputs(DIGEST_EXT, "nf.root_after");
+    private.push(nf_after[0]);
+    private.push(nf_after[1]);
+    claim_private(builder, after_w[0]);
+    claim_private(builder, after_w[1]);
+    let after: DigestExpr = [after_w[0], after_w[1]];
     for (got, want) in nf_root.iter().zip(&after) {
         let diff = builder.sub(*got, *want);
         builder.assert_zero(diff);
     }
-    statement.extend(const_limbs(builder, public.nullifier_roots.before.as_bytes()));
-    statement.extend(const_limbs(builder, public.nullifier_roots.after.as_bytes()));
+    statement.extend(export_digest_limbs(builder, &nf_start_pin)?);
+    statement.extend(export_digest_limbs(builder, &after)?);
 
     let fee = Amount::private(builder, transfer.fee)?;
     private.extend(fee.limbs.iter().map(|&l| Challenge::from_u16(l)));
@@ -548,7 +606,7 @@ pub fn constrain_transfer(
 fn constrain_outputs(
     builder: &mut CircuitBuilder<Challenge>,
     transfer: &Transfer<'_>,
-    root_ext: DigestExt,
+    root_pin: &DigestExpr,
     frontier: &FrontierWitness,
     private: &mut Vec<Challenge>,
     statement: &mut Vec<ExprId>,
@@ -557,11 +615,9 @@ fn constrain_outputs(
     let params = AppendParams::new(&pq_hash::Poseidon2Commitment::default());
     // The frontier fold starts at the published root: `constrain_append` pins
     // the witness`s fold to this value before merging anything, so a frontier
-    // from any other tree state cannot witness.
-    let mut tree_root: DigestExpr = [
-        builder.define_const(root_ext[0]),
-        builder.define_const(root_ext[1]),
-    ];
+    // from any other tree state cannot witness. H-03: the pin is the witness
+    // root the spends folded against, not a constant of it.
+    let mut tree_root: DigestExpr = [root_pin[0], root_pin[1]];
     for (i, note) in transfer.outputs.iter().enumerate() {
         let rho = Secret::new(builder, note.rho(), "output.rho")?;
         let psi = Secret::new(builder, note.psi(), "output.psi")?;
@@ -570,13 +626,20 @@ fn constrain_outputs(
         private.extend(psi.witness.iter().copied());
         private.extend(amount.limbs.iter().map(|&l| Challenge::from_u16(l)));
 
-        // The recipient's spend key is public to the sender, so it is a
-        // constant: the output commitment is pinned, not chosen.
+        // H-03: the recipient's `pk_d` is a range-checked *witness*, not a
+        // constant. It is public to the sender, but not to whoever holds the
+        // verifying key - as a constant it would name the recipient in the
+        // VK's public preprocessed column. The output commitment is computed
+        // from these limbs and exported to the statement, so the value the
+        // contract reads is the value proven; nothing is trusted about the
+        // witness beyond what the commitment already binds.
+        let pk_d = Secret::new(builder, note.pk_d().as_bytes(), "output.pk_d")?;
+        private.extend(pk_d.witness.iter().copied());
         let mut leaf_msg = const_limbs(builder, DOMAIN_NOTE);
         leaf_msg.extend(amount.exprs.iter().copied());
         leaf_msg.extend(rho.exprs.iter().copied());
         leaf_msg.extend(psi.exprs.iter().copied());
-        leaf_msg.extend(const_limbs(builder, note.pk_d().as_bytes()));
+        leaf_msg.extend(pk_d.exprs.iter().copied());
         let commitment = p2_sponge_limbs(builder, &leaf_msg)?;
         statement.extend(export_digest_limbs(builder, &commitment)?);
 
@@ -713,6 +776,13 @@ pub fn build_transfer_circuit(
 /// wire limbs the Keccak fold used: Poseidon2 digests are field-native, so each
 /// level is two selects and one perm row instead of sixteen selects and a
 /// 24-round permutation.
+///
+/// H-03: the siblings are *witnesses*, not constants. Preprocessed columns are
+/// committed publicly and unblinded, and the client hands its verifier to the
+/// sequencer - a constant sibling path would reveal the spent leaf's position.
+/// The fold is pinned to the published root, so a free sibling path is exactly
+/// as constrained as a constant one: it either folds to the root or the
+/// witness fails.
 fn fold_membership_p2(
     builder: &mut CircuitBuilder<Challenge>,
     leaf: DigestExpr,
@@ -728,10 +798,11 @@ fn fold_membership_p2(
             expected: DIGEST_LIMBS,
             actual: 0,
         })?;
-        let sib: DigestExpr = [
-            builder.define_const(sibling_ext[0]),
-            builder.define_const(sibling_ext[1]),
-        ];
+        // H-03: witness, not constant - see the function doc.
+        let exprs = builder.alloc_private_inputs(DIGEST_EXT, "merkle.sibling");
+        private.push(sibling_ext[0]);
+        private.push(sibling_ext[1]);
+        let sib: DigestExpr = [exprs[0], exprs[1]];
         let go_right = (index >> level) & 1 == 1;
         let bit = builder.alloc_private_input("merkle.bit");
         private.push(if go_right {

@@ -58,7 +58,9 @@ use pq_hash::CommitmentHasher;
 use pq_hash::Digest32;
 use shielded::nullifier_tree::{NonInclusionWitness, NullifierMap, NULLIFIER_TREE_DEPTH};
 
-use crate::commitment_gadget::{DigestExpr, digest_to_ext, export_digest_limbs, p2_compress};
+use crate::commitment_gadget::{
+    DIGEST_EXT, DigestExpr, digest_to_ext, export_digest_limbs, p2_compress,
+};
 use crate::whir_recursion::{Challenge, F};
 
 /// Levels the absence fold covers.
@@ -200,17 +202,22 @@ fn const_digest(
 ///
 /// Direction at each level is taken from `bits`, so the caller controls how the
 /// path is chosen and the prover cannot steer it.
+///
+/// H-03: siblings arrive as already-built expressions - witnesses for the
+/// note-specific path, constants only for the public empty-subtree levels.
+/// Preprocessed columns are committed publicly and unblinded, so a constant
+/// sibling path would reveal the nullifier's position to whoever holds the
+/// verifying key.
 fn fold_up(
     builder: &mut CircuitBuilder<Challenge>,
     start: DigestExpr,
     start_height: usize,
-    siblings: &[Digest32],
+    siblings: &[DigestExpr],
     bits: &[ExprId],
 ) -> Result<DigestExpr, CircuitBuilderError> {
     let mut current = start;
-    for (offset, sibling) in siblings.iter().enumerate() {
+    for (offset, sibling_expr) in siblings.iter().enumerate() {
         let level = start_height + offset;
-        let sibling_expr = const_digest(builder, sibling)?;
         let go_right = bits[level];
         builder.assert_bool(go_right);
 
@@ -245,6 +252,7 @@ pub fn constrain_nullifier_non_membership(
     builder: &mut CircuitBuilder<Challenge>,
     nullifier: &DigestExpr,
     witness: &NullifierWitness,
+    private: &mut Vec<Challenge>,
 ) -> Result<(DigestExpr, DigestExpr), CircuitBuilderError> {
     if witness.siblings.len() != FOLD_DEPTH {
         return Err(CircuitBuilderError::InvalidDimension {
@@ -262,6 +270,21 @@ pub fn constrain_nullifier_non_membership(
     let limbs = export_digest_limbs(builder, nullifier)?;
     let bits = digest_bits(builder, &limbs)?;
 
+    // H-03: the note-specific sibling path is a *witness*, allocated once and
+    // shared by both folds - the same expressions feed the absence fold and the
+    // insert fold, so the two folds provably walk the same path. A free path is
+    // no weaker than a constant one: both folds are pinned to roots the
+    // statement exports, and a path that does not fold to them witnesses
+    // nothing.
+    let mut sibling_exprs = Vec::with_capacity(witness.siblings.len());
+    for sibling in &witness.siblings {
+        let packed = digest_to_ext(sibling).ok_or(CircuitBuilderError::MissingOutput)?;
+        let exprs = builder.alloc_private_inputs(DIGEST_EXT, "nullifier.sibling");
+        private.push(packed[0]);
+        private.push(packed[1]);
+        sibling_exprs.push([exprs[0], exprs[1]]);
+    }
+
     // Absence: start from the empty-subtree constant at FOLD_START. The
     // constant is not a witness, so nothing is being trusted about it - the
     // fold either reaches the root or the nullifier was not absent.
@@ -273,7 +296,7 @@ pub fn constrain_nullifier_non_membership(
         .get(FOLD_START)
         .ok_or(CircuitBuilderError::MissingOutput)?;
     let start = const_digest(builder, start)?;
-    let root_before = fold_up(builder, start, FOLD_START, &witness.siblings, &bits)?;
+    let root_before = fold_up(builder, start, FOLD_START, &sibling_exprs, &bits)?;
 
     // Insertion: the same sibling path, but starting from the nullifier's own
     // digest at the leaf level, with the empty-subtree constants below
@@ -282,9 +305,14 @@ pub fn constrain_nullifier_non_membership(
     // carries heights `0..=FOLD_START`, and the top one is the absence fold's
     // *starting node*, not a level the insert fold consumes - including it
     // would push the insert fold one level past the root.
-    let mut insert_siblings = Vec::with_capacity(NULLIFIER_TREE_DEPTH);
-    insert_siblings.extend_from_slice(&witness.lower_empties[..FOLD_START]);
-    insert_siblings.extend_from_slice(&witness.siblings);
+    // The lower levels are the public empty-subtree digests - identical for
+    // every transfer of this shape, so constants remain the right encoding
+    // (H-03 constrains only note-specific values).
+    let mut insert_siblings: Vec<DigestExpr> = Vec::with_capacity(NULLIFIER_TREE_DEPTH);
+    for empty in &witness.lower_empties[..FOLD_START] {
+        insert_siblings.push(const_digest(builder, empty)?);
+    }
+    insert_siblings.extend_from_slice(&sibling_exprs);
     let root_after = fold_up(builder, *nullifier, 0, &insert_siblings, &bits)?;
 
     Ok((root_before, root_after))
@@ -336,8 +364,9 @@ mod tests {
             builder.define_const(ext[0]),
             builder.define_const(ext[1]),
         ];
+        let mut private = Vec::new();
         let (root_before, root_after) =
-            constrain_nullifier_non_membership(&mut builder, &probe_digest, witness)?;
+            constrain_nullifier_non_membership(&mut builder, &probe_digest, witness, &mut private)?;
 
         for (actual, expected) in [(&root_before, expect_before), (&root_after, expect_after)] {
             let got = export_digest_limbs(&mut builder, actual)?;
@@ -351,7 +380,7 @@ mod tests {
         let circuit = builder.build()?;
         let mut runner = circuit.runner();
         runner.set_public_inputs(&[])?;
-        runner.set_private_inputs(&[])?;
+        runner.set_private_inputs(&private)?;
         runner.run()?;
         Ok(())
     }

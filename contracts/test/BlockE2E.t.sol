@@ -46,7 +46,7 @@ contract BlockE2ETest is Test {
         bytes32 genesisRoot = vm.parseJsonBytes32(j, ".genesis_root_hex");
         expectedRootAfter = _asBytes32(vm.parseJsonBytes(j, ".pool_root_after_hex"));
 
-        WhirVerifier verifier = new WhirVerifier(address(new TerminalWeight()), 0x7d61ae57323bdb9c8a4c72178820ecd8a07835699ca5b27fd2fcf29045d96c16);
+        WhirVerifier verifier = new WhirVerifier(address(new TerminalWeight()), 0xb46b4403210bab3dc9ba9bb906a50408a07443129f274e47c44b722be5f151ec);
         pool = new ShieldedPool(verifier, address(0xB0B), genesisRoot, bytes32(0));
         // H-01: settlement is operator-gated; 0xB0B (the fee recipient) is
         // the seeded operator and admits this test contract.

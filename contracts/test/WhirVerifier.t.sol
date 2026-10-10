@@ -133,7 +133,7 @@ contract WhirVerifierTest is Test {
     function test_verify_rejects_foreign_circuit_config() public {
         WhirVerifier blockPinned = new WhirVerifier(
             address(new TerminalWeight()),
-            0x7d61ae57323bdb9c8a4c72178820ecd8a07835699ca5b27fd2fcf29045d96c16
+            0xb46b4403210bab3dc9ba9bb906a50408a07443129f274e47c44b722be5f151ec
         );
         vm.expectRevert(WhirVerifier.ConfigNotPinned.selector);
         blockPinned.verify(statement, _bundle());
@@ -296,7 +296,7 @@ contract WhirVerifierTest is Test {
         vm.expectRevert(abi.encodeWithSelector(
             WhirVerifier.TerminalClaimMismatch.selector,
             0,
-            56325714059354972294157867742800216252525559810956974801887900825513015377920
+            26680360537610394956755466636881435314427446113443067873233211526931481100288
         ));
         v.verify(statement, _bundle());
     }
@@ -310,7 +310,7 @@ contract WhirVerifierTest is Test {
         vm.expectRevert(abi.encodeWithSelector(
             WhirVerifier.TerminalClaimMismatch.selector,
             0,
-            56325714059354972294157867742800216252525559810956974801887900825513015377920
+            26680360537610394956755466636881435314427446113443067873233211526931481100288
         ));
         v.verify(statement, _bundle());
     }

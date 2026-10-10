@@ -3914,3 +3914,61 @@ task (the test's own docstring says it guards the fixed/varying
 classification, which is a property of the protocol, not of byte
 equality). Recorded so a future run does not re-investigate it as V-07
 fallout.
+
+## Batch 92 — H-03: transfer-circuit preprocessed constants → witnesses (Oct 9)
+
+H-03 (High): the transfer circuit baked note- and tree-specific values into
+`define_const` — membership sibling paths, nullifier-map siblings, the
+recipient `pk_d`, and the four roots (before/after, nullifier before/after).
+Preprocessed columns are committed publicly and unblinded, and the client
+hands its `CircuitVerifier` to the sequencer: the spent leaf position and
+the recipient identity were recoverable from the VK, and the VK varied per
+transfer (tree state in the key).
+
+Fix (docs/design/h03-preprocessed-to-witness.md): every note/tree-specific
+value is now a private witness or a witness-backed statement export.
+`fold_membership_p2` siblings: `alloc_private_inputs(2)` per level, folded
+against the witness root pin. `constrain_outputs`: recipient `pk_d` is a
+`Secret`-style range-checked limb witness (the commitment is computed from
+the limbs and exported to the statement, so nothing is trusted about the
+witness beyond what the commitment binds). Roots: `root_before`,
+`root_after` pin, `nf.before`, `nf.after` are ext witnesses exported via
+`export_digest_limbs` — byte-identical statement encoding (D-088 layout
+unchanged), pins compare witness-to-witness. `nullifier_gadget::fold_up`
+takes built `DigestExpr` siblings; the sibling path is witnessed once and
+shared by both folds (so they provably walk the same path); the
+empty-subtree `start`/`lower_empties` stay constants — public, shape-level.
+Each witness root gets a `claim_private` creator row so spend-less or
+output-less transfers still witness.
+
+Test: `crates/prover/tests/h03_vk_uniformity.rs` —
+`preprocessed_is_shape_only` (two same-shape transfers, different trees/
+keys/recipients: const multisets via `TransferCircuit::census_consts()`
+must be identical; RED before the fix, GREEN after) and
+`tampered_membership_sibling_rejected` (a foreign sibling fails to fold to
+the pinned root).
+
+Consensus ripple: the block CONFIG moved again (rc gadget bakes the child
+table shapes). New block CONFIG digest:
+0xb46b4403210bab3dc9ba9bb906a50408a07443129f274e47c44b722be5f151ec
+(was 0x7d61ae57...). Settlement (ffb29fe8) and chain v5 (ddd87cbe)
+unchanged: neither wraps the transfer circuit, so the fix does not touch
+their constraint programs. Pins updated: Deploy.s.sol, BlockE2E.t.sol, WhirVerifier.t.sol,
+AuditRegression.t.sol. WhirVerifier.t.sol's two TerminalClaimMismatch
+constants moved with the regenerated witness (5632571... -> 2668036...) —
+expected, same drill as batch 91.
+
+Full regeneration under the canonical env; grind flakes retried clean
+(constraint_identity 1 retry, export_chain_bundle 1 retry). Sizes/gas:
+v8 bundle 263,500 B (+1,440: sibling/pk_d witnesses add rows to the
+witness, not the constraint program); test_gas_v8 41,749,534 (+95,971),
+test_gas_v7 41,539,017 (-7,628). 300 KB target still met; 30M still open.
+
+Suites after: prover green modulo the known grind flake (3 passes, every
+test green at least once; all failures were grinding_challenger:304);
+forge 197/197.
+
+Prize: the transfer VK is now uniform per shape — the prerequisite for
+V-06's `constrain_trusted_preprocessing` (pin a child's preprocessing by
+digest). M-10 (settlement leakage) should be re-examined next: the
+sequencer no longer learns positions/recipient from the VK.

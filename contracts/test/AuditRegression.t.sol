@@ -17,7 +17,7 @@ import {ShieldedPool} from "../src/ShieldedPool.sol";
 contract AuditRegressionV01Test is Test {
     /// The block vectors' CONFIG digest (Deploy.s.sol's default).
     bytes32 internal constant BLOCK_CFG =
-        0x7d61ae57323bdb9c8a4c72178820ecd8a07835699ca5b27fd2fcf29045d96c16;
+        0xb46b4403210bab3dc9ba9bb906a50408a07443129f274e47c44b722be5f151ec;
 
     string internal constant FORGED = "test/vectors/audit/poc_f01_forged_block.json";
     string internal constant FORGED_BUNDLE = "test/vectors/audit/poc_f01_forged_bundle.bin";
