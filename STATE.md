@@ -1,11 +1,12 @@
 # STATE — resume pointer
 
-- Done: V-06 (child verifying key pinned: canonical per-shape verifier built
-  by the block circuit; native commitment+relation checks; in-circuit
-  constrain_constant) — design doc docs/design/v06-child-vk-pinning.md
+- Done: V-06 committed 4433f02 (canonical per-shape child verifier; native
+  commitment+relation checks; in-circuit constrain_constant; sequencer
+  admission NonCanonicalVerifier) — docs/design/v06-child-vk-pinning.md
   status: implemented. Ledger Batch 93.
 - Next task: V-08 — binary Merkle leaf/index binding in the Poseidon2 circuit
-  AIR (upstream-shaped). Then H-02, M-01 (pool-address half), M-06..M-10.
+  AIR (upstream-shaped). Write docs/design/v08-*.md from the template first
+  (AGENTS.md protocol). Then H-02, M-01 (pool-address half), M-06..M-10.
 - Remaining audit findings: V-08, H-02, M-01 (pool-address half), M-06..M-10.
 - Last gate: forge 197/197; prover green modulo grind flake; v8 bundle
   262,828 B; test_gas_v8 41,705,849; test_gas_v7 41,548,254.
