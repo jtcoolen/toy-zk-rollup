@@ -752,6 +752,17 @@ where
         })
     }
 
+    /// V-06: the allocated preprocessed-commitment targets, if the common data
+    /// carried a preprocessing section.
+    ///
+    /// These targets are allocated as free public inputs by [CommonDataTargets::new]
+    /// and are otherwise unconstrained; a caller that pins the child verifying key
+    /// must constrain them to a trusted constant via
+    /// [crate::prepared::ConstrainConstantCommitment::constrain_constant].
+    pub fn preprocessed_commit_targets(&self) -> Option<&Comm> {
+        self.common_data.preprocessed.as_ref().map(|p| &p.commitment)
+    }
+
     /// Checked batch allocation path. Native validation runs before any target
     /// allocation or circuit-builder mutation.
     pub fn try_allocate(

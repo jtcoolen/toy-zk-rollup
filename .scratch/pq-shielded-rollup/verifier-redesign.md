@@ -3972,3 +3972,76 @@ Prize: the transfer VK is now uniform per shape — the prerequisite for
 V-06's `constrain_trusted_preprocessing` (pin a child's preprocessing by
 digest). M-10 (settlement leakage) should be re-examined next: the
 sequencer no longer learns positions/recipient from the VK.
+
+
+## Batch 93 — V-06: child verifying key pinned in the block circuit
+
+Finding (Critical, structural): `build_multi_transfer_circuit` re-verifies each
+client transfer proof through `verify_trusted_p3_batch_proof_circuit` using the
+**client-supplied** `CircuitVerifier` (`ClientTransferProof.verifier` — stored at
+`submit()`, natively verified with itself, then handed to the block circuit).
+Two independent leaks: (a) the in-circuit verifier allocates the child's
+preprocessed commitment as free public-input targets
+(`CommonDataTargets::new` -> `MerkleCapTargets::new` -> `alloc_public_input_array`)
+and nothing constrains them; (b) worse — `trusted_batch_tables` builds the
+in-circuit constraint tables from **the supplied verifier's own relation and
+AIRs** (`verifier.relation()`, `table_airs()`, `config()`), so even pinning the
+commitment would not bind the constraint set: a circuit C' with identical
+preprocessed columns but weaker AIRs shares the commitment. Attack: build a
+weaker same-shape circuit, prove on it, submit verifier(C') + proof(C') —
+verifies natively at `submit()` and in-circuit; the block proof attests to a
+relation nobody pinned.
+
+Fix (design doc docs/design/v06-child-vk-pinning.md): the block circuit verifies
+every child against a **canonical verifier it builds itself**.
+- `crates/prover/src/transfer.rs`: split `prepare_transfer_circuit_with`
+  (prepare-only -> `PreparedCircuitProver`) out of `settle_transfer_circuit_with`;
+  `TransferCircuit` keeps its private inputs + a `#[doc(hidden)]`
+  `forge_append_const_for_test` hook (appends an unused `Op::Const`, re-witnesses)
+  for the negative test.
+- `crates/prover/src/block.rs`: `canonical_child_verifier(inner, shape)` builds a
+  deterministic witness-free fixture of the shape (fixed dummy keys/notes,
+  tree of the spends, same statement pipeline as the client path) and prepares
+  it under the block's own inner config -> `(CircuitVerifier, MerkleCap pin)`;
+  `canonical_child_preprocessed` is the pin-only wrapper. Pre-pass memo map keyed
+  by `(n_nullifiers, n_outputs)`. Per child: reject unless the supplied verifier's
+  preprocessed commitment equals the pin AND
+  `child.verifier.relation() == canonical.relation()` (`CircuitRelation: PartialEq`);
+  then the in-circuit verify, statement packing, and witness replay all read the
+  **canonical** verifier — the client's object influences nothing after the two
+  equality checks. In-circuit half: `preprocessed_commit_targets()` (new accessor
+  on `BatchStarkVerifierInputsBuilder`, vendor/p3-recursion/recursion/src/public_inputs.rs)
+  + `constrain_constant` to the canonical `MerkleCap`, so the settled block proof
+  itself attests the pinned key, not just the native build step.
+- Sequencer admission hardened (`crates/node/src/sequencer.rs`): `submit()` builds
+  and caches the canonical verifier per shape, rejects a submission whose
+  verifying key differs (`SequencerError::NonCanonicalVerifier`), and verifies the
+  proof against the canonical verifier — not the client's. Without this a forged
+  VK passes admission (it verifies with its own key) and then kills every batch
+  it is drained into at settle time: batch griefing. `settle_batch` remains the
+  enforcement point of record.
+
+Tests: `crates/prover/tests/v06_child_vk_pinned.rs` —
+`child_proof_under_forged_vk_rejected` (forged twin: same-shape circuit + one
+unused const; proof verifies under its own verifier — asserted — but
+`build_multi_transfer_circuit` rejects naming the canonical mismatch; RED before
+the fix), `canonical_pin_matches_honest_client_verifiers` (pin equals honest
+clients' preprocessed commitments for two fixtures — fixture-fidelity + H-03
+uniformity guard), `honest_block_still_builds_under_the_pin` (positive control).
+
+Consensus ripple: the block CONFIG moved again (the pin adds alloc_const ops +
+the canonical verifier's tables are what the block circuit now verifies against).
+New block CONFIG digest: 0x9d97d95258b8958f5c194cdcbc6051e30be940fef38d9e4a68a135fc95673c69
+(was 0xb46b4403...). Settlement (ffb29fe8) and chain v5 (ddd87cbe) unchanged —
+neither wraps the transfer circuit's constraint program; the chain bundles'
+embedded proofs/witnesses moved but not the pinned CONFIG. Pins updated:
+Deploy.s.sol, BlockE2E.t.sol, WhirVerifier.t.sol, AuditRegression.t.sol.
+WhirVerifier.t.sol's two TerminalClaimMismatch constants moved with the
+regenerated witness (2668036... -> 3158763...) — expected, same drill as 91/92.
+
+Full regeneration under the canonical env; grind flakes retried clean
+(export_chain_bundle 2 retries). Sizes/gas: v8 bundle 262,828 B (-672),
+test_gas_v8 41,705,849 (-43,685), test_gas_v7 41,548,254 (+9,237). 300 KB
+target still met; 30M still open.
+
+Suites after: prover green modulo the known grind flake; forge 197/197.

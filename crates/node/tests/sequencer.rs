@@ -19,11 +19,12 @@
 use node::{
     ClientTransferProof, PoolState, Sequencer, SequencerError, ShieldedTransfer, StateError,
 };
+use p3_field::PrimeCharacteristicRing;
 use pq_hash::{MerkleRoot, Poseidon2Commitment, Poseidon2Shielded};
-use pq_sign::rand::{rngs::StdRng, SeedableRng};
+use pq_sign::rand::{SeedableRng, rngs::StdRng};
 use pq_sign::{SpendAuth, SphincsPlusAuth};
 use prover::block::TransferShape;
-use prover::client::{prove_client_transfer, ClientSpec};
+use prover::client::{ClientSpec, prove_client_transfer};
 use prover::fixtures::{funded_note, seed, tree_with};
 use prover::transfer::LOG_MAX_LDE;
 use prover::whir_recursion::InnerWhirConfig;
@@ -220,8 +221,8 @@ fn two_client_proofs_settle_into_one_verified_block() -> Result<(), Box<dyn std:
 }
 
 #[test]
-fn a_double_spend_across_the_batch_is_rejected_at_admission(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn a_double_spend_across_the_batch_is_rejected_at_admission()
+-> Result<(), Box<dyn std::error::Error>> {
     let inner = InnerWhirConfig::new(LOG_MAX_LDE, 0)?;
     let recipient = derive_spend_pk(&Poseidon2Shielded, &seed(9));
     let (note_a, sk_a) = funded_note(11, 1_000);
@@ -322,4 +323,73 @@ fn a_funded_genesis_matches_a_tree_of_the_same_notes() {
     );
     assert_eq!(funded.note_count(), 2);
     assert_eq!(funded.block_number(), 0);
+}
+
+/// V-06: a transfer whose proof was made under a *non-canonical* verifying key
+/// — a same-shape circuit with one extra unused constant — must be rejected at
+/// admission, not at settle time. The forged proof verifies under its own
+/// verifier (that is the forgery), so an admission check that verifies with the
+/// client's verifier would queue it, and the block circuit would then refuse
+/// every batch it is drained into: batch griefing. The sequencer must verify
+/// against the canonical verifier it builds itself.
+#[test]
+fn submit_rejects_a_forged_verifier_at_admission() -> Result<(), Box<dyn std::error::Error>> {
+    let inner = InnerWhirConfig::new(LOG_MAX_LDE, 0)?;
+    let (note_a, sk_a) = funded_note(11, 1_000);
+    let (tree, paths) = tree_with(&[note_a]);
+    let recipient = derive_spend_pk(&Poseidon2Shielded, &seed(9));
+
+    // Same public shape as every other test here: 1-in / 1-out, fee 100.
+    let output = shielded::Note::new(900, seed(0x51), seed(0x52), recipient);
+    let transfer = shielded::transfer::Transfer {
+        spends: vec![shielded::transfer::Spend {
+            note: &note_a,
+            sk_d: &sk_a,
+            path: &paths[0],
+            index: 0,
+        }],
+        outputs: vec![output],
+        fee: 100,
+    };
+    transfer.check_balance()?;
+    let (public, witnesses, frontier) = prover::fixtures::public_and_witnesses(&transfer, &tree);
+    let mut tc =
+        prover::transfer::build_transfer_circuit(&transfer, &public, &witnesses, &frontier)?;
+    // The forge: one extra unused const op — a different circuit, a different
+    // verifying key, same public statement.
+    tc.forge_append_const_for_test(prover::whir_recursion::Challenge::from_u16(7))?;
+    let (proof, verifier) = prover::transfer::settle_transfer_circuit_with(&tc, inner.clone())?;
+    // The forged proof really is valid under the forged verifier — otherwise
+    // this test would pass for the wrong reason.
+    verifier.verify(&proof, tc.statement())?;
+
+    let envelope = sign_statement(&public, 7);
+    let forged = ClientTransferProof {
+        verifier,
+        proof,
+        statement: tc.statement().to_vec(),
+        shape: ONE_IN_ONE_OUT,
+        public,
+        envelope,
+    };
+
+    // Funded with exactly the one note the transfer spends: the admission
+    // root check must pass so the rejection comes from the verifier check.
+    let mut seq = Sequencer::funded(
+        LOG_MAX_LDE,
+        vec![note_a.commit(&Poseidon2Commitment::default())],
+    )?;
+    let err = seq
+        .submit(forged)
+        .expect_err("a proof under a forged verifying key must be rejected at admission (V-06)");
+    assert!(
+        matches!(err, SequencerError::NonCanonicalVerifier),
+        "expected NonCanonicalVerifier, got {err}"
+    );
+    assert_eq!(
+        seq.pending(),
+        0,
+        "a rejected submit must not grow the mempool"
+    );
+    Ok(())
 }

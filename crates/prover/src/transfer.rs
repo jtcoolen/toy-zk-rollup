@@ -269,6 +269,9 @@ pub struct TransferCircuit {
     traces: Traces<Challenge>,
     schema: StatementSchema,
     statement: Vec<F>,
+    /// The private witness inputs, retained so a test hook can append ops
+    /// and re-witness (V-06 forge fixture).
+    private: Vec<Challenge>,
 }
 
 impl fmt::Debug for TransferCircuit {
@@ -317,6 +320,29 @@ impl TransferCircuit {
         v
     }
 
+    /// V-06 test fixture: append one unused constant op and re-witness.
+    ///
+    /// A *different circuit* with the same public shape - what a client who
+    /// quietly edited their circuit would hand the sequencer. The extra const
+    /// changes the statement-table preprocessed commitment, so the resulting
+    /// verifier is a genuinely different verifying key while every witness
+    /// value still satisfies the (unchanged) constraints. Test-only: production
+    /// code must never call it.
+    #[doc(hidden)]
+    pub fn forge_append_const_for_test(
+        &mut self,
+        val: Challenge,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use p3_circuit::types::WitnessId;
+        let out = WitnessId(self.circuit.witness_count);
+        self.circuit.witness_count += 1;
+        self.circuit.ops.push(p3_circuit::Op::Const { out, val });
+        let mut runner = self.circuit.runner();
+        runner.set_public_inputs(&[])?;
+        runner.set_private_inputs(&self.private)?;
+        self.traces = runner.run()?;
+        Ok(())
+    }
     /// The exported statement: the exact slice `verify(&proof, statement)` must be
     /// called with.
     #[must_use = "the statement is what the settlement verifier must be called with"]
@@ -566,11 +592,12 @@ pub fn constrain_transfer(
     // The threaded nullifier root must land on the published `after` - pinned
     // against a witness of it, not a constant (H-03), and exported from that
     // same witness so the contract checks the value the thread was pinned to.
-    let nf_after = digest_to_ext(&Digest32::new(*public.nullifier_roots.after.as_bytes()))
-        .ok_or(CircuitBuilderError::InvalidDimension {
+    let nf_after = digest_to_ext(&Digest32::new(*public.nullifier_roots.after.as_bytes())).ok_or(
+        CircuitBuilderError::InvalidDimension {
             expected: DIGEST_LIMBS,
             actual: 0,
-        })?;
+        },
+    )?;
     let after_w = builder.alloc_private_inputs(DIGEST_EXT, "nf.root_after");
     private.push(nf_after[0]);
     private.push(nf_after[1]);
@@ -760,6 +787,7 @@ pub fn build_transfer_circuit(
         traces,
         schema,
         statement: statement_values,
+        private,
     })
 }
 
@@ -1068,6 +1096,65 @@ where
     p3_circuit_prover::batch_stark_prover::RecomposeAirBuilder<4>:
         p3_circuit_prover::common::NpoAirBuilder<SC, 4>,
 {
+    let prepared = prepare_transfer_circuit_with(tc, config)?;
+    let proof = prepared.prove::<Challenge>(&tc.traces)?;
+    Ok((proof, prepared.verifier()))
+}
+
+/// V-06: prepare the transfer's verifying key *without proving*.
+///
+/// The preprocessed commitment inside the returned verifier's `common_data` is
+/// a pure function of the circuit's shape and the config — the witness never
+/// touches it — so this is the cheap, deterministic way to derive the canonical
+/// child verifying-key pin for a shape (see `block::canonical_child_preprocessed`).
+/// The `PreparedCircuitProver` also proves: `settle_transfer_circuit_with` is
+/// this function plus `prove`.
+///
+/// # Errors
+///
+/// Returns a prover error if the circuit cannot be prepared under `config`.
+pub fn prepare_transfer_circuit_with<SC>(
+    tc: &TransferCircuit,
+    config: SC,
+) -> Result<
+    p3_circuit_prover::batch_stark_prover::PreparedCircuitProver<SC>,
+    Box<dyn std::error::Error>,
+>
+where
+    SC: p3_uni_stark::StarkGenericConfig<Challenge = Challenge> + Send + Sync + Clone + 'static,
+    p3_uni_stark::Val<SC>: p3_field::PrimeField64
+        + p3_field::Field
+        + p3_circuit_prover::config::StarkField
+        // D-088: the Poseidon2 and recompose tables are keyed on the base field
+        // and implemented per field, exactly like the Keccak preprocessor below -
+        // the bound is what lets a caller settle under *either* WHIR config, since
+        // both are KoalaBear-based.
+        + p3_field::extension::BinomiallyExtendable<4>,
+    Challenge: p3_field::ExtensionField<p3_uni_stark::Val<SC>>
+        + p3_field::BasedVectorSpace<p3_uni_stark::Val<SC>>
+        + From<p3_uni_stark::Val<SC>>
+        + p3_circuit_prover::field_params::ExtractBinomialW<p3_uni_stark::Val<SC>>,
+    SC::Challenger: p3_challenger::GrindingChallenger<Witness = p3_uni_stark::Val<SC>>,
+    p3_uni_stark::PcsProverError<SC>: Send,
+    SC::Pcs: Sync,
+    <SC::Pcs as p3_commit::Pcs<Challenge, SC::Challenger>>::Domain: Send + Sync,
+    <SC::Pcs as p3_commit::Pcs<Challenge, SC::Challenger>>::ProverData: Sync,
+    <SC::Pcs as p3_commit::Pcs<Challenge, SC::Challenger>>::Commitment: Sync,
+    p3_air::SymbolicExpressionExt<p3_uni_stark::Val<SC>, Challenge>: p3_field::Algebra<p3_uni_stark::SymbolicExpression<p3_uni_stark::Val<SC>>>
+        + p3_field::Algebra<Challenge>,
+    p3_circuit_prover::batch_stark_prover::KeccakF1600Preprocessor:
+        p3_circuit_prover::common::NpoPreprocessor<p3_uni_stark::Val<SC>>,
+    p3_circuit_prover::batch_stark_prover::StatementPreprocessor:
+        p3_circuit_prover::common::NpoPreprocessor<p3_uni_stark::Val<SC>>,
+    p3_circuit_prover::batch_stark_prover::Poseidon2SharedPreprocessor:
+        p3_circuit_prover::common::NpoPreprocessor<p3_uni_stark::Val<SC>>,
+    p3_circuit_prover::batch_stark_prover::RecomposePreprocessor:
+        p3_circuit_prover::common::NpoPreprocessor<p3_uni_stark::Val<SC>>,
+    p3_circuit_prover::batch_stark_prover::Poseidon2AirBuilderForConfig<4>:
+        p3_circuit_prover::common::NpoAirBuilder<SC, 4>,
+    p3_circuit_prover::batch_stark_prover::RecomposeAirBuilder<4>:
+        p3_circuit_prover::common::NpoAirBuilder<SC, 4>,
+{
     use p3_circuit_prover::batch_stark_prover::{
         BatchStarkProver, KeccakF1600AirBuilder, KeccakF1600Preprocessor, KeccakF1600Prover,
         Poseidon2AirBuilderForConfig, Poseidon2SharedPreprocessor, RecomposeAirBuilder,
@@ -1106,8 +1193,7 @@ where
         &air_builders,
         ConstraintProfile::Standard,
     )?;
-    let proof = prepared.prove(&tc.traces)?;
-    Ok((proof, prepared.verifier()))
+    Ok(prepared)
 }
 
 #[cfg(test)]

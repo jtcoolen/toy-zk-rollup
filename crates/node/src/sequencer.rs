@@ -35,9 +35,9 @@
 //! contract will run, so a proof that fails here would fail there. The native
 //! check is not a substitute for the contract's; it is a rehearsal of it.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
-use prover::block::{self, ChildProof, TransferShape};
+use prover::block::{self, ChildProof, TransferShape, canonical_child_verifier};
 use prover::whir_recursion::InnerWhirConfig;
 use shielded::TransferPublic;
 
@@ -47,10 +47,12 @@ use crate::tx::{ShieldedTransfer, TxError};
 /// A client-produced transfer proof, bundled with everything the block circuit
 /// needs to re-verify it.
 ///
-/// The `CircuitVerifier` travels with the proof because the block circuit
-/// takes the child's relation from the *retained verifier*, not from anything
-/// the proof asserts. A proof arriving without its verifier cannot be batched:
-/// there would be nothing to check its shape against.
+/// The `CircuitVerifier` travels with the proof as the client's *claim* about
+/// which circuit it proved on — since V-06 nothing verifies against it
+/// directly. Admission (`submit`) and the block circuit each build the
+/// canonical verifier for the shape themselves and reject this one unless it
+/// matches, so a proof arriving without its verifier still cannot be batched:
+/// there would be nothing to check its claim against.
 ///
 /// This bundle is not serializable, and that is a real architectural seam, not
 /// an oversight. A production sequencer would not receive the verifier from
@@ -128,6 +130,9 @@ pub enum SequencerError {
     State(StateError),
     /// A child proof failed native verification.
     InvalidChildProof,
+    /// V-06: the child's verifying key is not the canonical one for its
+    /// shape — the proof was made on some other circuit.
+    NonCanonicalVerifier,
     /// The block circuit could not be built or proven.
     Proving(String),
     /// The settled block proof failed native verification.
@@ -142,6 +147,9 @@ impl core::fmt::Display for SequencerError {
             Self::Tx(e) => write!(f, "transaction rejected: {e}"),
             Self::State(e) => write!(f, "state rejected transfer: {e}"),
             Self::InvalidChildProof => write!(f, "child transfer proof invalid"),
+            Self::NonCanonicalVerifier => {
+                write!(f, "child verifying key is not canonical for its shape")
+            }
             Self::Proving(msg) => write!(f, "block proving failed: {msg}"),
             Self::InvalidBlockProof => write!(f, "settled block proof invalid"),
             Self::Empty => write!(f, "mempool empty"),
@@ -200,6 +208,11 @@ pub struct Sequencer {
     pending_tree: shielded::tree::CommitmentTree<pq_hash::Poseidon2Commitment>,
     inner: InnerWhirConfig,
     max_transfers_per_block: usize,
+    /// V-06: the canonical child verifier per transfer shape, built lazily
+    /// from the prover's own fixture code (never from a client's submission)
+    /// and cached — preparing one per shape is the admission-time cost of
+    /// checking a verifying key.
+    canonical: HashMap<(usize, usize), p3_circuit_prover::CircuitVerifier<InnerWhirConfig>>,
 }
 
 impl core::fmt::Debug for Sequencer {
@@ -237,6 +250,7 @@ impl Sequencer {
             // at v=25). Raising this requires re-measuring the height budget;
             // see `prover::block::BLOCK_LOG_MAX_LDE`.
             max_transfers_per_block: 2,
+            canonical: HashMap::new(),
         })
     }
 
@@ -264,6 +278,7 @@ impl Sequencer {
             inner: InnerWhirConfig::new(log_max_lde, 0)
                 .map_err(|e| SequencerError::Proving(e.to_string()))?,
             max_transfers_per_block: 2,
+            canonical: HashMap::new(),
         })
     }
 
@@ -339,8 +354,44 @@ impl Sequencer {
             self.pending_tree.root(),
             self.pending.root(),
         )?;
-        transfer
+        // V-06: verify against the *canonical* verifier for this shape —
+        // built from the prover's own fixture code, never from anything the
+        // client supplied — and reject a submission whose verifying key
+        // differs. Without this, a forged verifier (a weaker circuit of the
+        // same shape) passes admission by verifying with its own key, then
+        // kills every batch it is drained into at settle time: the block
+        // circuit refuses non-canonical keys. Checking here rejects the
+        // forgery at the mempool door, where it belongs.
+        let key = (transfer.shape.num_nullifiers, transfer.shape.num_outputs);
+        if !self.canonical.contains_key(&key) {
+            let (v, _) = canonical_child_verifier(&self.inner, &transfer.shape)
+                .map_err(|e| SequencerError::Proving(e.to_string()))?;
+            self.canonical.insert(key, v);
+        }
+        let canonical = self
+            .canonical
+            .get(&key)
+            .expect("canonical verifier just inserted");
+        let same_key = transfer
             .verifier
+            .common_data()
+            .preprocessed
+            .as_ref()
+            .map(|g| g.commitment.clone())
+            .is_some_and(|c| {
+                let canon = canonical
+                    .common_data()
+                    .preprocessed
+                    .as_ref()
+                    .expect("canonical verifier carries preprocessed data")
+                    .commitment
+                    .clone();
+                canon == c && canonical.relation() == transfer.verifier.relation()
+            });
+        if !same_key {
+            return Err(SequencerError::NonCanonicalVerifier);
+        }
+        canonical
             .verify(&transfer.proof, &transfer.statement)
             .map_err(|_| SequencerError::InvalidChildProof)?;
         for nf in &transfer.public.nullifiers {

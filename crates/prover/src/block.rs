@@ -89,7 +89,10 @@
 //! chain of roots cannot be extended — the absent-fold inside each child's
 //! proof fails against the root it inherited.
 
-use crate::commitment_gadget::{export_digest_limbs, fold_statement, DigestExpr};
+use crate::commitment_gadget::{
+    export_digest_limbs, fold_statement, frontier_from_leaves, DigestExpr,
+};
+use crate::transfer::{build_transfer_circuit, prepare_transfer_circuit_with};
 use crate::whir_recursion::{Challenge, InnerWhirConfig, RecursionCircuit, WhirMmcs, DIGEST_ELEMS};
 use p3_circuit::{CircuitBuilder, ExprId, NonPrimitiveOpId, StatementExport};
 use p3_circuit_prover::common::{NpoAirBuilder, NpoPreprocessor};
@@ -100,14 +103,22 @@ use p3_circuit_prover::{
 };
 use p3_field::PrimeCharacteristicRing;
 use p3_lookup::logup::LogUpGadget;
+use p3_merkle_tree::MerkleCap;
 use p3_recursion::backend::whir::{WhirRecursionBackend, WhirRecursionConfig};
 use p3_recursion::pcs::fri::MerkleCapTargets;
 use p3_recursion::pcs::whir::uni::WhirUniProofTargets;
+use p3_recursion::prepared::ConstrainConstantCommitment;
 use p3_recursion::verifier::verify_trusted_p3_batch_proof_circuit;
 use p3_recursion::{
     BatchOnly, PcsRecursionBackend, Poseidon2Config, ProveNextLayerParams,
     TrustedPcsRecursionBackend,
 };
+use pq_hash::{Digest32, MerkleRoot, Poseidon2Commitment, Poseidon2Shielded};
+use shielded::keys::derive_spend_pk;
+use shielded::transfer::Spend;
+use shielded::tree::CommitmentTree;
+use shielded::{Note, NullifierMap, Transfer};
+use std::collections::HashMap;
 use std::error::Error;
 
 use crate::whir_recursion::F;
@@ -397,12 +408,152 @@ impl core::fmt::Debug for ChildProof<'_> {
     }
 }
 
+/// V-06: the canonical child verifier — the verifying key the block verifies
+/// every child of `shape` against — plus its preprocessed-commitment pin.
+///
+/// The block circuit verifies each child against a verifier the client
+/// *supplies*, and the in-circuit verifier allocates the child's preprocessed
+/// commitment as free public-input targets: left alone, a client could hand
+/// over a weaker circuit of the same shape whose proof verifies natively and
+/// in-circuit alike. The fix pins those targets to a constant derived here,
+/// from a witness-free fixture of the shape: after H-03 the preprocessed
+/// commitment depends only on the circuit's shape and config — never on
+/// witness values — so any balanced fixture of the shape yields the same
+/// commitment an honest client's verifier carries.
+///
+/// # Errors
+///
+/// Returns an error if the fixture circuit cannot be built or prepared, or if
+/// the prepared verifier carries no preprocessed commitment to pin.
+pub fn canonical_child_verifier(
+    inner: &InnerWhirConfig,
+    shape: &TransferShape,
+) -> Result<
+    (
+        p3_circuit_prover::CircuitVerifier<InnerWhirConfig>,
+        MerkleCap<F, [F; DIGEST_ELEMS]>,
+    ),
+    Box<dyn Error>,
+> {
+    let hasher = Poseidon2Commitment::default();
+    let shielded = Poseidon2Shielded;
+    // Deterministic dummy keys and notes. The values are arbitrary: the pin
+    // must not depend on them (the uniformity test pins that property).
+    let dummy_key = |i: u8| -> [u8; 32] {
+        let mut b = [0u8; 32];
+        b[0] = 0x5C;
+        b[31] = i;
+        b
+    };
+    let dummy_note = |i: u8, value: u64| -> Note {
+        let mut rho = [0u8; 32];
+        rho[0] = 0xB0;
+        rho[31] = i;
+        let mut psi = [0u8; 32];
+        psi[0] = 0xC1;
+        psi[31] = i;
+        Note::new(value, rho, psi, derive_spend_pk(&shielded, &dummy_key(i)))
+    };
+    // Any balanced assignment works; these keep the fee positive for every
+    // shape the block layer admits.
+    let spend_value: u64 = 10_000;
+    let out_value: u64 = 100;
+    let fee = spend_value
+        .checked_mul(shape.num_nullifiers as u64)
+        .and_then(|t| t.checked_sub(out_value.checked_mul(shape.num_outputs as u64)?))
+        .ok_or("transfer shape too large for the canonical fixture")?;
+
+    let notes: Vec<Note> = (0..shape.num_nullifiers)
+        .map(|i| dummy_note(i as u8, spend_value))
+        .collect();
+    let mut tree = CommitmentTree::new(hasher.clone());
+    for note in &notes {
+        tree.append(&note.commit(&hasher));
+    }
+    // Owned first, borrowed second: `Spend` holds references, so the keys and
+    // paths must outlive the vector that borrows them.
+    let keys: Vec<[u8; 32]> = (0..shape.num_nullifiers)
+        .map(|i| dummy_key(i as u8))
+        .collect();
+    let paths: Vec<Vec<Digest32>> = (0..shape.num_nullifiers)
+        .map(|i| tree.path(i).expect("fixture path exists").siblings)
+        .collect();
+    let spends: Vec<Spend<'_>> = (0..shape.num_nullifiers)
+        .map(|i| Spend {
+            note: &notes[i],
+            sk_d: &keys[i],
+            path: &paths[i],
+            index: i,
+        })
+        .collect();
+    let outputs: Vec<Note> = (0..shape.num_outputs)
+        .map(|i| dummy_note(0x80 + i as u8, out_value))
+        .collect();
+    let transfer = Transfer {
+        spends,
+        outputs: outputs.clone(),
+        fee,
+    };
+    transfer
+        .check_balance()
+        .map_err(|e| -> Box<dyn Error> { Box::new(e) })?;
+
+    let mut map = NullifierMap::new(Poseidon2Commitment::default());
+    let (nullifier_roots, witnesses) = crate::client::nullifier_transition(&transfer, &mut map)?;
+    let root = tree.root();
+    let mut frontier = frontier_from_leaves(&hasher, tree.leaves());
+    for note in &transfer.outputs {
+        let leaf = note.commit(&hasher);
+        crate::commitment_gadget::append_to_frontier(
+            &hasher,
+            &mut frontier,
+            &Digest32::new(*leaf.as_bytes()),
+        )
+        .map_err(|e| -> Box<dyn Error> { Box::new(std::io::Error::other(e)) })?;
+    }
+    let root_after = crate::commitment_gadget::fold_to_root(&hasher, &frontier);
+    let public = transfer.public(
+        &hasher,
+        &shielded,
+        root,
+        MerkleRoot::from_digest(root_after),
+        nullifier_roots,
+    );
+    let frontier_before = frontier_from_leaves(&hasher, tree.leaves());
+    let tc = build_transfer_circuit(&transfer, &public, &witnesses, &frontier_before)?;
+    let prepared = prepare_transfer_circuit_with(&tc, inner.clone())?;
+    let verifier = prepared.verifier();
+    let pin = verifier
+        .common_data()
+        .preprocessed
+        .as_ref()
+        .map(|g| g.commitment.clone())
+        .ok_or_else(|| "canonical child verifier carries no preprocessed commitment".to_string())?;
+    Ok((verifier, pin))
+}
+
+/// V-06: the canonical preprocessed commitment alone — see
+/// [`canonical_child_verifier`].
+///
+/// # Errors
+///
+/// Returns an error if the fixture circuit cannot be built or prepared, or if
+/// the prepared verifier carries no preprocessed commitment to pin.
+pub fn canonical_child_preprocessed(
+    inner: &InnerWhirConfig,
+    shape: &TransferShape,
+) -> Result<MerkleCap<F, [F; DIGEST_ELEMS]>, Box<dyn Error>> {
+    Ok(canonical_child_verifier(inner, shape)?.1)
+}
+
 /// Verify every child transfer proof inside one circuit and export the folded
 /// statement described in the module docs (D-089).
 ///
-/// Each child is re-verified through the trusted entry point, so a child's
-/// relation comes from its retained verifier rather than from anything the proof
-/// asserts. Each child's *verified* statement targets are folded into the
+/// V-06: each child is re-verified through the trusted entry point *against
+/// the canonical verifier this function builds itself* for the child's shape —
+/// never against the verifier object the client supplied. The client's proof
+/// and statement are the only parts of its submission the circuit trusts, and
+/// only after they verify. Each child's *verified* statement targets are folded into the
 /// running statement digest — the fold consumes the same targets the verifier
 /// constrained, so the exported root attests to the public inputs of the proofs
 /// that were actually verified.
@@ -476,6 +627,25 @@ pub fn build_multi_transfer_circuit(
     }
     debug_assert_eq!(exports.len(), shape_header_len(children.len()));
 
+    // V-06: the canonical child verifier per shape, built here — from the
+    // prover's own code, not from anything the client supplied. The fixture
+    // prepare is deterministic, so one entry per shape serves every child of
+    // that shape, and every child's proof verifies against exactly this
+    // relation and this preprocessing commitment. Built in a pre-pass so the
+    // main loop can hand out references that outlive each iteration.
+    let mut canonical: HashMap<
+        (usize, usize),
+        (
+            p3_circuit_prover::CircuitVerifier<InnerWhirConfig>,
+            MerkleCap<F, [F; DIGEST_ELEMS]>,
+        ),
+    > = HashMap::new();
+    for child in children {
+        let key = (child.shape.num_nullifiers, child.shape.num_outputs);
+        if !canonical.contains_key(&key) {
+            canonical.insert(key, canonical_child_verifier(inner, &child.shape)?);
+        }
+    }
     for child in children {
         let expected = child.shape.statement_len();
         if child.statement.len() != expected {
@@ -487,11 +657,41 @@ pub fn build_multi_transfer_circuit(
             .into());
         }
 
-        let statement_instance = child
-            .verifier
+        let (child_verifier, pin) = canonical
+            .get(&(child.shape.num_nullifiers, child.shape.num_outputs))
+            .expect("pre-pass populated every child shape");
+
+        let statement_instance = child_verifier
             .statement_layout()
             .table_instance()
-            .ok_or("child verifier carries no statement table to bind")?;
+            .ok_or("canonical child verifier carries no statement table to bind")?;
+
+        // The client's verifier object is *not* used to verify anything. It is
+        // compared against the canonical one and rejected on any difference —
+        // same preprocessed commitment, same relation — so a client that built
+        // its proof on a weaker circuit of the same shape fails here, natively,
+        // before the in-circuit verifier ever sees the proof.
+        let child_preprocessed = child
+            .verifier
+            .common_data()
+            .preprocessed
+            .as_ref()
+            .map(|g| g.commitment.clone())
+            .ok_or("child verifier carries no preprocessed commitment to pin")?;
+        if *pin != child_preprocessed {
+            return Err(format!(
+                "child verifying key does not match the canonical one for shape {:?}",
+                child.shape
+            )
+            .into());
+        }
+        if child_verifier.relation() != child.verifier.relation() {
+            return Err(format!(
+                "child relation does not match the canonical one for shape {:?}",
+                child.shape
+            )
+            .into());
+        }
 
         let (verifier_inputs, op_ids) = verify_trusted_p3_batch_proof_circuit::<
             InnerWhirConfig,
@@ -504,7 +704,7 @@ pub fn build_multi_transfer_circuit(
             8,
             4,
         >(
-            child.verifier,
+            child_verifier,
             &mut builder,
             child.proof,
             child.statement,
@@ -513,6 +713,15 @@ pub fn build_multi_transfer_circuit(
             perm,
         )?;
 
+        // V-06 (in-circuit half): the verifier allocated the child's
+        // preprocessed commitment as free public-input targets. Constrain them
+        // to the canonical value, so the *settled block proof itself* — not
+        // just this native build step — attests that the child verified under
+        // the pinned verifying key.
+        verifier_inputs
+            .preprocessed_commit_targets()
+            .ok_or("child verifier allocated no preprocessed targets to pin")?
+            .constrain_constant(&mut builder, pin)?;
         // The child's statement targets: the AIR public values of its statement
         // table instance — exactly the targets the in-circuit verifier
         // constrained against the child proof. Everything the block exports
@@ -548,16 +757,19 @@ pub fn build_multi_transfer_circuit(
         // Chain this child's nullifier transition onto the previous one's.
         nullifiers.advance(&mut builder, child.shape, statement_targets)?;
 
-        let table_public_inputs = child.verifier.table_public_values(child.statement)?;
+        // Everything downstream — public/private packing and the witness
+        // replay — reads from the canonical verifier too, so no client-supplied
+        // object influences the block circuit's witness.
+        let table_public_inputs = child_verifier.table_public_values(child.statement)?;
         public.extend(verifier_inputs.try_pack_public_values(
             &table_public_inputs,
             &child.proof.proof,
-            child.verifier.common_data(),
+            child_verifier.common_data(),
         )?);
         private.extend(verifier_inputs.try_pack_private_values(&child.proof.proof)?);
 
         replays.push(Replay {
-            verifier: child.verifier,
+            verifier: child_verifier,
             proof: child.proof,
             statement: child.statement,
             op_ids,
